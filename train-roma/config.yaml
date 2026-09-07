@@ -49,7 +49,7 @@ env:
   # ----- 训练控制 -----
   TOTAL_EPOCH: ${env:TOTAL_EPOCH,20}
   VERBOSITY: 'DEBUG'
-  N_WORKERS: ${env:N_WORKERS,16}
+  N_WORKERS: ${env:N_WORKERS,32}
 
   # ----- Agent / Tool 配置 -----
   ENABLE_TOOLS:
@@ -58,18 +58,18 @@ env:
       "Python_Coder_Tool",
       "Wikipedia_Search_Tool",
       "Web_Search_Tool",
-      "Brave_Search_Tool"
-    ]
 
+    ]
+#"Brave_Search_Tool"
   TOOL_ENGINE:
     [
       "vllm-Qwen3-30B-A3B-Instruct-2507",
       "vllm-Qwen3-30B-A3B-Instruct-2507",
       "vllm-Qwen3-30B-A3B-Instruct-2507",
       "vllm-Qwen3-30B-A3B-Instruct-2507",
-      "Default"
-    ]
 
+    ]
+#      "Default"
   MODEL_ENGINE:
     [
       "trainable",

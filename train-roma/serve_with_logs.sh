@@ -37,7 +37,7 @@ MAX_LOG_FILES=5000
 # 5. Read ASCEND_RT_VISIBLE_DEVICES from config.yaml if available
 if [ -f "train-roma/config.yaml" ]; then
     ## NPU setting
-    ASCEND_DEVICES=$(grep -m1 "ASCEND_RT_VISIBLE_DEVICES:" train-roma/config.yaml | sed "s/.*ASCEND_RT_VISIBLE_DEVICES: *['\"]\\([^'\"]*\\)['\"].*/\\1/")
+    ASCEND_DEVICES=$(grep -m1 "ASCEND_RT_VISIBLE_DEVICES:" train-roma/config.yaml | sed "s/.*ASCEND_RT_VISIBLE_DEVICES: *['\"]\([^'\"]*\)['\"].*/\1/")
     if [ -n "$ASCEND_DEVICES" ]; then
         export ASCEND_RT_VISIBLE_DEVICES="$ASCEND_DEVICES"
         echo "Setting ASCEND_RT_VISIBLE_DEVICES=$ASCEND_DEVICES from config.yaml"

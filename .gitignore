@@ -82,3 +82,7 @@ Thumbs.db
 core
 core.*
 nohup.out
+
+# Local process state and notebook autosaves
+*.pid
+.ipynb_checkpoints/
