@@ -8,14 +8,14 @@
 env:
   # ----- 任务与算法 -----
   TASK: ${env:TASK,qa}                                    # "webshop" | "qa" | "rule"
-  ALGORITHM: ${env:ALGORITHM,grpo+slic}                   # "grpo" | "grpo+slic" | "grpo+abpo" | "grpo+simpo" | "grpo+hspo"
+  ALGORITHM: ${env:ALGORITHM,grpo}                   # "grpo" | "grpo+slic" | "grpo+abpo" | "grpo+simpo" | "grpo+hspo"
   ADV_ESTIMATOR: ${env:ADV_ESTIMATOR,grpo}                # grpo | gigpo | graphgpo
 
   # ----- 训练数据与回放 -----
   TRAIN_DATA_PATH: ${env:TRAIN_DATA_PATH,train/webwalker_train.parquet}
   TEST_DATA_PATH: ${env:TEST_DATA_PATH,val/webwalker_val.parquet}
   STALE_ITERATION: ${env:STALE_ITERATION,0}
-  REPLAY_BUFFER_SIZE: ${env:REPLAY_BUFFER_SIZE,4096}
+  REPLAY_BUFFER_SIZE: ${env:REPLAY_BUFFER_SIZE,512}
   REPLAY_COLLECTION: ${env:REPLAY_COLLECTION,uid-turn}    # uid-turn(fast) | cross(slow) | turn(medium)
 
   # ----- 评分模型 (Reward Model) -----
@@ -32,10 +32,10 @@ env:
   # ----- 序列长度与批次大小 -----
   MAX_PROMPT_LENGTH: ${env:MAX_PROMPT_LENGTH,10240}
   MAX_RESPONSE_LENGTH: ${env:MAX_RESPONSE_LENGTH,512}
-  N_ROLLOUT: ${env:N_ROLLOUT,2}
-  TRAIN_BATCH_SIZE: ${env:TRAIN_BATCH_SIZE,32}
-  MINI_BATCH_SIZE: ${env:MINI_BATCH_SIZE,8}
-  MICRO_BATCH_SIZE_PER_GPU: ${env:MICRO_BATCH_SIZE_PER_GPU,1}
+  N_ROLLOUT: ${env:N_ROLLOUT,4}
+  TRAIN_BATCH_SIZE: ${env:TRAIN_BATCH_SIZE,16}
+  MINI_BATCH_SIZE: ${env:MINI_BATCH_SIZE,16}
+  MICRO_BATCH_SIZE_PER_GPU: ${env:MICRO_BATCH_SIZE_PER_GPU,4}
 
   # ----- 模型配置 -----
   BASE_MODEL: 'Qwen3-4B-Instruct-2507'
@@ -200,14 +200,14 @@ python_args:
   # 保持 1，避免 DPO backward OOM
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu: '${MICRO_BATCH_SIZE_PER_GPU}'
 
-  actor_rollout_ref.actor.loss_agg_mode: 'seq-mean-token-sum-norm'
+  actor_rollout_ref.actor.loss_agg_mode: 'token-mean'
 
   actor_rollout_ref.actor.optim.lr: 1e-6
 
-  actor_rollout_ref.actor.use_kl_loss: True
-  actor_rollout_ref.actor.kl_loss_coef: 0.001
+  actor_rollout_ref.actor.use_kl_loss: False
+  actor_rollout_ref.actor.kl_loss_coef: 0.00
 
-  actor_rollout_ref.actor.entropy_coeff: 0.0
+  actor_rollout_ref.actor.entropy_coeff: 0.00
   actor_rollout_ref.actor.entropy_checkpointing: False
 
   actor_rollout_ref.actor.clip_ratio_low: 0.2

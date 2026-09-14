@@ -171,79 +171,79 @@ class AlfWorldEnv:
                 
         return prompt
     
-    # # ==== 松弛检验 ==============================
-    # def _parse_action(self, response):
-    #     """
-    #     解析模型响应，提取 <action>...</action> 中的动作。
-    #     返回: (action_str, is_valid_format)
-    #     """
-    #     if not isinstance(response, str):
-    #         return str(response)[-30:], False
-
-    #     ## 必须不包括额外思考废话
-    #     # 严格检查格式
-    #     action_match = re.search(r'<action>(.*?)</action>', response)
-
-    #     if not action_match:
-    #         return "", False
-
-
-    #     original_str = response
-    #     text = response
-
-    #     start_tag = "<action>"
-    #     end_tag = "</action>"
-    #     start_idx = text.find(start_tag)
-    #     end_idx = text.find(end_tag)
-
-    #     # 找不到完整的 <action>...</action> 标签
-    #     if start_idx == -1 or end_idx == -1 or start_idx >= end_idx:
-    #         return original_str[-30:], False
-
-    #     extracted = text[start_idx + len(start_tag):end_idx]
-    #     if not extracted:
-    #         return "", False
-
-    #     return extracted, True
-
-
-    
-    ## ====== 暂时未启用的严格reward，避免think出来的检测 =======
+    # ==== 松弛检验 ==============================
     def _parse_action(self, response):
         """
-        严格解析模型响应。
-        合法格式：去除首尾空白后，必须严格为 <action>...content...</action>
-        任何前缀、后缀、嵌套标签、空内容都视为格式错误。
+        解析模型响应，提取 <action>...</action> 中的动作。
+        返回: (action_str, is_valid_format)
         """
         if not isinstance(response, str):
             return str(response)[-30:], False
 
-        text = response.strip()
-        start_tag = "<action>"
-        end_tag = "</action>"
+        ## 必须不包括额外思考废话
+        # 严格检查格式
+        action_match = re.search(r'<action>(.*?)</action>', response)
 
-        # 1. 必须以 <action> 开头，以 </action> 结尾
-        if not text.startswith(start_tag) or not text.endswith(end_tag):
-            return response[-30:], False
-
-        # 2. 提取内容
-        extracted = text[len(start_tag):-len(end_tag)]
-
-        # 3. 内容不能为空或纯空白
-        if not extracted or not extracted.strip():
+        if not action_match:
             return "", False
 
-        # 4. 内容内部不能包含其他标签符号（防止嵌套或乱码）
-        if '<' in extracted or '>' in extracted:
-            return response[-30:], False
 
-        # 5. 确保整个字符串只出现一次 <action> 和一次 </action>
-        # （防止 "<action>foo</action>bar<action>baz</action>" 这种重复结构）
-        if text.count(start_tag) != 1 or text.count(end_tag) != 1:
-            return response[-30:], False
+        original_str = response
+        text = response
+
+        start_tag = "<action>"
+        end_tag = "</action>"
+        start_idx = text.find(start_tag)
+        end_idx = text.find(end_tag)
+
+        # 找不到完整的 <action>...</action> 标签
+        if start_idx == -1 or end_idx == -1 or start_idx >= end_idx:
+            return original_str[-30:], False
+
+        extracted = text[start_idx + len(start_tag):end_idx]
+        if not extracted:
+            return "", False
 
         return extracted, True
-    # ======================================================================
+
+
+    
+    # ## ====== 暂时未启用的严格reward，避免think出来的检测 =======
+    # def _parse_action(self, response):
+    #     """
+    #     严格解析模型响应。
+    #     合法格式：去除首尾空白后，必须严格为 <action>...content...</action>
+    #     任何前缀、后缀、嵌套标签、空内容都视为格式错误。
+    #     """
+    #     if not isinstance(response, str):
+    #         return str(response)[-30:], False
+
+    #     text = response.strip()
+    #     start_tag = "<action>"
+    #     end_tag = "</action>"
+
+    #     # 1. 必须以 <action> 开头，以 </action> 结尾
+    #     if not text.startswith(start_tag) or not text.endswith(end_tag):
+    #         return response[-30:], False
+
+    #     # 2. 提取内容
+    #     extracted = text[len(start_tag):-len(end_tag)]
+
+    #     # 3. 内容不能为空或纯空白
+    #     if not extracted or not extracted.strip():
+    #         return "", False
+
+    #     # 4. 内容内部不能包含其他标签符号（防止嵌套或乱码）
+    #     if '<' in extracted or '>' in extracted:
+    #         return response[-30:], False
+
+    #     # 5. 确保整个字符串只出现一次 <action> 和一次 </action>
+    #     # （防止 "<action>foo</action>bar<action>baz</action>" 这种重复结构）
+    #     if text.count(start_tag) != 1 or text.count(end_tag) != 1:
+    #         return response[-30:], False
+
+    #     return extracted, True
+    # # ======================================================================
 
     def _is_valid_action(self, action, admissible_actions):
         """
@@ -332,7 +332,8 @@ class AlfWorldEnv:
                 "format_error": True,
                 "invalid_action": False,
             }
-            return error_obs, -0.01, True, info
+            # return error_obs, -0.01, True, info
+            return error_obs, 0.0, True, info
 
         # 3. 检查动作是否在 admissible_commands 中
         valid = self._is_valid_action(action, self.prev_admissible_command)
@@ -381,7 +382,8 @@ class AlfWorldEnv:
                     "env_error_action": action,              # 哪个动作触发的
                     "env_error_prev_obs": self.prev_text_obs, # 崩之前的状态
                 }
-                return error_obs, -0.05, True, info
+                # return error_obs, -0.05, True, info
+                return error_obs, 0.0, True, info
 
             if len(result) == 5:
                 next_observation, reward, terminated, truncated, info = result
@@ -433,7 +435,8 @@ class AlfWorldEnv:
                 "format_error": False,
                 "invalid_action": True,
             }
-            return error_obs, -0.001, True, info
+            # return error_obs, -0.001, True, info
+            return error_obs, 0.0, True, info
 
     def close(self):
         if self.env is not None:

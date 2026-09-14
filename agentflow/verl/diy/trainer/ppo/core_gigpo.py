@@ -146,6 +146,7 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
                                    mode: str = "mean_norm",
                                    enable_similarity: bool = False,
                                    similarity_thresh: float = 0.95,
+                                   compute_mean_std_cross_steps: bool = True
                                    ):
     """
     Compute the advantages for GiGPO (https://arxiv.org/abs/2505.10978).
@@ -158,7 +159,7 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
         raise ValueError(f"Unknown mode: {mode}")
     
     # Compute episode relative advantages (Eq. 3 in the paper).
-    episode_advantages = episode_norm_reward(token_level_rewards, response_mask, index, traj_index, epsilon, remove_std)
+    episode_advantages = episode_norm_reward(token_level_rewards, response_mask, index, traj_index, epsilon, remove_std, compute_mean_std_cross_steps)
     
     # Anchor state grouping (Eq. 6 in the paper).
     step_group_uids = build_step_group(anchor_obs, index, enable_similarity, similarity_thresh)
@@ -383,3 +384,54 @@ def step_norm_reward(step_rewards: torch.Tensor,
     
     return step_advantages
 
+
+
+
+## 新增 grpo outcome advantage agent
+def compute_grpo_outcome_advantage_agent(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    traj_index: np.ndarray,
+    norm_adv_by_std_in_grpo: bool = True,
+    epsilon: float = 1e-6,
+):
+    """
+    Agent-aware GRPO: 按 (data_id, traj_id) 去重，确保每个 rollout 只贡献一个 episode reward 到组内统计。
+    计算完成后，advantage 广播回该 rollout 的所有 turns。
+    """
+    scores = token_level_rewards.sum(dim=-1)
+
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+    seen_pairs = set()
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            # 关键：按 (uid, traj_uid) 去重，每个 rollout 只算一次 episode reward
+            pair = (index[i], traj_index[i])
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            id2score[index[i]].append(scores[i])
+
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0, device=scores.device)
+                id2std[idx] = torch.tensor(1.0, device=scores.device)
+            elif len(id2score[idx]) > 1:
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx] = torch.mean(scores_tensor)
+                id2std[idx] = torch.std(scores_tensor)
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+
+        for i in range(bsz):
+            if norm_adv_by_std_in_grpo:
+                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                scores[i] = scores[i] - id2mean[index[i]]
+        scores = scores.unsqueeze(-1) * response_mask
+    return scores, scores

@@ -106,7 +106,7 @@ class AgentModeDaemon:
         mini_batch_size,
         pad_token_id,
         reward_fillna_value=0.0,
-        llm_timeout_seconds=1200.0,
+        llm_timeout_seconds=1200 * 10,
         enable_rollout_validation=True,
         max_empty_retries=2,
     ):

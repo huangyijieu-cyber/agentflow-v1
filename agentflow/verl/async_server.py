@@ -36,7 +36,7 @@ class PatchedvLLMServer(_unwrap_ray_remote(AsyncvLLMServer)):
             # 仅对生成部分设置超时，例如 100 秒
             generator = await asyncio.wait_for(
                 self.openai_serving_chat.create_chat_completion(request, raw_request),
-                timeout=1200.0
+                timeout=1200 * 10
             )
         except asyncio.TimeoutError:
             return JSONResponse(

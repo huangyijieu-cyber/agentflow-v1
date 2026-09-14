@@ -62,7 +62,7 @@ class ChatVLLM(EngineLM, CachedEngine):
             self.client = OpenAI(
                 base_url=self.base_url,
                 api_key=self.api_key,
-                timeout=1200.0
+                timeout=1200 * 10
             )
         except Exception as e:
             raise ValueError(f"Failed to connect to VLLM server at {self.base_url}. Please ensure the server is running and try again.")

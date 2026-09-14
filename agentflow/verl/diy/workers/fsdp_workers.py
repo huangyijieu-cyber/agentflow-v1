@@ -149,7 +149,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
                 rank=rank,
                 world_size=world_size,
-                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 3600)),
+                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 1200 * 10)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
 
@@ -1167,7 +1167,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
                 backend=get_nccl_backend(),
-                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 3600)),
+                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 1200 * 10)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
         self.config: FSDPCriticConfig = config
@@ -1595,7 +1595,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
                 backend=get_nccl_backend(),
-                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 3600)),
+                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 1200 * 10)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
 

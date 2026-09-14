@@ -39,7 +39,7 @@ class AgentFlowClient:
         self.endpoint = endpoint
         self.task_count = 0
         poll_interval = 10
-        timeout = 1200
+        timeout = 1200 * 10
         self.poll_interval = poll_interval
         self.timeout = timeout
         self._resource_cache: Dict[str, ResourcesUpdate] = {}

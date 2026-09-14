@@ -48,7 +48,7 @@ class LLMClient:
                 "max_tokens": max_tokens
             }
             try:
-                resp = requests.post(f"{self.base_url}/chat/completions", headers=self.headers, json=payload, timeout=1200)
+                resp = requests.post(f"{self.base_url}/chat/completions", headers=self.headers, json=payload, timeout=1200 * 10)
                 resp.raise_for_status()
                 return resp.json()["choices"][0]["message"]["content"]
             except Exception as e:
@@ -57,7 +57,7 @@ class LLMClient:
         else:
             payload = {"model": self.model, "prompt": prompt, "temperature": temperature, "max_tokens": max_tokens}
             try:
-                resp = requests.post(f"{self.base_url}/completions", headers=self.headers, json=payload, timeout=1200)
+                resp = requests.post(f"{self.base_url}/completions", headers=self.headers, json=payload, timeout=1200 * 10)
                 resp.raise_for_status()
                 return resp.json()["choices"][0]["text"]
             except Exception as e:

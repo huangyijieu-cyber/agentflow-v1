@@ -1,0 +1,172 @@
+# config.yaml
+
+## (ppo_mini_batch_size * n_roll_out) % (n_gpus * sp * bs_per_gpu) == 0
+env:
+  TASK: ${env:TASK,qa}  ## "webshop" | "qa" | "rule"
+  # 算法保持不变
+  ALGORITHM: ${env:ALGORITHM,grpo} ## "grpo" | "grpo+slic" | "grpo+abpo" | "grpo+simpo" | "grpo+hspo"
+  ADV_ESTIMATOR: ${env:ADV_ESTIMATOR,grpo}  ## grpo | gigpo | graphgpo
+
+  STALE_ITERATION: ${env:STALE_ITERATION,0}
+  REPLAY_BUFFER_SIZE: ${env:REPLAY_BUFFER_SIZE,64}
+  REPLAY_COLLECTION: ${env:REPLAY_COLLECTION,uid-turn}   ## uid-turn | cross | turn  == uid-turn(fast), cross(slow), turn(medium)
+
+  TRAIN_DATA_PATH: ${env:TRAIN_DATA_PATH,train/webwalker_train.parquet}
+  TEST_DATA_PATH: ${env:TEST_DATA_PATH,val/webwalker_val.parquet}
+
+  SCORE_MODEL_NAME: "Qwen3-30B-A3B-Instruct-2507"
+  SCORE_MODEL_URL: "http://127.0.0.1:19998/v1"
+  OPENAI_API_KEY: "YOUR_ONENAI_API"
+
+  CUDA_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+  ASCEND_RT_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+  HYDRA_FULL_ERROR: 1
+
+  MAX_PROMPT_LENGTH: ${env:MAX_PROMPT_LENGTH,10240}
+  MAX_RESPONSE_LENGTH: ${env:MAX_RESPONSE_LENGTH,512}
+
+  N_ROLLOUT: ${env:N_ROLLOUT,4}
+  TRAIN_BATCH_SIZE: ${env:TRAIN_BATCH_SIZE,16}
+  MINI_BATCH_SIZE: ${env:MINI_BATCH_SIZE,8}
+  MICRO_BATCH_SIZE_PER_GPU: ${env:MICRO_BATCH_SIZE_PER_GPU,1}
+
+  N_GPUS: ${env:N_GPUS,8}
+  NNODES: ${env:NNODES,1}
+
+  BASE_MODEL: "Qwen3-4B-Instruct-2507"
+  ROLLOUT_TP_SIZE: 1
+
+  EXPERIMENT_NAME: "AgentFlow_pro"
+  PROJECT_NAME: "AgentFlow_pro"
+  BASE_DATA_DIR: "data"
+  VERBOSITY: "DEBUG"
+
+  N_WORKERS: ${env:N_WORKERS,16}
+  TOTAL_EPOCH: ${env:TOTAL_EPOCH,10}
+
+  ENABLE_TOOLS:
+    - "Base_Generator_Tool"
+    - "Python_Coder_Tool"
+    - "Wikipedia_Search_Tool"
+    - "Web_Search_Tool"
+    - "Brave_Search_Tool"
+
+  TOOL_ENGINE:
+    - "vllm-Qwen3-30B-A3B-Instruct-2507"
+    - "vllm-Qwen3-30B-A3B-Instruct-2507"
+    - "vllm-Qwen3-30B-A3B-Instruct-2507"
+    - "vllm-Qwen3-30B-A3B-Instruct-2507"
+    - "Default"
+
+  MODEL_ENGINE:
+    - "trainable"
+    - "vllm-Qwen3-30B-A3B-Instruct-2507"
+    - "vllm-Qwen3-30B-A3B-Instruct-2507"
+    - "vllm-Qwen3-30B-A3B-Instruct-2507"
+
+  # 按要求使用 5 个 tool steps
+  TOOL_STEPS: 5
+
+  TEST_TEMPERATURE: 0.0
+  TRAIN_TEMPERATURE: 0.7
+
+  OUTPUT_TYPE: "final"
+  AGENT_MAX_TIMEOUT: 480
+
+python_args:
+  agentflow.port: 8088
+
+  algorithm.adv_estimator: "${ADV_ESTIMATOR}"
+  algorithm.norm_adv_by_std_in_grpo: True
+
+  data.train_files: "${BASE_DATA_DIR}/${TRAIN_DATA_PATH}"
+  data.val_files: "${BASE_DATA_DIR}/${TEST_DATA_PATH}"
+  data.train_batch_size: "${TRAIN_BATCH_SIZE}"
+  data.trust_remote_code: True
+  data.dataloader_num_workers: 4
+  data.max_prompt_length: "${MAX_PROMPT_LENGTH}"
+  data.max_response_length: "${MAX_RESPONSE_LENGTH}"
+  data.truncation: "truncate"
+
+  +data.stale_iteration: "${STALE_ITERATION}"
+  +data.task: "${TASK}"
+  +data.algorithm: "${ALGORITHM}"
+  +data.replay_buffer_size: "${REPLAY_BUFFER_SIZE}"
+  +data.replay_collection: "${REPLAY_COLLECTION}"
+
+  trainer.n_gpus_per_node: "${N_GPUS}"
+  trainer.nnodes: "${NNODES}"
+
+  actor_rollout_ref.model.path: "${BASE_MODEL}"
+  actor_rollout_ref.model.enable_gradient_checkpointing: False
+  actor_rollout_ref.model.use_remove_padding: True
+  actor_rollout_ref.model.enable_activation_offload: False
+
+  actor_rollout_ref.rollout.name: "vllm"
+  actor_rollout_ref.rollout.tensor_model_parallel_size: "${ROLLOUT_TP_SIZE}"
+  actor_rollout_ref.rollout.pipeline_model_parallel_size: 1
+  actor_rollout_ref.rollout.n: "${N_ROLLOUT}"
+
+  actor_rollout_ref.rollout.temperature: "${TRAIN_TEMPERATURE}"
+
+  actor_rollout_ref.rollout.enable_prefix_caching: True
+  actor_rollout_ref.rollout.gpu_memory_utilization: 0.65
+  actor_rollout_ref.rollout.max_num_seqs: 12
+  actor_rollout_ref.rollout.max_num_batched_tokens: 16384
+
+  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu: 2
+  actor_rollout_ref.rollout.log_prob_use_dynamic_bsz: False
+  actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu: 32768
+
+  actor_rollout_ref.rollout.multi_turn.format: "hermes"
+  actor_rollout_ref.rollout.agent.num_workers: 1
+
+  actor_rollout_ref.actor.ulysses_sequence_parallel_size: 2
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu: 12288
+  actor_rollout_ref.actor.ppo_mini_batch_size: "${MINI_BATCH_SIZE}"
+  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu: "${MICRO_BATCH_SIZE_PER_GPU}"
+  actor_rollout_ref.actor.ppo_epochs: 1
+
+  actor_rollout_ref.actor.loss_agg_mode: "seq-mean-token-sum-norm"
+  actor_rollout_ref.actor.use_dynamic_bsz: False
+
+  actor_rollout_ref.actor.optim.lr: 1e-6
+
+  actor_rollout_ref.actor.use_kl_loss: True
+  actor_rollout_ref.actor.kl_loss_coef: 0.01
+
+  actor_rollout_ref.actor.entropy_coeff: 0.0005
+  actor_rollout_ref.actor.entropy_checkpointing: True
+
+  actor_rollout_ref.actor.clip_ratio_low: 0.2
+  actor_rollout_ref.actor.clip_ratio_high: 0.2
+  actor_rollout_ref.actor.grad_clip: 0.5
+
+  +actor_rollout_ref.actor.use_m2po_loss: False
+  +actor_rollout_ref.actor.M2_budget: 0.001
+
+  actor_rollout_ref.actor.fsdp_config.use_torch_compile: False
+  actor_rollout_ref.actor.fsdp_config.param_offload: False
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload: False
+
+  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu: 2
+  actor_rollout_ref.ref.log_prob_use_dynamic_bsz: False
+  actor_rollout_ref.ref.fsdp_config.param_offload: False
+
+  algorithm.use_kl_in_reward: False
+
+  trainer.val_before_train: True
+  trainer.balance_batch: True
+  trainer.critic_warmup: 0
+
+  trainer.logger:
+    - "console"
+
+  trainer.project_name: "${PROJECT_NAME}"
+  trainer.experiment_name: "${EXPERIMENT_NAME}"
+  trainer.resume_mode: "disable"
+  trainer.save_freq: -1
+  trainer.test_freq: 8
+  trainer.total_epochs: "${TOTAL_EPOCH}"
+
+  trainer.device: "npu"

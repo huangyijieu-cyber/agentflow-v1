@@ -336,96 +336,96 @@ class DataParallelPPOActor(BasePPOActor):
 
 
 
-    # def _ppo_loss(self, old_log_prob, log_prob, advantages, response_mask, loss_agg_mode, rollout_is_weights, max_response_length):
+    def _ppo_loss(self, old_log_prob, log_prob, advantages, response_mask, loss_agg_mode, rollout_is_weights, max_response_length):
         
-    #     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-    #     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
+        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+        # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
 
-    #     # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
-    #     # are computed centrally in ray_trainer.py for consistency and efficiency.
-    #     # This ensures metrics are computed uniformly across all batches at the trainer level
-    #     # and avoids redundant computation across workers and micro-batches.
+        # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
+        # are computed centrally in ray_trainer.py for consistency and efficiency.
+        # This ensures metrics are computed uniformly across all batches at the trainer level
+        # and avoids redundant computation across workers and micro-batches.
 
-    #     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
-    #     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
-    #     policy_loss_fn = get_policy_loss_fn(loss_mode)
+        # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
+        # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+        policy_loss_fn = get_policy_loss_fn(loss_mode)
 
-    #     # clip advantages (避免梯度爆炸)
-    #     advantages = torch.clamp(advantages, min=-5.0, max=5.0)
+        # clip advantages (避免梯度爆炸)
+        # advantages = torch.clamp(advantages, min=-5.0, max=5.0)
 
-    #     # Compute policy loss (all functions return 4 values)
-    #     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-    #         old_log_prob=old_log_prob,
-    #         log_prob=log_prob,
-    #         advantages=advantages,
-    #         response_mask=response_mask,
-    #         loss_agg_mode=loss_agg_mode,
-    #         config=self.config,
-    #         rollout_is_weights=rollout_is_weights,
-    #     )
-    #     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
-
-
-    ### DR.GRPO
-    def _ppo_loss(self, old_log_prob, log_prob, advantages, response_mask, loss_agg_mode, rollout_is_weights, max_response_length=1024):
-        ## ================= DR.GRPO loss ========================================
-        config = self.config
-        clip_ratio = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
-        clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
-        clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
-        clip_ratio_c = config.get(  # Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
-            "clip_ratio_c", 3.0
+        # Compute policy loss (all functions return 4 values)
+        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            loss_agg_mode=loss_agg_mode,
+            config=self.config,
+            rollout_is_weights=rollout_is_weights,
         )
-
-        cliprange = clip_ratio
-        cliprange_low = clip_ratio_low
-        cliprange_high = clip_ratio_high
-
-        assert clip_ratio_c > 1.0, (
-            "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
-            + f" but get the value: {clip_ratio_c}."
-        )
-
-        negative_approx_kl = log_prob - old_log_prob
-        # Clamp negative_approx_kl for stability
-        negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
-        ratio = torch.exp(negative_approx_kl)
-        ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
-
-        pg_losses1 = -advantages * ratio
-        if cliprange_low is None:
-            cliprange_low = cliprange
-        if cliprange_high is None:
-            cliprange_high = cliprange
-        pg_losses2 = -advantages * torch.clamp(
-            ratio, 1 - cliprange_low, 1 + cliprange_high
-        )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
-        clip_pg_losses1 = torch.maximum(
-            pg_losses1, pg_losses2
-        )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-        pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
-
-        pg_losses3 = -advantages * clip_ratio_c
-        clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
-        pg_clipfrac_lower = verl_F.masked_mean(
-            torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
-        )
-
-        pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
-
-        # Apply rollout importance sampling weights if provided
-        if rollout_is_weights is not None:
-            pg_losses = pg_losses * rollout_is_weights
-        
-        # ===== Dr.GRPO 核心修改：固定长度归一化 =====
-        ## "max_response_length must be provided for Dr.GRPO mode"
-        # 对每个 response 的 loss 求和，除以固定 max_response_length，再对 batch 平均
-        # 等价于: (1/G) * sum_i [ (1/MAX) * sum_t loss_{i,t} ]
-        seq_loss = (pg_losses * response_mask).sum(dim=-1)  # (batch_size,)
-        pg_loss = (seq_loss / max_response_length).mean()
-        ## ==========================================================
-
         return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
+    # ### DR.GRPO
+    # def _ppo_loss(self, old_log_prob, log_prob, advantages, response_mask, loss_agg_mode, rollout_is_weights, max_response_length=1024):
+    #     ## ================= DR.GRPO loss ========================================
+    #     config = self.config
+    #     clip_ratio = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+    #     clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    #     clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+    #     clip_ratio_c = config.get(  # Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
+    #         "clip_ratio_c", 3.0
+    #     )
+
+    #     cliprange = clip_ratio
+    #     cliprange_low = clip_ratio_low
+    #     cliprange_high = clip_ratio_high
+
+    #     assert clip_ratio_c > 1.0, (
+    #         "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
+    #         + f" but get the value: {clip_ratio_c}."
+    #     )
+
+    #     negative_approx_kl = log_prob - old_log_prob
+    #     # Clamp negative_approx_kl for stability
+    #     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    #     ratio = torch.exp(negative_approx_kl)
+    #     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    #     pg_losses1 = -advantages * ratio
+    #     if cliprange_low is None:
+    #         cliprange_low = cliprange
+    #     if cliprange_high is None:
+    #         cliprange_high = cliprange
+    #     pg_losses2 = -advantages * torch.clamp(
+    #         ratio, 1 - cliprange_low, 1 + cliprange_high
+    #     )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    #     clip_pg_losses1 = torch.maximum(
+    #         pg_losses1, pg_losses2
+    #     )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+    #     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+    #     pg_losses3 = -advantages * clip_ratio_c
+    #     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    #     pg_clipfrac_lower = verl_F.masked_mean(
+    #         torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
+    #     )
+
+    #     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
+    #     # Apply rollout importance sampling weights if provided
+    #     if rollout_is_weights is not None:
+    #         pg_losses = pg_losses * rollout_is_weights
+        
+    #     # ===== Dr.GRPO 核心修改：固定长度归一化 =====
+    #     ## "max_response_length must be provided for Dr.GRPO mode"
+    #     # 对每个 response 的 loss 求和，除以固定 max_response_length，再对 batch 平均
+    #     # 等价于: (1/G) * sum_i [ (1/MAX) * sum_t loss_{i,t} ]
+    #     seq_loss = (pg_losses * response_mask).sum(dim=-1)  # (batch_size,)
+    #     pg_loss = (seq_loss / max_response_length).mean()
+    #     ## ==========================================================
+
+    #     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
     def _hspo_loss(self, inputs, log_probs, beta=1.0, gamma=0.25, sft_weight=0.05, 
@@ -1086,7 +1086,7 @@ class DataParallelPPOActor(BasePPOActor):
                         raise ValueError(f"Miss dpo type:{dpo_type}")
 
                     ## add loss scale factor
-                    dpo_loss = dpo_loss * loss_scale_factor * 0.001  ## add scale factor (magic number)
+                    dpo_loss = dpo_loss * loss_scale_factor  ## add scale factor
                     dpo_loss.backward()
                     append_to_dict(metrics, dpo_metrics)
                     
@@ -1170,7 +1170,7 @@ class DataParallelPPOActor(BasePPOActor):
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 
-                    print(">>> Use PPO Loss")
+                    # print(">>> Use PPO Loss")
                     if on_policy:
                         old_log_prob = log_prob.detach()
                     else:
