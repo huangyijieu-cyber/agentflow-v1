@@ -329,21 +329,19 @@ class RolloutAgent(LitAgent):
 
         # print(f"Return reward value, Rollout data saved to: {save_path}")
 
-        def encode_logs(tokenizer, logs):
+        def encode_logs(logs):
             triplets = []
             for turn_index, log in enumerate(logs):
-                response = log["response"]
-                prompt_ids = getattr(response, "prompt_token_ids", None)
-                response_ids = getattr(response, "response_token_ids", None)
-                finish_reason = getattr(response, "finish_reason", None)
+                prompt_ids = log.get("prompt_token_ids")
+                response_ids = log.get("response_token_ids")
+                finish_reason = log.get("finish_reason")
 
-                # Training must use the exact token trajectory sampled by vLLM.
-                # Do not silently fall back to text re-tokenization, because that
-                # recreates the original prompt/response mismatch.
+                # Same source of truth as upstream AgentFlow: train on the exact
+                # prompt/output token ids returned by the patched vLLM server.
                 if prompt_ids is None or response_ids is None:
                     raise RuntimeError(
                         f"Planner turn {turn_index} is missing exact vLLM token ids. "
-                        "Refusing to train on re-tokenized text."
+                        "Refusing to train/evaluate on re-tokenized text."
                     )
 
                 triplets.append(
@@ -370,7 +368,7 @@ class RolloutAgent(LitAgent):
             rollout_package = Rollout(
                 rollout_id = rollout_id,
                 final_reward = reward_value,
-                triplets = await asyncio.to_thread(encode_logs, self.tokenizer, planner_logs),
+                triplets = encode_logs(planner_logs),
                 metadata = metadata
             )
         except Exception as e:
