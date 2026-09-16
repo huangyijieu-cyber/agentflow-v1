@@ -254,7 +254,7 @@ Tool Name: <tool_name>
 Where:
 - <context> MUST include ALL necessary information for the tool to function, structured as follows:
 * Relevant data from previous steps
-* File names or paths created or used from previous steps (list EACH ONE individually)
+* File names or paths created or used in previous steps (list EACH ONE individually)
 * Variable names and their values from previous steps' results
 * Any other context-specific information required by the tool
 - <sub_goal> is a specific, achievable objective for the tool, based on its metadata and previous outcomes.
