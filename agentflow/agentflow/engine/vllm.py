@@ -24,6 +24,24 @@ from tenacity import (
 from .base import EngineLM, CachedEngine
 from openai import APIConnectionError, APITimeoutError
 
+
+class GenerationText(str):
+    """String response carrying the exact vLLM sampling metadata."""
+
+    def __new__(
+        cls,
+        value,
+        prompt_token_ids=None,
+        response_token_ids=None,
+        finish_reason=None,
+    ):
+        obj = super().__new__(cls, value)
+        obj.prompt_token_ids = list(prompt_token_ids) if prompt_token_ids is not None else None
+        obj.response_token_ids = list(response_token_ids) if response_token_ids is not None else None
+        obj.finish_reason = finish_reason
+        return obj
+
+
 class ChatVLLM(EngineLM, CachedEngine):
     DEFAULT_SYSTEM_PROMPT = "You are a helpful, creative, and smart assistant."
 
@@ -158,7 +176,7 @@ class ChatVLLM(EngineLM, CachedEngine):
         else:
             response_format_arg = None
         # ## Chat models without structured outputs (without stream)
-        response = self.client.chat.completions.create(
+        raw_response = self.client.chat.completions.create(
             model=self.model_string,
             messages=[
                 {"role": "system", "content": sys_prompt_arg},
@@ -179,7 +197,35 @@ class ChatVLLM(EngineLM, CachedEngine):
             # }
             response_format=response_format_arg,
         )
-        response = response.choices[0].message.content
+
+        response_text = raw_response.choices[0].message.content or ""
+        payload = raw_response.model_dump()
+
+        # The patched AgentFlow vLLM server exposes the exact prompt/output token ids.
+        # Prefer attributes, and fall back to model_dump() for OpenAI-client compatibility.
+        prompt_token_ids = getattr(raw_response, "prompt_token_ids", None)
+        if prompt_token_ids is None:
+            prompt_token_ids = payload.get("prompt_token_ids")
+
+        response_token_ids = getattr(raw_response, "response_token_ids", None)
+        if response_token_ids is None:
+            response_token_ids = payload.get("response_token_ids")
+
+        # vLLM reports one response-token list per choice; this client requests one choice.
+        if (
+            isinstance(response_token_ids, (list, tuple))
+            and response_token_ids
+            and isinstance(response_token_ids[0], (list, tuple))
+        ):
+            response_token_ids = response_token_ids[0]
+
+        finish_reason = raw_response.choices[0].finish_reason
+        response = GenerationText(
+            response_text,
+            prompt_token_ids=prompt_token_ids,
+            response_token_ids=response_token_ids,
+            finish_reason=finish_reason,
+        )
         
         
 
