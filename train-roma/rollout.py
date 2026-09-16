@@ -330,9 +330,31 @@ class RolloutAgent(LitAgent):
         # print(f"Return reward value, Rollout data saved to: {save_path}")
 
         def encode_logs(tokenizer, logs):
-            return [Triplet(prompt = {"token_ids": tokenizer.encode(log["prompt"], add_special_tokens=False)},
-                                response = {"token_ids": tokenizer.encode(log["response"], add_special_tokens=False)},
-                                reward = None) for log in logs]
+            triplets = []
+            for turn_index, log in enumerate(logs):
+                response = log["response"]
+                prompt_ids = getattr(response, "prompt_token_ids", None)
+                response_ids = getattr(response, "response_token_ids", None)
+                finish_reason = getattr(response, "finish_reason", None)
+
+                # Training must use the exact token trajectory sampled by vLLM.
+                # Do not silently fall back to text re-tokenization, because that
+                # recreates the original prompt/response mismatch.
+                if prompt_ids is None or response_ids is None:
+                    raise RuntimeError(
+                        f"Planner turn {turn_index} is missing exact vLLM token ids. "
+                        "Refusing to train on re-tokenized text."
+                    )
+
+                triplets.append(
+                    Triplet(
+                        prompt={"token_ids": list(prompt_ids)},
+                        response={"token_ids": list(response_ids)},
+                        reward=None,
+                        metadata={"finish_reason": finish_reason},
+                    )
+                )
+            return triplets
 
 
         ## planner logs
