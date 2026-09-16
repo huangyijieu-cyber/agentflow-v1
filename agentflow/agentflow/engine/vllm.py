@@ -24,24 +24,6 @@ from tenacity import (
 from .base import EngineLM, CachedEngine
 from openai import APIConnectionError, APITimeoutError
 
-
-class GenerationText(str):
-    """String response carrying the exact vLLM sampling metadata."""
-
-    def __new__(
-        cls,
-        value,
-        prompt_token_ids=None,
-        response_token_ids=None,
-        finish_reason=None,
-    ):
-        obj = super().__new__(cls, value)
-        obj.prompt_token_ids = list(prompt_token_ids) if prompt_token_ids is not None else None
-        obj.response_token_ids = list(response_token_ids) if response_token_ids is not None else None
-        obj.finish_reason = finish_reason
-        return obj
-
-
 class ChatVLLM(EngineLM, CachedEngine):
     DEFAULT_SYSTEM_PROMPT = "You are a helpful, creative, and smart assistant."
 
@@ -65,6 +47,7 @@ class ChatVLLM(EngineLM, CachedEngine):
         self.use_cache = use_cache
         self.system_prompt = system_prompt
         self.is_multimodal = is_multimodal
+        self.last_generation_metadata = None
 
         if self.use_cache:
             root = platformdirs.user_cache_dir("agentflow")
@@ -108,10 +91,12 @@ class ChatVLLM(EngineLM, CachedEngine):
                     raise ValueError("Unsupported content in list: only str or bytes are allowed.")
         except (APIConnectionError, APITimeoutError) as e:
             # 3 次重试后还是连不上 / 超时，打印日志，返回空字符串
+            self.last_generation_metadata = None
             print(f"Traceback [ChatVLLM] Serving unreachable after retries: {e}")
             return ""  # ← 调用方拿到 str，不会 TypeError
                 
         except Exception as e:
+            self.last_generation_metadata = None
             print(f"Error in generate method: {str(e)}")
             print(f"Error type: {type(e).__name__}")
             print(f"Error details: {e.args}")
@@ -135,6 +120,7 @@ class ChatVLLM(EngineLM, CachedEngine):
         self, prompt, system_prompt=None, max_tokens=2048, top_p=0.99, response_format=None, **kwargs
     ):
 
+        self.last_generation_metadata = None
         sys_prompt_arg = system_prompt if system_prompt else self.system_prompt
 
         if self.use_cache:
@@ -198,11 +184,10 @@ class ChatVLLM(EngineLM, CachedEngine):
             response_format=response_format_arg,
         )
 
-        response_text = raw_response.choices[0].message.content or ""
+        # AgentFlow's patched vLLM server adds exact prompt/response token ids
+        # to the OpenAI-compatible response. Keep the outward return value as
+        # plain text so the existing Planner/tool logic is unchanged.
         payload = raw_response.model_dump()
-
-        # The patched AgentFlow vLLM server exposes the exact prompt/output token ids.
-        # Prefer attributes, and fall back to model_dump() for OpenAI-client compatibility.
         prompt_token_ids = getattr(raw_response, "prompt_token_ids", None)
         if prompt_token_ids is None:
             prompt_token_ids = payload.get("prompt_token_ids")
@@ -211,7 +196,8 @@ class ChatVLLM(EngineLM, CachedEngine):
         if response_token_ids is None:
             response_token_ids = payload.get("response_token_ids")
 
-        # vLLM reports one response-token list per choice; this client requests one choice.
+        # vLLM returns one list of token ids per choice; this client requests
+        # a single choice, so keep that one exact sampled sequence.
         if (
             isinstance(response_token_ids, (list, tuple))
             and response_token_ids
@@ -219,13 +205,12 @@ class ChatVLLM(EngineLM, CachedEngine):
         ):
             response_token_ids = response_token_ids[0]
 
-        finish_reason = raw_response.choices[0].finish_reason
-        response = GenerationText(
-            response_text,
-            prompt_token_ids=prompt_token_ids,
-            response_token_ids=response_token_ids,
-            finish_reason=finish_reason,
-        )
+        self.last_generation_metadata = {
+            "prompt_token_ids": list(prompt_token_ids) if prompt_token_ids is not None else None,
+            "response_token_ids": list(response_token_ids) if response_token_ids is not None else None,
+            "finish_reason": raw_response.choices[0].finish_reason,
+        }
+        response = raw_response.choices[0].message.content or ""
         
         
 
@@ -282,6 +267,7 @@ class ChatVLLM(EngineLM, CachedEngine):
     def _generate_multimodal(
         self, content: List[Union[str, bytes]], system_prompt=None, temperature=0, max_tokens=2048, top_p=0.99, response_format=None
     ):
+        self.last_generation_metadata = None
         sys_prompt_arg = system_prompt if system_prompt else self.system_prompt
         formatted_content = self._format_content(content)
 
