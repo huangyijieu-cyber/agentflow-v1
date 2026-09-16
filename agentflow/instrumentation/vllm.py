@@ -32,9 +32,11 @@ async def chat_completion_full_generator(
     async def _generate_inceptor():
         nonlocal prompt_token_ids, response_token_ids
         async for res in result_generator:
-            yield res
+            # Capture exact ids before yielding so they are not lost if the
+            # consumer stops iteration immediately after the final result.
             prompt_token_ids = res.prompt_token_ids
             response_token_ids = [output.token_ids for output in res.outputs]
+            yield res
 
     response = await original_chat_completion_full_generator(
         self,
