@@ -1,83 +1,79 @@
-# Exact serving token IDs: QA rollout
+# vLLM 0.11 native token IDs for QA
 
-This change targets the non-streaming text QA endpoint. It does not change GRPO,
-reward, tool, memory, Planner, or rollout encoding. Original replaced production
-code is retained as comments marked `[原代码保留]`; new behavior is marked
-`[修改目的]`. There is no text re-tokenization fallback.
+## Confirmed cause
 
-## Evidence and limits
+The user verified VERL 0.6.0, vLLM 0.11.0 and vLLM-Ascend 0.11.0.
+A curl request through the existing AgentFlow proxy returned non-null
+`prompt_token_ids` and `choices[i].token_ids` when `return_token_ids: true`
+was present. The previous client neither requested this flag nor read the native
+choice field. It incorrectly expected a top-level `response_token_ids` field.
+The previous custom server also imported `AsyncvLLMServer`, which is absent in
+VERL 0.6.0; that version uses `vLLMHttpServer` and native vLLM HTTP serving.
 
-The reported normal text response with `prompt_token_ids=None` and no
-`response_token_ids` establishes that exact IDs did not reach the client. It does
-not alone establish whether the wrapper was bypassed (A), the generation output
-lacked IDs (B), or serialization dropped fields (C). The actual Ascend runtime was
-not accessible during this repair. Repository requirements pin vLLM 0.8.5 but do
-not establish the installed VERL/vLLM-Ascend versions. No specific runtime root
-cause or successful 910B training run is claimed.
+Upstream source checks:
+- https://github.com/vllm-project/vllm/blob/v0.11.0/vllm/entrypoints/openai/serving_chat.py#L1379
+- https://github.com/vllm-project/vllm/blob/v0.11.0/vllm/entrypoints/openai/serving_chat.py#L1422
+- https://github.com/verl-project/verl/blob/v0.6.0/verl/workers/config/rollout.py#L64
 
-The previous patch targeted one imported class and used a protocol-class identity
-check as an installation sentinel. That cannot verify the method on an actual
-serving instance with an override or an already-bound method. Replacing the
-protocol module's response class also does not replace class aliases imported
-elsewhere. Whether aliases cause field loss depends on the actual Pydantic model;
-in particular, an `extra=allow` model may already preserve fields.
+## Minimal correction and rollback
 
-## Changes
+The resulting tree uses main `bf300f9a5aa042d063c424fcfe289a329ef3ea90` as its
+baseline, retaining only the QA exact-token data path and its tests/docs.
+The commit is an ordinary single-parent commit on `fix`, not a merge or a force
+reset. Main is not changed.
 
-- Bind the wrapper to `self.openai_serving_chat` immediately before non-streaming
-  generation, after the actual object exists. Verify the method itself for
-  idempotence, and bind its signature instead of copying version-specific args.
-- Copy `RequestOutput.prompt_token_ids` and each indexed output's `token_ids`
-  before yielding. Align sequences to the returned choice indexes.
-- Extend the actual response model with declared `List[int]` and `List[List[int]]`
-  fields; explicitly include them in the final HTTP JSON. No global response class
-  alias replacement is needed.
-- Refuse missing/invalid IDs with a serving error instead of a successful HTTP
-  response that fails only later during Triplet creation.
+- `agentflow/agentflow/engine/vllm.py`: request `extra_body={"return_token_ids": True}`;
+  read root prompt IDs and the first choice's `token_ids`. Keep ordinary text
+  returns and internal `last_generation_metadata.response_token_ids`.
+- `agentflow/agentflow/models/planner.py` and `train-roma/rollout.py`: preserve the
+  existing exact-ID logging and Triplet construction. No re-tokenization fallback.
+- `agentflow/verl/config.yaml`: set custom server path/name to null, matching
+  VERL 0.6's Optional[str] schema/defaults.
+- `agentflow/verl/async_server.py`: retain the main legacy code entirely as
+  comments; no executable server imports or monkey patch remain in this module.
+  Importing this retired module is harmless; it does not provide a replacement
+  PatchedvLLMServer alias.
+- `agentflow/instrumentation/vllm.py`: restore exactly to main, undoing the previous
+  instance-capture framework. This legacy file is not used by the QA native server.
+- `agentflow/scripts/check_serving_token_ids.py`: probe the native protocol and
+  validate every returned choice.
+- Replace the previous monkey-patch tests with native request-to-Triplet tests.
 
-The wrapper supports the cumulative/final `RequestOutput` contract used by the
-full non-streaming generator. Unknown method signatures, output schemas, or
-non-cumulative sequences fail explicitly; no guessed alternative token field is
-substituted. Such failures require adapting against the installed source.
+Replaced production statements are retained as `[原代码保留]` comments, with
+`[修改目的]` explaining new behavior. Superseded speculative patch code/tests
+remain available in Git history. GRPO, rewards, tools, memory, proxy forwarding,
+sampling settings, and response length settings are unchanged.
 
-## Runtime verification
+## Tests and remaining runtime checks
 
-1. Update the **fix** checkout and ensure the installed `agentflow` package uses
-   that checkout. Restart all serving actors; editing disk alone does not update
-   methods already loaded in workers.
-2. Set `AGENTFLOW_TOKEN_DEBUG=1` in the environment inherited by serving/Ray actors
-   before launching them. Logs show package versions, actual class, method,
-   signature/source path, wrapper entry, field names and token lengths. They do
-   not log prompts, answers or complete token sequences.
-3. Against the actual **model serving** endpoint (not AgentFlow's task queue), run:
-
-   ```sh
-   python agentflow/scripts/check_serving_token_ids.py --base-url http://HOST:PORT/v1 --model MODEL
-   ```
-
-   Use the served model name and port from the runtime. If authenticated, provide
-   `OPENAI_API_KEY` through the environment. The probe disables client retries to
-   expose the first failure, validates both fields through the OpenAI client, and
-   prints only token counts/prefixes. A length-limited answer need not contain EOS;
-   the fix never fabricates one.
-4. Run one QA rollout and confirm Planner IDs are non-null and Triplet construction
-   succeeds before restarting a full training run.
-
-Interpretation: no `[TOKEN PATCH]` implies this request path has not installed the
-patch (or logs are from another process). Patch log without `wrapper entered` on a
-completion implies a bypassed method; `[TOKEN B]` and output field diagnostics
-identify absent/unsupported raw generation data. `wrapper entered` and valid
-counts followed by boundary failure localizes the response/serialization path.
-`[TOKEN A/C]` intentionally does not claim to distinguish bypass from field loss
-without those preceding logs.
-
-## Local checks
+Run CPU tests from repository root:
 
 ```sh
 python -m unittest discover -s agentflow/tests -v
 ```
 
-These CPU contract tests stub vLLM/VERL generation. They cover response models
-that ignore unknown fields, bound methods, subclasses, cumulative outputs,
-multiple choices, early iterator exit, concurrency, error responses, missing
-IDs, and the endpoint body. They are not a replacement for the runtime probe.
+Eight tests cover the outgoing HTTP flag, native SDK fields and dump fallback,
+exact IDs/EOS in Triplets, missing IDs, length termination without invented EOS,
+metadata retention, retired-module import, native server configuration, and probe
+validation of all choices. Generation/HTTP transport is simulated; these tests do
+not establish success on real Ascend workers or a training run.
+
+After updating the fix checkout actually imported by the runtime, restart the
+workers. Against the user's proxy (replace port/model if they changed):
+
+```sh
+python agentflow/scripts/check_serving_token_ids.py \
+  --base-url http://127.0.0.1:35571/v1 \
+  --model Qwen3-4B-Instruct-2507
+```
+
+Expected: `PASS: OpenAI client received prompt_token_ids and response token ids`.
+The response must contain root `prompt_token_ids` and each `choices[i].token_ids`,
+not a synthetic root `response_token_ids` field.
+
+Next run one QA rollout with `AGENTFLOW_TOKEN_DEBUG=1` in the agent worker's
+environment. Confirm both internal ID lists are non-null and the Triplet response
+IDs equal that request's `choices[0].token_ids`, including EOS if it was generated.
+The debug flag prints token lists only when explicitly enabled. Do not infer full
+RL success from the probe. Real endpoint and single-rollout verification remain
+for the user's Ascend environment.

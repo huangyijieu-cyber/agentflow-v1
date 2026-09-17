@@ -190,7 +190,7 @@ class ChatVLLM(EngineLM, CachedEngine):
         # )
         # response = response.choices[0].message.content
 
-        # [修改目的] 保留完整服务端响应，先读取 AgentFlow patched vLLM 返回的真实 token ids 和 finish_reason；
+        # [修改目的] 保留完整服务端响应，先读取 vLLM 0.11 原生返回的真实 token ids 和 finish_reason；
         # 对 Planner 的最终返回值仍保持普通 str，不改变原有 Agent 逻辑。
         raw_response = self.client.chat.completions.create(
             model=self.model_string,
@@ -211,6 +211,8 @@ class ChatVLLM(EngineLM, CachedEngine):
             #     "top_k": top_k,
             #     "min_p": min_p
             # }
+            # [修改目的] vLLM 0.11 仅在显式请求时返回本次 serving 的真实 token ids。
+            extra_body={"return_token_ids": True},
             response_format=response_format_arg,
         )
 
@@ -220,23 +222,36 @@ class ChatVLLM(EngineLM, CachedEngine):
         if prompt_token_ids is None:
             prompt_token_ids = payload.get("prompt_token_ids")
 
-        response_token_ids = getattr(raw_response, "response_token_ids", None)
-        if response_token_ids is None:
-            response_token_ids = payload.get("response_token_ids")
+        # [原代码保留] 旧逻辑读取 patched server 的顶层字段，原生 vLLM 0.11 不使用该协议。
+        # response_token_ids = getattr(raw_response, "response_token_ids", None)
+        # if response_token_ids is None:
+        #     response_token_ids = payload.get("response_token_ids")
+        #
+        # # vLLM 返回每个 choice 一组 response token ids；当前请求只有一个 choice，因此取第一组真实采样序列。
+        # if (
+        #     isinstance(response_token_ids, (list, tuple))
+        #     and response_token_ids
+        #     and isinstance(response_token_ids[0], (list, tuple))
+        # ):
+        #     response_token_ids = response_token_ids[0]
 
-        # vLLM 返回每个 choice 一组 response token ids；当前请求只有一个 choice，因此取第一组真实采样序列。
-        if (
-            isinstance(response_token_ids, (list, tuple))
-            and response_token_ids
-            and isinstance(response_token_ids[0], (list, tuple))
-        ):
-            response_token_ids = response_token_ids[0]
+        # [修改目的] vLLM 0.11 把生成序列放在 choices[i].token_ids；与返回的第一个 choice 文本对应。
+        response_token_ids = getattr(raw_response.choices[0], "token_ids", None)
+        if response_token_ids is None:
+            choices_payload = payload.get("choices", [])
+            if choices_payload:
+                response_token_ids = choices_payload[0].get("token_ids")
 
         self.last_generation_metadata = {
             "prompt_token_ids": list(prompt_token_ids) if prompt_token_ids is not None else None,
             "response_token_ids": list(response_token_ids) if response_token_ids is not None else None,
             "finish_reason": raw_response.choices[0].finish_reason,
         }
+
+        # [修改目的] 按需确认真实字段已到客户端，默认不输出 token 内容。
+        if os.environ.get("AGENTFLOW_TOKEN_DEBUG") == "1":
+            print("[TOKEN DEBUG] prompt_token_ids:", prompt_token_ids)
+            print("[TOKEN DEBUG] response_token_ids:", response_token_ids)
 
         # [原代码保留] response = response.choices[0].message.content
         # [修改目的] 仍然只把普通文本返回给 Planner，避免修改 Planner / tool / parser 的既有行为。
@@ -348,3 +363,4 @@ class ChatVLLM(EngineLM, CachedEngine):
         if self.use_cache:
             self._save_cache(cache_key, response_text)
         return response_text
+

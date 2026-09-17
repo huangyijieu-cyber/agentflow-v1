@@ -16,6 +16,13 @@ actor_rollout_ref:
   rollout:
     mode: async
     agent:
+      # [原代码保留]
+      # custom_async_server:
+      #   path: pkg://agentflow.verl.async_server
+      #   name: PatchedvLLMServer
+      # [修改目的] VERL 0.6 使用原生 vLLMHttpServer；真实 IDs 由 return_token_ids 获取。
+      # CustomAsyncServerConfig 的 path/name 均为 Optional[str]，默认值为 None。
       custom_async_server:
-        path: pkg://agentflow.verl.async_server
-        name: PatchedvLLMServer
+        path: null
+        name: null
+
