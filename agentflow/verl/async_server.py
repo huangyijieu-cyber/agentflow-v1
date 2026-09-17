@@ -1,3 +1,5 @@
+# [修改目的] 原代码下面已经显式调用 asyncio.wait_for / asyncio.TimeoutError，
+# 但没有导入 asyncio，会在执行 chat_completion 时触发 NameError。
 import asyncio
 import ray
 from copy import deepcopy
