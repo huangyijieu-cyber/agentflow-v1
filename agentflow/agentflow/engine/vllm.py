@@ -47,6 +47,9 @@ class ChatVLLM(EngineLM, CachedEngine):
         self.use_cache = use_cache
         self.system_prompt = system_prompt
         self.is_multimodal = is_multimodal
+
+        # [修改目的] 保存当前一次 vLLM 调用的真实 token ids / finish_reason，供 Planner 日志和 RL Triplet 使用。
+        # 原代码没有这个字段，因此 rollout 完成后只剩文本，训练阶段只能重新 tokenize。
         self.last_generation_metadata = None
 
         if self.use_cache:
@@ -90,12 +93,14 @@ class ChatVLLM(EngineLM, CachedEngine):
                 else:
                     raise ValueError("Unsupported content in list: only str or bytes are allowed.")
         except (APIConnectionError, APITimeoutError) as e:
-            # 3 次重试后还是连不上 / 超时，打印日志，返回空字符串
+            # [修改目的] 本次请求失败时清空上一次调用留下的 metadata，避免错误复用旧 token ids。
             self.last_generation_metadata = None
+            # 3 次重试后还是连不上 / 超时，打印日志，返回空字符串
             print(f"Traceback [ChatVLLM] Serving unreachable after retries: {e}")
             return ""  # ← 调用方拿到 str，不会 TypeError
                 
         except Exception as e:
+            # [修改目的] 同上，异常路径必须清空 metadata，避免 Planner 误绑定上一轮 token ids。
             self.last_generation_metadata = None
             print(f"Error in generate method: {str(e)}")
             print(f"Error type: {type(e).__name__}")
@@ -120,6 +125,7 @@ class ChatVLLM(EngineLM, CachedEngine):
         self, prompt, system_prompt=None, max_tokens=2048, top_p=0.99, response_format=None, **kwargs
     ):
 
+        # [修改目的] 每次新请求开始前清空上一次 metadata，确保一条日志只绑定本次生成结果。
         self.last_generation_metadata = None
         sys_prompt_arg = system_prompt if system_prompt else self.system_prompt
 
@@ -161,7 +167,31 @@ class ChatVLLM(EngineLM, CachedEngine):
             }
         else:
             response_format_arg = None
+
         # ## Chat models without structured outputs (without stream)
+        # [原代码保留]
+        # 原来这里直接用 response 接完整 ChatCompletion，随后又把 response 覆盖成 message.content：
+        # response = self.client.chat.completions.create(
+        #     model=self.model_string,
+        #     messages=[
+        #         {"role": "system", "content": sys_prompt_arg},
+        #         {"role": "user", "content": prompt},
+        #     ],
+        #     # frequency_penalty=kwargs.get("frequency_penalty", 1.2),
+        #     # stop=None,
+        #     presence_penalty=presence_penalty,
+        #     temperature=temperature,
+        #     max_tokens=max_tokens,
+        #     top_p=top_p,
+        #     # top_k=top_k,
+        #     # min_p=min_p,
+        #     stream=False,
+        #     response_format=response_format_arg,
+        # )
+        # response = response.choices[0].message.content
+
+        # [修改目的] 保留完整服务端响应，先读取 AgentFlow patched vLLM 返回的真实 token ids 和 finish_reason；
+        # 对 Planner 的最终返回值仍保持普通 str，不改变原有 Agent 逻辑。
         raw_response = self.client.chat.completions.create(
             model=self.model_string,
             messages=[
@@ -184,9 +214,7 @@ class ChatVLLM(EngineLM, CachedEngine):
             response_format=response_format_arg,
         )
 
-        # AgentFlow's patched vLLM server adds exact prompt/response token ids
-        # to the OpenAI-compatible response. Keep the outward return value as
-        # plain text so the existing Planner/tool logic is unchanged.
+        # [修改目的] token ids 以 serving 端真实采样结果为唯一来源，不再通过文本 decode -> encode 重建。
         payload = raw_response.model_dump()
         prompt_token_ids = getattr(raw_response, "prompt_token_ids", None)
         if prompt_token_ids is None:
@@ -196,8 +224,7 @@ class ChatVLLM(EngineLM, CachedEngine):
         if response_token_ids is None:
             response_token_ids = payload.get("response_token_ids")
 
-        # vLLM returns one list of token ids per choice; this client requests
-        # a single choice, so keep that one exact sampled sequence.
+        # vLLM 返回每个 choice 一组 response token ids；当前请求只有一个 choice，因此取第一组真实采样序列。
         if (
             isinstance(response_token_ids, (list, tuple))
             and response_token_ids
@@ -210,6 +237,9 @@ class ChatVLLM(EngineLM, CachedEngine):
             "response_token_ids": list(response_token_ids) if response_token_ids is not None else None,
             "finish_reason": raw_response.choices[0].finish_reason,
         }
+
+        # [原代码保留] response = response.choices[0].message.content
+        # [修改目的] 仍然只把普通文本返回给 Planner，避免修改 Planner / tool / parser 的既有行为。
         response = raw_response.choices[0].message.content or ""
         
         
@@ -267,6 +297,7 @@ class ChatVLLM(EngineLM, CachedEngine):
     def _generate_multimodal(
         self, content: List[Union[str, bytes]], system_prompt=None, temperature=0, max_tokens=2048, top_p=0.99, response_format=None
     ):
+        # [修改目的] 与文本路径保持一致，防止多模态调用后误复用上一轮文本调用的 metadata。
         self.last_generation_metadata = None
         sys_prompt_arg = system_prompt if system_prompt else self.system_prompt
         formatted_content = self._format_content(content)
