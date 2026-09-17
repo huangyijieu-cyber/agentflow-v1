@@ -27,12 +27,12 @@ reset. Main is not changed.
   returns and internal `last_generation_metadata.response_token_ids`.
 - `agentflow/agentflow/models/planner.py` and `train-roma/rollout.py`: preserve the
   existing exact-ID logging and Triplet construction. No re-tokenization fallback.
-- `agentflow/verl/config.yaml`: set custom server path/name to null, matching
-  VERL 0.6's Optional[str] schema/defaults.
-- `agentflow/verl/async_server.py`: retain the main legacy code entirely as
-  comments; no executable server imports or monkey patch remain in this module.
-  Importing this retired module is harmless; it does not provide a replacement
-  PatchedvLLMServer alias.
+- `agentflow/verl/config.yaml` and `agentflow/verl/async_server.py`: restored exactly
+  to main. VERL 0.6's AgentLoopManager selects vLLMReplica, which directly creates
+  vLLMHttpServer without reading custom_async_server.path/name. The old config
+  and module are therefore not used on this QA startup path; changing them was
+  unnecessary. This does not make the legacy module compatible with direct
+  import under VERL 0.6.
 - `agentflow/instrumentation/vllm.py`: restore exactly to main, undoing the previous
   instance-capture framework. This legacy file is not used by the QA native server.
 - `agentflow/scripts/check_serving_token_ids.py`: probe the native protocol and
@@ -52,10 +52,9 @@ Run CPU tests from repository root:
 python -m unittest discover -s agentflow/tests -v
 ```
 
-Eight tests cover the outgoing HTTP flag, native SDK fields and dump fallback,
+Six tests cover the outgoing HTTP flag, native SDK fields and dump fallback,
 exact IDs/EOS in Triplets, missing IDs, length termination without invented EOS,
-metadata retention, retired-module import, native server configuration, and probe
-validation of all choices. Generation/HTTP transport is simulated; these tests do
+metadata retention, and probe validation of all choices. Generation/HTTP transport is simulated; these tests do
 not establish success on real Ascend workers or a training run.
 
 After updating the fix checkout actually imported by the runtime, restart the

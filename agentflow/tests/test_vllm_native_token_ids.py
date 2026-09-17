@@ -106,18 +106,6 @@ class NativeTokenTests(unittest.TestCase):
         engine.last_generation_metadata = None
         self.assertEqual(planner.logs[0]['response_token_ids'], [17, 151645])
 
-    def test_retired_server_import_has_no_dependencies(self):
-        path = ROOT / 'agentflow/verl/async_server.py'
-        tree = ast.parse(path.read_text())
-        self.assertFalse(any(isinstance(n, (ast.Import, ast.ImportFrom, ast.Call)) for n in ast.walk(tree)))
-        spec = importlib.util.spec_from_file_location('retired_async_server', path)
-        spec.loader.exec_module(importlib.util.module_from_spec(spec))
-
-    def test_config_uses_native_server(self):
-        import yaml
-        config = yaml.safe_load((ROOT / 'agentflow/verl/config.yaml').read_text())
-        self.assertEqual(config['actor_rollout_ref']['rollout']['agent']['custom_async_server'], {'path': None, 'name': None})
-
     def test_probe_requests_native_fields_and_checks_all_choices(self):
         path = ROOT / 'agentflow/scripts/check_serving_token_ids.py'
         spec = importlib.util.spec_from_file_location('native_probe', path)
