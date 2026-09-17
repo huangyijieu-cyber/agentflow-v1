@@ -329,6 +329,18 @@ class RolloutAgent(LitAgent):
 
         # print(f"Return reward value, Rollout data saved to: {save_path}")
 
+        # [原代码保留]
+        # def encode_logs(tokenizer, logs):
+        #     return [Triplet(
+        #         prompt={"token_ids": tokenizer.encode(log["prompt"], add_special_tokens=False)},
+        #         response={"token_ids": tokenizer.encode(log["response"], add_special_tokens=False)},
+        #         reward=None
+        #     ) for log in logs]
+        #
+        # [修改目的]
+        # 原逻辑在 rollout 完成后把文本重新 tokenizer.encode，会导致训练 token 序列与 vLLM 实际采样序列不一致；
+        # 现在直接使用 Planner log 中由 serving 返回的真实 prompt_token_ids / response_token_ids，
+        # 同时把 finish_reason 写入 Triplet.metadata，避免 decode -> encode 重建轨迹。
         def encode_logs(logs):
             triplets = []
             for turn_index, log in enumerate(logs):
@@ -336,8 +348,6 @@ class RolloutAgent(LitAgent):
                 response_ids = log.get("response_token_ids")
                 finish_reason = log.get("finish_reason")
 
-                # Same source of truth as upstream AgentFlow: train on the exact
-                # prompt/output token ids returned by the patched vLLM server.
                 if prompt_ids is None or response_ids is None:
                     raise RuntimeError(
                         f"Planner turn {turn_index} is missing exact vLLM token ids. "
@@ -368,6 +378,9 @@ class RolloutAgent(LitAgent):
             rollout_package = Rollout(
                 rollout_id = rollout_id,
                 final_reward = reward_value,
+                # [原代码保留]
+                # triplets = await asyncio.to_thread(encode_logs, self.tokenizer, planner_logs),
+                # [修改目的] 新 encode_logs 不再执行 tokenizer.encode，只读取已保存的真实 token ids，因此无需 tokenizer 参数或 to_thread。
                 triplets = encode_logs(planner_logs),
                 metadata = metadata
             )
