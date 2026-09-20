@@ -202,11 +202,22 @@ class AgentFlowTrainer(RayPPOTrainer):
             response_mask = history_batch.batch["response_mask"]
             uids = history_batch.non_tensor_batch["uid"]
             turn_indices = history_batch.non_tensor_batch["turn_index_list"]
+            rollout_ids = history_batch.non_tensor_batch["rollout_id_list"]
             old_log_probs = history_batch.batch["old_log_probs"]
 
             scores = token_level_scores.sum(dim=-1)
             lengths = response_mask.sum(dim=-1)
             bsz = scores.shape[0]
+
+            task = str(self.config.data.get("task", "")).lower()
+            rollout_last_turn = {}
+            if task == "qa":
+                for i in range(bsz):
+                    rollout_id = str(rollout_ids[i])
+                    turn = int(turn_indices[i])
+                    rollout_last_turn[rollout_id] = max(
+                        rollout_last_turn.get(rollout_id, -1), turn
+                    )
 
             id2score = defaultdict(list)
             id2index = defaultdict(list)
@@ -242,7 +253,22 @@ class AgentFlowTrainer(RayPPOTrainer):
                     group_logPs = id2logP[idx]
                     group_lengths = [max(l.item(), 1) for l in id2length[idx]]
                     per_tokens = [lp / l for lp, l in zip(group_logPs, group_lengths)]
-                    id2baseline[idx] = float(sum(per_tokens) / max(len(per_tokens), 1))
+
+                    if task == "qa":
+                        stage_per_tokens = defaultdict(list)
+
+                        for sample_index, per_token in zip(id2index[idx], per_tokens):
+                            rollout_id = str(rollout_ids[sample_index])
+                            turn = int(turn_indices[sample_index])
+                            is_last = turn == rollout_last_turn[rollout_id]
+                            stage_per_tokens[is_last].append(per_token)
+
+                        id2baseline[idx] = {
+                            is_last: float(sum(values) / max(len(values), 1))
+                            for is_last, values in stage_per_tokens.items()
+                        }
+                    else:
+                        id2baseline[idx] = float(sum(per_tokens) / max(len(per_tokens), 1))
 
                 # usage = defaultdict(int)
                 # MAX_USE = 4
@@ -280,6 +306,13 @@ class AgentFlowTrainer(RayPPOTrainer):
                         for n_idx, _, n_len in neg_samples:
                             # if paired >= MAX_NEG_PER_POS:
                             #     break
+                            if task == "qa":
+                                p_rollout_id = str(rollout_ids[p_idx])
+                                n_rollout_id = str(rollout_ids[n_idx])
+                                p_is_last = int(turn_indices[p_idx]) == rollout_last_turn[p_rollout_id]
+                                n_is_last = int(turn_indices[n_idx]) == rollout_last_turn[n_rollout_id]
+                                if p_is_last != n_is_last:
+                                    continue
                             if max(p_len, n_len) / min(p_len, n_len) > 1.8:
                                 continue
                             # if usage[p_idx] >= MAX_USE or usage[n_idx] >= MAX_USE:
@@ -306,7 +339,7 @@ class AgentFlowTrainer(RayPPOTrainer):
 
                     # max_pairs = min(len(valid_pairs), max(bsz, 64))
 
-                    SOFT_CAP = 512  # 可按显存调整，建议 256~1024
+                    SOFT_CAP = 256  # 可按显存调整，建议 256~1024
                     max_pairs = min(len(valid_pairs), SOFT_CAP)
 
                     if len(valid_pairs) <= max_pairs:
@@ -320,6 +353,13 @@ class AgentFlowTrainer(RayPPOTrainer):
                     
                     for s in selected:
                         p_idx, n_idx, _, _ = valid_pairs[s]
+
+                        pair_baseline = baseline
+                        if task == "qa":
+                            p_rollout_id = str(rollout_ids[p_idx])
+                            p_is_last = int(turn_indices[p_idx]) == rollout_last_turn[p_rollout_id]
+                            pair_baseline = baseline[p_is_last]
+
                         proto = DataProto.from_single_dict(             
                             {key + "_a": history_batch.batch[key][p_idx: p_idx+1, :] for key in split_select_keys} 
                             | {key + "_b": history_batch.batch[key][n_idx: n_idx+1, :] for key in split_select_keys} 
@@ -329,7 +369,7 @@ class AgentFlowTrainer(RayPPOTrainer):
                         )
                         # ========== 关键：baseline 和 group_size 放入 non_tensor_batch ==========
                         # DataProto.concat 会正确拼接 non_tensor_batch，不会丢失 per-sample 标量
-                        proto.non_tensor_batch["group_baseline"] = np.array([baseline], dtype=np.float32)
+                        proto.non_tensor_batch["group_baseline"] = np.array([pair_baseline], dtype=np.float32)
                         proto.non_tensor_batch["group_size"] = np.array([group_size], dtype=np.int32)
                         # =====================================================================
                         proto_list.append(proto)
@@ -337,6 +377,11 @@ class AgentFlowTrainer(RayPPOTrainer):
         if not proto_list:
             print("## DPO pair is not found!")
             return None
+
+        ## 增加最大上限
+        MAX_PAIRS_PER_STEP = SOFT_CAP
+        if len(proto_list) > MAX_PAIRS_PER_STEP:
+            proto_list = random.sample(proto_list, MAX_PAIRS_PER_STEP)
 
         remainder = len(proto_list) % k_partitions
         if remainder != 0:
