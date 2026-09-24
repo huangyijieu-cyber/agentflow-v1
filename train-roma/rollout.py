@@ -29,11 +29,30 @@ import uuid, json
 from filelock import FileLock
 import asyncio
 
-from utils import load_and_set_env_from_yaml
+from utils import compute_score, load_and_set_env_from_yaml
 from transformers import AutoTokenizer
 
 import logging
 configure_logger(logging.INFO)
+
+
+@reward
+async def evaluate(question: str, groundtruth: any, answer_extracted: any, val: bool = False) -> float:
+    """
+    Evaluates if the extracted answer is correct by calling an LLM judge.
+    """
+    question_str = str(question)
+    groundtruth_str = str(groundtruth)
+    answer_extracted_str = str(answer_extracted)
+
+    is_correct = await asyncio.to_thread(
+        compute_score,
+        question_str,
+        groundtruth_str,
+        answer_extracted_str
+    )
+
+    return 1.0 if is_correct else 0.0
 
 
 def _as_dict(value: Any) -> dict:
@@ -353,11 +372,12 @@ class RolloutAgent(LitAgent):
         idx = task.get("extra_info", {}).get("idx", "unknown_idx")
 
         if self.task == "qa":
-            ## InfoSeek QA: final entity exact match + search-result subgoal reward
-            final_reward = evaluate_entity_answer(
-                task["result"],
+            ## InfoSeek QA: LLM judge final reward + search-result subgoal reward
+            final_reward = await evaluate(
+                task["question"],
+                str(task["result"]),
                 answer,
-                task.get("final_answer", {}),
+                val
             )
 
             reward_spec = task.get("reward_spec", {})
