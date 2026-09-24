@@ -50,6 +50,7 @@ env:
   TOTAL_EPOCH: ${env:TOTAL_EPOCH,20}
   VERBOSITY: 'DEBUG'
   N_WORKERS: ${env:N_WORKERS,64}
+  MAX_VAL_SAMPLES: ${env:MAX_VAL_SAMPLES,0}                  # 0=全部验证集；N=只取前N条
 
   # ----- Agent / Tool 配置 -----
   ENABLE_TOOLS:
@@ -122,6 +123,7 @@ python_args:
   +data.algorithm: '${ALGORITHM}'
   +data.replay_buffer_size: '${REPLAY_BUFFER_SIZE}'
   +data.replay_collection: '${REPLAY_COLLECTION}'
+  +data.max_val_samples: '${MAX_VAL_SAMPLES}'
 
   # --------------------------------------------------------------------------
   # Trainer 配置
