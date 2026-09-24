@@ -13,6 +13,7 @@ os.environ["_JAVA_OPTIONS"] = "-Dorg.apache.lucene.store.MMapDirectory.enableMem
 # jnius_config.set_classpath(jar_path)
 
 import string
+import hashlib
 import re
 import unicodedata
 from typing import Any, Optional
@@ -509,9 +510,13 @@ class RolloutAgent(LitAgent):
             if anchor is not None:
                 metadata["anchor"] = anchor
             if self.task == "qa":
-                # GiGPO anchor state: use the actual prompt/state seen by each planner turn.
-                # This list is aligned 1:1 with planner_logs / rollout.triplets.
-                metadata["anchor"] = [str(log["prompt"]) for log in planner_logs]
+                # GiGPO anchor state: exact-state grouping via a stable hash of each planner prompt.
+                # The list is aligned 1:1 with planner_logs / rollout.triplets and avoids
+                # carrying large prompt strings through Rollout.metadata.
+                metadata["anchor"] = [
+                    hashlib.sha256(str(log["prompt"]).encode("utf-8")).hexdigest()
+                    for log in planner_logs
+                ]
                 metadata["reward_breakdown"] = {
                     "final_reward": final_reward,
                     "subreward": subreward,
