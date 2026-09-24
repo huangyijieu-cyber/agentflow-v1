@@ -182,12 +182,12 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
     # Joint advantage rules for this AgentFlow adaptation:
     #   1) answer turns (step_pair_mask=False): episode advantage only;
     #   2) analysis/tool groups with >=2 turns: episode + step advantage;
-    #   3) analysis/tool singleton groups: no update at all.
-    scores = episode_advantages + step_advantage_w * step_advantages
-    pair_mask_t = torch.tensor(pairable_mask, dtype=torch.bool, device=scores.device).unsqueeze(-1)
-    excluded_mask_t = torch.tensor(~step_pair_mask, dtype=torch.bool, device=scores.device).unsqueeze(-1)
-    scores = torch.where(pair_mask_t, scores, torch.zeros_like(scores))
-    scores = torch.where(excluded_mask_t, episode_advantages, scores)
+    #   3) analysis/tool singleton groups: episode advantage only.
+    # Pairing controls only the step component, never the episode component.
+    pair_mask_t = torch.tensor(pairable_mask, dtype=torch.bool, device=step_advantages.device).unsqueeze(-1)
+    scores = episode_advantages + step_advantage_w * torch.where(
+        pair_mask_t, step_advantages, torch.zeros_like(step_advantages)
+    )
     return scores, scores
 
 

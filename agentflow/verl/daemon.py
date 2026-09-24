@@ -24,6 +24,14 @@ configure_logger()
 logger = logging.getLogger(__name__)
 
 
+def _gigpo_turn_step_reward(turn_process_rewards: dict, turn_index: int, final_reward: float) -> float:
+    """Give a turn its first-hit subgoal reward and the final-answer reward equally."""
+    subgoal_reward = turn_process_rewards.get(
+        str(turn_index), turn_process_rewards.get(turn_index, 0.0)
+    )
+    return float(subgoal_reward) + float(final_reward)
+
+
 def get_left_padded_ids_and_attention_mask(ids: List[int], max_length: int, pad_token_id: int):
     """
     Left-pad (or truncate) a sequence of token IDs to a fixed length,
@@ -777,7 +785,6 @@ class AgentModeDaemon:
 
             # GiGPO separates outcome reward and local process reward.
             episode_reward = float(reward_breakdown.get("final_reward", trajectory_reward))
-            subreward_weight = float(reward_breakdown.get("subreward_weight", 0.0))
             turn_process_rewards = reward_breakdown.get("turn_process_rewards", {}) or {}
             if not isinstance(turn_process_rewards, dict):
                 turn_process_rewards = {}
@@ -785,7 +792,6 @@ class AgentModeDaemon:
             info = {
                 "reward": trajectory_reward,
                 "episode_reward": episode_reward,
-                "subreward_weight": subreward_weight,
                 "turn_process_rewards": turn_process_rewards,
                 "trace_list": trace_list,
                 "data_id": original_sample["data_id"],
@@ -852,14 +858,15 @@ class AgentModeDaemon:
                 # GiGPO episode signal: final-answer outcome only.
                 episode_reward_list.append(sample_info["episode_reward"])
 
-                # GiGPO step signal: only the turn that first hits a new gold subgoal.
+                # GiGPO step signal: first-hit subgoal reward at this turn plus
+                # the final-answer reward for every turn (both with weight 1).
                 # Action Step k is aligned to planner-log turn_index == k.
-                turn_process_rewards = sample_info["turn_process_rewards"]
-                raw_step_reward = turn_process_rewards.get(
-                    str(turn_index), turn_process_rewards.get(turn_index, 0.0)
-                )
                 step_reward_list.append(
-                    sample_info["subreward_weight"] * float(raw_step_reward)
+                    _gigpo_turn_step_reward(
+                        sample_info["turn_process_rewards"],
+                        turn_index,
+                        sample_info["episode_reward"],
+                    )
                 )
 
                 # Mark samples with prompts exceeding max_prompt_length to be dropped later

@@ -69,7 +69,7 @@ def _as_dict(value: Any) -> dict:
 
 def _normalize_entity(text: Any) -> str:
     text = unicodedata.normalize("NFKC", str(text or "")).casefold()
-    text = re.sub(r"\\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", text).strip()
     return text.strip(string.whitespace + string.punctuation + "“”‘’")
 
 
@@ -84,9 +84,9 @@ def _entity_mentioned(alias: Any, observation: Any) -> bool:
         observation_text = json.dumps(observation, ensure_ascii=False, default=str)
 
     observation_norm = unicodedata.normalize("NFKC", observation_text).casefold()
-    observation_norm = re.sub(r"\\s+", " ", observation_norm)
+    observation_norm = re.sub(r"\s+", " ", observation_norm)
 
-    pattern = r"(?<!\\w)" + re.escape(alias_norm) + r"(?!\\w)"
+    pattern = r"(?<!\w)" + re.escape(alias_norm) + r"(?!\w)"
     return re.search(pattern, observation_norm) is not None
 
 
@@ -101,6 +101,11 @@ def evaluate_entity_answer(groundtruth: Any, answer_extracted: Any, final_answer
     answer_norm = _normalize_entity(answer_extracted)
     candidate_norms = {_normalize_entity(candidate) for candidate in candidates if _normalize_entity(candidate)}
     return 1.0 if answer_norm in candidate_norms else 0.0
+
+
+def _training_reward(final_reward: float, subreward: float) -> float:
+    """Combine InfoSeek outcome and subgoal rewards with equal weight."""
+    return float(final_reward) + float(subreward)
 
 
 def compute_search_subreward(result: dict, reward_spec: Any):
@@ -122,7 +127,7 @@ def compute_search_subreward(result: dict, reward_spec: Any):
             continue
 
         observation = action.get("result", "")
-        turn_match = re.search(r"(\\d+)", str(step_name))
+        turn_match = re.search(r"(\d+)", str(step_name))
         turn = int(turn_match.group(1)) if turn_match else None
 
         for subgoal in subgoals:
@@ -385,10 +390,6 @@ class RolloutAgent(LitAgent):
                 reward_spec = _as_dict(task.get("extra_info", {})).get("reward_spec", {})
 
             subreward, subgoal_hits = compute_search_subreward(result, reward_spec)
-            reward_spec_dict = _as_dict(reward_spec)
-            subreward_weight = float(reward_spec_dict.get("subreward_weight", 0.0))
-            weighted_subreward = subreward_weight * subreward
-
             # Per-turn process reward for GiGPO.  Keys are planner-log turn indices:
             # analyze_query=0, Action Step k=k, final_output=last turn.
             # Each subgoal contributes only at the Search step where it is first hit.
@@ -402,17 +403,15 @@ class RolloutAgent(LitAgent):
                     turn_process_rewards.get(turn_key, 0.0) + float(hit.get("weight", 0.0))
                 )
 
-            reward_value = final_reward + weighted_subreward
+            reward_value = _training_reward(final_reward, subreward)
 
             print(
                 "[REWARD] answer={} ground_truth={} final_reward={} subreward={} "
-                "subreward_weight={} weighted_subreward={} training_reward={} hits={}".format(
+                "training_reward={} hits={}".format(
                     answer,
                     task["result"],
                     final_reward,
                     subreward,
-                    subreward_weight,
-                    weighted_subreward,
                     reward_value,
                     subgoal_hits,
                 )
@@ -428,8 +427,6 @@ class RolloutAgent(LitAgent):
                 "answer_extracted": answer,
                 "final_reward": final_reward,
                 "subreward": subreward,
-                "subreward_weight": subreward_weight,
-                "weighted_subreward": weighted_subreward,
                 "subgoal_hits": subgoal_hits,
                 "turn_process_rewards": turn_process_rewards,
                 "reward": reward_value,
@@ -554,8 +551,6 @@ class RolloutAgent(LitAgent):
                 metadata["reward_breakdown"] = {
                     "final_reward": final_reward,
                     "subreward": subreward,
-                    "subreward_weight": subreward_weight,
-                    "weighted_subreward": weighted_subreward,
                     "training_reward": reward_value,
                     "subgoal_hits": subgoal_hits,
                     "turn_process_rewards": turn_process_rewards,
