@@ -388,6 +388,20 @@ class RolloutAgent(LitAgent):
             reward_spec_dict = _as_dict(reward_spec)
             subreward_weight = float(reward_spec_dict.get("subreward_weight", 0.0))
             weighted_subreward = subreward_weight * subreward
+
+            # Per-turn process reward for GiGPO.  Keys are planner-log turn indices:
+            # analyze_query=0, Action Step k=k, final_output=last turn.
+            # Each subgoal contributes only at the Search step where it is first hit.
+            turn_process_rewards = {}
+            for hit in subgoal_hits:
+                turn = hit.get("turn")
+                if turn is None:
+                    continue
+                turn_key = str(turn)
+                turn_process_rewards[turn_key] = (
+                    turn_process_rewards.get(turn_key, 0.0) + float(hit.get("weight", 0.0))
+                )
+
             reward_value = final_reward + weighted_subreward
 
             print(
@@ -417,6 +431,7 @@ class RolloutAgent(LitAgent):
                 "subreward_weight": subreward_weight,
                 "weighted_subreward": weighted_subreward,
                 "subgoal_hits": subgoal_hits,
+                "turn_process_rewards": turn_process_rewards,
                 "reward": reward_value,
                 "total_result":result,
                 "timestamp": datetime.now().isoformat(),
@@ -494,6 +509,9 @@ class RolloutAgent(LitAgent):
             if anchor is not None:
                 metadata["anchor"] = anchor
             if self.task == "qa":
+                # GiGPO anchor state: use the actual prompt/state seen by each planner turn.
+                # This list is aligned 1:1 with planner_logs / rollout.triplets.
+                metadata["anchor"] = [str(log["prompt"]) for log in planner_logs]
                 metadata["reward_breakdown"] = {
                     "final_reward": final_reward,
                     "subreward": subreward,
@@ -501,6 +519,7 @@ class RolloutAgent(LitAgent):
                     "weighted_subreward": weighted_subreward,
                     "training_reward": reward_value,
                     "subgoal_hits": subgoal_hits,
+                    "turn_process_rewards": turn_process_rewards,
                 }
             
             rollout_package = Rollout(
