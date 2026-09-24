@@ -243,7 +243,7 @@ class WebShopEnv:
                 current_observation=observation,
                 available_actions=reformatted_available_actions
             )
-            if len(prompt) > 13000:  ## todo: fixed here!
+            if len(prompt) > 13000:
                     print(f"Warning len(prompt)={len(prompt)} is too long")
                     prompt = WEBSHOP_TEMPLATE_NO_HIS.format(
                         task_description=self.task,

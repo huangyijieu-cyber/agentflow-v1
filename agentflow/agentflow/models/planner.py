@@ -64,12 +64,12 @@ class Planner:
         # print("Input data of `generate_base_response()`: ", input_data)
         self.base_response = self.llm_engine(input_data[0], max_tokens=max_tokens, temperature=self.temperature, usage_by="[planner] base generation")
         # self.base_response = self.llm_engine_fixed(input_data, max_tokens=max_tokens)
-        
+
         ## add trajectory
         self.logs.append({"prompt": input_data[0], "response": self.base_response})
         return self.base_response
 
-    def analyze_query(self, question: str, image: str, max_tokens: int = 2048) -> str:
+    def analyze_query(self, question: str, image: str) -> str:
         image_info = self.get_image_info(image)
 
         if self.is_multimodal:
@@ -99,7 +99,7 @@ Your response should include:
 
 Please present your analysis in a clear, structured format.
                         """
-        else: 
+        else:
             query_prompt = f"""
 Task: Analyze the given query to determine necessary skills and tools.
 
@@ -116,7 +116,7 @@ Instructions:
 
 Format your response with a summary of the query, lists of skills and tools with explanations, and a section for additional considerations.
 
-Be biref and precise with insight. 
+Be biref and precise with insight.
 """
 
 
@@ -132,9 +132,9 @@ Be biref and precise with insight.
         print("Input data of `analyze_query()`: ", input_data)
 
         # self.query_analysis = self.llm_engine_mm(input_data, response_format=QueryAnalysis)
-        self.query_analysis = self.llm_engine(input_data[0], max_tokens=max_tokens, response_format=QueryAnalysis, temperature=self.temperature, usage_by="[planner] analyze query")
+        self.query_analysis = self.llm_engine(input_data[0], response_format=QueryAnalysis, temperature=self.temperature, usage_by="[planner] analyze query")
         # self.query_analysis = self.llm_engine_fixed(input_data, response_format=QueryAnalysis)
-        
+
         self.logs.append({"prompt": input_data[0], "response": self.query_analysis})
 
         return str(self.query_analysis).strip()
@@ -153,11 +153,11 @@ Be biref and precise with insight.
                 return "_".join(part.lower() for part in parts)
 
             normalized_input = to_canonical(tool_name)
-            
+
             for tool in self.available_tools:
                 if to_canonical(tool) == normalized_input:
                     return tool
-                    
+
             return f"No matched tool given: {tool_name}"
 
         try:
@@ -195,7 +195,7 @@ Be biref and precise with insight.
 
         return context, sub_goal, tool_name
 
-    def generate_next_step(self, question: str, image: str, query_analysis: str, memory: Memory, step_count: int, max_step_count: int, json_data: Any = None, max_tokens: int = 2048) -> Any:
+    def generate_next_step(self, question: str, image: str, query_analysis: str, memory: Memory, step_count: int, max_step_count: int, json_data: Any = None) -> Any:
         if self.is_multimodal:
             prompt_generate_next_step = f"""
 Task: Determine the optimal next step to address the given query based on the provided analysis, available tools, and previous steps taken.
@@ -299,17 +299,17 @@ Rules:
         # print(f"response_format: {NextStep}")
         # print(f"prompt_generate_next_step:\n{prompt_generate_next_step}")
 
-        next_step = self.llm_engine(prompt_generate_next_step, max_tokens=max_tokens, response_format=NextStep, temperature=self.temperature, usage_by="[planner] next step")
+        next_step = self.llm_engine(prompt_generate_next_step, response_format=NextStep, temperature=self.temperature, usage_by="[planner] next step")
         if json_data is not None:
             json_data[f"action_predictor_{step_count}_prompt"] = prompt_generate_next_step
             json_data[f"action_predictor_{step_count}_response"] = str(next_step)
-        
+
         self.logs.append({"prompt": prompt_generate_next_step, "response": next_step})
 
         return next_step
 
 
-    def generate_final_output(self, question: str, image: str, memory: Memory, max_tokens: int = 2048) -> str:
+    def generate_final_output(self, question: str, image: str, memory: Memory) -> str:
         image_info = self.get_image_info(image)
         if self.is_multimodal:
             prompt_generate_final_output = f"""
@@ -377,14 +377,14 @@ Instructions:
                 print(f"Error reading image file: {str(e)}")
 
         # final_output = self.llm_engine_mm(input_data)
-        final_output = self.llm_engine(input_data[0], max_tokens=max_tokens, temperature=self.temperature, usage_by="[planner] generate final output")
+        final_output = self.llm_engine(input_data[0], temperature=self.temperature, usage_by="[planner] generate final output")
         # final_output = self.llm_engine_fixed(input_data)
 
         self.logs.append({"prompt": input_data[0], "response": final_output})
         return final_output
 
 
-    def generate_direct_output(self, question: str, image: str, memory: Memory, max_tokens: int = 2048) -> str:
+    def generate_direct_output(self, question: str, image: str, memory: Memory) -> str:
         image_info = self.get_image_info(image)
         if self.is_multimodal:
             prompt_generate_direct_output = f"""
@@ -428,7 +428,7 @@ Output Structure:
             except Exception as e:
                 print(f"Error reading image file: {str(e)}")
 
-        final_output = self.llm_engine(input_data[0], max_tokens=max_tokens, temperature=self.temperature, usage_by="[planner] generate direct output")
+        final_output = self.llm_engine(input_data[0], temperature=self.temperature, usage_by="[planner] generate direct output")
         # final_output = self.llm_engine_fixed(input_data)
         # final_output = self.llm_engine_mm(input_data)
 

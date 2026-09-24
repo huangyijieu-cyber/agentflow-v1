@@ -75,7 +75,8 @@ class ServerDataStore:
             metadata=metadata or {},
         )
         await self._task_queue.put(task)
-        logger.info(f"Task queued: {rollout_id} (mode: {mode}, resources_id: {resources_id})")
+        # logger.info(f"Task queued: {rollout_id} (mode: {mode}, resources_id: {resources_id})")
+
         return rollout_id
 
     async def get_next_task(self) -> Optional[Task]:

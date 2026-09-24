@@ -15,7 +15,6 @@ def main(config):
 
 
 def run_ppo(config) -> None:
-    
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(
@@ -145,7 +144,6 @@ class TaskRunner:
         )
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-        ## input config.yaml by data.xxx
         task = config.data.get("task", "qa")
         algorithm = config.data.get("algorithm", "grpo")
 

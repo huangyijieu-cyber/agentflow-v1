@@ -84,44 +84,25 @@ class AgentRunner(ParallelWorkerBase):
         triplets: Optional[List[Triplet]] = None
         trace_spans: Optional[List[ReadableSpan]] = None
 
-        if result is None:
-            raise ValueError(
-                f"Rollout method returned None for rollout_id={rollout_id}. "
-                "The agent must return a supported rollout result."
-            )
-
         # Handle different types of results from the agent
         # Case 1: result is a float (final reward)
         if isinstance(result, float):
             final_reward = result
-        # Cases 2-4: supported homogeneous list results
-        elif isinstance(result, list):
-            if not result:
-                raise ValueError(
-                    f"Rollout method returned an empty list for rollout_id={rollout_id}."
-                )
-            if all(isinstance(t, Triplet) for t in result):
-                triplets = result  # type: ignore
-            elif all(isinstance(t, ReadableSpan) for t in result):
-                trace_spans = result  # type: ignore
-                trace = [json.loads(readable_span.to_json()) for readable_span in trace_spans]  # type: ignore
-            elif all(isinstance(t, dict) for t in result):
-                trace = result
-            else:
-                raise TypeError(
-                    f"Unsupported or mixed list result for rollout_id={rollout_id}: "
-                    f"element types={sorted({type(item).__name__ for item in result})}"
-                )
+        # Case 2: result is a list of Triplets
+        if isinstance(result, list) and all(isinstance(t, Triplet) for t in result):
+            triplets = result  # type: ignore
+        # Case 3: result is a list of ReadableSpan (OpenTelemetry spans)
+        if isinstance(result, list) and all(isinstance(t, ReadableSpan) for t in result):
+            trace_spans = result  # type: ignore
+            trace = [json.loads(readable_span.to_json()) for readable_span in trace_spans]  # type: ignore
+        # Case 4: result is a list of dict (trace JSON)
+        if isinstance(result, list) and all(isinstance(t, dict) for t in result):
+            trace = result
         # Case 5: result is a Rollout object
-        elif isinstance(result, Rollout):
+        if isinstance(result, Rollout):
             final_reward = result.final_reward
             triplets = result.triplets
             trace = result.trace
-        else:
-            raise TypeError(
-                f"Unsupported rollout result type for rollout_id={rollout_id}: "
-                f"{type(result).__name__}"
-            )
 
         # If the agent has tracing enabled, use the tracer's last trace if not already set
         # if self.tracer and (trace is None or trace_spans is None):
@@ -250,10 +231,6 @@ class AgentRunner(ParallelWorkerBase):
                 result = await rollout_method(task.input, task.rollout_id, resources_update.resources)
                 # print("result in run_async:", result)
                 rollout_obj = self._to_rollout_object(result, task.rollout_id)
-                if task.mode == "train" and not rollout_obj.triplets:
-                    raise ValueError(
-                        f"Training rollout {task.rollout_id} contains no triplets."
-                    )
                 ## update resource_id
                 rollout_obj.metadata["resources_id"] = resources_id
                 # print("rollout_obj in run_async:", rollout_obj)
@@ -267,7 +244,9 @@ class AgentRunner(ParallelWorkerBase):
                 print(f"[DEBUG] Post rollout response: {str(response)[:200]}")
         except Exception:
             logger.info("#4. except Exception")
-            logger.exception(f"{self._log_prefix(rollout_id)} Exception during rollout.")
+            import traceback
+            logger.error(f"detail:{traceback.print_exc()}")
+            logger.error(f"{self._log_prefix(rollout_id)} Exception during rollout.")
             return False
         logger.info("#5. return true")
         return True

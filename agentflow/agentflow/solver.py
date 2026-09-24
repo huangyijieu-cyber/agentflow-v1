@@ -75,10 +75,6 @@ class Solver:
         reward = None ## placeholder
 
         if self.task == "qa":
-            # The Solver and its Memory are reused by a worker across tasks.
-            # Clear task-local actions so prompts do not accumulate history
-            # from earlier rollouts and eventually exceed the context window.
-            self.memory.clear()
             # Update cache directory for the executor
             self.executor.set_query_cache_dir(self.root_cache_dir)
 
@@ -114,7 +110,7 @@ class Solver:
 
                 # [1] Analyze query
                 query_start_time = time.time()
-                query_analysis = self.planner.analyze_query(question, image_path, self.max_tokens)
+                query_analysis = self.planner.analyze_query(question, image_path)
                 json_data["query_analysis"] = query_analysis
                 if self.verbose:
                     log_info(f"\n==> 🔍 Step 0: Query Analysis\n")
@@ -137,8 +133,7 @@ class Solver:
                         self.memory, 
                         step_count, 
                         self.max_steps,
-                        json_data,
-                        max_tokens=self.max_tokens
+                        json_data
                     )
                     context, sub_goal, tool_name = self.planner.extract_context_subgoal_and_tool(next_step)
                     if self.verbose:
@@ -219,13 +214,13 @@ class Solver:
 
                 # Generate final output if requested
                 if 'final' in self.output_types:
-                    final_output = self.planner.generate_final_output(question, image_path, self.memory, self.max_tokens)
+                    final_output = self.planner.generate_final_output(question, image_path, self.memory)
                     json_data["final_output"] = final_output
                     log_info(f"\n==> 🐙 Detailed Solution:\n\n{final_output}")
 
                 # Generate direct output if requested
                 if 'direct' in self.output_types:
-                    direct_output = self.planner.generate_direct_output(question, image_path, self.memory, self.max_tokens)
+                    direct_output = self.planner.generate_direct_output(question, image_path, self.memory)
                     json_data["direct_output"] = direct_output
                     log_info(f"\n==> 🐙 Final Answer:\n\n{direct_output}")
 
@@ -299,11 +294,8 @@ class Solver:
                     print(f"Action:\n{base_response}")
                     question, reward, done, info = self.env.step(base_response)
                     print(f'Reward = {reward}, Done = {done}')
-                    next_anchor = info.get("anchor")
-                    if next_anchor is not None:
-                        if json_data["anchor"] is None:
-                            json_data["anchor"] = []
-                        json_data["anchor"].append(next_anchor)
+                    if info["anchor"] is not None:
+                        json_data["anchor"].append(info["anchor"])
                     
         
                     if done:

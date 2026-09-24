@@ -1020,8 +1020,8 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_scale_factor = 1 / self.gradient_accumulation
                     # Start: all return: (bsz, response_length)
                     calculate_entropy = False
-                    if entropy_coeff != 0:
-                        calculate_entropy = True
+                    # if entropy_coeff != 0:
+                    #     calculate_entropy = True
                     
                     # entropy_a, log_prob_a = self._forward_micro_batch(
                     #     pair_a, temperature=temperature, calculate_entropy=calculate_entropy

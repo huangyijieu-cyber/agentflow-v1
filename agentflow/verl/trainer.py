@@ -131,7 +131,7 @@ class AgentFlowTrainer(RayPPOTrainer):
             is_train=False,
         )
 
-        # whether persisting queueing 
+        # whether persisting queueing
         if self.agent_mode_daemon._total_tasks_queued == 0:
             raise ValueError("No validation tasks were queued. Check data preparation.")
 
@@ -179,44 +179,7 @@ class AgentFlowTrainer(RayPPOTrainer):
         gc.collect()
 
     ## score=0, score=1, classify(统一划分)
-    # [修改目的] SLiC 独立长度阈值；0 关闭，其他偏好算法不受影响。
-    def _slic_response_length_limit(self):
-        if "slic" not in self.algorithm.split("+"):
-            return 0
-        value = self.config.data.get("slic_max_response_length", 0)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError("data.slic_max_response_length must be a non-negative integer (0 disables filtering)")
-        return value
-
-    def _prune_slic_replay_buffer(self):
-        limit = self._slic_response_length_limit()
-        dropped = 0
-        unknown = 0
-        if limit and getattr(self, "_dpo_ring_buffer", None):
-            kept = deque(maxlen=self._dpo_ring_buffer.maxlen)
-            for pair in self._dpo_ring_buffer:
-                lengths = [pair.non_tensor_batch.get("original_response_length" + suffix)
-                           for suffix in ("_a", "_b")]
-                # [修改目的] 旧回放缺少原始长度时无法排除截断伪装，启用过滤时保守清除。
-                if any(value is None for value in lengths):
-                    unknown += 1
-                elif any(np.any(value > limit) for value in lengths):
-                    dropped += 1
-                else:
-                    kept.append(pair)
-            self._dpo_ring_buffer = kept
-        return {"slic/length_filter/replay_dropped": dropped,
-                "slic/length_filter/replay_unknown_dropped": unknown}
-
     def _trans_to_dpo_batch(self, history_batch_list: list):
-        limit = self._slic_response_length_limit()
-        self._slic_length_metrics = {
-            "slic/length_filter/limit": limit,
-            "slic/length_filter/candidates": 0,
-            "slic/length_filter/chosen_dropped": 0,
-            "slic/length_filter/rejected_dropped": 0,
-            "slic/length_filter/pairs_before_padding": 0,
-        }
         if not history_batch_list:
             print("## No DPO data with history")
             return None
@@ -233,34 +196,17 @@ class AgentFlowTrainer(RayPPOTrainer):
         non_tensor_split_select_keys = ["turn_index_list", "rollout_id_list"]
 
         proto_list = []
-        task = str(self.config.data.get("task", "")).lower()
-        # [原代码保留] qa_first_turn_slic = task == "qa" and "slic" in self.algorithm.split("+")
-        # [修改目的] 恢复各 turn 按 replay_collection 配对，继续保留阶段检查和长度过滤。
-        SOFT_CAP = 256  # Cap newly collected pairs before device padding.
-        
+
         for history_batch in history_batch_list:
             token_level_scores = history_batch.batch["token_level_scores"]
             response_mask = history_batch.batch["response_mask"]
             uids = history_batch.non_tensor_batch["uid"]
             turn_indices = history_batch.non_tensor_batch["turn_index_list"]
-            rollout_ids = history_batch.non_tensor_batch["rollout_id_list"]
             old_log_probs = history_batch.batch["old_log_probs"]
 
             scores = token_level_scores.sum(dim=-1)
             lengths = response_mask.sum(dim=-1)
-            raw_lengths = history_batch.non_tensor_batch.get("original_response_length")
-            if limit and raw_lengths is None:
-                raise ValueError("SLiC length filtering requires original_response_length; update daemon.py together with trainer.py")
             bsz = scores.shape[0]
-
-            rollout_last_turn = {}
-            if task == "qa":
-                for i in range(bsz):
-                    rollout_id = str(rollout_ids[i])
-                    turn = int(turn_indices[i])
-                    rollout_last_turn[rollout_id] = max(
-                        rollout_last_turn.get(rollout_id, -1), turn
-                    )
 
             id2score = defaultdict(list)
             id2index = defaultdict(list)
@@ -273,44 +219,18 @@ class AgentFlowTrainer(RayPPOTrainer):
                     turn = str(turn_indices[i])
                     ## replay collection
                     replay_collection = self.config.data.get("replay_collection", "uid-turn")
-                    # [原代码保留] 首轮和相同 prompt 限制已撤销：
-                    # if qa_first_turn_slic:
-                    # # daemon enumerates triplets from zero. Never substitute a
-                    # # later surviving turn when the real first turn is absent.
-                    # if int(turn_indices[i]) != 0 or lengths[i].item() == 0:
-                    # continue
-                    # if history_batch.batch["is_drop_mask"][i].item():
-                    # continue
-                    # prompt = history_batch.batch["prompts"][i]
-                    # prompt_mask = history_batch.batch["attention_mask"][i, :prompt.shape[-1]].bool()
-                    # prompt_tokens = tuple(prompt[prompt_mask].tolist())
-                    # # Even cross/turn replay modes must not mix QA contexts.
-                    # key_index = (uid, prompt_tokens)
-                    # elif replay_collection == "uid-turn":
-                    # [修改目的] 只撤销首轮限制，保留 QA SLiC 对超长 prompt 的排除。
-                    if task == "qa" and "slic" in self.algorithm.split("+"):
-                        if history_batch.batch["is_drop_mask"][i].item():
-                            continue
                     if replay_collection == "uid-turn":
                         key_index = f"{uid}::turn_{turn}"
                     elif replay_collection == "cross":
                         key_index = "0"
                     elif replay_collection == "turn":
-                        key_index = f"0::trun_{turn}"
+                        key_index = f"0::turn_{turn}"
                     else:
                         raise ValueError(f"replay collection: {key_index} is invalid!")
-                    
-                    # [修改目的] 在组内 baseline 和偏好配对之前，按原始回答长度过滤。
-                    if limit and lengths[i].item() > 0:
-                        self._slic_length_metrics["slic/length_filter/candidates"] += 1
-                        if int(raw_lengths[i]) > limit:
-                            side = "chosen" if scores[i].item() > 0 else "rejected"
-                            self._slic_length_metrics[f"slic/length_filter/{side}_dropped"] += 1
-                            continue
 
                     # 累积 logP（用于 baseline）
                     logP = (old_log_probs[i] * response_mask[i]).sum().item()
-                    
+
                     id2score[key_index].append(scores[i])
                     id2length[key_index].append(lengths[i])
                     id2index[key_index].append(i)
@@ -322,42 +242,43 @@ class AgentFlowTrainer(RayPPOTrainer):
                     group_logPs = id2logP[idx]
                     group_lengths = [max(l.item(), 1) for l in id2length[idx]]
                     per_tokens = [lp / l for lp, l in zip(group_logPs, group_lengths)]
-
-                    if task == "qa":
-                        stage_per_tokens = defaultdict(list)
-
-                        for sample_index, per_token in zip(id2index[idx], per_tokens):
-                            rollout_id = str(rollout_ids[sample_index])
-                            turn = int(turn_indices[sample_index])
-                            is_last = turn == rollout_last_turn[rollout_id]
-                            stage_per_tokens[is_last].append(per_token)
-
-                        id2baseline[idx] = {
-                            is_last: float(sum(values) / max(len(values), 1))
-                            for is_last, values in stage_per_tokens.items()
-                        }
-                    else:
-                        id2baseline[idx] = float(sum(per_tokens) / max(len(per_tokens), 1))
+                    id2baseline[idx] = float(sum(per_tokens) / max(len(per_tokens), 1))
 
                 # usage = defaultdict(int)
                 # MAX_USE = 4
+
+                # ========== 新增 0：配置 ==========
+                cfg = self.config.data.get("replay_filter", {})
+                K_PAIRS_PER_GROUP   = cfg.get("k_pairs_per_group", 2)      # 每 turn 最多入队对数
+                LENGTH_RATIO_MAX    = cfg.get("length_ratio_max", 1.8)     # 你原来的 1.8 提到配置
+                MARGIN_SAT_QUANTILE = cfg.get("margin_sat_quantile", 0.9)  # 组内 margin 饱和分位
+
 
                 for idx in id2score.keys():
                     group_size = len(id2score[idx])
                     if group_size <= 1:
                         continue
 
+                    # ========== 新增 1：turn 级分歧度过滤 ==========
+                    group_scores = torch.stack(id2score[idx]).float()
+                    g_std  = group_scores.std().item()
+                    g_mean = group_scores.mean().item()
+
+                    # 全同分（全成/全败）的 turn，pair 梯度≈0，直接跳过
+                    if g_std < 1e-6:
+                        continue
+
                     pos_samples = []
                     neg_samples = []
-                    
+
                     for i in range(group_size):
                         score = id2score[idx][i].item()
                         length = id2length[idx][i].item()
                         index = id2index[idx][i]
-                        
+
                         if length == 0:
                             continue
-                            
+
                         if score > 0:
                             pos_samples.append((index, score, length))
                         else:
@@ -366,100 +287,64 @@ class AgentFlowTrainer(RayPPOTrainer):
                     if not pos_samples or not neg_samples:
                         continue
 
+                    # ========== 新增 2：构建全部候选对 + margin 饱和过滤 ==========
+                    # 先算组内所有对的 margin，取饱和分位做阈值
+                    pair_margins = [p_s - n_s for _, p_s, _ in pos_samples for _, n_s, _ in neg_samples]
+                    sat_thresh = np.quantile(pair_margins, MARGIN_SAT_QUANTILE)
+
                     valid_pairs = []
-                    # MAX_NEG_PER_POS = 5
-                    random.shuffle(neg_samples)
-                    
-                    for p_idx, _, p_len in pos_samples:
-                        # paired = 0
-                        for n_idx, _, n_len in neg_samples:
-                            # if paired >= MAX_NEG_PER_POS:
-                            #     break
-                            if task == "qa":
-                                p_rollout_id = str(rollout_ids[p_idx])
-                                n_rollout_id = str(rollout_ids[n_idx])
-                                p_is_last = int(turn_indices[p_idx]) == rollout_last_turn[p_rollout_id]
-                                n_is_last = int(turn_indices[n_idx]) == rollout_last_turn[n_rollout_id]
-                                if p_is_last != n_is_last:
-                                    continue
-                            if max(p_len, n_len) / min(p_len, n_len) > 1.8:
+                    for p_idx, p_score, p_len in pos_samples:
+                        for n_idx, n_score, n_len in neg_samples:
+                            if p_score - n_score > sat_thresh:      # 白送对，梯度≈0
                                 continue
-                            # if usage[p_idx] >= MAX_USE or usage[n_idx] >= MAX_USE:
-                            #     continue
+                            if max(p_len, n_len) / min(p_len, n_len) > LENGTH_RATIO_MAX:
+                                continue
                             valid_pairs.append((p_idx, n_idx, p_len, n_len))
-                            # usage[p_idx] += 1
-                            # usage[n_idx] += 1
-                            # paired += 1
 
                     if not valid_pairs:
                         continue
 
-                    # ========== 采样权重：长度接近优先（与任务无关）==========
-                    weights = []
-                    for _, _, p_len, n_len in valid_pairs:
-                        length_diff = abs(p_len - n_len)
-                        # 长度越接近，权重越高；彻底消除"短 chosen 优先"的系统性偏见
-                        w = 1.0 / (1.0 + length_diff / 64.0)
-                        weights.append(max(w, 0.1))
-                    
-                    total_w = sum(weights)
-                    weights = [w / total_w for w in weights]
-                    # =======================================================
+                    # ========== 新增 3：近似难对度 top-K（替代随机 shuffle + 长度权重采样）==========
+                    # 用生成时 per-token logP 的接近程度近似"模型当前难分"
+                    pos_in_group = {batch_idx: i for i, batch_idx in enumerate(id2index[idx])}
+                    def _hardness(pair):
+                        p_idx, n_idx, _, _ = pair
+                        p_pos = pos_in_group[p_idx]          # batch 行号 → 组内位置
+                        n_pos = pos_in_group[n_idx]
+                        pt_a = id2logP[idx][p_pos] / max(id2length[idx][p_pos].item(), 1)
+                        pt_b = id2logP[idx][n_pos] / max(id2length[idx][n_pos].item(), 1)
+                        return abs(pt_a - pt_b)
 
-                    # max_pairs = min(len(valid_pairs), max(bsz, 64))
-
-                    max_pairs = min(len(valid_pairs), SOFT_CAP)
-
-                    if len(valid_pairs) <= max_pairs:
-                        selected = list(range(len(valid_pairs)))
-                    else:
-                        selected = np.random.choice(
-                            len(valid_pairs), size=max_pairs, replace=False, p=weights
-                        )
+                    valid_pairs.sort(key=_hardness)                        # 难分在前
+                    selected = valid_pairs[:K_PAIRS_PER_GROUP]             # 只留 top-K
 
                     baseline = id2baseline[idx]
-                    
-                    for s in selected:
-                        p_idx, n_idx, _, _ = valid_pairs[s]
 
-                        pair_baseline = baseline
-                        if task == "qa":
-                            p_rollout_id = str(rollout_ids[p_idx])
-                            p_is_last = int(turn_indices[p_idx]) == rollout_last_turn[p_rollout_id]
-                            pair_baseline = baseline[p_is_last]
-
-                        proto = DataProto.from_single_dict(             
-                            {key + "_a": history_batch.batch[key][p_idx: p_idx+1, :] for key in split_select_keys} 
-                            | {key + "_b": history_batch.batch[key][n_idx: n_idx+1, :] for key in split_select_keys} 
-                            | {key: history_batch.non_tensor_batch[key][p_idx: p_idx+1] for key in non_tensor_select_keys} 
+                    for p_idx, n_idx, _, _ in selected:
+                        proto = DataProto.from_single_dict(
+                            {key + "_a": history_batch.batch[key][p_idx: p_idx+1, :] for key in split_select_keys}
+                            | {key + "_b": history_batch.batch[key][n_idx: n_idx+1, :] for key in split_select_keys}
+                            | {key: history_batch.non_tensor_batch[key][p_idx: p_idx+1] for key in non_tensor_select_keys}
                             | {key + "_a": history_batch.non_tensor_batch[key][p_idx: p_idx+1] for key in non_tensor_split_select_keys}
                             | {key + "_b": history_batch.non_tensor_batch[key][n_idx: n_idx+1] for key in non_tensor_split_select_keys}
                         )
                         # ========== 关键：baseline 和 group_size 放入 non_tensor_batch ==========
                         # DataProto.concat 会正确拼接 non_tensor_batch，不会丢失 per-sample 标量
-                        proto.non_tensor_batch["group_baseline"] = np.array([pair_baseline], dtype=np.float32)
+                        proto.non_tensor_batch["group_baseline"] = np.array([baseline], dtype=np.float32)
                         proto.non_tensor_batch["group_size"] = np.array([group_size], dtype=np.int32)
-                        # [修改目的] 回放再次筛选时仍使用截断前长度。
-                        if raw_lengths is not None:
-                            proto.non_tensor_batch["original_response_length_a"] = np.array([raw_lengths[p_idx]], dtype=np.int64)
-                            proto.non_tensor_batch["original_response_length_b"] = np.array([raw_lengths[n_idx]], dtype=np.int64)
+                        proto.non_tensor_batch["born_step"] = np.array([self.global_steps], dtype=np.int64)
                         # =====================================================================
                         proto_list.append(proto)
 
         if not proto_list:
-            if limit:
-                print(f"[SLiC length filter] {self._slic_length_metrics}")
             print("## DPO pair is not found!")
             return None
 
         ## 增加最大上限
-        MAX_PAIRS_PER_STEP = SOFT_CAP
+        MAX_PAIRS_PER_STEP = 256
         if len(proto_list) > MAX_PAIRS_PER_STEP:
             proto_list = random.sample(proto_list, MAX_PAIRS_PER_STEP)
 
-        self._slic_length_metrics["slic/length_filter/pairs_before_padding"] = len(proto_list)
-        if limit:
-            print(f"[SLiC length filter] {self._slic_length_metrics}")
         remainder = len(proto_list) % k_partitions
         if remainder != 0:
             extra = random.choices(proto_list, k=k_partitions - remainder)
@@ -470,45 +355,36 @@ class AgentFlowTrainer(RayPPOTrainer):
         temperature = history_batch_list[0].meta_info.get("temperature", 0.7)
         for proto in proto_list:
             proto.meta_info["temperature"] = temperature
-            
+
         return proto_list
 
-    
+
     def _sample_dpo_data(self, dpo_queue: deque, bs: int):
         """
            从环形缓冲中随机有放回采样 bs 个单样本，拼接成 DataProto。
            只在需要训练 DPO 时才做一次 concat，避免每 step 全量拷贝。
         """
         n_size = len(dpo_queue)
-        # [原代码保留] if n_size == 0:
-        # [修改目的] 过滤后不足设备分区数时 bs=0，安全跳过，避免 concat([])。
-        if n_size == 0 or bs <= 0:
-          return None
-        
-        # # 随机回放机制：
-        # indices = [random.randint(0, n_size - 1) for _ in range(bs)]
-        # selected = [dpo_queue[i] for i in indices]
+        if n_size == 0:
+            return None
 
-        # ## 新增“新鲜度经验”回放
-        # # 索引 i 越接近 n_size-1（越新），权重越高
-        # weights = np.exp(0.1 * np.arange(n_size))  # 指数加权
-        # weights = weights / weights.sum()
-        # indices = np.random.choice(n_size, size=bs, replace=True, p=weights)
-        # selected = [dpo_queue[i] for i in indices]
 
-        ## 保证至少都训一遍
+        ages = np.array([self.global_steps - int(p.non_tensor_batch["born_step"][0])
+                 for p in dpo_queue], dtype=np.float64)
+        tau = max(float(np.median(ages)), 1.0)   # max(·,1) 只防除零，不是调参
+        w = np.exp(-ages / tau)
+        w = w / w.sum()
+
         if bs <= n_size:
-            indices = random.sample(range(n_size), bs)
+            indices = np.random.choice(n_size, size=bs, replace=False, p=w)
         else:
-            # buffer 不够，先全取一遍，剩余有放回补齐
-            indices = random.sample(range(n_size), n_size)
-            indices += random.choices(range(n_size), k=bs - n_size)
-            random.shuffle(indices)
+            idx1 = np.random.choice(n_size, size=n_size, replace=False, p=w)
+            idx2 = np.random.choice(n_size, size=bs - n_size, replace=True, p=w)
+            indices = np.concatenate([idx1, idx2])
+            np.random.shuffle(indices)
 
         selected = [dpo_queue[i] for i in indices]
-        
-        sample_data = DataProto.concat(selected)
-        return sample_data
+        return DataProto.concat(selected)
 
 
 
@@ -650,12 +526,36 @@ class AgentFlowTrainer(RayPPOTrainer):
                     self._dpo_ring_buffer = deque(maxlen=replay_buffer_size)
 
                 new_dpo_pairs = self._trans_to_dpo_batch([batch])
-                if "slic" in self.algorithm.split("+"):
-                    metrics.update(self._slic_length_metrics)
                 if new_dpo_pairs is not None:
-                    # 逐个样本入队；超长的自动从左侧弹出，无大 tensor concat/截断拷贝
-                    self._dpo_ring_buffer.extend(new_dpo_pairs)
+                    # uid 全局配额：同一 uid 在 buffer 中最多 M 对（防多轮相邻 turn 冗余）
+                    if not hasattr(self, '_uid_pair_count'):
+                        self._uid_pair_count = defaultdict(int)
+                    M_PER_UID = self.config.data.get("replay_filter", {}).get("max_pairs_per_uid", 4)
+
+                    n_skipped = 0
+                    for proto in new_dpo_pairs:
+                        uid = str(proto.non_tensor_batch["uid"][0])
+
+                        ## ## 不遗漏，都要
+                        # if self._uid_pair_count[uid] >= M_PER_UID:
+                        #     n_skipped += 1
+                        #     continue
+
+                        self._dpo_ring_buffer.append(proto)
+                        self._uid_pair_count[uid] += 1
+                    # 惰性清理：buffer 左侧弹出后计数会虚高，定期重建
+                    if self.global_steps % 50 == 0:
+                        self._uid_pair_count = defaultdict(int)
+                        for p in self._dpo_ring_buffer:
+                            self._uid_pair_count[str(p.non_tensor_batch["uid"][0])] += 1
                     print(f"DPO ring buffer size: {len(self._dpo_ring_buffer)} / {self._dpo_ring_buffer.maxlen}")
+                    metrics["replay/n_new_pairs"] = len(new_dpo_pairs)
+                    metrics["replay/n_quota_skipped"] = n_skipped
+                else:
+                    metrics["replay/n_new_pairs"] = 0
+                metrics["replay/buffer_size"] = len(self._dpo_ring_buffer)
+
+
                 self._stale_step_counter += 1
                 stale_iteration = self.config.data.get("stale_iteration", 0)
                 if self._stale_step_counter > stale_iteration:
@@ -744,7 +644,6 @@ class AgentFlowTrainer(RayPPOTrainer):
             # implement critic warmup
             if self.config.trainer.critic_warmup <= self.global_steps:
                 ### FFN-GRPO
-
                 if "grpo" in algorithm:
                     # update actor with grpo
                     print(f"{time.strftime('%Y-%m-%d %H-%M-%S')}: >>> Begin GRPO")
@@ -756,53 +655,57 @@ class AgentFlowTrainer(RayPPOTrainer):
                     metrics.update(actor_output_metrics)
                     print(f"{time.strftime('%Y-%m-%d %H-%M-%S')}: >>> End GRPO")
 
-                # update actor by dpo
+                # FFN-DPO
                 dpo_type = next((k for k in dpo_types if k in algorithm), None)
                 if dpo_type is not None:
                     print(f"{time.strftime('%Y-%m-%d %H-%M-%S')}: >>> Begin DPO")
-                    
+
                     with _timer("update_actor_by_dpo", timing_raw):
                         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
 
-                        if dpo_type == "slic":
-                            metrics.update(self._prune_slic_replay_buffer())
-                            metrics["slic/length_filter/replay_size"] = len(getattr(self, "_dpo_ring_buffer", None) or [])
-                            metrics["slic/length_filter/update_skipped"] = 1
                         if hasattr(self, '_dpo_ring_buffer') and len(self._dpo_ring_buffer) > 0:
                             batch_size = len(batch)
                             history_length = len(self._dpo_ring_buffer)
-                            
-                            # 保守策略：DPO batch不超过GRPO batch，且硬上限128（版本2优点）
-                            # n_ratio = max(history_length // batch_size, 1)
-                            # n_ratio = min(n_ratio, 2)  # 不放大，防止DPO主导训练
-                            # n_batch = n_ratio * batch_size
 
-                            ## batch size (full)
-                            n_batch = history_length // k_partitions * k_partitions
-                            
+                            # 闭环：消化速率 = 实际入队速率 EMA（0 入队步不更新）
+                            enq = metrics.get("replay/n_new_pairs", 0) - metrics.get("replay/n_quota_skipped", 0)
+                            enq = max(enq, 0)
+                            if enq > 0:
+                                self._enq_ema = float(enq) if getattr(self, '_enq_ema', None) is None \
+                                                else 0.9 * self._enq_ema + 0.1 * enq
+
+                            # 消化 = 入队；三重上限：能切分、不超存量、不超 GRPO 两倍
+                            n_batch = max(int(round(self._enq_ema)), k_partitions)
+                            n_batch = min(n_batch, history_length)
+                            n_batch = n_batch // k_partitions * k_partitions
+                            n_batch = max(n_batch, k_partitions)
+                            metrics["replay/enq_ema"] = getattr(self, '_enq_ema', 0.0)
+                            metrics["replay/n_dpo_batch"] = n_batch
+
+                            # ## batch size (full)
+                            # n_batch = history_length // k_partitions * k_partitions
+
                             print(f"## update dpo ({n_batch}) bs from ({history_length})")
                             sample_batch = self._sample_dpo_data(self._dpo_ring_buffer, bs=n_batch)
-                            
+
                             if sample_batch is not None and len(sample_batch) > 0:
                                 print(f"{time.strftime('%Y-%m-%d %H-%M-%S')}: >>> Middle-2 DPO")
                                 sample_batch.meta_info["dpo_type"] = dpo_type
                                 sample_batch.meta_info["max_response_length"] = self.config.data.max_response_length
-                                
+
                                 # 建议：在DPO前也做长度检查，过滤极端长短样本
                                 # 可在 update_actor_by_dpo 内部或这里加
                                 dpo_output = self.actor_rollout_wg.update_actor_by_dpo(sample_batch)
-                                if dpo_type == "slic":
-                                    metrics["slic/length_filter/update_skipped"] = 0
                                 dpo_output_metrics = reduce_metrics(dpo_output.meta_info["metrics"])
                                 metrics.update(dpo_output_metrics)
                             else:
                                 print("## DPO skipped this step (insufficient fresh pairs).")
                         else:
                             print("## DPO skipped: ring buffer empty.")
-                            
+
                     print(f"{time.strftime('%Y-%m-%d %H-%M-%S')}: >>> END DPO")
 
-            
+
 
         # compute training metrics
         metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
@@ -810,7 +713,7 @@ class AgentFlowTrainer(RayPPOTrainer):
 
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-        
+
 
         # 释放目标(pytorch, 释放训练过程)
         print(f"Free pytorch memory!")
@@ -929,12 +832,12 @@ class AgentFlowTrainer(RayPPOTrainer):
                 self._clean_npu_cache()
                 metrics = self._train_step(batch_dict)
                 self._clean_npu_cache()
-                ## skip stale 
+                ## skip stale
                 if metrics is None:
                     print("stale data is not collnected enough, skip this batch.")
                     continue
-                
-                
+
+
 
                 # validate
                 # ### is_last_step close

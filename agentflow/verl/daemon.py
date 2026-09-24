@@ -147,40 +147,40 @@ class AgentModeDaemon:
         """
         lines = event_text.strip().split('\n')
         output_lines = []
-        
+
         for line in lines:
             if not line.startswith('data: '):
                 output_lines.append(line)
                 continue
-            
+
             data_content = line[6:]  # 去掉 "data: " 前缀
-            
+
             # [DONE] 标记直接透传
             if data_content == '[DONE]':
                 output_lines.append('data: [DONE]')
                 continue
-            
+
             # 尝试解析并修改 JSON
             try:
                 data_json = json.loads(data_content)
-                
+
                 if 'choices' in data_json:
                     for choice in data_json['choices']:
                         if 'delta' in choice and 'content' in choice['delta']:
                             content = choice['delta']['content']
                             # content = content.replace('敏感词', '**')
                             choice['delta']['content'] = content
-                
+
                 modified_line = 'data: ' + json.dumps(
-                    data_json, 
+                    data_json,
                     ensure_ascii=False  # 保留中文
                 )
                 output_lines.append(modified_line)
-                
+
             except json.JSONDecodeError:
                 # 非 JSON 直接透传
                 output_lines.append(line)
-        
+
         if output_lines:
             return '\n'.join(output_lines) + '\n\n'
         return None
@@ -204,8 +204,8 @@ class AgentModeDaemon:
             target_server = random.choice(self.backend_llm_server_addresses)
             target_url = f"http://{target_server}/v1/{path}"
 
-            print(f"##backend_llm_server_addresses: {self.backend_llm_server_addresses}")
-            print(f"##target_url: {target_url}")
+            # print(f"##backend_llm_server_addresses: {self.backend_llm_server_addresses}")
+            # print(f"##target_url: {target_url}")
 
             # Copy client request headers, removing the Host header
             headers = {key: value for key, value in request.headers if key.lower() != "host"}
@@ -265,40 +265,40 @@ class AgentModeDaemon:
                             支持 OpenAI 格式: data: {...}\n\n
                             """
                             buffer = ""  # 行级缓冲
-                            
+
                             for chunk in resp.iter_content(chunk_size=1024):
                                 if not chunk:
                                     continue
-                                
+
                                 try:
                                     char = chunk.decode('utf-8')
                                 except UnicodeDecodeError:
                                     # 二进制数据直接透传
                                     yield chunk
                                     continue
-                                
+
                                 buffer += char
-                                
+
                                 # SSE 事件以 \n\n 分隔
                                 while '\n\n' in buffer:
                                     event, buffer = buffer.split('\n\n', 1)
                                     processed = self._process_sse_event(event)
                                     if processed:
                                         yield processed.encode('utf-8')
-                            
+
                             # 处理剩余数据（不以 \n\n 结尾）
                             if buffer.strip():
                                 processed = self._process_sse_event(buffer)
                                 if processed:
                                     yield processed.encode('utf-8')
-                        
+
                         # 确保响应头正确标识为流式
                         headers_dict = dict(response_headers)
                         headers_dict['Content-Type'] = 'text/event-stream'
                         # 流式响应必须移除 content-length
                         headers_dict.pop('content-length', None)
                         headers_dict.pop('Content-Length', None)
-                        
+
                         return Response(
                             stream_with_context(generate_stream()),
                             status=resp.status_code,
@@ -306,7 +306,7 @@ class AgentModeDaemon:
                         )
 
 
-                    
+
                 return Response(resp.content, resp.status_code, response_headers)
             except requests.exceptions.RequestException as e:
                 abort(500, description=f"Error proxying request: {e}")
@@ -418,7 +418,7 @@ class AgentModeDaemon:
         if rollout.triplets is None or len(rollout.triplets) == 0:
             logger.warning(f"Warning: No triplets to save for rollout {rollout.rollout_id}.")
             return
-        
+
         response_token_ids = [r.response.get("token_ids", []) for r in rollout.triplets]
         response_texts = [self.tokenizer.decode(ids) for ids in response_token_ids]
 
@@ -439,11 +439,11 @@ class AgentModeDaemon:
         import json
         from pathlib import Path
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        
+
         if rollout.triplets is None or len(rollout.triplets) == 0:
             logger.warning(f"Warning: No triplets to save for rollout {rollout.rollout_id}.")
             return
-        
+
         empty_response_prompts = []
         for r in rollout.triplets:
             if not r.response.get("token_ids", []):
@@ -453,16 +453,16 @@ class AgentModeDaemon:
                     "prompt_token_ids": prompt_ids,
                     "prompt_text": prompt_text
                 })
-        
+
         if not empty_response_prompts:
             logger.warning(f"No empty responses found for rollout {rollout.rollout_id}.")
             return
-        
+
         data = {
             "rollout_id": rollout.rollout_id,
             "empty_response_prompts": empty_response_prompts
         }
-        
+
         with open(save_path, "a", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
@@ -485,15 +485,15 @@ class AgentModeDaemon:
         elif any(not r.prompt.get("token_ids", []) for r in rollout.triplets):
             # logger.warning(f"Warning: Rollout {rollout.rollout_id} contains empty prompt: {rollout.triplets}")
             logger.warning(f"Warning: Rollout {rollout.rollout_id} contains empty prompt")
-    
-    def _validate_rollout_for_retry(self, rollout: Rollout) -> bool:                                                                                                                                                                                                       
-          """Returns True if rollout should be retried due to empty/invalid data"""                                                                                                                                                                                          
-          if not self.enable_rollout_validation:                                                                                                                                                                                                                             
-              return False                                                                                                                                                                                                                                                   
-                                                                                                                                                                                                                                                                             
-          # Check for empty/invalid rollouts                                                                                                                                                                                                                                 
-          is_invalid = (                                                                                                                                                                                                                                                     
-              rollout.triplets is None or                                                                                                                                                                                                                                    
+
+    def _validate_rollout_for_retry(self, rollout: Rollout) -> bool:
+          """Returns True if rollout should be retried due to empty/invalid data"""
+          if not self.enable_rollout_validation:
+              return False
+
+          # Check for empty/invalid rollouts
+          is_invalid = (
+              rollout.triplets is None or
               len(rollout.triplets) == 0 or
               any(not r.response.get("token_ids", []) for r in rollout.triplets) or
               any(not r.prompt.get("token_ids", []) for r in rollout.triplets)
@@ -650,7 +650,7 @@ class AgentModeDaemon:
         if not self.server.startup_event.is_set():
             raise RuntimeError("Server is not ready (startup event not set).")
 
-       
+
 
         coro = self._async_run_until_finished(verbose)
         future = asyncio.run_coroutine_threadsafe(coro, self.server.loop)
@@ -748,18 +748,11 @@ class AgentModeDaemon:
                 {"prompt_ids": t.prompt.get("token_ids", []), "response_ids": t.response.get("token_ids", [])}
                 for t in rollout.triplets
             ]
-            
-            # Anchor observations are needed by GIGPO-style step grouping,
-            # but ordinary QA/GRPO rollouts do not have environment anchors.
-            # Always normalize to one entry per triplet so downstream batch
-            # assembly can index it safely regardless of the task/estimator.
-            raw_anchor_list = rollout.metadata.get("anchor")
-            if isinstance(raw_anchor_list, (list, tuple)):
-                anchor_list = list(raw_anchor_list[:len(trace_list)])
-                if len(anchor_list) < len(trace_list):
-                    anchor_list.extend([None] * (len(trace_list) - len(anchor_list)))
+
+            if "anchor" in rollout.metadata.keys():
+                anchor_list = [anchor for anchor in rollout.metadata["anchor"]]
             else:
-                anchor_list = [None] * len(trace_list)
+                anchor_list = None
 
             final_reward = self._fillna_reward(rollout)
             info = {
@@ -793,21 +786,31 @@ class AgentModeDaemon:
         response_ids_list, response_attention_mask_list = [], []
         reward_list, data_id_list, rollout_id_list, turn_index_list, is_drop_list = [], [], [], [], []
         anchor_list, traj_id_list, active_mask_list = [], [], []
-        # [修改目的] 保留截断前长度，仅供 SLiC 筛选；不改变 GRPO 数据。
-        original_response_lengths = []
         n_trunc_sample_because_of_response = 0
         valid_samples = 0
         all_samples_num = 0
 
+        ## use discount reward
+        # discount_factor = 0.99
+        discount_factor = 1.0
+
         for rollout_id, sample_info in finished_id_to_sample_info.items():
             traj_id = str(uuid.uuid4())
+            n_turns = len(sample_info["trace_list"])
             for turn_index, trace in enumerate(sample_info["trace_list"]):
                 is_done = False
 
                 reward_list.append(sample_info["reward"])
+
+                # ## 设计turn reward (衰减)
+                # if turn_index == n_turns - 1:
+                #     turn_reward = sample_info["reward"]
+                # else:
+                #     turn_reward = sample_info["reward"] * (discount_factor ** (n_turns - 1 - turn_index))
+                # reward_list.append(turn_reward)
                 prompt_ids, response_ids = trace["prompt_ids"], trace["response_ids"]
                 all_samples_num += 1
-                
+
                 if len(prompt_ids) == 0 and len(response_ids) == 0:
                     reward_list = reward_list[:-1]
                     continue
@@ -820,8 +823,6 @@ class AgentModeDaemon:
                     is_drop_list.append(True)
                 else:
                     is_drop_list.append(False)
-
-                original_response_lengths.append(len(response_ids))
 
                 # Truncate responses that exceed max_response_length
                 if len(response_ids) > max_response_length:
@@ -908,7 +909,6 @@ class AgentModeDaemon:
         }
 
         # Add non-tensor data for advantage calculation and logging
-        data_proto.non_tensor_batch["original_response_length"] = np.array(original_response_lengths, dtype=np.int64)
         data_proto.non_tensor_batch["data_id_list"] = np.array(data_id_list)
         data_proto.non_tensor_batch["rollout_id_list"] = np.array(rollout_id_list)
         data_proto.non_tensor_batch["turn_index_list"] = np.array(turn_index_list)
