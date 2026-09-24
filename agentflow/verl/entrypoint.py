@@ -163,6 +163,22 @@ class TaskRunner:
             processor=processor,
             config=config.data,
         )
+
+        # Optional validation subset for quick rollout-only tests.
+        # Keep this as a dataset subset so val_batch_size=None still produces
+        # exactly one validation batch, as required by AgentFlowTrainer._validate().
+        max_val_samples = int(config.data.get("max_val_samples", 0) or 0)
+        if max_val_samples > 0:
+            from torch.utils.data import Subset
+
+            original_val_size = len(val_dataset)
+            subset_size = min(max_val_samples, original_val_size)
+            val_dataset = Subset(val_dataset, range(subset_size))
+            print(
+                f"Validation subset enabled: {subset_size}/{original_val_size} samples "
+                f"(max_val_samples={max_val_samples})"
+            )
+
         train_sampler = create_rl_sampler(config.data, train_dataset)
         trainer = AgentFlowTrainer(
             config=config,
