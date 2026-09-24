@@ -13,7 +13,6 @@ os.environ["_JAVA_OPTIONS"] = "-Dorg.apache.lucene.store.MMapDirectory.enableMem
 # jnius_config.set_classpath(jar_path)
 
 import string
-import hashlib
 import re
 import unicodedata
 from typing import Any, Optional
@@ -510,13 +509,41 @@ class RolloutAgent(LitAgent):
             if anchor is not None:
                 metadata["anchor"] = anchor
             if self.task == "qa":
-                # GiGPO anchor state: exact-state grouping via a stable hash of each planner prompt.
-                # The list is aligned 1:1 with planner_logs / rollout.triplets and avoids
-                # carrying large prompt strings through Rollout.metadata.
-                metadata["anchor"] = [
-                    hashlib.sha256(str(log["prompt"]).encode("utf-8")).hexdigest()
-                    for log in planner_logs
-                ]
+                # GiGPO state = subgoals already hit BEFORE the current action.
+                # Keep analysis separate from tool turns; final answer never participates
+                # in step-level GiGPO pairing (unique singleton anchor per rollout).
+                hits_by_turn = {}
+                for hit in subgoal_hits:
+                    hit_turn = hit.get("turn")
+                    subgoal_id = str(hit.get("subgoal_id", ""))
+                    if hit_turn is None or not subgoal_id:
+                        continue
+                    hits_by_turn.setdefault(int(hit_turn), set()).add(subgoal_id)
+
+                hit_state = set()
+                gigpo_anchors = []
+                last_turn_index = len(planner_logs) - 1
+                for turn_index in range(len(planner_logs)):
+                    if turn_index == 0:
+                        # planner analysis only pairs with planner analysis.
+                        anchor_state = {"type": "analysis"}
+                    elif turn_index == last_turn_index:
+                        # final answer must not be step-paired with any other turn.
+                        anchor_state = {"type": "answer", "rollout_id": rollout_id}
+                    else:
+                        # Tool turns pair only when the pre-action hit-subgoal state matches.
+                        anchor_state = {
+                            "type": "tool",
+                            "hit_subgoals": sorted(hit_state),
+                        }
+
+                    gigpo_anchors.append(json.dumps(anchor_state, sort_keys=True, ensure_ascii=False))
+
+                    # A subgoal hit at turn k becomes part of the state from turn k+1 onward.
+                    if turn_index in hits_by_turn:
+                        hit_state.update(hits_by_turn[turn_index])
+
+                metadata["anchor"] = gigpo_anchors
                 metadata["reward_breakdown"] = {
                     "final_reward": final_reward,
                     "subreward": subreward,
