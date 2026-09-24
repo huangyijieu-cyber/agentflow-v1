@@ -14,6 +14,7 @@ os.environ["_JAVA_OPTIONS"] = "-Dorg.apache.lucene.store.MMapDirectory.enableMem
 
 import string
 import re
+import unicodedata
 from typing import Any, Optional
 
 import sympy
@@ -28,26 +29,114 @@ import uuid, json
 from filelock import FileLock
 import asyncio
 
-from utils import compute_score, load_and_set_env_from_yaml
+from utils import load_and_set_env_from_yaml
 from transformers import AutoTokenizer
 
 import logging
 configure_logger(logging.INFO)
 
 
-@reward
-async def evaluate(question: str, groundtruth: any, answer_extracted: any, val: bool = False) -> float:
-    """
-    Evaluates if the extracted answer is correct by calling an LLM judge (gpt-4o).
-    It strip(), and matches the final answer.
-    """
-    question_str = str(question)
-    groundtruth_str = str(groundtruth)
-    answer_extracted_str = str(answer_extracted)
+def _as_dict(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            loaded = json.loads(value)
+            return loaded if isinstance(loaded, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return {}
 
-    is_correct = await asyncio.to_thread(compute_score, question_str, groundtruth_str, answer_extracted_str)
-    
-    return 1.0 if is_correct else 0.0
+
+def _normalize_entity(text: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    text = re.sub(r"\\s+", " ", text).strip()
+    return text.strip(string.whitespace + string.punctuation + "“”‘’")
+
+
+def _entity_mentioned(alias: Any, observation: Any) -> bool:
+    alias_norm = _normalize_entity(alias)
+    if not alias_norm:
+        return False
+
+    if isinstance(observation, str):
+        observation_text = observation
+    else:
+        observation_text = json.dumps(observation, ensure_ascii=False, default=str)
+
+    observation_norm = unicodedata.normalize("NFKC", observation_text).casefold()
+    observation_norm = re.sub(r"\\s+", " ", observation_norm)
+
+    pattern = r"(?<!\\w)" + re.escape(alias_norm) + r"(?!\\w)"
+    return re.search(pattern, observation_norm) is not None
+
+
+def evaluate_entity_answer(groundtruth: Any, answer_extracted: Any, final_answer_spec: Any = None) -> float:
+    """Exact normalized entity match for InfoSeek final answers."""
+    candidates = [groundtruth]
+    final_answer_spec = _as_dict(final_answer_spec)
+    candidates.extend(final_answer_spec.get("aliases", []) or [])
+    if final_answer_spec.get("answer"):
+        candidates.append(final_answer_spec["answer"])
+
+    answer_norm = _normalize_entity(answer_extracted)
+    candidate_norms = {_normalize_entity(candidate) for candidate in candidates if _normalize_entity(candidate)}
+    return 1.0 if answer_norm in candidate_norms else 0.0
+
+
+def compute_search_subreward(result: dict, reward_spec: Any):
+    """Reward a subgoal once when one of its entity aliases appears in a search-tool result."""
+    reward_spec = _as_dict(reward_spec)
+    subgoals = reward_spec.get("subgoals", []) or []
+    count_once = bool(reward_spec.get("count_each_subgoal_once", True))
+
+    hit_subgoals = set()
+    hit_details = []
+    subreward = 0.0
+
+    for step_name, action in (result.get("memory", {}) or {}).items():
+        if not isinstance(action, dict):
+            continue
+
+        tool_name = str(action.get("tool_name", ""))
+        if "search" not in tool_name.casefold():
+            continue
+
+        observation = action.get("result", "")
+        turn_match = re.search(r"(\\d+)", str(step_name))
+        turn = int(turn_match.group(1)) if turn_match else None
+
+        for subgoal in subgoals:
+            if not isinstance(subgoal, dict):
+                continue
+
+            subgoal_id = str(subgoal.get("id", ""))
+            if count_once and subgoal_id in hit_subgoals:
+                continue
+
+            aliases = list(subgoal.get("aliases", []) or [])
+            if subgoal.get("answer"):
+                aliases.append(subgoal["answer"])
+
+            matched_alias = next(
+                (alias for alias in aliases if _entity_mentioned(alias, observation)),
+                None,
+            )
+            if matched_alias is None:
+                continue
+
+            weight = float(subgoal.get("weight", 0.0))
+            subreward += weight
+            hit_subgoals.add(subgoal_id)
+            hit_details.append({
+                "turn": turn,
+                "tool_name": tool_name,
+                "subgoal_id": subgoal_id,
+                "matched_alias": str(matched_alias),
+                "weight": weight,
+            })
+
+    return subreward, hit_details
 
 class AgentFlowRollout:
     def __init__(
@@ -264,10 +353,36 @@ class RolloutAgent(LitAgent):
         idx = task.get("extra_info", {}).get("idx", "unknown_idx")
 
         if self.task == "qa":
-            ## 纯QA
-            # Evaluate the answer against the ground truth
-            reward_value = await evaluate(task["question"], str(task["result"]), answer, val)  # reward is tracked with the decorator
-            print("answer: {} ground_truth: {} reward: {}".format(answer, task["result"], reward_value))
+            ## InfoSeek QA: final entity exact match + search-result subgoal reward
+            final_reward = evaluate_entity_answer(
+                task["result"],
+                answer,
+                task.get("final_answer", {}),
+            )
+
+            reward_spec = task.get("reward_spec", {})
+            if not reward_spec:
+                reward_spec = _as_dict(task.get("extra_info", {})).get("reward_spec", {})
+
+            subreward, subgoal_hits = compute_search_subreward(result, reward_spec)
+            reward_spec_dict = _as_dict(reward_spec)
+            subreward_weight = float(reward_spec_dict.get("subreward_weight", 0.0))
+            weighted_subreward = subreward_weight * subreward
+            reward_value = final_reward + weighted_subreward
+
+            print(
+                "[REWARD] answer={} ground_truth={} final_reward={} subreward={} "
+                "subreward_weight={} weighted_subreward={} training_reward={} hits={}".format(
+                    answer,
+                    task["result"],
+                    final_reward,
+                    subreward,
+                    subreward_weight,
+                    weighted_subreward,
+                    reward_value,
+                    subgoal_hits,
+                )
+            )
             rollout_data = {
                 "step": task.get("step", ""), # TODO: check whether it can be solved
                 "idx": idx,
@@ -277,6 +392,11 @@ class RolloutAgent(LitAgent):
                 "tools":self.tools,
                 "groundtruth": task.get("extra_info", {}).get("groundtruth", task["result"]),
                 "answer_extracted": answer,
+                "final_reward": final_reward,
+                "subreward": subreward,
+                "subreward_weight": subreward_weight,
+                "weighted_subreward": weighted_subreward,
+                "subgoal_hits": subgoal_hits,
                 "reward": reward_value,
                 "total_result":result,
                 "timestamp": datetime.now().isoformat(),
@@ -344,6 +464,15 @@ class RolloutAgent(LitAgent):
             metadata = {}
             if anchor is not None:
                 metadata["anchor"] = anchor
+            if self.task == "qa":
+                metadata["reward_breakdown"] = {
+                    "final_reward": final_reward,
+                    "subreward": subreward,
+                    "subreward_weight": subreward_weight,
+                    "weighted_subreward": weighted_subreward,
+                    "training_reward": reward_value,
+                    "subgoal_hits": subgoal_hits,
+                }
             
             rollout_package = Rollout(
                 rollout_id = rollout_id,
