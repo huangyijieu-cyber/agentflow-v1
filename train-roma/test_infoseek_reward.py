@@ -116,7 +116,7 @@ def iter_json_records(path: Path) -> Iterable[dict]:
 
     if path.is_dir():
         for child in sorted(path.rglob("*")):
-            if child.suffix.lower() in {".json", ".jsonl"}:
+            if child.suffix.lower() in {".json", ".jsonl", ".parquet"}:
                 yield from iter_json_records(child)
         return
 
@@ -192,19 +192,146 @@ def safe_rate(numerator: int, denominator: int) -> float:
     return numerator / denominator if denominator else 0.0
 
 
+def get_final_reward(rollout_record: dict) -> float:
+    value = rollout_record.get("final_reward", None)
+    if value is not None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            pass
+
+    answer = rollout_record.get("answer_extracted", "")
+    groundtruth = rollout_record.get("groundtruth", "")
+    return 1.0 if normalize_entity(answer) == normalize_entity(groundtruth) else 0.0
+
+
+def aggregate_metrics(rows: List[dict]) -> dict:
+    total_rollouts = len(rows)
+
+    rollout_hit_count = 0
+    rollout_full_hit_count = 0
+    total_subreward = 0.0
+    total_hit_subgoals = 0
+    total_available_subgoals = 0
+
+    sample_stats = defaultdict(
+        lambda: {
+            "rollouts": 0,
+            "hit_rollouts": 0,
+            "hit_subgoals_union": set(),
+        }
+    )
+    hit_turn_counter = Counter()
+    subgoal_hit_counter = Counter()
+
+    for row in rows:
+        n_hits = row["hit_subgoal_count"]
+        n_subgoals = row["total_subgoal_count"]
+        subreward = row["subreward"]
+
+        total_subreward += subreward
+        total_hit_subgoals += n_hits
+        total_available_subgoals += n_subgoals
+
+        if n_hits > 0:
+            rollout_hit_count += 1
+
+        if n_subgoals > 0 and n_hits == n_subgoals:
+            rollout_full_hit_count += 1
+
+        stat = sample_stats[row["id"]]
+        stat["rollouts"] += 1
+        stat["hit_subgoals_union"].update(row["hit_subgoal_ids"])
+        if n_hits > 0:
+            stat["hit_rollouts"] += 1
+
+        for hit in row["hits"]:
+            subgoal_hit_counter[hit["subgoal_id"]] += 1
+            if hit["turn"] is not None:
+                hit_turn_counter[str(hit["turn"])] += 1
+
+    evaluated_samples = len(sample_stats)
+
+    sample_any_hit_count = sum(
+        1 for stat in sample_stats.values() if stat["hit_rollouts"] > 0
+    )
+    sample_all_zero_count = sum(
+        1 for stat in sample_stats.values() if stat["hit_rollouts"] == 0
+    )
+
+    return {
+        "evaluated_samples": evaluated_samples,
+        "evaluated_rollouts": total_rollouts,
+        "rollout_hit_rate": safe_rate(rollout_hit_count, total_rollouts),
+        "rollout_zero_hit_rate": safe_rate(
+            total_rollouts - rollout_hit_count, total_rollouts
+        ),
+        "rollout_full_hit_rate": safe_rate(
+            rollout_full_hit_count, total_rollouts
+        ),
+        "sample_any_hit_rate": safe_rate(
+            sample_any_hit_count, evaluated_samples
+        ),
+        "sample_all_zero_rate": safe_rate(
+            sample_all_zero_count, evaluated_samples
+        ),
+        "subgoal_hit_rate": safe_rate(
+            total_hit_subgoals, total_available_subgoals
+        ),
+        "avg_subreward": (
+            total_subreward / total_rollouts if total_rollouts else 0.0
+        ),
+        "avg_hit_subgoals_per_rollout": (
+            total_hit_subgoals / total_rollouts if total_rollouts else 0.0
+        ),
+        "total_hit_subgoals": total_hit_subgoals,
+        "total_available_subgoals": total_available_subgoals,
+        "first_hit_turn_counts": dict(
+            sorted(hit_turn_counter.items(), key=lambda x: int(x[0]))
+        ),
+        "subgoal_hit_counts": dict(sorted(subgoal_hit_counter.items())),
+    }
+
+
+def print_metrics(title: str, metrics: dict):
+    print(f"\n=== {title} ===")
+    print(f"Evaluated samples        : {metrics['evaluated_samples']}")
+    print(f"Evaluated rollouts       : {metrics['evaluated_rollouts']}")
+    print(f"Rollout hit rate         : {metrics['rollout_hit_rate']:.2%}")
+    print(f"Rollout zero-hit rate    : {metrics['rollout_zero_hit_rate']:.2%}")
+    print(f"Rollout full-hit rate    : {metrics['rollout_full_hit_rate']:.2%}")
+    print(f"Sample any-hit rate      : {metrics['sample_any_hit_rate']:.2%}")
+    print(f"Sample all-zero rate     : {metrics['sample_all_zero_rate']:.2%}")
+    print(f"Subgoal hit rate         : {metrics['subgoal_hit_rate']:.2%}")
+    print(
+        f"Subgoals hit / total     : "
+        f"{metrics['total_hit_subgoals']} / {metrics['total_available_subgoals']}"
+    )
+    print(f"Average subreward        : {metrics['avg_subreward']:.4f}")
+    print(
+        "Avg hit subgoals/rollout: "
+        f"{metrics['avg_hit_subgoals_per_rollout']:.4f}"
+    )
+    print(f"First-hit turn counts    : {metrics['first_hit_turn_counts']}")
+    print(f"Subgoal hit counts       : {metrics['subgoal_hit_counts']}")
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate InfoSeek search-result subgoal reward hit rates."
+        description=(
+            "Evaluate InfoSeek search-result subgoal reward hit rates, "
+            "split by final-answer correctness."
+        )
     )
     parser.add_argument(
         "--dataset",
         required=True,
-        help="Original InfoSeek reward JSON/JSONL/Parquet containing id + reward_spec.",
+        help="InfoSeek reward JSON/JSONL/Parquet containing id + reward_spec.",
     )
     parser.add_argument(
         "--rollouts",
         required=True,
-        help="Rollout JSON/JSONL file or directory. Each rollout needs id + total_result/result.",
+        help="Rollout JSON/JSONL file or directory.",
     )
     parser.add_argument(
         "--output",
@@ -232,26 +359,9 @@ def main():
     missing_result = 0
     missing_reward_spec = 0
 
-    total_rollouts = 0
-    rollout_hit_count = 0
-    rollout_full_hit_count = 0
-    total_subreward = 0.0
-    total_hit_subgoals = 0
-    total_available_subgoals = 0
-
-    sample_stats = defaultdict(
-        lambda: {
-            "rollouts": 0,
-            "hit_rollouts": 0,
-            "subrewards": [],
-            "hit_subgoals_union": set(),
-        }
-    )
-    hit_turn_counter = Counter()
-    subgoal_hit_counter = Counter()
-
     for rollout_index, rollout_record in enumerate(iter_json_records(rollouts_path)):
         sid = sample_id(rollout_record)
+
         if not sid or sid not in dataset:
             missing_sample_ids.append(sid or f"<missing-id:{rollout_index}>")
             continue
@@ -263,87 +373,54 @@ def main():
 
         reward_spec = extract_reward_spec(dataset[sid])
         subgoals = reward_spec.get("subgoals", []) or []
+
         if not reward_spec or not subgoals:
             missing_reward_spec += 1
             continue
 
         subreward, hits = compute_search_subreward(result, reward_spec)
         hit_ids = {hit["subgoal_id"] for hit in hits}
-        n_subgoals = len(subgoals)
-        n_hits = len(hit_ids)
 
-        total_rollouts += 1
-        total_subreward += subreward
-        total_hit_subgoals += n_hits
-        total_available_subgoals += n_subgoals
-
-        if n_hits > 0:
-            rollout_hit_count += 1
-        if n_subgoals > 0 and n_hits == n_subgoals:
-            rollout_full_hit_count += 1
-
-        stat = sample_stats[sid]
-        stat["rollouts"] += 1
-        stat["subrewards"].append(subreward)
-        stat["hit_subgoals_union"].update(hit_ids)
-        if n_hits > 0:
-            stat["hit_rollouts"] += 1
-
-        for hit in hits:
-            subgoal_hit_counter[hit["subgoal_id"]] += 1
-            if hit["turn"] is not None:
-                hit_turn_counter[str(hit["turn"])] += 1
+        final_reward = get_final_reward(rollout_record)
+        final_correct = final_reward >= 0.5
 
         detail_rows.append(
             {
                 "id": sid,
                 "rollout_index": rollout_index,
+                "final_reward": final_reward,
+                "final_correct": final_correct,
+                "answer_extracted": rollout_record.get("answer_extracted", ""),
+                "groundtruth": rollout_record.get("groundtruth", dataset[sid].get("result", "")),
                 "subreward": subreward,
-                "hit_subgoal_count": n_hits,
-                "total_subgoal_count": n_subgoals,
+                "hit_subgoal_count": len(hit_ids),
+                "total_subgoal_count": len(subgoals),
                 "hit_subgoal_ids": sorted(hit_ids),
                 "hits": hits,
             }
         )
 
-    evaluated_samples = len(sample_stats)
-    sample_any_hit_count = sum(
-        1 for stat in sample_stats.values() if stat["hit_rollouts"] > 0
-    )
-    sample_all_zero_count = sum(
-        1 for stat in sample_stats.values() if stat["hit_rollouts"] == 0
-    )
+    correct_rows = [row for row in detail_rows if row["final_correct"]]
+    incorrect_rows = [row for row in detail_rows if not row["final_correct"]]
+
+    overall_metrics = aggregate_metrics(detail_rows)
+    correct_metrics = aggregate_metrics(correct_rows)
+    incorrect_metrics = aggregate_metrics(incorrect_rows)
+
+    final_correct_count = len(correct_rows)
+    final_incorrect_count = len(incorrect_rows)
+    total_evaluated = len(detail_rows)
 
     summary = {
         "dataset_samples": len(dataset),
-        "evaluated_samples": evaluated_samples,
-        "evaluated_rollouts": total_rollouts,
-        "rollout_hit_rate": safe_rate(rollout_hit_count, total_rollouts),
-        "rollout_zero_hit_rate": safe_rate(
-            total_rollouts - rollout_hit_count, total_rollouts
-        ),
-        "rollout_full_hit_rate": safe_rate(
-            rollout_full_hit_count, total_rollouts
-        ),
-        "sample_any_hit_rate": safe_rate(
-            sample_any_hit_count, evaluated_samples
-        ),
-        "sample_all_zero_rate": safe_rate(
-            sample_all_zero_count, evaluated_samples
-        ),
-        "subgoal_hit_rate": safe_rate(
-            total_hit_subgoals, total_available_subgoals
-        ),
-        "avg_subreward": (
-            total_subreward / total_rollouts if total_rollouts else 0.0
-        ),
-        "avg_hit_subgoals_per_rollout": (
-            total_hit_subgoals / total_rollouts if total_rollouts else 0.0
-        ),
-        "first_hit_turn_counts": dict(
-            sorted(hit_turn_counter.items(), key=lambda x: int(x[0]))
-        ),
-        "subgoal_hit_counts": dict(sorted(subgoal_hit_counter.items())),
+        "final_answer": {
+            "correct_rollouts": final_correct_count,
+            "incorrect_rollouts": final_incorrect_count,
+            "accuracy": safe_rate(final_correct_count, total_evaluated),
+        },
+        "overall": overall_metrics,
+        "final_correct": correct_metrics,
+        "final_incorrect": incorrect_metrics,
         "skipped": {
             "missing_sample_id_or_not_in_dataset": len(missing_sample_ids),
             "missing_result": missing_result,
@@ -360,23 +437,19 @@ def main():
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    print("\n=== InfoSeek Process Reward Evaluation ===")
-    print(f"Dataset samples          : {summary['dataset_samples']}")
-    print(f"Evaluated samples        : {summary['evaluated_samples']}")
-    print(f"Evaluated rollouts       : {summary['evaluated_rollouts']}")
-    print(f"Rollout hit rate         : {summary['rollout_hit_rate']:.2%}")
-    print(f"Rollout zero-hit rate    : {summary['rollout_zero_hit_rate']:.2%}")
-    print(f"Rollout full-hit rate    : {summary['rollout_full_hit_rate']:.2%}")
-    print(f"Sample any-hit rate      : {summary['sample_any_hit_rate']:.2%}")
-    print(f"Sample all-zero rate     : {summary['sample_all_zero_rate']:.2%}")
-    print(f"Subgoal hit rate         : {summary['subgoal_hit_rate']:.2%}")
-    print(f"Average subreward        : {summary['avg_subreward']:.4f}")
-    print(
-        "Avg hit subgoals/rollout: "
-        f"{summary['avg_hit_subgoals_per_rollout']:.4f}"
-    )
-    print(f"First-hit turn counts    : {summary['first_hit_turn_counts']}")
-    print(f"Skipped                  : {summary['skipped']}")
+    print("\n========================================")
+    print("InfoSeek Process Reward Evaluation")
+    print("========================================")
+    print(f"Dataset samples          : {len(dataset)}")
+    print(f"Final correct rollouts   : {final_correct_count}")
+    print(f"Final incorrect rollouts : {final_incorrect_count}")
+    print(f"Final answer accuracy    : {safe_rate(final_correct_count, total_evaluated):.2%}")
+
+    print_metrics("OVERALL", overall_metrics)
+    print_metrics("FINAL CORRECT", correct_metrics)
+    print_metrics("FINAL INCORRECT", incorrect_metrics)
+
+    print(f"\nSkipped                  : {summary['skipped']}")
     print(f"Summary saved to         : {output_path}")
     print(f"Details saved to         : {details_path}")
 
