@@ -318,6 +318,7 @@ def compute_advantage(
             anchor_obs=data.non_tensor_batch['anchor_list'],
             index=data.non_tensor_batch['uid'],
             traj_index=data.non_tensor_batch['traj_uid'],
+            step_pair_mask=data.non_tensor_batch.get('gigpo_pair_mask_list', None),
             step_advantage_w=step_advantage_w,
             mode=gigpo_mode,
             enable_similarity=gigpo_enable_similarity,
