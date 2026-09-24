@@ -358,6 +358,7 @@ def step_norm_reward(step_rewards: torch.Tensor,
     id2score = defaultdict(list)
     id2mean = {}
     id2std = {}
+    singleton_groups = set()
 
     with torch.no_grad():
         bsz = scores.shape[0]
@@ -366,6 +367,9 @@ def step_norm_reward(step_rewards: torch.Tensor,
 
         for idx in id2score:
             if len(id2score[idx]) == 1:
+                # No relative comparison is possible for a one-turn group.
+                # Explicitly force its GiGPO step advantage to zero.
+                singleton_groups.add(idx)
                 id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
                 id2std[idx] = torch.tensor(1.0)
             elif len(id2score[idx]) > 1:
@@ -376,7 +380,9 @@ def step_norm_reward(step_rewards: torch.Tensor,
                 print(f"len(id2score[idx]): {len(id2score[idx])}")
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
-            if remove_std:
+            if index[i] in singleton_groups:
+                scores[i] = 0.0
+            elif remove_std:
                 scores[i] = scores[i] - id2mean[index[i]]
             else:
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
