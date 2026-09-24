@@ -752,11 +752,33 @@ class AgentModeDaemon:
             if "anchor" in rollout.metadata.keys():
                 anchor_list = [anchor for anchor in rollout.metadata["anchor"]]
             else:
-                anchor_list = None
+                # Safe fallback for GiGPO: the current planner prompt token IDs are the state anchor.
+                anchor_list = [tuple(trace["prompt_ids"]) for trace in trace_list]
 
-            final_reward = self._fillna_reward(rollout)
+            if len(anchor_list) != len(trace_list):
+                logger.warning(
+                    f"Anchor/trace length mismatch for rollout {rollout_id}: "
+                    f"{len(anchor_list)} vs {len(trace_list)}; falling back to prompt token IDs."
+                )
+                anchor_list = [tuple(trace["prompt_ids"]) for trace in trace_list]
+
+            trajectory_reward = self._fillna_reward(rollout)
+            reward_breakdown = rollout.metadata.get("reward_breakdown", {})
+            if not isinstance(reward_breakdown, dict):
+                reward_breakdown = {}
+
+            # GiGPO separates outcome reward and local process reward.
+            episode_reward = float(reward_breakdown.get("final_reward", trajectory_reward))
+            subreward_weight = float(reward_breakdown.get("subreward_weight", 0.0))
+            turn_process_rewards = reward_breakdown.get("turn_process_rewards", {}) or {}
+            if not isinstance(turn_process_rewards, dict):
+                turn_process_rewards = {}
+
             info = {
-                "reward": final_reward,
+                "reward": trajectory_reward,
+                "episode_reward": episode_reward,
+                "subreward_weight": subreward_weight,
+                "turn_process_rewards": turn_process_rewards,
                 "trace_list": trace_list,
                 "data_id": original_sample["data_id"],
                 "anchor_list": anchor_list
@@ -784,7 +806,8 @@ class AgentModeDaemon:
         #   - The discard for the PPO mini-batch should also be handled this way.
         input_ids_list, input_attention_mask_list = [], []
         response_ids_list, response_attention_mask_list = [], []
-        reward_list, data_id_list, rollout_id_list, turn_index_list, is_drop_list = [], [], [], [], []
+        reward_list, episode_reward_list, step_reward_list = [], [], []
+        data_id_list, rollout_id_list, turn_index_list, is_drop_list = [], [], [], []
         anchor_list, traj_id_list, active_mask_list = [], [], []
         n_trunc_sample_because_of_response = 0
         valid_samples = 0
@@ -800,8 +823,6 @@ class AgentModeDaemon:
             for turn_index, trace in enumerate(sample_info["trace_list"]):
                 is_done = False
 
-                reward_list.append(sample_info["reward"])
-
                 # ## 设计turn reward (衰减)
                 # if turn_index == n_turns - 1:
                 #     turn_reward = sample_info["reward"]
@@ -812,10 +833,25 @@ class AgentModeDaemon:
                 all_samples_num += 1
 
                 if len(prompt_ids) == 0 and len(response_ids) == 0:
-                    reward_list = reward_list[:-1]
                     continue
                 else:
                     valid_samples += 1
+
+                # Keep the legacy trajectory reward for GRPO compatibility.
+                reward_list.append(sample_info["reward"])
+
+                # GiGPO episode signal: final-answer outcome only.
+                episode_reward_list.append(sample_info["episode_reward"])
+
+                # GiGPO step signal: only the turn that first hits a new gold subgoal.
+                # Action Step k is aligned to planner-log turn_index == k.
+                turn_process_rewards = sample_info["turn_process_rewards"]
+                raw_step_reward = turn_process_rewards.get(
+                    str(turn_index), turn_process_rewards.get(turn_index, 0.0)
+                )
+                step_reward_list.append(
+                    sample_info["subreward_weight"] * float(raw_step_reward)
+                )
 
                 # Mark samples with prompts exceeding max_prompt_length to be dropped later
                 if len(prompt_ids) > max_prompt_length:
@@ -915,6 +951,8 @@ class AgentModeDaemon:
         data_proto.non_tensor_batch["anchor_list"] = np.array(anchor_list)
         data_proto.non_tensor_batch["traj_id_list"] = np.array(traj_id_list)
         data_proto.non_tensor_batch["reward_list"] = np.array(reward_list)
+        data_proto.non_tensor_batch["episode_reward_list"] = np.array(episode_reward_list, dtype=np.float32)
+        data_proto.non_tensor_batch["step_reward_list"] = np.array(step_reward_list, dtype=np.float32)
         data_proto.non_tensor_batch["active_mask_list"] = np.array(active_mask_list)
 
         logger.info(f"[STEP-WISE-DEBUG]: transform {len(input_ids_list)} data to torch tensor.")
