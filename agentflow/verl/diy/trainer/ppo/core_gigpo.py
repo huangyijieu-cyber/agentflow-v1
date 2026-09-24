@@ -141,6 +141,7 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
                                    anchor_obs: np.array,
                                    index: np.array,
                                    traj_index: np.array,
+                                   step_pair_mask: np.array = None,
                                    epsilon: float = 1e-6,
                                    step_advantage_w: float = 1.0,
                                    mode: str = "mean_norm",
@@ -167,8 +168,26 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
     # Compute step relative advantages (Eq. 7 in the paper).
     step_advantages = step_norm_reward(step_rewards, response_mask, step_group_uids, epsilon, remove_std)
 
-    # Compute joint advantages (Eq. 8 in the paper).
+    if step_pair_mask is None:
+        step_pair_mask = np.ones(len(step_group_uids), dtype=bool)
+    else:
+        step_pair_mask = np.asarray(step_pair_mask, dtype=bool)
+
+    group_sizes = Counter(step_group_uids.tolist())
+    pairable_mask = np.array([
+        bool(step_pair_mask[i]) and group_sizes[step_group_uids[i]] > 1
+        for i in range(len(step_group_uids))
+    ], dtype=bool)
+
+    # Joint advantage rules for this AgentFlow adaptation:
+    #   1) answer turns (step_pair_mask=False): episode advantage only;
+    #   2) analysis/tool groups with >=2 turns: episode + step advantage;
+    #   3) analysis/tool singleton groups: no update at all.
     scores = episode_advantages + step_advantage_w * step_advantages
+    pair_mask_t = torch.tensor(pairable_mask, dtype=torch.bool, device=scores.device).unsqueeze(-1)
+    excluded_mask_t = torch.tensor(~step_pair_mask, dtype=torch.bool, device=scores.device).unsqueeze(-1)
+    scores = torch.where(pair_mask_t, scores, torch.zeros_like(scores))
+    scores = torch.where(excluded_mask_t, episode_advantages, scores)
     return scores, scores
 
 
