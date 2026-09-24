@@ -401,15 +401,6 @@ class RolloutAgent(LitAgent):
                 "total_result":result,
                 "timestamp": datetime.now().isoformat(),
             }
-        # Save validation rollout details for offline reward-hit analysis.
-        if val:
-            os.makedirs(self.val_rollout_dir, exist_ok=True)
-            val_output_path = os.path.join(self.val_rollout_dir, "rollouts.jsonl")
-            val_output_lock = FileLock(val_output_path + ".lock", timeout=3600)
-            with val_output_lock:
-                with open(val_output_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(rollout_data, ensure_ascii=False, default=str) + "\n")
-
         else:
             reward_value = reward
             if self.task == "webshop":
@@ -429,6 +420,15 @@ class RolloutAgent(LitAgent):
                 "total_result":result,
                 "timestamp": datetime.now().isoformat(),
             }
+
+        # Save validation rollout details for offline reward-hit analysis.
+        if val:
+            os.makedirs(self.val_rollout_dir, exist_ok=True)
+            val_output_path = os.path.join(self.val_rollout_dir, "rollouts.jsonl")
+            val_output_lock = FileLock(val_output_path + ".lock", timeout=3600)
+            with val_output_lock:
+                with open(val_output_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rollout_data, ensure_ascii=False, default=str) + "\n")
 
 
         # data_id = str(uuid.uuid4())
