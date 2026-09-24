@@ -522,28 +522,35 @@ class RolloutAgent(LitAgent):
 
                 hit_state = set()
                 gigpo_anchors = []
+                gigpo_pair_mask = []
                 last_turn_index = len(planner_logs) - 1
                 for turn_index in range(len(planner_logs)):
                     if turn_index == 0:
                         # planner analysis only pairs with planner analysis.
                         anchor_state = {"type": "analysis"}
+                        pair_enabled = True
                     elif turn_index == last_turn_index:
-                        # final answer must not be step-paired with any other turn.
+                        # final answer is excluded from GiGPO step pairing and keeps
+                        # only the episode/outcome advantage.
                         anchor_state = {"type": "answer", "rollout_id": rollout_id}
+                        pair_enabled = False
                     else:
                         # Tool turns pair only when the pre-action hit-subgoal state matches.
                         anchor_state = {
                             "type": "tool",
                             "hit_subgoals": sorted(hit_state),
                         }
+                        pair_enabled = True
 
                     gigpo_anchors.append(json.dumps(anchor_state, sort_keys=True, ensure_ascii=False))
+                    gigpo_pair_mask.append(pair_enabled)
 
                     # A subgoal hit at turn k becomes part of the state from turn k+1 onward.
                     if turn_index in hits_by_turn:
                         hit_state.update(hits_by_turn[turn_index])
 
                 metadata["anchor"] = gigpo_anchors
+                metadata["gigpo_pair_mask"] = gigpo_pair_mask
                 metadata["reward_breakdown"] = {
                     "final_reward": final_reward,
                     "subreward": subreward,
