@@ -105,6 +105,15 @@ def compute_search_subreward(result: dict, reward_spec: Any) -> Tuple[float, Lis
 
 
 def iter_json_records(path: Path) -> Iterable[dict]:
+    if path.suffix.lower() == ".parquet":
+        import pandas as pd
+
+        df = pd.read_parquet(path)
+        for record in df.to_dict(orient="records"):
+            if isinstance(record, dict):
+                yield record
+        return
+
     if path.is_dir():
         for child in sorted(path.rglob("*")):
             if child.suffix.lower() in {".json", ".jsonl"}:
@@ -190,7 +199,7 @@ def main():
     parser.add_argument(
         "--dataset",
         required=True,
-        help="Original InfoSeek reward JSON/JSONL containing id + reward_spec.",
+        help="Original InfoSeek reward JSON/JSONL/Parquet containing id + reward_spec.",
     )
     parser.add_argument(
         "--rollouts",
