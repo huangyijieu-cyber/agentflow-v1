@@ -13,7 +13,7 @@ env:
 
   # ----- 训练数据与回放 -----
   TRAIN_DATA_PATH: ${env:TRAIN_DATA_PATH,train/webwalker_train.parquet}
-  TEST_DATA_PATH: ${env:TEST_DATA_PATH,val/webwalker_val.parquet}
+  TEST_DATA_PATH: ${env:TEST_DATA_PATH,train/infoseek_train.parquet}
   STALE_ITERATION: ${env:STALE_ITERATION,0}
   REPLAY_BUFFER_SIZE: ${env:REPLAY_BUFFER_SIZE,512}
   REPLAY_COLLECTION: ${env:REPLAY_COLLECTION,uid-turn}    # uid-turn(fast) | cross(slow) | turn(medium)
@@ -50,7 +50,7 @@ env:
   TOTAL_EPOCH: ${env:TOTAL_EPOCH,20}
   VERBOSITY: 'DEBUG'
   N_WORKERS: ${env:N_WORKERS,64}
-  MAX_VAL_SAMPLES: ${env:MAX_VAL_SAMPLES,0}                  # 0=全部验证集；N=只取前N条
+  MAX_VAL_SAMPLES: ${env:MAX_VAL_SAMPLES,50}                 # 0=全部验证集；N=只取前N条
 
   # ----- Agent / Tool 配置 -----
   ENABLE_TOOLS:
@@ -131,8 +131,8 @@ python_args:
   trainer.n_gpus_per_node: '${N_GPUS}'
   trainer.nnodes: '${NNODES}'                             # 与 ModelArts 实例数同步
 
-  trainer.val_before_train: False
-  trainer.val_only: False
+  trainer.val_before_train: True
+  trainer.val_only: True
   trainer.balance_batch: True
   trainer.critic_warmup: 0
 
