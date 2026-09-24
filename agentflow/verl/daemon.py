@@ -762,6 +762,14 @@ class AgentModeDaemon:
                 )
                 anchor_list = [tuple(trace["prompt_ids"]) for trace in trace_list]
 
+            gigpo_pair_mask = rollout.metadata.get("gigpo_pair_mask", [True] * len(trace_list))
+            if len(gigpo_pair_mask) != len(trace_list):
+                logger.warning(
+                    f"GiGPO pair-mask/trace length mismatch for rollout {rollout_id}: "
+                    f"{len(gigpo_pair_mask)} vs {len(trace_list)}; enabling pairing for all turns."
+                )
+                gigpo_pair_mask = [True] * len(trace_list)
+
             trajectory_reward = self._fillna_reward(rollout)
             reward_breakdown = rollout.metadata.get("reward_breakdown", {})
             if not isinstance(reward_breakdown, dict):
@@ -781,7 +789,8 @@ class AgentModeDaemon:
                 "turn_process_rewards": turn_process_rewards,
                 "trace_list": trace_list,
                 "data_id": original_sample["data_id"],
-                "anchor_list": anchor_list
+                "anchor_list": anchor_list,
+                "gigpo_pair_mask": gigpo_pair_mask
             }
             finished_id_to_sample_info[rollout_id] = info
 
@@ -808,7 +817,7 @@ class AgentModeDaemon:
         response_ids_list, response_attention_mask_list = [], []
         reward_list, episode_reward_list, step_reward_list = [], [], []
         data_id_list, rollout_id_list, turn_index_list, is_drop_list = [], [], [], []
-        anchor_list, traj_id_list, active_mask_list = [], [], []
+        anchor_list, traj_id_list, active_mask_list, gigpo_pair_mask_list = [], [], [], []
         n_trunc_sample_because_of_response = 0
         valid_samples = 0
         all_samples_num = 0
@@ -881,6 +890,7 @@ class AgentModeDaemon:
                 traj_id_list.append(traj_id)
                 active_mask_list.append(np.logical_not(is_done))
                 anchor_list.append(sample_info["anchor_list"][turn_index])
+                gigpo_pair_mask_list.append(bool(sample_info["gigpo_pair_mask"][turn_index]))
                 rollout_id_list.append(rollout_id)
                 turn_index_list.append(turn_index)
 
@@ -949,6 +959,7 @@ class AgentModeDaemon:
         data_proto.non_tensor_batch["rollout_id_list"] = np.array(rollout_id_list)
         data_proto.non_tensor_batch["turn_index_list"] = np.array(turn_index_list)
         data_proto.non_tensor_batch["anchor_list"] = np.array(anchor_list)
+        data_proto.non_tensor_batch["gigpo_pair_mask_list"] = np.array(gigpo_pair_mask_list, dtype=bool)
         data_proto.non_tensor_batch["traj_id_list"] = np.array(traj_id_list)
         data_proto.non_tensor_batch["reward_list"] = np.array(reward_list)
         data_proto.non_tensor_batch["episode_reward_list"] = np.array(episode_reward_list, dtype=np.float32)
