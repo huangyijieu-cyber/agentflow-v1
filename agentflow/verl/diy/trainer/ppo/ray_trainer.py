@@ -285,15 +285,25 @@ def compute_advantage(
         data.batch["returns"] = returns
 
     elif adv_estimator == "gigpo":
-        # 延续 reward list
-        rewards = data.non_tensor_batch['reward_list'].astype(np.float32)
-        step_rewards = torch.tensor(rewards, dtype=torch.float32, device=data.batch['input_ids'].device)
+        device = data.batch['input_ids'].device
 
-        # 计算 step reward
-        # gamma = 0.95
-        # step_rewards = core_gigpo.compute_step_discounted_returns(
-        #     batch=data,
-        #     gamma=gamma)
+        # InfoSeek + GiGPO:
+        #   episode reward = final-answer outcome only
+        #   step reward    = local subgoal process reward for this planner turn
+        episode_rewards_np = data.non_tensor_batch.get(
+            'episode_reward_list', data.non_tensor_batch['reward_list']
+        ).astype(np.float32)
+        step_rewards_np = data.non_tensor_batch.get(
+            'step_reward_list', data.non_tensor_batch['reward_list']
+        ).astype(np.float32)
+
+        episode_rewards = torch.tensor(episode_rewards_np, dtype=torch.float32, device=device)
+        step_rewards = torch.tensor(step_rewards_np, dtype=torch.float32, device=device)
+
+        # GiGPO's episode_norm_reward expects token-level tensors and sums them back
+        # to one scalar per turn. Put the episode outcome once in each turn tensor.
+        episode_token_level_rewards = torch.zeros_like(token_level_rewards, dtype=torch.float32)
+        episode_token_level_rewards[:, 0] = episode_rewards
 
         # default parameters for gigpo
         step_advantage_w = 1.0
@@ -302,8 +312,8 @@ def compute_advantage(
         gigpo_similarity_thresh = 0.95
         compute_cross_step_data = False
         advantages, returns = core_gigpo.compute_gigpo_outcome_advantage(
-            token_level_rewards=token_level_rewards, # for episode group reward computing
-            step_rewards=step_rewards, # for step group reward computing
+            token_level_rewards=episode_token_level_rewards, # final-answer episode reward
+            step_rewards=step_rewards, # local subgoal process reward
             response_mask=data.batch['response_mask'],
             anchor_obs=data.non_tensor_batch['anchor_list'],
             index=data.non_tensor_batch['uid'],
