@@ -55,33 +55,25 @@ file_path = os.path.dirname(os.path.abspath(__file__))
 config_file_path = f'{file_path}/config.yaml'
 load_and_set_env_from_yaml(config_file_path)
 
-try:
-    # llm_scorer_engine = ChatOpenAI(
-    #     model_string=AI_MODEL,   # (o:"gpt-4o")
-    #     is_multimodal=False, 
-    #     enable_cache=True
-    # )
+llm_scorer_engine = None
 
-    ## local setting
-    LOCAL_MODEL = os.environ["SCORE_MODEL_NAME"]
-    LOCAL_BASE_URL = os.environ["SCORE_MODEL_URL"]
-    LOCAL_API_KEY = "NONE"
 
-    print("LOCAL_MODEL:", LOCAL_MODEL)
-    print("LOCAL_BASE_URL:", LOCAL_BASE_URL)
+def _get_llm_scorer_engine():
+    """Initialize the legacy LLM judge only if compute_score() is explicitly used."""
+    global llm_scorer_engine
+    if llm_scorer_engine is not None:
+        return llm_scorer_engine
 
+    local_model = os.environ["SCORE_MODEL_NAME"]
+    local_base_url = os.environ["SCORE_MODEL_URL"]
     llm_scorer_engine = ChatOpenAI(
-        model_string=LOCAL_MODEL,
-        base_url=LOCAL_BASE_URL,
-        api_key=LOCAL_API_KEY, 
-        is_multimodal=False, 
-        use_cache=False
+        model_string=local_model,
+        base_url=local_base_url,
+        api_key="NONE",
+        is_multimodal=False,
+        use_cache=False,
     )
-    
-    print(f"\nLLM Scorer engine '{llm_scorer_engine.model_string}' initialized successfully.\n")
-except Exception as e:
-    print(f"Failed to initialize LLM Scorer engine: {e}")
-    llm_scorer_engine = None
+    return llm_scorer_engine
 
 
 
@@ -187,10 +179,8 @@ def compute_score(question: str,  groundtruth: str, answer_extracted: str,) -> b
     Returns:
         A boolean indicating whether the answer is correct.
     """
-    if llm_scorer_engine is None:
-        raise RuntimeError("LLM Scorer engine is not available.")
-        
-    
+    scorer = _get_llm_scorer_engine()
+
     ## chat-model prompt
     query_prompt = f"""
 You are a precise evaluator. Determine if the Model Response is equivalent to the Ground Truth.
@@ -242,7 +232,7 @@ Required JSON structure:
 # <true_false>: "True" or "False".
 # """
 
-    verification_result = llm_scorer_engine(query_prompt, response_format=AnswerVerification)
+    verification_result = scorer(query_prompt, response_format=AnswerVerification)
 
     if hasattr(verification_result, "true_false"):
         return verification_result.true_false
