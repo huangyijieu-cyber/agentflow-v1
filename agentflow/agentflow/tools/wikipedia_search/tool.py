@@ -73,7 +73,7 @@ def _patched_get(url, params=None, **kwargs):
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as error:
             if attempt >= MAX_NETWORK_RETRIES:
                 raise
-            wait_time = retry_wait_seconds(None, attempt)
+            wait_time = retry_wait_seconds(attempt)
             print(f"[Wikipedia Network] {type(error).__name__}; retrying in {wait_time:.1f}s "
                   f"({attempt + 1}/{MAX_NETWORK_RETRIES})")
             time.sleep(wait_time)
@@ -89,7 +89,11 @@ def _patched_get(url, params=None, **kwargs):
             return response
 
         retry_after = response.headers.get("Retry-After")
-        wait_time = retry_wait_seconds(retry_after, attempt)
+        wait_time = retry_wait_seconds(
+            attempt,
+            status_code=response.status_code,
+            retry_after=retry_after,
+        )
         if attempt >= MAX_NETWORK_RETRIES or wait_time > MAX_RETRY_WAIT_SECONDS:
             if response.status_code == 429:
                 response.close()

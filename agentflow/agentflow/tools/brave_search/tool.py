@@ -173,7 +173,11 @@ class Brave_Search_Tool(BaseTool):
                     verify=False,
                 )
                 if response.status_code in RETRYABLE_HTTP_STATUSES and attempt < self.max_retries:
-                    wait_time = retry_wait_seconds(response.headers.get("Retry-After"), attempt)
+                    wait_time = retry_wait_seconds(
+                        attempt,
+                        status_code=response.status_code,
+                        retry_after=response.headers.get("Retry-After"),
+                    )
                     if wait_time <= MAX_RETRY_WAIT_SECONDS:
                         print(f"[Yibu Brave HTTP] {response.status_code}; retrying in {wait_time:.1f}s "
                               f"({attempt + 1}/{self.max_retries})")
@@ -186,7 +190,7 @@ class Brave_Search_Tool(BaseTool):
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                 last_error = e
                 if attempt < self.max_retries:
-                    wait_time = retry_wait_seconds(None, attempt)
+                    wait_time = retry_wait_seconds(attempt)
                     print(f"[Yibu Brave Network] {type(e).__name__}; retrying in {wait_time:.1f}s "
                           f"({attempt + 1}/{self.max_retries})")
                     time.sleep(wait_time)

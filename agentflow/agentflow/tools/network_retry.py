@@ -11,8 +11,12 @@ MAX_RETRY_WAIT_SECONDS = 30.0
 RETRYABLE_HTTP_STATUSES = frozenset({403, 412, 422, 429, 500, 502, 503, 504})
 
 
-def retry_wait_seconds(retry_after, attempt):
-    """Honor Retry-After when possible; otherwise use exponential backoff."""
+def retry_wait_seconds(attempt, *, status_code=None, retry_after=None):
+    """Use fixed 1/2/4-second waits except for rate-limited HTTP 429."""
+    base_wait = float(2 ** attempt)
+    if status_code != 429:
+        return base_wait
+
     if retry_after:
         try:
             delay = float(retry_after)
@@ -27,4 +31,4 @@ def retry_wait_seconds(retry_after, attempt):
         if delay is not None and math.isfinite(delay):
             return max(0.0, delay) + 0.5
 
-    return 2 ** attempt + random.uniform(0.0, 0.5)
+    return base_wait + random.uniform(0.0, 0.5)
