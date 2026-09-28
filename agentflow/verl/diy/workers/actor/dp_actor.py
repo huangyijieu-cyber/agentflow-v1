@@ -366,66 +366,66 @@ class DataParallelPPOActor(BasePPOActor):
         return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
-    # ### DR.GRPO
-    # def _ppo_loss(self, old_log_prob, log_prob, advantages, response_mask, loss_agg_mode, rollout_is_weights, max_response_length=1024):
-    #     ## ================= DR.GRPO loss ========================================
-    #     config = self.config
-    #     clip_ratio = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
-    #     clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
-    #     clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
-    #     clip_ratio_c = config.get(  # Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
-    #         "clip_ratio_c", 3.0
-    #     )
+    ### DR.GRPO
+    def _dr_ppo_loss(self, old_log_prob, log_prob, advantages, response_mask, loss_agg_mode, rollout_is_weights, max_response_length=1024):
+        ## ================= DR.GRPO loss ========================================
+        config = self.config
+        clip_ratio = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+        clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+        clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+        clip_ratio_c = config.get(  # Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
+            "clip_ratio_c", 3.0
+        )
 
-    #     cliprange = clip_ratio
-    #     cliprange_low = clip_ratio_low
-    #     cliprange_high = clip_ratio_high
+        cliprange = clip_ratio
+        cliprange_low = clip_ratio_low
+        cliprange_high = clip_ratio_high
 
-    #     assert clip_ratio_c > 1.0, (
-    #         "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
-    #         + f" but get the value: {clip_ratio_c}."
-    #     )
+        assert clip_ratio_c > 1.0, (
+            "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
+            + f" but get the value: {clip_ratio_c}."
+        )
 
-    #     negative_approx_kl = log_prob - old_log_prob
-    #     # Clamp negative_approx_kl for stability
-    #     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
-    #     ratio = torch.exp(negative_approx_kl)
-    #     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+        negative_approx_kl = log_prob - old_log_prob
+        # Clamp negative_approx_kl for stability
+        negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+        ratio = torch.exp(negative_approx_kl)
+        ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
-    #     pg_losses1 = -advantages * ratio
-    #     if cliprange_low is None:
-    #         cliprange_low = cliprange
-    #     if cliprange_high is None:
-    #         cliprange_high = cliprange
-    #     pg_losses2 = -advantages * torch.clamp(
-    #         ratio, 1 - cliprange_low, 1 + cliprange_high
-    #     )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
-    #     clip_pg_losses1 = torch.maximum(
-    #         pg_losses1, pg_losses2
-    #     )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-    #     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+        pg_losses1 = -advantages * ratio
+        if cliprange_low is None:
+            cliprange_low = cliprange
+        if cliprange_high is None:
+            cliprange_high = cliprange
+        pg_losses2 = -advantages * torch.clamp(
+            ratio, 1 - cliprange_low, 1 + cliprange_high
+        )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+        clip_pg_losses1 = torch.maximum(
+            pg_losses1, pg_losses2
+        )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+        pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
 
-    #     pg_losses3 = -advantages * clip_ratio_c
-    #     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
-    #     pg_clipfrac_lower = verl_F.masked_mean(
-    #         torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
-    #     )
+        pg_losses3 = -advantages * clip_ratio_c
+        clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+        pg_clipfrac_lower = verl_F.masked_mean(
+            torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
+        )
 
-    #     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+        pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
 
-    #     # Apply rollout importance sampling weights if provided
-    #     if rollout_is_weights is not None:
-    #         pg_losses = pg_losses * rollout_is_weights
+        # Apply rollout importance sampling weights if provided
+        if rollout_is_weights is not None:
+            pg_losses = pg_losses * rollout_is_weights
         
-    #     # ===== Dr.GRPO 核心修改：固定长度归一化 =====
-    #     ## "max_response_length must be provided for Dr.GRPO mode"
-    #     # 对每个 response 的 loss 求和，除以固定 max_response_length，再对 batch 平均
-    #     # 等价于: (1/G) * sum_i [ (1/MAX) * sum_t loss_{i,t} ]
-    #     seq_loss = (pg_losses * response_mask).sum(dim=-1)  # (batch_size,)
-    #     pg_loss = (seq_loss / max_response_length).mean()
-    #     ## ==========================================================
+        # ===== Dr.GRPO 核心修改：固定长度归一化 =====
+        ## "max_response_length must be provided for Dr.GRPO mode"
+        # 对每个 response 的 loss 求和，除以固定 max_response_length，再对 batch 平均
+        # 等价于: (1/G) * sum_i [ (1/MAX) * sum_t loss_{i,t} ]
+        seq_loss = (pg_losses * response_mask).sum(dim=-1)  # (batch_size,)
+        pg_loss = (seq_loss / max_response_length).mean()
+        ## ==========================================================
 
-    #     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
     def _hspo_loss(self, inputs, log_probs, beta=1.0, gamma=0.25, sft_weight=0.05, 
@@ -1180,15 +1180,26 @@ class DataParallelPPOActor(BasePPOActor):
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = self._ppo_loss(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob, 
-                        advantages=advantages, 
-                        response_mask=response_mask, 
-                        loss_agg_mode=loss_agg_mode, 
-                        rollout_is_weights=rollout_is_weights,
-                        max_response_length=max_response_length
-                        )
+                    if self.config.get("use_drgrpo", False):
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = self._dr_ppo_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            rollout_is_weights=rollout_is_weights,
+                            max_response_length=max_response_length
+                            )
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = self._ppo_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            rollout_is_weights=rollout_is_weights,
+                            max_response_length=max_response_length
+                            )
 
 
                     # ## M2PO: t00620714

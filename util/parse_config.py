@@ -7,6 +7,16 @@ import os
 def convert_value(v):
     if not isinstance(v, str):
         return v
+
+    # 解析bool
+    s = v.strip()
+
+    # 解析 bool，支持 True / False / true / false
+    if s.lower() == "true":
+        return True
+    if s.lower() == "false":
+        return False
+
     # 尝试解析列表
     if v.strip().startswith('[') and v.strip().endswith(']'):
         try:

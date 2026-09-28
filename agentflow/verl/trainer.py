@@ -708,8 +708,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                                 self._enq_ema = float(enq) if getattr(self, '_enq_ema', None) is None \
                                                 else 0.9 * self._enq_ema + 0.1 * enq
 
-                            # 消化 = 入队；三重上限：能切分、不超存量、不超 GRPO 两倍
-                            n_batch = max(int(round(self._enq_ema)), k_partitions)
+                            # 目标采样量为入队速率 EMA 的 4 倍，随后受回放池存量及分区整除约束。
+                            n_batch = max(int(round(self._enq_ema)) * 4, k_partitions)
                             n_batch = min(n_batch, history_length)
                             n_batch = n_batch // k_partitions * k_partitions
                             n_batch = max(n_batch, k_partitions)
