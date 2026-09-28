@@ -3,6 +3,12 @@ import ssl
 import time
 import urllib3
 from agentflow.models.utils import robust_json_loads
+from agentflow.tools.network_retry import (
+    MAX_NETWORK_RETRIES,
+    MAX_RETRY_WAIT_SECONDS,
+    RETRYABLE_HTTP_STATUSES,
+    retry_wait_seconds,
+)
 
 # 1. 全局禁用 SSL 证书验证
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -50,7 +56,7 @@ _original_post = requests.api.post
 def _patched_get(url, params=None, **kwargs):
     kwargs['verify'] = False
 
-    # 只对 Wikipedia 请求增加 429 处理
+    # Wikipedia 请求统一处理短暂的 HTTP 和网络故障。
     is_wikipedia = "wikipedia.org" in url
 
     # 非 Wikipedia 请求保持原逻辑
@@ -61,75 +67,40 @@ def _patched_get(url, params=None, **kwargs):
             **kwargs
         )
 
-    # ==========================================================
-    # Wikipedia 429 Rate Limit 处理
-    #
-    # 第一次正常请求 + 最多 2 次重试
-    #
-    # 如果服务端返回：
-    # Retry-After: 15
-    #
-    # 就真正等待约 15 秒后再请求，
-    # 不再使用原先的 1s -> 2s 强行重试。
-    # ==========================================================
-    max_retries = 2
-
-    for attempt in range(max_retries + 1):
-
-        response = _original_get(
-            url,
-            params=params,
-            **kwargs
-        )
+    for attempt in range(MAX_NETWORK_RETRIES + 1):
+        try:
+            response = _original_get(url, params=params, **kwargs)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as error:
+            if attempt >= MAX_NETWORK_RETRIES:
+                raise
+            wait_time = retry_wait_seconds(None, attempt)
+            print(f"[Wikipedia Network] {type(error).__name__}; retrying in {wait_time:.1f}s "
+                  f"({attempt + 1}/{MAX_NETWORK_RETRIES})")
+            time.sleep(wait_time)
+            continue
 
         print(
             f"[Wikipedia HTTP] "
             f"status={response.status_code}, "
-            f"attempt={attempt + 1}/{max_retries + 1}"
+            f"attempt={attempt + 1}/{MAX_NETWORK_RETRIES + 1}"
         )
 
-        # 非 429，正常返回
-        if response.status_code != 429:
+        if response.status_code not in RETRYABLE_HTTP_STATUSES:
             return response
 
-        # ==============================
-        # 命中 Wikipedia 429 限流
-        # ==============================
         retry_after = response.headers.get("Retry-After")
-
-        print(
-            f"[Wikipedia Rate Limit] "
-            f"429 Too Many Requests, "
-            f"Retry-After={retry_after}"
-        )
-
-        # 已经达到最大重试次数
-        if attempt >= max_retries:
-            raise WikipediaRateLimitError(
-                f"Wikipedia API rate limited after "
-                f"{max_retries} retries. "
-                f"Retry-After={retry_after}"
-            )
-
-        # ======================================================
-        # 优先遵循 Wikipedia 返回的 Retry-After
-        # ======================================================
-        if retry_after is not None:
-            try:
-                # 多等 0.5 秒，避免正好卡在限流边界
-                wait_time = float(retry_after) + 0.5
-            except (TypeError, ValueError):
-                # Retry-After 无法解析时，才使用指数退避
-                wait_time = 1.0 * (2 ** attempt)
-        else:
-            # 服务端没有返回 Retry-After 时才自己退避
-            wait_time = 1.0 * (2 ** attempt)
-
-        print(
-            f"[Wikipedia Rate Limit] "
-            f"waiting {wait_time:.1f}s before retry..."
-        )
-
+        wait_time = retry_wait_seconds(retry_after, attempt)
+        if attempt >= MAX_NETWORK_RETRIES or wait_time > MAX_RETRY_WAIT_SECONDS:
+            if response.status_code == 429:
+                response.close()
+                raise WikipediaRateLimitError(
+                    f"Wikipedia API rate limited after {attempt} retries. "
+                    f"Retry-After={retry_after}"
+                )
+            response.raise_for_status()
+        print(f"[Wikipedia HTTP] {response.status_code}; retrying in {wait_time:.1f}s "
+              f"({attempt + 1}/{MAX_NETWORK_RETRIES})")
+        response.close()
         time.sleep(wait_time)
 
 
@@ -410,7 +381,7 @@ class Wikipedia_Search_Tool(BaseTool):
             # 429 限流不能被下面的 Exception 吃掉
             #
             # 如果 _patched_get 已经按照 Retry-After 等待并
-            # 重试了 2 次仍然失败，就直接把异常往上传。
+            # 重试了 3 次仍然失败，就直接把异常往上传。
             #
             # 否则如果这里被普通 Exception 捕获，
             # for 循环会马上请求下一个页面，

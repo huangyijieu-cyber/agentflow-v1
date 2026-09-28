@@ -6,6 +6,12 @@ import requests
 from dotenv import load_dotenv
 
 from agentflow.tools.base import BaseTool
+from agentflow.tools.network_retry import (
+    MAX_NETWORK_RETRIES,
+    MAX_RETRY_WAIT_SECONDS,
+    RETRYABLE_HTTP_STATUSES,
+    retry_wait_seconds,
+)
 
 load_dotenv()
 
@@ -75,7 +81,7 @@ class Brave_Search_Tool(BaseTool):
             )
 
         self.endpoint = os.getenv("BRAVE_YIBU_BASE_URL", DEFAULT_ENDPOINT)
-        self.max_retries = 3
+        self.max_retries = MAX_NETWORK_RETRIES
         self.timeout = 20
 
     @staticmethod
@@ -155,25 +161,44 @@ class Brave_Search_Tool(BaseTool):
         }
 
         last_error = None
-        for attempt in range(self.max_retries):
+        attempts_made = 0
+        for attempt in range(self.max_retries + 1):
+            attempts_made += 1
             try:
                 response = requests.get(
                     self.endpoint,
                     params=params,
                     headers=headers,
-                    timeout=self.timeout,  
-                    verify=False
+                    timeout=self.timeout,
+                    verify=False,
                 )
+                if response.status_code in RETRYABLE_HTTP_STATUSES and attempt < self.max_retries:
+                    wait_time = retry_wait_seconds(response.headers.get("Retry-After"), attempt)
+                    if wait_time <= MAX_RETRY_WAIT_SECONDS:
+                        print(f"[Yibu Brave HTTP] {response.status_code}; retrying in {wait_time:.1f}s "
+                              f"({attempt + 1}/{self.max_retries})")
+                        response.close()
+                        time.sleep(wait_time)
+                        continue
                 response.raise_for_status()
                 data = response.json()
                 return self._format_results(query, data, params["count"])
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                last_error = e
+                if attempt < self.max_retries:
+                    wait_time = retry_wait_seconds(None, attempt)
+                    print(f"[Yibu Brave Network] {type(e).__name__}; retrying in {wait_time:.1f}s "
+                          f"({attempt + 1}/{self.max_retries})")
+                    time.sleep(wait_time)
+                    continue
+                break
             except Exception as e:
                 last_error = e
-                if attempt < self.max_retries - 1:
-                    time.sleep(1)
+                break
 
         return (
-            f"Yibu Brave Search tried {self.max_retries} times but failed. "
+            f"Yibu Brave Search tried {attempts_made} "
+            f"time{'s' if attempts_made != 1 else ''} but failed. "
             f"Last error: {last_error}"
         )
 
