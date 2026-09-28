@@ -8,7 +8,8 @@ from email.utils import parsedate_to_datetime
 
 MAX_NETWORK_RETRIES = 3
 MAX_RETRY_WAIT_SECONDS = 30.0
-RETRYABLE_HTTP_STATUSES = frozenset({403, 412, 422, 429, 500, 502, 503, 504})
+RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+YIBU_RETRYABLE_HTTP_STATUSES = RETRYABLE_HTTP_STATUSES | {422}
 
 
 def retry_wait_seconds(attempt, *, status_code=None, retry_after=None):

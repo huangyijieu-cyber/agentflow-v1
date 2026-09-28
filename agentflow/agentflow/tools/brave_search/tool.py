@@ -9,7 +9,7 @@ from agentflow.tools.base import BaseTool
 from agentflow.tools.network_retry import (
     MAX_NETWORK_RETRIES,
     MAX_RETRY_WAIT_SECONDS,
-    RETRYABLE_HTTP_STATUSES,
+    YIBU_RETRYABLE_HTTP_STATUSES,
     retry_wait_seconds,
 )
 
@@ -172,7 +172,7 @@ class Brave_Search_Tool(BaseTool):
                     timeout=self.timeout,
                     verify=False,
                 )
-                if response.status_code in RETRYABLE_HTTP_STATUSES and attempt < self.max_retries:
+                if response.status_code in YIBU_RETRYABLE_HTTP_STATUSES and attempt < self.max_retries:
                     wait_time = retry_wait_seconds(
                         attempt,
                         status_code=response.status_code,
