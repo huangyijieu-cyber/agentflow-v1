@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import random
 import socket
 import threading
@@ -18,6 +19,7 @@ from tensordict import TensorDict
 import concurrent.futures
 
 from verl import DataProto
+from agentflow.rollout_timing import profiling_enabled
 
 configure_logger()
 
@@ -531,6 +533,11 @@ class AgentModeDaemon:
         min_timeout = 600  # At least 10 minutes
         max_timeout = 3600  # At most 1 hour
         dynamic_timeout = max(min_timeout, min(max_timeout, estimated_total_time))
+        profile_timeout = None
+        if not self.is_train and profiling_enabled():
+            profile_timeout = int(os.environ.get("AGENTFLOW_PROFILE_VAL_TIMEOUT_S", "3600"))
+            if profile_timeout <= 0:
+                raise ValueError("AGENTFLOW_PROFILE_VAL_TIMEOUT_S must be positive")
 
         logger.info(f"Starting {original_task_count} {'training' if self.is_train else 'validation'} tasks")
         logger.info(f"Estimated completion time: {dynamic_timeout/60:.1f} minutes (avg {avg_task_time_sec}s per task)")
@@ -545,6 +552,12 @@ class AgentModeDaemon:
             # if completed_count >= self._total_tasks_queued:
             if completed_count >= original_task_count:
                 logger.info("All tasks completed")
+                break
+            if profile_timeout is not None and elapsed >= profile_timeout:
+                logger.warning(
+                    "Timing profile stopped after %ss: %s/%s validation tasks completed",
+                    profile_timeout, completed_count, original_task_count,
+                )
                 break
 
             # Smart early exit: if >90% done and no progress for 2 minutes

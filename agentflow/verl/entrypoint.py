@@ -2,6 +2,7 @@ import hydra
 import ray
 import os
 import traceback
+from pathlib import Path
 
 from .dataset import AgentDataset
 from .trainer import AgentFlowTrainer
@@ -17,12 +18,17 @@ def main(config):
 def run_ppo(config) -> None:
     if not ray.is_initialized():
         # this is for local ray cluster
+        env_vars = {"ASCEND_RT_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}
+        for name in (
+            "AGENTFLOW_PROFILE_VAL_TIMING",
+            "AGENTFLOW_PROFILE_VAL_LIMIT",
+            "AGENTFLOW_PROFILE_VAL_TIMEOUT_S",
+            "AGENTFLOW_PROFILE_OUTPUT_DIR",
+        ):
+            if name in os.environ:
+                env_vars[name] = os.environ[name]
         ray.init(
-            runtime_env={"env_vars":
-                {
-                  "ASCEND_RT_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
-                },
-            }
+            runtime_env={"env_vars": env_vars}
             # runtime_env={
             #     "env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN", "ASCEND_RT_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}
             # },
@@ -36,7 +42,7 @@ def run_ppo(config) -> None:
     # ray.get(runner.run.remote(config))
 
     try:
-        ray.get(runner.run.remote(config))
+        result = ray.get(runner.run.remote(config))
     except ray.exceptions.RayTaskError as e:
         print("\n" + "="*80)
         print(f"RayTaskError wrapper: {e}")
@@ -49,6 +55,18 @@ def run_ppo(config) -> None:
             print("NO CAUSE AVAILABLE")
         print("="*80 + "\n")
         raise
+
+    if result is not None:
+        output_dir = Path(os.environ.get("AGENTFLOW_PROFILE_OUTPUT_DIR", "rollout_data/val_timing")).expanduser().resolve()
+        if "detail_jsonl" in result:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            detail_path = output_dir / result["detail_name"]
+            summary_path = output_dir / result["summary_name"]
+            detail_path.write_text(result["detail_jsonl"], encoding="utf-8")
+            summary_path.write_text(result["summary_json"], encoding="utf-8")
+            print(f"Timing report copied to head: {detail_path}\nTiming summary copied to head: {summary_path}")
+        if result.get("error"):
+            raise RuntimeError(f"Validation task failed after timing report collection:\n{result['error']}")
 
 
 @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
@@ -181,7 +199,30 @@ class TaskRunner:
             algorithm=algorithm
         )
         trainer.init_workers()
-        trainer.fit()
+        try:
+            trainer.fit()
+        except Exception:
+            if os.environ.get("AGENTFLOW_PROFILE_VAL_TIMING", "").lower() in {"1", "true", "yes"}:
+                return self._timing_result(trainer, traceback.format_exc())
+            raise
+        if os.environ.get("AGENTFLOW_PROFILE_VAL_TIMING", "").lower() in {"1", "true", "yes"}:
+            return self._timing_result(trainer)
+
+    @staticmethod
+    def _timing_result(trainer, error=None):
+        paths = getattr(trainer, "timing_report_paths", None)
+        if paths is None:
+            if error:
+                return {"error": error}
+            raise RuntimeError("Timing profile finished without producing a validation report")
+        detail_path, summary_path = paths
+        return {
+            "detail_name": detail_path.name,
+            "detail_jsonl": detail_path.read_text(encoding="utf-8"),
+            "summary_name": summary_path.name,
+            "summary_json": summary_path.read_text(encoding="utf-8"),
+            "error": error,
+        }
 
 
 if __name__ == "__main__":

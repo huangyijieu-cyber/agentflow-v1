@@ -29,6 +29,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.tracking import Tracking
 
 from .daemon import AgentModeDaemon
+from agentflow.rollout_timing import PHASES, profiling_enabled, write_validation_report
 
 import os
 import json
@@ -122,6 +123,17 @@ class AgentFlowTrainer(RayPPOTrainer):
         if not test_data or all((isinstance(v, list) and len(v) == 0) or (isinstance(v, torch.Tensor) and v.numel() == 0) for v in test_data.values()):
             raise ValueError("Validation data is empty. Check your validation dataset.")
 
+        profile_limit = None
+        if profiling_enabled():
+            profile_limit = int(os.environ.get("AGENTFLOW_PROFILE_VAL_LIMIT", "100"))
+            if profile_limit <= 0:
+                raise ValueError("AGENTFLOW_PROFILE_VAL_LIMIT must be positive")
+            sizes = {key: len(value) for key, value in test_data.items()}
+            if len(set(sizes.values())) != 1 or next(iter(sizes.values())) < profile_limit:
+                raise ValueError(f"Expected at least {profile_limit} aligned val samples, got {sizes}")
+            test_data = {key: value[:profile_limit] for key, value in test_data.items()}
+            print(f"Timing profile: using the first {profile_limit} validation samples")
+
         test_batch = DataProto.from_single_dict(test_data)
         # test_batch.non_tensor_batch["step"] = np.ones_like(test_batch.non_tensor_batch["question"]) * self.global_steps
         self.async_rollout_manager.wake_up()
@@ -142,6 +154,28 @@ class AgentFlowTrainer(RayPPOTrainer):
         valid_count = len([r for r in self.agent_mode_daemon._completed_rollouts.values()
                           if r.triplets and len(r.triplets) > 0])
         original_count = self.agent_mode_daemon._total_tasks_queued
+
+        if profile_limit is not None:
+            output_dir = os.environ.get("AGENTFLOW_PROFILE_OUTPUT_DIR", "rollout_data/val_timing")
+            run_name = f"val_step_{self.global_steps}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+            detail_path, summary_path, timing_summary = write_validation_report(
+                self.agent_mode_daemon._completed_rollouts.values(),
+                output_dir,
+                profile_limit,
+                run_name,
+            )
+            self.timing_report_paths = (detail_path, summary_path)
+            print(f"Timing profile: {timing_summary['profiled_count']}/{profile_limit} rollouts, "
+                  f"mean total {timing_summary['mean_total_s']:.3f}s")
+            print("  executor is command generation/parsing; search and other_tools are tool execution")
+            for phase in PHASES:
+                stats = timing_summary["phase_stats"][phase]
+                print(f"  {phase:12s} {stats['mean_s']:9.3f}s  {stats['mean_pct']:6.2f}%")
+            print(f"  executor_full (derived) {timing_summary['executor_full_mean_s']:.3f}s  "
+                  f"{timing_summary['executor_full_mean_pct']:.2f}%")
+            for tool, mean_s in timing_summary["search_tool_mean_s"].items():
+                print(f"  search/{tool}: {mean_s:.3f}s average per rollout")
+            print(f"Timing details: {detail_path}\nTiming summary: {summary_path}")
 
         completion_rate = completed_count / original_count if original_count > 0 else 0
         print(f"Validation summary: {completed_count}/{original_count} total rollouts ({completion_rate:.1%}), {valid_count} valid rollouts")

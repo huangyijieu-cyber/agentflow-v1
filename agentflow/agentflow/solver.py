@@ -4,6 +4,7 @@ import json
 from datetime import datetime
 from typing import Optional
 import os
+from contextlib import nullcontext
 
 from copy import deepcopy
 
@@ -13,6 +14,7 @@ from agentflow.models.verifier import Verifier
 from agentflow.models.memory import Memory
 from agentflow.models.executor import Executor
 from agentflow.models.utils import make_json_serializable_truncated
+from agentflow.rollout_timing import RolloutTiming, is_search_tool, profiling_enabled
 
 
 def log_info(message):
@@ -75,6 +77,8 @@ class Solver:
         reward = None ## placeholder
 
         if self.task == "qa":
+            timing = RolloutTiming() if profiling_enabled() else None
+            measure = timing.track if timing else lambda *args, **kwargs: nullcontext()
             # Update cache directory for the executor
             self.executor.set_query_cache_dir(self.root_cache_dir)
 
@@ -91,7 +95,8 @@ class Solver:
 
             # Generate base response if requested
             if 'base' in self.output_types:
-                base_response = self.planner.generate_base_response(question, image_path, self.max_tokens)
+                with measure("planner", detail="base_response"):
+                    base_response = self.planner.generate_base_response(question, image_path, self.max_tokens)
                 json_data["base_response"] = base_response
                 if self.verbose:
                     log_info(f"\n==> 📝 Base Response from LLM:\n{base_response}")
@@ -101,6 +106,8 @@ class Solver:
                 ## update logs
                 json_data.update({"planner_logs": deepcopy(self.planner.logs)})
                 self.planner.logs.clear()
+                if timing:
+                    json_data["timing_profile"] = timing.snapshot()
                 return json_data, reward
         
             # Continue with query analysis and tool execution if final or direct responses are needed
@@ -110,7 +117,8 @@ class Solver:
 
                 # [1] Analyze query
                 query_start_time = time.time()
-                query_analysis = self.planner.analyze_query(question, image_path)
+                with measure("planner", detail="query_analysis"):
+                    query_analysis = self.planner.analyze_query(question, image_path)
                 json_data["query_analysis"] = query_analysis
                 if self.verbose:
                     log_info(f"\n==> 🔍 Step 0: Query Analysis\n")
@@ -126,16 +134,17 @@ class Solver:
 
                     # [2] Generate next step
                     local_start_time = time.time()
-                    next_step = self.planner.generate_next_step(
-                        question, 
-                        image_path, 
-                        query_analysis, 
-                        self.memory, 
-                        step_count, 
-                        self.max_steps,
-                        json_data
-                    )
-                    context, sub_goal, tool_name = self.planner.extract_context_subgoal_and_tool(next_step)
+                    with measure("planner", detail="next_step"):
+                        next_step = self.planner.generate_next_step(
+                            question,
+                            image_path,
+                            query_analysis,
+                            self.memory,
+                            step_count,
+                            self.max_steps,
+                            json_data,
+                        )
+                        context, sub_goal, tool_name = self.planner.extract_context_subgoal_and_tool(next_step)
                     if self.verbose:
                         log_info(f"\n==> 🎯 Step {step_count}: Action Prediction ({tool_name})\n")
                         log_info(f"[Context]: {context}\n[Sub Goal]: {sub_goal}\n[Tool]: {tool_name}")
@@ -149,17 +158,18 @@ class Solver:
                     else:
                         # [3] Generate the tool command
                         local_start_time = time.time()
-                        tool_command = self.executor.generate_tool_command(
-                            question, 
-                            image_path, 
-                            context, 
-                            sub_goal, 
-                            tool_name, 
-                            self.planner.toolbox_metadata[tool_name],
-                            step_count,
-                            json_data
-                        )
-                        analysis, explanation, command = self.executor.extract_explanation_and_command(tool_command)
+                        with measure("executor"):
+                            tool_command = self.executor.generate_tool_command(
+                                question,
+                                image_path,
+                                context,
+                                sub_goal,
+                                tool_name,
+                                self.planner.toolbox_metadata[tool_name],
+                                step_count,
+                                json_data,
+                            )
+                            analysis, explanation, command = self.executor.extract_explanation_and_command(tool_command)
                         if self.verbose:
                             log_info(f"\n==> 📝 Step {step_count}: Command Generation ({tool_name})\n")
                             log_info(f"[Analysis]: {analysis}\n[Explanation]: {explanation}\n[Command]: {command}")
@@ -167,7 +177,9 @@ class Solver:
                         
                         # [4] Execute the tool command
                         local_start_time = time.time()
-                        result = self.executor.execute_tool_command(tool_name, command)
+                        tool_phase = "search" if is_search_tool(tool_name) else "other_tools"
+                        with measure(tool_phase, tool=tool_name):
+                            result = self.executor.execute_tool_command(tool_name, command)
                         result = make_json_serializable_truncated(result) # Convert to JSON serializable format
                         json_data[f"tool_result_{step_count}"] = result
 
@@ -186,15 +198,16 @@ class Solver:
 
                     # [5] Verify memory (context verification)
                     local_start_time = time.time()
-                    stop_verification = self.verifier.verificate_context(
-                        question,
-                        image_path,
-                        query_analysis,
-                        self.memory,
-                        step_count,
-                        json_data
-                    )
-                    context_verification, conclusion = self.verifier.extract_conclusion(stop_verification)
+                    with measure("verifier"):
+                        stop_verification = self.verifier.verificate_context(
+                            question,
+                            image_path,
+                            query_analysis,
+                            self.memory,
+                            step_count,
+                            json_data,
+                        )
+                        context_verification, conclusion = self.verifier.extract_conclusion(stop_verification)
                     if self.verbose:
                         conclusion_emoji = "✅" if conclusion == 'STOP' else "🛑"
                         log_info(f"\n==> 🤖 Step {step_count}: Context Verification\n")
@@ -214,13 +227,15 @@ class Solver:
 
                 # Generate final output if requested
                 if 'final' in self.output_types:
-                    final_output = self.planner.generate_final_output(question, image_path, self.memory)
+                    with measure("planner", detail="final_output"):
+                        final_output = self.planner.generate_final_output(question, image_path, self.memory)
                     json_data["final_output"] = final_output
                     log_info(f"\n==> 🐙 Detailed Solution:\n\n{final_output}")
 
                 # Generate direct output if requested
                 if 'direct' in self.output_types:
-                    direct_output = self.planner.generate_direct_output(question, image_path, self.memory)
+                    with measure("planner", detail="direct_output"):
+                        direct_output = self.planner.generate_direct_output(question, image_path, self.memory)
                     json_data["direct_output"] = direct_output
                     log_info(f"\n==> 🐙 Final Answer:\n\n{direct_output}")
 
@@ -230,6 +245,8 @@ class Solver:
             ## update logs
             json_data.update({"planner_logs": deepcopy(self.planner.logs)})
             self.planner.logs.clear()
+            if timing:
+                json_data["timing_profile"] = timing.snapshot()
             return json_data, reward
 
         

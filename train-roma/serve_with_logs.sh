@@ -46,6 +46,9 @@ fi
 
 # 6. The Python command you want to run
 PYTHON_COMMAND="python train-roma/rollout.py"
+if [ "${AGENTFLOW_PROFILE_VAL_TIMING:-}" = "1" ]; then
+    PYTHON_COMMAND="python train-roma/rollout_main_profiled.py"
+fi
 
 # --- Function: calculate digit length of a number ---
 suffix_length() {

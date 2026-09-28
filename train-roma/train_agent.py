@@ -48,7 +48,14 @@ def main():
                 command.append(f"{key}={value}")
 
     # Add any user-provided overrides to the command
+    command.extend(args.overrides)
     command.extend(unknown)
+    if os.environ.get("AGENTFLOW_PROFILE_VAL_ONLY", "").lower() in {"1", "true", "yes"}:
+        command.extend([
+            "trainer.val_before_train=True",
+            "trainer.val_only=True",
+            "++data.validation_shuffle=False",
+        ])
     
     # --- Execute the command ---
     print("\nStarting training script with the following command:")
