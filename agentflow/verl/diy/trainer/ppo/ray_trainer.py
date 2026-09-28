@@ -289,7 +289,7 @@ def compute_advantage(
 
         # InfoSeek + GiGPO:
         #   episode reward = final-answer outcome only
-        #   step reward    = local subgoal reward + final-answer outcome (1:1)
+        #   step reward    = 0.5 * local subgoal reward + 0.25 * final-answer outcome
         episode_rewards_np = data.non_tensor_batch.get(
             'episode_reward_list', data.non_tensor_batch['reward_list']
         ).astype(np.float32)

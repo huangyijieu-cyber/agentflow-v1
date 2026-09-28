@@ -29,6 +29,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.tracking import Tracking
 
 from .daemon import AgentModeDaemon
+from .reward_metrics import summarize_gigpo_groups
 
 import os
 import json
@@ -594,6 +595,19 @@ class AgentFlowTrainer(RayPPOTrainer):
                     config=self.config.algorithm,
                 )
 
+                if self.config.algorithm.adv_estimator == "gigpo":
+                    trainable_turns = (
+                        (batch.batch["response_mask"].sum(dim=-1) > 0)
+                        & (~batch.batch["is_drop_mask"])
+                    ).cpu().numpy()
+                    metrics.update(summarize_gigpo_groups(
+                        batch.non_tensor_batch["uid"],
+                        batch.non_tensor_batch["anchor_list"],
+                        batch.non_tensor_batch["gigpo_pair_mask_list"],
+                        batch.non_tensor_batch["step_reward_list"],
+                        trainable_turns,
+                    ))
+
             # after advantages are assinged, we begin to drop (1) long prompt (2) floor to ppo minisize
             keep_indices = (~batch.batch["is_drop_mask"]).nonzero(as_tuple=True)[0]
             metrics["agent_mode/n_dropped_sample_because_of_prompt"] = (
@@ -709,6 +723,19 @@ class AgentFlowTrainer(RayPPOTrainer):
 
         # compute training metrics
         metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+        # The generic metric averages per-turn token scores. Count each retained
+        # rollout once so critic/score/mean reflects its final-answer reward.
+        if self.config.algorithm.adv_estimator == "gigpo":
+            final_by_traj = {
+                str(traj_uid): float(final_reward)
+                for traj_uid, final_reward in zip(
+                    batch.non_tensor_batch["traj_uid"],
+                    batch.non_tensor_batch["episode_reward_list"],
+                    strict=True,
+                )
+            }
+            if final_by_traj:
+                metrics["critic/score/mean"] = float(np.mean(list(final_by_traj.values())))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
 
         n_gpus = self.resource_pool_manager.get_n_gpus()
@@ -793,6 +820,7 @@ class AgentFlowTrainer(RayPPOTrainer):
             train_information={
                 "model": self.config.actor_rollout_ref.model.path,
                 "temperature": self.config.actor_rollout_ref.rollout.temperature,
+                "adv_estimator": self.config.algorithm.adv_estimator,
             },
             tokenizer=self.tokenizer,
             mini_batch_size=self.config.actor_rollout_ref.actor.ppo_mini_batch_size,

@@ -126,7 +126,9 @@ def compute_search_subreward(result: dict, reward_spec: Any):
         if "search" not in tool_name.casefold():
             continue
 
-        observation = action.get("result", "")
+        # Match the same result text that Memory.get_actions() puts in the
+        # planner/verifier prompt (max_result_chars=2000).
+        observation = str(action.get("result", ""))[:2000]
         turn_match = re.search(r"(\d+)", str(step_name))
         turn = int(turn_match.group(1)) if turn_match else None
 
@@ -388,8 +390,23 @@ class RolloutAgent(LitAgent):
             reward_spec = task.get("reward_spec", {})
             if not reward_spec:
                 reward_spec = _as_dict(task.get("extra_info", {})).get("reward_spec", {})
+            reward_spec = _as_dict(reward_spec)
 
             subreward, subgoal_hits = compute_search_subreward(result, reward_spec)
+            annotated_subgoals = {
+                str(subgoal.get("id", ""))
+                for subgoal in reward_spec.get("subgoals", []) or []
+                if isinstance(subgoal, dict)
+            }
+            search_turn_indices = []
+            for step_name, action in (result.get("memory", {}) or {}).items():
+                if isinstance(action, dict) and "search" in str(action.get("tool_name", "")).casefold():
+                    turn_match = re.search(r"(\d+)", str(step_name))
+                    if turn_match:
+                        search_turn_indices.append(int(turn_match.group(1)))
+            answer_tag_valid = bool(output and any(
+                match.strip() for match in re.findall(r"<answer>(.*?)</answer>", output, re.DOTALL)
+            ))
             # Per-turn process reward for GiGPO.  Keys are planner-log turn indices:
             # analyze_query=0, Action Step k=k, final_output=last turn.
             # Each subgoal contributes only at the Search step where it is first hit.
@@ -554,6 +571,9 @@ class RolloutAgent(LitAgent):
                     "training_reward": reward_value,
                     "subgoal_hits": subgoal_hits,
                     "turn_process_rewards": turn_process_rewards,
+                    "n_subgoals": len(annotated_subgoals),
+                    "search_turn_indices": search_turn_indices,
+                    "answer_tag_valid": answer_tag_valid,
                 }
             
             rollout_package = Rollout(

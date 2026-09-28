@@ -65,7 +65,8 @@ def compute_search_subreward(result: dict, reward_spec: Any) -> Tuple[float, Lis
         if "search" not in tool_name.casefold():
             continue
 
-        observation = action.get("result", "")
+        # Keep offline reward analysis aligned with the model-visible result.
+        observation = str(action.get("result", ""))[:2000]
         turn_match = re.search(r"(\d+)", str(step_name))
         turn = int(turn_match.group(1)) if turn_match else None
 

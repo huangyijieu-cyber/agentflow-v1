@@ -18,18 +18,30 @@ from tensordict import TensorDict
 import concurrent.futures
 
 from verl import DataProto
+from .reward_metrics import summarize_reward_metrics
 
 configure_logger()
 
 logger = logging.getLogger(__name__)
 
 
-def _gigpo_turn_step_reward(turn_process_rewards: dict, turn_index: int, final_reward: float) -> float:
-    """Give a turn its first-hit subgoal reward and the final-answer reward equally."""
+def _gigpo_turn_step_reward(
+    turn_process_rewards: dict,
+    turn_index: int,
+    final_reward: float,
+    subreward_coeff: float = 0.5,
+    final_reward_coeff: float = 0.25,
+) -> float:
+    """Weight local subgoal hits above the final outcome in the GiGPO step signal."""
     subgoal_reward = turn_process_rewards.get(
         str(turn_index), turn_process_rewards.get(turn_index, 0.0)
     )
-    return float(subgoal_reward) + float(final_reward)
+    return subreward_coeff * float(subgoal_reward) + final_reward_coeff * float(final_reward)
+
+
+def _training_token_scores(episode_rewards: list, aggregate_rewards: list, adv_estimator: str) -> list:
+    """Use final-answer scores for GiGPO's critic while preserving legacy GRPO."""
+    return episode_rewards if adv_estimator == "gigpo" else aggregate_rewards
 
 
 def get_left_padded_ids_and_attention_mask(ids: List[int], max_length: int, pad_token_id: int):
@@ -690,19 +702,26 @@ class AgentModeDaemon:
 
         if len(self._completed_rollouts) == 0:
             logger.warning("No completed rollouts found for validation metrics calculation")
-            return {
+            metrics = {
                 "val/reward": 0.0,
                 "val/mean_response_length": 0.0,
                 "val/sum_response_length": 0.0,
                 "val/turn_count": 0.0,
             }
+            metrics.update(summarize_reward_metrics([], "val"))
+            return metrics
 
         sample_stat_list = []
+        reward_breakdowns = []
         for rollout_id, rollout in self._completed_rollouts.items():
             if not rollout.triplets:
                 continue
             response_length_list = [len(triplet.response.get("token_ids", [])) for triplet in rollout.triplets]
-            final_reward = self._fillna_reward(rollout)
+            breakdown = rollout.metadata.get("reward_breakdown", {})
+            if not isinstance(breakdown, dict):
+                breakdown = {}
+            reward_breakdowns.append(breakdown)
+            final_reward = float(breakdown.get("final_reward", self._fillna_reward(rollout)))
             sample_stat_list.append(
                 {
                     "sum_response_length": np.sum(response_length_list),
@@ -712,12 +731,24 @@ class AgentModeDaemon:
                 }
             )
 
-        return {
+        if not sample_stat_list:
+            metrics = {
+                "val/reward": 0.0,
+                "val/mean_response_length": 0.0,
+                "val/sum_response_length": 0.0,
+                "val/turn_count": 0.0,
+            }
+            metrics.update(summarize_reward_metrics(reward_breakdowns, "val"))
+            return metrics
+
+        metrics = {
             "val/reward": np.mean([stat["reward"] for stat in sample_stat_list]),
             "val/mean_response_length": np.mean([stat["mean_response_length"] for stat in sample_stat_list]),
             "val/sum_response_length": np.mean([stat["sum_response_length"] for stat in sample_stat_list]),
             "val/turn_count": np.mean([stat["turn_count"] for stat in sample_stat_list]),
         }
+        metrics.update(summarize_reward_metrics(reward_breakdowns, "val"))
+        return metrics
 
     def get_train_data_batch(self, max_prompt_length, max_response_length, device):
         """
@@ -793,6 +824,7 @@ class AgentModeDaemon:
                 "reward": trajectory_reward,
                 "episode_reward": episode_reward,
                 "turn_process_rewards": turn_process_rewards,
+                "reward_breakdown": reward_breakdown,
                 "trace_list": trace_list,
                 "data_id": original_sample["data_id"],
                 "anchor_list": anchor_list,
@@ -858,8 +890,8 @@ class AgentModeDaemon:
                 # GiGPO episode signal: final-answer outcome only.
                 episode_reward_list.append(sample_info["episode_reward"])
 
-                # GiGPO step signal: first-hit subgoal reward at this turn plus
-                # the final-answer reward for every turn (both with weight 1).
+                # GiGPO step signal: 0.5 * first-hit subgoal reward at this turn
+                # plus 0.25 * final-answer reward for every turn.
                 # Action Step k is aligned to planner-log turn_index == k.
                 step_reward_list.append(
                     _gigpo_turn_step_reward(
@@ -930,7 +962,12 @@ class AgentModeDaemon:
         attention_mask = torch.cat([input_attention_mask, response_attention_mask], dim=-1)
         position_ids = torch.clamp(torch.cumsum(attention_mask, dim=-1) - 1, min=0)
         is_drop_mask = torch.BoolTensor(is_drop_list).to(device)
-        scores = torch.tensor(reward_list, dtype=torch.bfloat16).to(device)
+        # GiGPO's critic/token-level score measures final outcome only. Keep
+        # legacy aggregate scores for other advantage estimators.
+        score_values = _training_token_scores(
+            episode_reward_list, reward_list, self.train_information.get("adv_estimator", "")
+        )
+        scores = torch.tensor(score_values, dtype=torch.bfloat16).to(device)
 
         # Create token-level scores by placing the final reward at the last token position
         token_level_scores = torch.zeros_like(attention_mask, dtype=scores.dtype)
@@ -960,6 +997,10 @@ class AgentModeDaemon:
             "agent_mode/n_trunc_sample_because_of_response": n_trunc_sample_because_of_response,
             "agent_mode/n_sample_to_train": n_transition,
         }
+        data_metrics.update(summarize_reward_metrics(
+            (info["reward_breakdown"] for info in finished_id_to_sample_info.values()),
+            "train",
+        ))
 
         # Add non-tensor data for advantage calculation and logging
         data_proto.non_tensor_batch["data_id_list"] = np.array(data_id_list)
