@@ -146,6 +146,7 @@ class Solver:
                         )
                         context, sub_goal, tool_name = self.planner.extract_context_subgoal_and_tool(next_step)
                     if self.verbose:
+                        log_info(f"[NextStep raw][step={step_count}]: {next_step}")
                         log_info(f"\n==> 🎯 Step {step_count}: Action Prediction ({tool_name})\n")
                         log_info(f"[Context]: {context}\n[Sub Goal]: {sub_goal}\n[Tool]: {tool_name}")
                         log_info(f"[Time]: {round(time.time() - local_start_time, 2)}s")
