@@ -1,4 +1,9 @@
+import math
 import os
+import random
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import numpy as np
 import openai
 import requests
@@ -9,6 +14,28 @@ from agentflow.tools.base import BaseTool
 from agentflow.engine.factory import create_llm_engine
 
 load_dotenv()
+
+MAX_RATE_LIMIT_RETRIES = 2
+MAX_RATE_LIMIT_WAIT_SECONDS = 30.0
+
+
+def _rate_limit_wait_seconds(retry_after, attempt):
+    """Use Retry-After when available; otherwise back off with jitter."""
+    if retry_after:
+        try:
+            delay = float(retry_after)
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError, AttributeError):
+                delay = None
+        if delay is not None and math.isfinite(delay):
+            return max(0.0, delay) + 0.5
+
+    return 2 ** attempt + random.uniform(0.0, 0.5)
 
 # Tool name mapping - this defines the external name for this tool
 TOOL_NAME = "Web_RAG_Search_Tool"
@@ -148,17 +175,25 @@ class Web_Search_Tool(BaseTool):
             'Upgrade-Insecure-Requests': '1',
         }
 
-        try:
-            response = requests.get(url, headers=headers, timeout=10, verify=False)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'html.parser')
-            text = soup.get_text(separator='\n', strip=True)
-            text = text[:self.max_window_size] # Limit the text to max_window_size characters
-            return text
-        except requests.RequestException as e:
-            return f"Error fetching URL: {str(e)}"
-        except Exception as e:
-            return f"Error extracting text: {str(e)}"
+        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+            try:
+                response = requests.get(url, headers=headers, timeout=10, verify=False)
+                if response.status_code == 429 and attempt < MAX_RATE_LIMIT_RETRIES:
+                    wait_time = _rate_limit_wait_seconds(response.headers.get("Retry-After"), attempt)
+                    if wait_time <= MAX_RATE_LIMIT_WAIT_SECONDS:
+                        print(f"[Web RAG Rate Limit] 429; retrying in {wait_time:.1f}s "
+                              f"({attempt + 1}/{MAX_RATE_LIMIT_RETRIES})")
+                        response.close()
+                        time.sleep(wait_time)
+                        continue
+                response.raise_for_status()
+                soup = BeautifulSoup(response.content, 'html.parser')
+                text = soup.get_text(separator='\n', strip=True)
+                return text[:self.max_window_size]
+            except requests.RequestException as e:
+                return f"Error fetching URL: {str(e)}"
+            except Exception as e:
+                return f"Error extracting text: {str(e)}"
 
     def _chunk_website_content(self, content):
         """
