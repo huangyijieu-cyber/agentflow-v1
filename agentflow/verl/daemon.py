@@ -25,18 +25,22 @@ configure_logger()
 logger = logging.getLogger(__name__)
 
 
-def _gigpo_turn_step_reward(
-    turn_process_rewards: dict,
-    turn_index: int,
-    final_reward: float,
-    subreward_coeff: float = 0.5,
-    final_reward_coeff: float = 0.25,
-) -> float:
-    """Weight local subgoal hits above the final outcome in the GiGPO step signal."""
-    subgoal_reward = turn_process_rewards.get(
-        str(turn_index), turn_process_rewards.get(turn_index, 0.0)
-    )
-    return subreward_coeff * float(subgoal_reward) + final_reward_coeff * float(final_reward)
+def _gigpo_return_to_go(
+    turn_process_rewards: dict, n_turns: int, final_reward: float, gamma: float = 0.5
+) -> list[float]:
+    """Propagate first-hit subgoals and the terminal answer reward backward."""
+    returns = [0.0] * n_turns
+    future_return = 0.0
+    for turn_index in range(n_turns - 1, -1, -1):
+        subreward = turn_process_rewards.get(
+            str(turn_index), turn_process_rewards.get(turn_index, 0.0)
+        )
+        immediate_reward = float(subreward)
+        if turn_index == n_turns - 1:
+            immediate_reward += float(final_reward)
+        future_return = immediate_reward + gamma * future_return
+        returns[turn_index] = future_return
+    return returns
 
 
 def _training_token_scores(episode_rewards: list, aggregate_rewards: list, adv_estimator: str) -> list:
@@ -867,6 +871,9 @@ class AgentModeDaemon:
         for rollout_id, sample_info in finished_id_to_sample_info.items():
             traj_id = str(uuid.uuid4())
             n_turns = len(sample_info["trace_list"])
+            step_returns = _gigpo_return_to_go(
+                sample_info["turn_process_rewards"], n_turns, sample_info["episode_reward"]
+            )
             for turn_index, trace in enumerate(sample_info["trace_list"]):
                 is_done = False
 
@@ -890,16 +897,9 @@ class AgentModeDaemon:
                 # GiGPO episode signal: final-answer outcome only.
                 episode_reward_list.append(sample_info["episode_reward"])
 
-                # GiGPO step signal: 0.5 * first-hit subgoal reward at this turn
-                # plus 0.25 * final-answer reward for every turn.
-                # Action Step k is aligned to planner-log turn_index == k.
-                step_reward_list.append(
-                    _gigpo_turn_step_reward(
-                        sample_info["turn_process_rewards"],
-                        turn_index,
-                        sample_info["episode_reward"],
-                    )
-                )
+                # Reward-to-go discounts each later subgoal hit and the final
+                # answer by 0.5 per turn; no final reward is added at every turn.
+                step_reward_list.append(step_returns[turn_index])
 
                 # Mark samples with prompts exceeding max_prompt_length to be dropped later
                 if len(prompt_ids) > max_prompt_length:

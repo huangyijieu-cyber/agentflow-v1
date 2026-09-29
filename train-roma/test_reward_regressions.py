@@ -38,7 +38,7 @@ class InfoSeekRewardTests(unittest.TestCase):
         cls.rollout = load_functions(
             ROOT / "train-roma" / "rollout.py",
             {"_as_dict", "_normalize_entity", "_entity_mentioned", "_training_reward",
-             "compute_search_subreward"},
+             "compute_search_subreward", "build_gigpo_anchors", "build_turn_process_rewards"},
             {
                 "Any": Any,
                 "json": json,
@@ -49,7 +49,7 @@ class InfoSeekRewardTests(unittest.TestCase):
         )
         cls.daemon = load_functions(
             ROOT / "agentflow" / "verl" / "daemon.py",
-            {"_gigpo_turn_step_reward", "_training_token_scores"},
+            {"_gigpo_return_to_go", "_training_token_scores"},
             {},
         )
 
@@ -91,13 +91,36 @@ class InfoSeekRewardTests(unittest.TestCase):
         action["result"] = {"query": "John Smith spouse", "relevant_pages": []}
         self.assertEqual(self.rollout["compute_search_subreward"](result, spec)[0], 1.0)
 
-    def test_step_reward_uses_smaller_final_coefficient(self):
-        compute = self.daemon["_gigpo_turn_step_reward"]
-        hits_by_turn = {"1": 1.0}
-        self.assertEqual(compute(hits_by_turn, 0, 1.0), 0.25)
-        self.assertEqual(compute(hits_by_turn, 1, 1.0), 0.75)
-        self.assertEqual(compute(hits_by_turn, 1, 0.0), 0.5)
-        self.assertEqual(compute(hits_by_turn, 2, 0.0), 0.0)
+    def test_subgoal_and_terminal_rewards_propagate_by_half_per_turn(self):
+        hits = [{"turn": 2, "subgoal_id": "a", "weight": 0.3}]
+        turn_rewards = self.rollout["build_turn_process_rewards"](hits)
+        self.assertEqual(turn_rewards, {"2": 1.0})
+        compute = self.daemon["_gigpo_return_to_go"]
+        self.assertEqual(compute(turn_rewards, 4, 0.0), [0.25, 0.5, 1.0, 0.0])
+        self.assertEqual(compute({}, 4, 1.0), [0.125, 0.25, 0.5, 1.0])
+        self.assertEqual(compute(turn_rewards, 4, 1.0), [0.375, 0.75, 1.5, 1.0])
+
+    def test_active_subgoal_hit_is_one_point_even_with_fractional_source_weight(self):
+        result = {"memory": {"Action Step 1": {
+            "tool_name": "Wikipedia_Search_Tool", "result": "John Smith",
+        }}}
+        spec = {"subgoals": [{"id": "a", "answer": "John Smith", "weight": 0.3}]}
+        score, hits = self.rollout["compute_search_subreward"](result, spec)
+        self.assertEqual(score, 1.0)
+        self.assertEqual(hits[0]["weight"], 1.0)
+
+        spec["subgoals"][0]["weight"] = 0.0
+        self.assertEqual(self.rollout["compute_search_subreward"](result, spec), (0.0, []))
+
+    def test_anchor_visit_pairs_equal_progress_from_different_rollouts(self):
+        make_anchors = self.rollout["build_gigpo_anchors"]
+        a, a_mask = make_anchors([{"turn": 2, "subgoal_id": "f1"}], 6, "a")
+        b, b_mask = make_anchors([{"turn": 3, "subgoal_id": "f1"}], 7, "b")
+        self.assertNotEqual(a[1], a[2])  # same rollout, different visits to empty anchor
+        self.assertEqual(a[3], b[4])  # first visit after finding f1
+        self.assertEqual(a[4], b[5])  # second visit after finding f1
+        self.assertFalse(a_mask[-1])
+        self.assertFalse(b_mask[-1])
 
     def test_gigpo_critic_token_scores_use_only_final_reward(self):
         choose = self.daemon["_training_token_scores"]

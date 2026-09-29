@@ -89,7 +89,9 @@ def compute_search_subreward(result: dict, reward_spec: Any) -> Tuple[float, Lis
             if matched_alias is None:
                 continue
 
-            weight = float(subgoal.get("weight", 0.0))
+            if float(subgoal.get("weight", 1.0)) <= 0:
+                continue
+            weight = 1.0
             subreward += weight
             hit_subgoals.add(subgoal_id)
             hit_details.append(

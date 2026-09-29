@@ -289,7 +289,7 @@ def compute_advantage(
 
         # InfoSeek + GiGPO:
         #   episode reward = final-answer outcome only
-        #   step reward    = 0.5 * local subgoal reward + 0.25 * final-answer outcome
+        #   step reward    = reward-to-go over unit subgoal hits and terminal outcome
         episode_rewards_np = data.non_tensor_batch.get(
             'episode_reward_list', data.non_tensor_batch['reward_list']
         ).astype(np.float32)
@@ -313,7 +313,7 @@ def compute_advantage(
         compute_cross_step_data = False
         advantages, returns = core_gigpo.compute_gigpo_outcome_advantage(
             token_level_rewards=episode_token_level_rewards, # final-answer episode reward
-            step_rewards=step_rewards, # subgoal hit at this turn + final-answer outcome
+            step_rewards=step_rewards, # discounted future subgoal hits + terminal outcome
             response_mask=data.batch['response_mask'],
             anchor_obs=data.non_tensor_batch['anchor_list'],
             index=data.non_tensor_batch['uid'],

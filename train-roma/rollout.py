@@ -151,7 +151,11 @@ def compute_search_subreward(result: dict, reward_spec: Any):
             if matched_alias is None:
                 continue
 
-            weight = float(subgoal.get("weight", 0.0))
+            # An active first hit is one process-reward point regardless of
+            # the source annotation's optional weight.
+            if float(subgoal.get("weight", 1.0)) <= 0:
+                continue
+            weight = 1.0
             subreward += weight
             hit_subgoals.add(subgoal_id)
             hit_details.append({
@@ -163,6 +167,56 @@ def compute_search_subreward(result: dict, reward_spec: Any):
             })
 
     return subreward, hit_details
+
+
+def build_gigpo_anchors(subgoal_hits: list, n_turns: int, rollout_id: str):
+    """Pair turns by verified-hit state and visit number within that state."""
+    hits_by_turn = {}
+    for hit in subgoal_hits:
+        hit_turn = hit.get("turn")
+        subgoal_id = str(hit.get("subgoal_id", ""))
+        if hit_turn is not None and subgoal_id:
+            hits_by_turn.setdefault(int(hit_turn), set()).add(subgoal_id)
+
+    hit_state = set()
+    previous_tool_state = None
+    anchor_visit = -1
+    anchors = []
+    pair_mask = []
+    for turn_index in range(n_turns):
+        if turn_index == 0:
+            anchor_state = {"type": "analysis"}
+            pair_enabled = True
+        elif turn_index == n_turns - 1:
+            anchor_state = {"type": "answer", "rollout_id": rollout_id}
+            pair_enabled = False
+        else:
+            tool_state = tuple(sorted(hit_state))
+            anchor_visit = anchor_visit + 1 if tool_state == previous_tool_state else 0
+            previous_tool_state = tool_state
+            anchor_state = {
+                "type": "tool",
+                "hit_subgoals": list(tool_state),
+                "anchor_visit": anchor_visit,
+            }
+            pair_enabled = True
+
+        anchors.append(json.dumps(anchor_state, sort_keys=True, ensure_ascii=False))
+        pair_mask.append(pair_enabled)
+        if turn_index in hits_by_turn:
+            hit_state.update(hits_by_turn[turn_index])
+    return anchors, pair_mask
+
+
+def build_turn_process_rewards(subgoal_hits: list) -> dict[str, float]:
+    """Give each newly hit subgoal one unit at its search turn."""
+    rewards = {}
+    for hit in subgoal_hits:
+        turn = hit.get("turn")
+        if turn is not None:
+            key = str(turn)
+            rewards[key] = rewards.get(key, 0.0) + 1.0
+    return rewards
 
 class AgentFlowRollout:
     def __init__(
@@ -409,16 +463,8 @@ class RolloutAgent(LitAgent):
             ))
             # Per-turn process reward for GiGPO.  Keys are planner-log turn indices:
             # analyze_query=0, Action Step k=k, final_output=last turn.
-            # Each subgoal contributes only at the Search step where it is first hit.
-            turn_process_rewards = {}
-            for hit in subgoal_hits:
-                turn = hit.get("turn")
-                if turn is None:
-                    continue
-                turn_key = str(turn)
-                turn_process_rewards[turn_key] = (
-                    turn_process_rewards.get(turn_key, 0.0) + float(hit.get("weight", 0.0))
-                )
+            # Each newly hit subgoal contributes one point at its Search step.
+            turn_process_rewards = build_turn_process_rewards(subgoal_hits)
 
             reward_value = _training_reward(final_reward, subreward)
 
@@ -523,46 +569,10 @@ class RolloutAgent(LitAgent):
             if anchor is not None:
                 metadata["anchor"] = anchor
             if self.task == "qa":
-                # GiGPO state = subgoals already hit BEFORE the current action.
-                # Keep analysis separate from tool turns; final answer never participates
-                # in step-level GiGPO pairing (unique singleton anchor per rollout).
-                hits_by_turn = {}
-                for hit in subgoal_hits:
-                    hit_turn = hit.get("turn")
-                    subgoal_id = str(hit.get("subgoal_id", ""))
-                    if hit_turn is None or not subgoal_id:
-                        continue
-                    hits_by_turn.setdefault(int(hit_turn), set()).add(subgoal_id)
-
-                hit_state = set()
-                gigpo_anchors = []
-                gigpo_pair_mask = []
-                last_turn_index = len(planner_logs) - 1
-                for turn_index in range(len(planner_logs)):
-                    if turn_index == 0:
-                        # planner analysis only pairs with planner analysis.
-                        anchor_state = {"type": "analysis"}
-                        pair_enabled = True
-                    elif turn_index == last_turn_index:
-                        # final answer is excluded from GiGPO step pairing and keeps
-                        # only the episode/outcome advantage.
-                        anchor_state = {"type": "answer", "rollout_id": rollout_id}
-                        pair_enabled = False
-                    else:
-                        # Tool turns pair only when the pre-action hit-subgoal state matches.
-                        anchor_state = {
-                            "type": "tool",
-                            "hit_subgoals": sorted(hit_state),
-                        }
-                        pair_enabled = True
-
-                    gigpo_anchors.append(json.dumps(anchor_state, sort_keys=True, ensure_ascii=False))
-                    gigpo_pair_mask.append(pair_enabled)
-
-                    # A subgoal hit at turn k becomes part of the state from turn k+1 onward.
-                    if turn_index in hits_by_turn:
-                        hit_state.update(hits_by_turn[turn_index])
-
+                # Use the pre-action hit state and its local visit count.
+                gigpo_anchors, gigpo_pair_mask = build_gigpo_anchors(
+                    subgoal_hits, len(planner_logs), rollout_id
+                )
                 metadata["anchor"] = gigpo_anchors
                 metadata["gigpo_pair_mask"] = gigpo_pair_mask
                 metadata["reward_breakdown"] = {
