@@ -1,6 +1,5 @@
 import math
 import os
-import time
 os.environ["AGENTOPS_API_KEY"] = ""  # 清空 API key 禁用监控
 os.environ["AGENTOPS_AUTO_INIT"] = "false"
 os.environ["_JAVA_OPTIONS"] = "-Dorg.apache.lucene.store.MMapDirectory.enableMemorySegments=false"
@@ -24,7 +23,6 @@ from autogen_ext.tools.mcp import StdioServerParams
 from agentflow import Trainer, LitAgent, NamedResources, LLM, reward, configure_logger, DevTaskLoader
 
 from agentflow.solver import construct_solver
-from agentflow.rollout_timing import finish_rollout, profiling_enabled
 from datetime import datetime
 import uuid, json
 from filelock import FileLock
@@ -223,8 +221,6 @@ class RolloutAgent(LitAgent):
 
     async def _solve_and_evaluate(self, rollout_id: str, rollout: AgentFlowRollout, task: Any, step_n: int, val: bool = False, is_train: bool = True):
         """A helper function to run the agent, parse the result, and evaluate it."""
-        profile_val = val and profiling_enabled()
-        rollout_started = time.perf_counter() if profile_val else 0.0
         result = {}
         # try:
         if True:
@@ -272,7 +268,6 @@ class RolloutAgent(LitAgent):
         
         idx = task.get("extra_info", {}).get("idx", "unknown_idx")
 
-        reward_started = time.perf_counter() if profile_val else 0.0
         if self.task == "qa":
             ## 纯QA
             # Evaluate the answer against the ground truth
@@ -311,7 +306,6 @@ class RolloutAgent(LitAgent):
                 "timestamp": datetime.now().isoformat(),
             }
 
-        reward_s = time.perf_counter() - reward_started if profile_val else 0.0
 
         # data_id = str(uuid.uuid4())
         # filename = f"rollout_{data_id}.json"
@@ -348,7 +342,6 @@ class RolloutAgent(LitAgent):
 
         ## planner logs
         planner_logs = result["planner_logs"]
-        encoding_started = time.perf_counter() if profile_val else 0.0
         try:
             # Rollout.metadata is declared as Dict[str, Any].  Passing None
             # explicitly bypasses the model's default_factory and causes a
@@ -374,17 +367,6 @@ class RolloutAgent(LitAgent):
                 f"Failed to build Rollout for rollout_id={rollout_id}"
             ) from e
 
-        if profile_val:
-            finished = time.perf_counter()
-            profile = finish_rollout(
-                result.get("timing_profile"),
-                finished - rollout_started,
-                reward_s,
-                finished - encoding_started,
-            )
-            profile["step_count"] = result.get("step_count", 0)
-            profile["sample_index"] = str(task.get("index", idx))
-            rollout_package.metadata["timing_profile"] = profile
         
         return rollout_package
         
