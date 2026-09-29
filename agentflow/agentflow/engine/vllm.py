@@ -140,7 +140,8 @@ class ChatVLLM(EngineLM, CachedEngine):
 
 
         ## fixed parameters
-        temperature = 0.7
+        # temperature = 0.7
+        temperature = kwargs.get("temperature", 0.7)
         top_p = 1.0
         presence_penalty = 0
         print(f"post by _generate_text, temperature: {temperature}")

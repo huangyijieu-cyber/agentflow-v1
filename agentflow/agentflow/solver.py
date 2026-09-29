@@ -79,6 +79,7 @@ class Solver:
         if self.task == "qa":
             timing = RolloutTiming() if profiling_enabled() else None
             measure = timing.track if timing else lambda *args, **kwargs: nullcontext()
+            self.memory.clear()
             # Update cache directory for the executor
             self.executor.set_query_cache_dir(self.root_cache_dir)
 
