@@ -170,7 +170,7 @@ def compute_search_subreward(result: dict, reward_spec: Any):
 
 
 def build_gigpo_anchors(subgoal_hits: list, n_turns: int, rollout_id: str):
-    """Pair turns by verified-hit state and visit number within that state."""
+    """Pair non-answer turns by hit state and visit, including initial analysis."""
     hits_by_turn = {}
     for hit in subgoal_hits:
         hit_turn = hit.get("turn")
@@ -179,24 +179,20 @@ def build_gigpo_anchors(subgoal_hits: list, n_turns: int, rollout_id: str):
             hits_by_turn.setdefault(int(hit_turn), set()).add(subgoal_id)
 
     hit_state = set()
-    previous_tool_state = None
+    previous_state = None
     anchor_visit = -1
     anchors = []
     pair_mask = []
     for turn_index in range(n_turns):
-        if turn_index == 0:
-            anchor_state = {"type": "analysis"}
-            pair_enabled = True
-        elif turn_index == n_turns - 1:
+        if turn_index == n_turns - 1:
             anchor_state = {"type": "answer", "rollout_id": rollout_id}
             pair_enabled = False
         else:
-            tool_state = tuple(sorted(hit_state))
-            anchor_visit = anchor_visit + 1 if tool_state == previous_tool_state else 0
-            previous_tool_state = tool_state
+            state = tuple(sorted(hit_state))
+            anchor_visit = anchor_visit + 1 if state == previous_state else 0
+            previous_state = state
             anchor_state = {
-                "type": "tool",
-                "hit_subgoals": list(tool_state),
+                "hit_subgoals": list(state),
                 "anchor_visit": anchor_visit,
             }
             pair_enabled = True

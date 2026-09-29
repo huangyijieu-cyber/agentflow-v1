@@ -122,6 +122,25 @@ class InfoSeekRewardTests(unittest.TestCase):
         self.assertFalse(a_mask[-1])
         self.assertFalse(b_mask[-1])
 
+    def test_analysis_uses_empty_anchor_and_starts_visit_count(self):
+        make_anchors = self.rollout["build_gigpo_anchors"]
+        a, a_mask = make_anchors([{"turn": 1, "subgoal_id": "f1"}], 5, "a")
+        b, b_mask = make_anchors([], 5, "b")
+        self.assertEqual([json.loads(anchor) for anchor in a[:-1]], [
+            {"hit_subgoals": [], "anchor_visit": 0},
+            {"hit_subgoals": [], "anchor_visit": 1},
+            {"hit_subgoals": ["f1"], "anchor_visit": 0},
+            {"hit_subgoals": ["f1"], "anchor_visit": 1},
+        ])
+        self.assertEqual([json.loads(anchor) for anchor in b[:-1]], [
+            {"hit_subgoals": [], "anchor_visit": visit} for visit in range(4)
+        ])
+        self.assertEqual(a[0], b[0])
+        self.assertEqual(a[1], b[1])
+        self.assertNotEqual(a[0], b[1])
+        self.assertEqual(a_mask, [True, True, True, True, False])
+        self.assertEqual(a_mask, b_mask)
+
     def test_gigpo_critic_token_scores_use_only_final_reward(self):
         choose = self.daemon["_training_token_scores"]
         self.assertEqual(choose([1.0, 0.0], [2.0, 1.0], "gigpo"), [1.0, 0.0])
@@ -141,6 +160,39 @@ class GiGPOAdvantageTests(unittest.TestCase):
         with patch.dict(sys.modules, {"verl": verl}):
             spec.loader.exec_module(module)
         cls.core_gigpo = module
+
+    def test_single_trajectory_has_zero_episode_advantage(self):
+        for reward in (0.0, 1.0):
+            for turns in (1, 3):
+                for remove_std in (True, False):
+                    for cross_steps in (True, False):
+                        with self.subTest(reward=reward, turns=turns,
+                                          remove_std=remove_std, cross_steps=cross_steps):
+                            advantages = self.core_gigpo.episode_norm_reward(
+                                token_level_rewards=torch.tensor([[0.0, reward]] * turns),
+                                response_mask=torch.ones(turns, 2),
+                                index=np.array(["question"] * turns),
+                                traj_index=np.array(["only_rollout"] * turns),
+                                remove_std=remove_std,
+                                compute_mean_std_cross_steps=cross_steps,
+                            )
+                            self.assertTrue(torch.equal(advantages, torch.zeros(turns, 2)))
+
+    def test_single_trajectory_question_does_not_change_other_groups(self):
+        for remove_std in (True, False):
+            with self.subTest(remove_std=remove_std):
+                advantages = self.core_gigpo.episode_norm_reward(
+                    token_level_rewards=torch.tensor([[1.0], [1.0], [1.0], [1.0], [0.0]]),
+                    response_mask=torch.ones(5, 1),
+                    index=np.array(["single", "single", "paired", "paired", "paired"]),
+                    traj_index=np.array(["a", "a", "b", "b", "c"]),
+                    remove_std=remove_std,
+                    compute_mean_std_cross_steps=False,
+                )
+                expected = torch.tensor([[0.0], [0.0], [0.5], [0.5], [-0.5]])
+                if not remove_std:
+                    expected /= torch.tensor([1.0, 0.0]).std() + 1e-6
+                self.assertTrue(torch.allclose(advantages, expected))
 
     def test_singleton_keeps_episode_advantage_and_answer_excludes_step(self):
         # Two rollouts of one question, each with analysis, tool and answer turns.

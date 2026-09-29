@@ -243,8 +243,10 @@ def episode_norm_reward(token_level_rewards: torch.Tensor,
 
         for idx in id2score:
             if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-                id2std[idx] = torch.tensor(1.0)
+                # No peer trajectory means no relative episode signal. Clone
+                # the baseline because scores are updated in place below.
+                id2mean[idx] = id2score[idx][0].clone()
+                id2std[idx] = torch.ones_like(id2mean[idx])
             elif len(id2score[idx]) > 1:
                 id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
                 id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
