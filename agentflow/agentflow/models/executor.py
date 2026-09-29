@@ -221,8 +221,10 @@ execution = tool.execute(query=["Methanol", "function of hyperbola", "Fermat's L
             cancel_event = threading.Event()
             
             def target():
+                from agentflow.tools.page_summary import summary_cancel_event
+                cancel_token = summary_cancel_event.set(cancel_event)
                 try:
-                    # Inject cancel_event into the execution context for cooperative cancellation
+                    # Inject cancel_event into the execution context for other tools.
                     local_context['_cancel_event'] = cancel_event
                     exec(block, globals(), local_context)
                     result_container['result'] = local_context.get('execution')
@@ -230,7 +232,9 @@ execution = tool.execute(query=["Methanol", "function of hyperbola", "Fermat's L
                 except Exception as e:
                     result_container['exception'] = e
                     result_container['completed'] = True
-            
+                finally:
+                    summary_cancel_event.reset(cancel_token)
+
             # Start execution in a daemon thread
             exec_thread = threading.Thread(target=target, name=f"ToolExec-{id(block)}")
             exec_thread.daemon = True

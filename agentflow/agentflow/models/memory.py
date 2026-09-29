@@ -1,6 +1,10 @@
 from typing import Dict, Any, List, Union, Optional
 import os
 
+from agentflow.context_budget import ContextBudgetError, get_context_budget
+
+MEMORY_PLACEHOLDER = "__AGENTFLOW_TOOL_MEMORY__"
+
 class Memory:
 
     def __init__(self):
@@ -70,47 +74,34 @@ class Memory:
             'result': result,
         }
         step_name = f"Action Step {step_count}"
+        # Replacing a key must also refresh its position in the recency window.
+        self.actions.pop(step_name, None)
         self.actions[step_name] = action
     
     def clear(self) -> None:
-        """Clear all accumulated actions (and file list).
-
-        Called at the start of each task's solve() to prevent cross-task memory
-        accumulation: without this, a shared solver instance keeps appending every
-        tool result across tasks, which blows up the prompt input_tokens and causes
-        vLLM context-limit 400 errors (see memory accumulation analysis).
-        """
+        """Explicitly clear actions and files; callers control when to reset."""
         self.actions = {}
         self.files = []
 
-    def get_actions(self, max_steps: int = 3, max_result_chars: int = 2000,
+    def get_actions(self, max_steps: int = 3, max_result_chars: Optional[int] = None,
                     max_command_chars: int = 500) -> Dict[str, Dict[str, Any]]:
-        """Return actions with bounded size to keep the prompt's input_tokens in check.
+        """Recent actions with complete summaries; raw records remain untouched.
 
-        The raw actions dict grows unboundedly: each step stores the full tool result
-        (e.g. long Brave/Web_RAG snippets). Embedding all of it into every
-        Planner/Verifier prompt eventually exceeds the model's context window
-        (input_tokens + max_tokens > max_model_len -> vLLM 400).
-
-        Strategy (bounded memory view):
-          - keep only the most recent `max_steps` actions (older steps are usually
-            less relevant to the current sub-goal);
-          - truncate each step's `result` to `max_result_chars`;
-          - truncate `command` to `max_command_chars`.
-
-        Returns a dict with the same shape as before so existing
-        `{memory.get_actions()}` f-string usage keeps working.
+        render_prompt enforces a token budget on the entire model input. The
+        optional character limit is retained only for explicit legacy callers.
         """
-        if not self.actions:
+        if not self.actions or max_steps <= 0:
             return {}
         # Keep the most recent max_steps actions (dict preserves insertion order).
         steps = list(self.actions.items())[-max_steps:]
         truncated = {}
         for step_name, action in steps:
             item = dict(action)
+            if item.get("tool_name") in {"Wikipedia_RAG_Search_Tool", "Wikipedia_Search_Tool"}:
+                item["result"] = self._wiki_evidence(item.get("result"))
             try:
                 result_str = str(item.get("result", ""))
-                if len(result_str) > max_result_chars:
+                if max_result_chars is not None and len(result_str) > max_result_chars:
                     item["result"] = result_str[:max_result_chars] + "...[truncated]"
             except Exception:
                 pass
@@ -122,6 +113,70 @@ class Memory:
                 pass
             truncated[step_name] = item
         return truncated
+
+    @staticmethod
+    def _wiki_evidence(result):
+        # Executor wraps tool outputs in a list, even for a single command.
+        if isinstance(result, list):
+            return [Memory._wiki_evidence(value) for value in result]
+        if not isinstance(result, dict):
+            return result
+        key = next((key for key in result if key.startswith("relevant_pages")), None)
+        pages = result.get(key) if key else None
+        if not isinstance(pages, list) or not pages:
+            return result  # Preserve candidate URLs and error information on failures.
+        compact = []
+        for page in pages:
+            if not isinstance(page, dict):
+                compact.append(page)
+                continue
+            fields = ["title", "url", "retrieved_information", "error"]
+            if not page.get("retrieved_information") or str(page["retrieved_information"]).startswith("Error"):
+                fields.append("abstract")
+            compact.append({field: page[field] for field in fields if field in page})
+        return {"query": result.get("query"), key: compact}
+
+    def render_prompt(self, template, engine, output_tokens=2048, budget=None):
+        """Fit recent history into the *whole* prompt, keeping the latest result.
+
+        Older results are replaced by small action records first, then dropped
+        if needed. The latest summary is never sliced. If it alone cannot fit,
+        report a configuration error rather than silently discarding evidence.
+        """
+        if MEMORY_PLACEHOLDER not in template:
+            raise ValueError("Memory placeholder missing from prompt template")
+        budget = budget or get_context_budget(engine, "AGENTFLOW_AGENT")
+        actions = self.get_actions()
+
+        def render():
+            return template.replace(MEMORY_PLACEHOLDER, str(actions))
+
+        prompt = render()
+        if budget.fits(prompt, output_tokens):
+            return prompt
+        older = list(actions)[:-1]
+        for name in older:
+            action = actions[name]
+            actions[name] = {
+                "tool_name": action["tool_name"],
+                "sub_goal": action["sub_goal"],
+                "result": "[Earlier evidence omitted to fit the context budget]",
+            }
+            prompt = render()
+            if budget.fits(prompt, output_tokens):
+                print(f"[Memory budget] Omitted older evidence through {name}; latest summary retained")
+                return prompt
+        for name in older:
+            del actions[name]
+            prompt = render()
+            if budget.fits(prompt, output_tokens):
+                print("[Memory budget] Dropped older action records; latest summary retained")
+                return prompt
+        raise ContextBudgetError(
+            "The question, instructions and latest complete tool result cannot fit "
+            "the agent context budget. Reduce AGENTFLOW_WEB_SUMMARY_TOKENS or "
+            "increase the agent's serving context limit; no summary was truncated."
+        )
 
     def get_all_actions(self) -> Dict[str, Dict[str, Any]]:
         """Return the FULL (untruncated) actions dict, for trace/logging purposes.

@@ -7,7 +7,7 @@ from PIL import Image
 
 from agentflow.engine.factory import create_llm_engine
 from agentflow.models.formatters import MemoryVerification
-from agentflow.models.memory import Memory
+from agentflow.models.memory import Memory, MEMORY_PLACEHOLDER
 from agentflow.models.utils import robust_json_loads
 
 class Verifier:
@@ -52,7 +52,7 @@ Image: {image_info}
 Available Tools: {self.available_tools}
 Toolbox Metadata: {self.toolbox_metadata}
 Initial Analysis: {query_analysis}
-Memory (tools used and results): {memory.get_actions()}
+Memory (tools used and results): {MEMORY_PLACEHOLDER}
 
 Detailed Instructions:
 1. Carefully analyze the query, initial analysis, and image (if provided):
@@ -113,7 +113,7 @@ Context:
 - **Available Tools:** {self.available_tools}
 - **Toolbox Metadata:** {self.toolbox_metadata}
 - **Initial Analysis:** {query_analysis}
-- **Memory (Tools Used & Results):** {memory.get_actions()}
+- **Memory (Tools Used & Results):** {MEMORY_PLACEHOLDER}
 
 Instructions:
 1.  Review the query, initial analysis, and memory.
@@ -130,6 +130,7 @@ Final Determination:
 IMPORTANT: The response must end with either "Conclusion: STOP" or "Conclusion: CONTINUE".
 """
 
+        prompt_memory_verification = memory.render_prompt(prompt_memory_verification, self.llm_engine_fixed)
         input_data = [prompt_memory_verification]
         if image_info:
             try:

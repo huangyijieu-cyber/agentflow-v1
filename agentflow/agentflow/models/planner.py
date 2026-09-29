@@ -7,7 +7,7 @@ from PIL import Image
 
 from agentflow.engine.factory import create_llm_engine
 from agentflow.models.formatters import NextStep, QueryAnalysis
-from agentflow.models.memory import Memory
+from agentflow.models.memory import Memory, MEMORY_PLACEHOLDER
 from agentflow.models.utils import robust_json_loads
 
 class Planner:
@@ -212,7 +212,7 @@ Tool Metadata:
 {self.toolbox_metadata}
 
 Previous Steps and Their Results:
-{memory.get_actions()}
+{MEMORY_PLACEHOLDER}
 
 Current Step: {step_count} in {max_step_count} steps
 Remaining Steps: {max_step_count - step_count}
@@ -276,7 +276,7 @@ Context:
 - **Query Analysis:** {query_analysis}
 - **Available Tools:** {self.available_tools}
 - **Toolbox Metadata:** {self.toolbox_metadata}
-- **Previous Steps:** {memory.get_actions()}
+- **Previous Steps:** {MEMORY_PLACEHOLDER}
 
 Instructions:
 1. Analyze the query, previous steps, and available tools.
@@ -299,6 +299,7 @@ Rules:
         # print(f"response_format: {NextStep}")
         # print(f"prompt_generate_next_step:\n{prompt_generate_next_step}")
 
+        prompt_generate_next_step = memory.render_prompt(prompt_generate_next_step, self.llm_engine)
         next_step = self.llm_engine(prompt_generate_next_step, response_format=NextStep, temperature=self.temperature, usage_by="[planner] next step")
         if json_data is not None:
             json_data[f"action_predictor_{step_count}_prompt"] = prompt_generate_next_step
@@ -319,7 +320,7 @@ Context:
 Query: {question}
 Image: {image_info}
 Actions Taken:
-{memory.get_actions()}
+{MEMORY_PLACEHOLDER}
 
 Instructions:
 1. Review the query, image, and all actions taken during the process.
@@ -360,13 +361,14 @@ Task: Generate the final output based on the query and the results from all tool
 
 Context:
 - **Query:** {question}
-- **Actions Taken:** {memory.get_actions()}
+- **Actions Taken:** {MEMORY_PLACEHOLDER}
 
 Instructions:
 1. Review the query and the results from all tool executions.
 2. Incorporate the relevant information to create a coherent, step-by-step final output.
 """
 
+        prompt_generate_final_output = memory.render_prompt(prompt_generate_final_output, self.llm_engine)
         input_data = [prompt_generate_final_output]
         if image_info:
             try:
@@ -394,7 +396,7 @@ Image: {image_info}
 Initial Analysis:
 {self.query_analysis}
 Actions Taken:
-{memory.get_actions()}
+{MEMORY_PLACEHOLDER}
 
 Please generate the concise output based on the query, image information, initial analysis, and actions taken. Break down the process into clear, logical, and conherent steps. Conclude with a precise and direct answer to the query.
 
@@ -407,7 +409,7 @@ Task: Generate a concise final answer to the query based on all provided context
 Context:
 - **Query:** {question}
 - **Initial Analysis:** {self.query_analysis}
-- **Actions Taken:** {memory.get_actions()}
+- **Actions Taken:** {MEMORY_PLACEHOLDER}
 
 Instructions:
 1. Review the query and the results from all actions.
@@ -419,6 +421,7 @@ Output Structure:
 2.  **Answer:** A direct and concise final answer to the query.
 """
 
+        prompt_generate_direct_output = memory.render_prompt(prompt_generate_direct_output, self.llm_engine)
         input_data = [prompt_generate_direct_output]
         if image_info:
             try:

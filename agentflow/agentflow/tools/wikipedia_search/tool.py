@@ -273,7 +273,7 @@ class Wikipedia_Search_Tool(BaseTool):
     def __init__(self, model_string="gpt-4o-mini"):
         super().__init__(
             tool_name=TOOL_NAME,
-            tool_description="A tool that searches Wikipedia and returns relevant pages with their page titles, URLs, abstract, and retrieved information based on a given query.",
+            tool_description="Searches Wikipedia, selects relevant pages and reads each selected page in full (in segments when needed), returning titles, URLs, abstracts and query-focused evidence summaries.",
             tool_version="1.0.0",
             input_types={
                 "query": "str - The search query for Wikipedia."
@@ -300,6 +300,7 @@ class Wikipedia_Search_Tool(BaseTool):
         )
 
         self.model_string = model_string
+        self._web_summary_tool = None
 
         self.llm_engine = create_llm_engine(
             model_string=model_string,
@@ -461,12 +462,14 @@ class Wikipedia_Search_Tool(BaseTool):
             if i not in matched_query_ids
         ]
 
-        # For each relevant page, get detailed information using Web RAG
+        # Read every selected page using the shared full-page summarization path.
         print("model_string:", self.model_string)
 
-        web_rag_tool = Web_Search_Tool(
-            model_string=self.model_string
-        )
+        if self._web_summary_tool is None:
+            self._web_summary_tool = Web_Search_Tool(
+                model_string=self.model_string, llm_engine=self.llm_engine
+            )
+        web_rag_tool = self._web_summary_tool
 
         for page in pages_data:
 
@@ -485,6 +488,8 @@ class Wikipedia_Search_Tool(BaseTool):
 
             except Exception as e:
                 page["retrieved_information"] = None
+                page["error"] = f"Page summarization failed: {e}"
+                print(f"[Wikipedia summary] {url}: {e}")
 
         return {
             "query": query,
