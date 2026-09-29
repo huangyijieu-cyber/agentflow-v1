@@ -20,6 +20,7 @@ import concurrent.futures
 
 from verl import DataProto
 from agentflow.rollout_timing import profiling_enabled
+from .context_endpoints import register_tokenizer_routes
 
 configure_logger()
 
@@ -193,6 +194,7 @@ class AgentModeDaemon:
         This proxy load-balances requests to the actual backend LLM servers.
         """
         app = Flask(__name__)
+        register_tokenizer_routes(app, self.tokenizer)
 
         num_requests = 0
         last_request_time = 0
@@ -251,8 +253,10 @@ class AgentModeDaemon:
                 ]
                 if resp.status_code == 200:
                     ## judge stream or not
-                    json_data = json.loads(req_data)
-                    is_stream = json_data.get("stream", False)
+                    # GET /v1/models has no request body. Parsing that empty
+                    # body used to turn a successful backend response into 500.
+                    json_data = request.get_json(silent=True)
+                    is_stream = isinstance(json_data, dict) and bool(json_data.get("stream", False))
 
                     if not is_stream:
                         ## 非流式处理

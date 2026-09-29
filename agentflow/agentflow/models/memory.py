@@ -172,10 +172,21 @@ class Memory:
             if budget.fits(prompt, output_tokens):
                 print("[Memory budget] Dropped older action records; latest summary retained")
                 return prompt
+        if getattr(budget, "tokenizer_mode", None) == "utf8-upper-bound":
+            # An upper bound above a limit does NOT establish that the actual
+            # token count is above it. Let the serving model validate its input.
+            print("[Memory budget] Exact token count unavailable; preserving the latest "
+                  "complete result and letting the model server validate context length. "
+                  "Configure AGENTFLOW_AGENT_TOKENIZER_PATH for exact local counting.")
+            return prompt
+        input_tokens = budget.count(getattr(budget, "system_prompt", "") + "\n" + prompt)
         raise ContextBudgetError(
-            "The question, instructions and latest complete tool result cannot fit "
-            "the agent context budget. Reduce AGENTFLOW_WEB_SUMMARY_TOKENS or "
-            "increase the agent's serving context limit; no summary was truncated."
+            f"Agent prompt does not fit: input={input_tokens}, output_reserved={output_tokens}, "
+            f"margin={getattr(budget, 'margin', 0)}, limit={budget.limit}, "
+            f"counting={getattr(budget, 'tokenizer_mode', 'provided-tokenizer')}, "
+            f"model={getattr(budget, 'model', 'unknown')}, memory_steps={len(actions)}. "
+            "Check this model's serving limit or reduce the tool summary length; "
+            "no summary was truncated."
         )
 
     def get_all_actions(self) -> Dict[str, Dict[str, Any]]:

@@ -178,12 +178,53 @@ class ContextTests(unittest.TestCase):
 
     def test_unavailable_endpoints_use_byte_bound_and_stop_retrying_tokenizer(self):
         with patch.dict(os.environ, {"AGENTFLOW_WEB_CONTEXT_TOKENS": "6000"}), \
+                patch("agentflow.context_budget._load_local_tokenizer", return_value=None), \
                 patch.object(ContextBudget, "_json_request", side_effect=requests.ConnectionError) as http:
             budget = ContextBudget(self.engine())
             self.assertEqual(budget.limit, 6000)
             self.assertEqual(budget.count("中文"), 6)
             self.assertEqual(budget.count("another"), 7)
-            self.assertEqual(http.call_count, 2)  # Discovery once, tokenizer once.
+            self.assertEqual(http.call_count, 3)  # Discovery once, two tokenizer routes once each.
+
+    def test_versioned_tokenizer_route_is_remembered(self):
+        def response(method, url, **kwargs):
+            if url.endswith("/models"):
+                return {"data": [{"id": "qwen", "max_model_len": 32768}]}
+            if url == "http://server/tokenize":
+                raise requests.HTTPError("404")
+            self.assertEqual(url, "http://server/v1/tokenize")
+            return {"count": 10}
+        with patch.object(ContextBudget, "_json_request", side_effect=response) as http:
+            budget = ContextBudget(self.engine())
+            self.assertEqual(budget.count("first"), 10)
+            self.assertEqual(budget.count("second"), 10)
+            self.assertEqual(http.call_count, 4)
+            self.assertEqual(budget.limit, 32768)
+
+    def test_single_model_alias_does_not_hide_serving_limit(self):
+        with patch.object(ContextBudget, "_json_request", return_value={
+                "data": [{"id": "/models/qwen", "max_model_len": 32768}]}):
+            self.assertEqual(ContextBudget(self.engine()).limit, 32768)
+
+    def test_unavailable_endpoints_use_exact_local_tokenizer(self):
+        tokenizer = types.SimpleNamespace(encode=lambda text, **kwargs: text.split())
+        with patch.object(ContextBudget, "_json_request", side_effect=requests.ConnectionError), \
+                patch("agentflow.context_budget._load_local_tokenizer", return_value=tokenizer):
+            budget = ContextBudget(self.engine(), "AGENTFLOW_AGENT")
+            prompt = "information " * 1000  # 12000 bytes, only 1000 toy tokens.
+            self.assertTrue(budget.fits(prompt, 2048))
+            self.assertEqual(budget.tokenizer_mode, "local-tokenizer")
+
+    def test_byte_estimate_alone_does_not_abort_an_agent_rollout(self):
+        with patch.object(ContextBudget, "_json_request", side_effect=requests.ConnectionError), \
+                patch("agentflow.context_budget._load_local_tokenizer", return_value=None):
+            budget = ContextBudget(self.engine(), "AGENTFLOW_AGENT")
+            memory = Memory()
+            result = "information " * 1000 + "TAIL"
+            memory.add_action(1, "Web_RAG_Search_Tool", "goal", "command", [result])
+            prompt = memory.render_prompt(MEMORY_PLACEHOLDER, None, budget=budget)
+            self.assertIn(result, prompt)
+            self.assertEqual(budget.tokenizer_mode, "utf8-upper-bound")
 
 
 class MemoryTests(unittest.TestCase):
