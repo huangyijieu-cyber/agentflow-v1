@@ -69,7 +69,7 @@ class Planner:
         self.logs.append({"prompt": input_data[0], "response": self.base_response})
         return self.base_response
 
-    def analyze_query(self, question: str, image: str) -> str:
+    def analyze_query(self, question: str, image: str, max_tokens: int = 2048) -> str:
         image_info = self.get_image_info(image)
 
         if self.is_multimodal:
@@ -132,7 +132,7 @@ Be biref and precise with insight.
         print("Input data of `analyze_query()`: ", input_data)
 
         # self.query_analysis = self.llm_engine_mm(input_data, response_format=QueryAnalysis)
-        self.query_analysis = self.llm_engine(input_data[0], response_format=QueryAnalysis, temperature=self.temperature, usage_by="[planner] analyze query")
+        self.query_analysis = self.llm_engine(input_data[0], max_tokens=max_tokens, response_format=QueryAnalysis, temperature=self.temperature, usage_by="[planner] analyze query")
         # self.query_analysis = self.llm_engine_fixed(input_data, response_format=QueryAnalysis)
 
         self.logs.append({"prompt": input_data[0], "response": self.query_analysis})
@@ -195,7 +195,7 @@ Be biref and precise with insight.
 
         return context, sub_goal, tool_name
 
-    def generate_next_step(self, question: str, image: str, query_analysis: str, memory: Memory, step_count: int, max_step_count: int, json_data: Any = None) -> Any:
+    def generate_next_step(self, question: str, image: str, query_analysis: str, memory: Memory, step_count: int, max_step_count: int, json_data: Any = None, max_tokens: int = 2048) -> Any:
         if self.is_multimodal:
             prompt_generate_next_step = f"""
 Task: Determine the optimal next step to address the given query based on the provided analysis, available tools, and previous steps taken.
@@ -299,8 +299,8 @@ Rules:
         # print(f"response_format: {NextStep}")
         # print(f"prompt_generate_next_step:\n{prompt_generate_next_step}")
 
-        prompt_generate_next_step = memory.render_prompt(prompt_generate_next_step, self.llm_engine)
-        next_step = self.llm_engine(prompt_generate_next_step, response_format=NextStep, temperature=self.temperature, usage_by="[planner] next step")
+        prompt_generate_next_step = memory.render_prompt(prompt_generate_next_step, self.llm_engine, output_tokens=max_tokens)
+        next_step = self.llm_engine(prompt_generate_next_step, max_tokens=max_tokens, response_format=NextStep, temperature=self.temperature, usage_by="[planner] next step")
         if json_data is not None:
             json_data[f"action_predictor_{step_count}_prompt"] = prompt_generate_next_step
             json_data[f"action_predictor_{step_count}_response"] = str(next_step)
@@ -368,7 +368,7 @@ Instructions:
 2. Incorporate the relevant information to create a coherent, step-by-step final output.
 """
 
-        prompt_generate_final_output = memory.render_prompt(prompt_generate_final_output, self.llm_engine)
+        prompt_generate_final_output = memory.render_prompt(prompt_generate_final_output, self.llm_engine, output_tokens=max_tokens)
         input_data = [prompt_generate_final_output]
         if image_info:
             try:
@@ -386,7 +386,7 @@ Instructions:
         return final_output
 
 
-    def generate_direct_output(self, question: str, image: str, memory: Memory) -> str:
+    def generate_direct_output(self, question: str, image: str, memory: Memory, max_tokens: int = 2048) -> str:
         image_info = self.get_image_info(image)
         if self.is_multimodal:
             prompt_generate_direct_output = f"""
@@ -421,7 +421,7 @@ Output Structure:
 2.  **Answer:** A direct and concise final answer to the query.
 """
 
-        prompt_generate_direct_output = memory.render_prompt(prompt_generate_direct_output, self.llm_engine)
+        prompt_generate_direct_output = memory.render_prompt(prompt_generate_direct_output, self.llm_engine, output_tokens=max_tokens)
         input_data = [prompt_generate_direct_output]
         if image_info:
             try:
@@ -431,7 +431,7 @@ Output Structure:
             except Exception as e:
                 print(f"Error reading image file: {str(e)}")
 
-        final_output = self.llm_engine(input_data[0], temperature=self.temperature, usage_by="[planner] generate direct output")
+        final_output = self.llm_engine(input_data[0], max_tokens=max_tokens, temperature=self.temperature, usage_by="[planner] generate direct output")
         # final_output = self.llm_engine_fixed(input_data)
         # final_output = self.llm_engine_mm(input_data)
 
