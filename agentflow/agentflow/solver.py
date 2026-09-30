@@ -119,7 +119,7 @@ class Solver:
                 # [1] Analyze query
                 query_start_time = time.time()
                 with measure("planner", detail="query_analysis"):
-                    query_analysis = self.planner.analyze_query(question, image_path)
+                    query_analysis = self.planner.analyze_query(question, image_path, self.max_tokens)
                 json_data["query_analysis"] = query_analysis
                 if self.verbose:
                     log_info(f"\n==> 🔍 Step 0: Query Analysis\n")
@@ -144,6 +144,7 @@ class Solver:
                             step_count,
                             self.max_steps,
                             json_data,
+                            self.max_tokens,
                         )
                         context, sub_goal, tool_name = self.planner.extract_context_subgoal_and_tool(next_step)
                     if self.verbose:
@@ -237,7 +238,7 @@ class Solver:
                 # Generate direct output if requested
                 if 'direct' in self.output_types:
                     with measure("planner", detail="direct_output"):
-                        direct_output = self.planner.generate_direct_output(question, image_path, self.memory)
+                        direct_output = self.planner.generate_direct_output(question, image_path, self.memory, self.max_tokens)
                     json_data["direct_output"] = direct_output
                     log_info(f"\n==> 🐙 Final Answer:\n\n{direct_output}")
 
