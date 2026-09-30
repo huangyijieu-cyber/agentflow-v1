@@ -5,7 +5,6 @@ import urllib3
 from agentflow.models.utils import robust_json_loads
 from agentflow.tools.network_retry import (
     MAX_NETWORK_RETRIES,
-    MAX_RETRY_WAIT_SECONDS,
     RETRYABLE_HTTP_STATUSES,
     retry_wait_seconds,
 )
@@ -94,7 +93,8 @@ def _patched_get(url, params=None, **kwargs):
             status_code=response.status_code,
             retry_after=retry_after,
         )
-        if attempt >= MAX_NETWORK_RETRIES or wait_time > MAX_RETRY_WAIT_SECONDS:
+        # Honor Retry-After even when Wikipedia asks for a long cooldown.
+        if attempt >= MAX_NETWORK_RETRIES:
             if response.status_code == 429:
                 response.close()
                 raise WikipediaRateLimitError(
