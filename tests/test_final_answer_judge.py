@@ -15,9 +15,9 @@ def scoring_namespace(filename, judge):
     evaluate = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == 'evaluate')
     solve = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == '_solve_and_evaluate')
     qa = next(n for n in ast.walk(solve) if isinstance(n, ast.If) and ast.unparse(n.test) == "self.task == 'qa'")
-    assignment = next(n for n in qa.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'final_reward' for t in n.targets))
+    assignment = next(n for n in qa.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'reward_value' for t in n.targets))
     wrapper = ast.parse('async def score(task, answer, val):\n    pass\n').body[0]
-    wrapper.body = [assignment, ast.Return(value=ast.Name(id='final_reward', ctx=ast.Load()))]
+    wrapper.body = [assignment, ast.Return(value=ast.Name(id='reward_value', ctx=ast.Load()))]
     module = ast.fix_missing_locations(ast.Module(body=[evaluate, wrapper], type_ignores=[]))
     namespace = {'asyncio': asyncio, 'reward': REWARD, 'compute_score': judge}
     exec(compile(module, filename, 'exec'), namespace)
@@ -32,7 +32,8 @@ class FinalAnswerJudgeTests(unittest.TestCase):
                     with self.subTest(filename=filename, val=val, verdict=verdict):
                         judge = Mock(return_value=verdict)
                         ns = scoring_namespace(filename, judge)
-                        task = {'question': 'Where did it launch?', 'result': 'Apple Arcade'}
+                        task = {'question': 'Where did it launch?', 'result': 'Apple Arcade',
+                                'reward_spec': {'subreward_weight': 100, 'subgoals': [{'answer': 'Apple Arcade', 'weight': 100}]}}
                         answer = 'It launched on Apple Arcade in 2021.'
                         score = asyncio.run(ns['score'](task, answer, val))
                         self.assertEqual(score, float(verdict))
