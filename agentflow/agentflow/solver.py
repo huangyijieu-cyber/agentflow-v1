@@ -214,7 +214,7 @@ class Solver:
 
                 # Generate final output if requested
                 if 'final' in self.output_types:
-                    final_output = self.planner.generate_final_output(question, image_path, self.memory)
+                    final_output = self.planner.generate_final_output(question, image_path, self.memory, self.max_tokens)
                     json_data["final_output"] = final_output
                     log_info(f"\n==> 🐙 Detailed Solution:\n\n{final_output}")
 
