@@ -22,6 +22,7 @@ from agentflow.models.memory import Memory, MEMORY_PLACEHOLDER
 from agentflow.tools.page_summary import (
     PageSummarizer, extract_page_text, summary_cancel_event,
 )
+from agentflow.tools.wiki_summary import WikiResultSummarizer, WIKI_RESULT_TOKENS
 
 
 class Budget:
@@ -152,6 +153,99 @@ class SummaryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "cancelled"):
                 PageSummarizer(engine, engine.budget).summarize("q", "url", "text")
             self.assertEqual(engine.calls, [])
+        finally:
+            summary_cancel_event.reset(token)
+
+
+class WikiSummaryTests(unittest.TestCase):
+    def pages(self):
+        return [{"title": f"Page {i}", "url": f"https://en.wikipedia.org/wiki/Page_{i}",
+                 "retrieved_information": f"FACT_{i:03d} " + "detail " * 400}
+                for i in range(1, 4)]
+
+    def test_combines_all_pages_and_preserves_sources_in_memory(self):
+        engine = EvidenceEngine(Budget(32768))
+        reader = WikiResultSummarizer(engine)
+        result = reader.summarize_pages("query", self.pages(), [])
+        self.assertEqual(len(engine.calls), 1)
+        for i in range(1, 4):
+            self.assertIn(f"FACT_{i:03d}", result["summary"])
+            self.assertEqual(result["sources"][i - 1]["id"], i)
+        self.assertLessEqual(reader._size(result), WIKI_RESULT_TOKENS)
+        self.assertLess(engine.calls[0][1]["max_tokens"], WIKI_RESULT_TOKENS)
+        memory = Memory()
+        memory.add_action(1, "Wikipedia_RAG_Search_Tool", "goal", "cmd", [result])
+        visible = memory.get_actions()["Action Step 1"]["result"]
+        self.assertEqual(visible, [result])
+
+    def test_oversized_merge_input_considers_last_page(self):
+        engine = EvidenceEngine(Budget(5000))
+        reader = WikiResultSummarizer(engine)
+        result = reader.summarize_pages("query", self.pages(), [])
+        self.assertGreater(len(engine.calls), 1)
+        self.assertIn("FACT_003", result["summary"])
+        self.assertLessEqual(reader._size(result), WIKI_RESULT_TOKENS)
+
+    def test_oversized_generated_summary_is_recompressed_once(self):
+        class Engine(EvidenceEngine):
+            def __call__(self, prompt, **kwargs):
+                super().__call__(prompt, **kwargs)
+                return "escaped \\\"中文\n" * 500 if len(self.calls) == 1 else "FACT_003"
+        engine = Engine(Budget(32768))
+        reader = WikiResultSummarizer(engine)
+        result = reader.summarize_pages("query", self.pages(), [])
+        self.assertEqual(len(engine.calls), 2)
+        self.assertEqual(result["summary"], "FACT_003")
+        self.assertLessEqual(reader._size(result), WIKI_RESULT_TOKENS)
+
+    def test_backend_ignoring_limit_returns_small_error_without_partial_evidence(self):
+        class Engine(EvidenceEngine):
+            def __call__(self, prompt, **kwargs):
+                super().__call__(prompt, **kwargs)
+                return "x" * 3000
+        engine = Engine(Budget(32768))
+        reader = WikiResultSummarizer(engine)
+        result = reader.summarize_pages("query", self.pages(), [])
+        self.assertEqual(len(engine.calls), 2)
+        self.assertIn("no partial summary", result["error"])
+        self.assertLessEqual(reader._size(result), WIKI_RESULT_TOKENS)
+
+    def test_empty_and_unselected_results_do_not_call_model(self):
+        engine = EvidenceEngine(Budget(32768))
+        reader = WikiResultSummarizer(engine)
+        result = reader.summarize_pages("query", [], [{"error": "No results found for query: query"}])
+        self.assertEqual(result["summary"], "No results found for query: query")
+        result = reader.summarize_pages("query", [], self.pages())
+        self.assertIn("Candidates only", result["summary"])
+        self.assertEqual(len(result["sources"]), 3)
+        self.assertEqual(engine.calls, [])
+
+    def test_large_metadata_or_query_returns_bounded_diagnostic(self):
+        engine = EvidenceEngine(Budget(32768))
+        reader = WikiResultSummarizer(engine)
+        pages = self.pages()
+        pages[0]["url"] += "中文" * 3000
+        for query, selected, candidates in [("q", pages, []), ("q", [], pages),
+                                            ("q" * 5000, [], [])]:
+            result = reader.summarize_pages(query, selected, candidates)
+            self.assertIn("error", result)
+            self.assertLessEqual(reader._size(result), WIKI_RESULT_TOKENS)
+        self.assertEqual(engine.calls, [])
+
+    def test_merge_failure_returns_error_and_cancellation_still_propagates(self):
+        import threading
+        engine = EvidenceEngine(Budget(32768))
+        reader = WikiResultSummarizer(engine)
+        with patch.object(reader, "summarize", side_effect=RuntimeError("offline")):
+            result = reader.summarize_pages("q", self.pages(), [])
+        self.assertIn("failed", result["error"])
+        self.assertLessEqual(reader._size(result), WIKI_RESULT_TOKENS)
+        event = threading.Event()
+        event.set()
+        token = summary_cancel_event.set(event)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "cancelled"):
+                reader.summarize_pages("q", self.pages(), [])
         finally:
             summary_cancel_event.reset(token)
 
@@ -332,10 +426,11 @@ class ToolIntegrationTests(unittest.TestCase):
                 patch.object(self.web.Web_Search_Tool, "_get_website_content",
                              side_effect=["Full page FACT_011", "Full page FACT_012"]):
             result = tool.execute("query")
-        selected = result["relevant_pages (to the query)"]
-        self.assertIn("FACT_011", selected[0]["retrieved_information"])
-        self.assertIn("FACT_012", selected[1]["retrieved_information"])
-        self.assertEqual(len(engine.calls), 2)
+        self.assertIn("FACT_011", result["summary"])
+        self.assertIn("FACT_012", result["summary"])
+        self.assertEqual([source["url"] for source in result["sources"]], ["url1", "url2"])
+        self.assertEqual(len(engine.calls), 3)  # Two page summaries + one combined summary.
+        self.assertLessEqual(WikiResultSummarizer(engine)._size(result), WIKI_RESULT_TOKENS)
 
     def test_planner_and_verifier_receive_complete_latest_summary(self):
         planner_module = importlib.import_module("agentflow.models.planner")

@@ -131,6 +131,7 @@ from pydantic import BaseModel
 from agentflow.tools.base import BaseTool
 from agentflow.engine.factory import create_llm_engine
 from agentflow.tools.web_search.tool import Web_Search_Tool
+from agentflow.tools.wiki_summary import WikiResultSummarizer
 
 # from web_rag import Web_Search_Tool
 # from agentflow.tools.web_search.tool import Web_Search_Tool # NOTE: Shall be used in the future
@@ -156,8 +157,8 @@ LIMITATION = f"""
 BEST_PRACTICE = f"""
 For optimal results with {TOOL_NAME}:
 1. Use specific, targeted queries rather than broad or ambiguous questions.
-2. The tool automatically filters for relevant pages using LLM-based selection - trust the "relevant_pages" results.
-3. If initial results are insufficient, examine the "other_pages" section for additional potentially relevant content.
+2. The tool automatically selects relevant pages and combines their evidence in "summary".
+3. The "sources" section identifies evidence sources, or labels candidate pages when no pages were selected.
 4. Use this tool as part of a multi-step research process rather than a single source of truth.
 5. You can use the {TOOL_NAME} to get more information from the URLs.
 """
@@ -273,12 +274,12 @@ class Wikipedia_Search_Tool(BaseTool):
     def __init__(self, model_string="gpt-4o-mini"):
         super().__init__(
             tool_name=TOOL_NAME,
-            tool_description="Searches Wikipedia, selects relevant pages and reads each selected page in full (in segments when needed), returning titles, URLs, abstracts and query-focused evidence summaries.",
+            tool_description="Searches Wikipedia, selects relevant pages and reads each selected page in full (in segments when needed), returning a combined evidence summary and sources within a 2048-token result budget.",
             tool_version="1.0.0",
             input_types={
                 "query": "str - The search query for Wikipedia."
             },
-            output_type="dict - A dictionary containing search results, all matching pages with their content, URLs, and metadata.",
+            output_type="dict - Combined summary with source titles and URLs, or an explicit retrieval/summarization failure.",
             demo_commands=[
                 {
                     "command": 'execution = tool.execute(query="What is the exact mass in kg of the moon")',
@@ -408,13 +409,13 @@ class Wikipedia_Search_Tool(BaseTool):
 
     def execute(self, query):
         """
-        Searches Wikipedia based on the provided query and returns all matching pages.
+        Searches Wikipedia and returns bounded, combined evidence with sources.
 
         Parameters:
             query (str): The search query for Wikipedia.
 
         Returns:
-            dict: A dictionary containing the search results and all matching pages with their content.
+            dict: Combined summary and sources, at most 2048 tool-model tokens.
         """
 
         # Check if OpenAI API key is set
@@ -437,11 +438,7 @@ class Wikipedia_Search_Tool(BaseTool):
         ]
 
         if not titles:
-            return {
-                "query": query,
-                "relevant_pages": [],
-                "other_pages (may be irrelevant to the query)": search_results
-            }
+            return WikiResultSummarizer(self.llm_engine).summarize_pages(query, [], search_results)
 
         # Select the most relevant pages
         matched_queries, matched_query_ids = select_relevant_queries(
@@ -454,12 +451,6 @@ class Wikipedia_Search_Tool(BaseTool):
         pages_data = [
             search_results[i]
             for i in matched_query_ids
-        ]
-
-        other_pages = [
-            search_results[i]
-            for i in range(len(search_results))
-            if i not in matched_query_ids
         ]
 
         # Read every selected page using the shared full-page summarization path.
@@ -491,11 +482,7 @@ class Wikipedia_Search_Tool(BaseTool):
                 page["error"] = f"Page summarization failed: {e}"
                 print(f"[Wikipedia summary] {url}: {e}")
 
-        return {
-            "query": query,
-            "relevant_pages (to the query)": pages_data,
-            "other_pages (may be irrelevant to the query)": other_pages
-        }
+        return WikiResultSummarizer(self.llm_engine).summarize_pages(query, pages_data, search_results)
 
 
     def get_metadata(self):
