@@ -766,10 +766,17 @@ class AgentModeDaemon:
                 for t in rollout.triplets
             ]
 
-            if "anchor" in rollout.metadata.keys():
-                anchor_list = [anchor for anchor in rollout.metadata["anchor"]]
+            if "anchor" in rollout.metadata.keys() and rollout.metadata["anchor"] is not None:
+                anchor_list = list(rollout.metadata["anchor"])
+
+                # 保证 anchor_list 与 trace_list 等长
+                if len(anchor_list) < len(trace_list):
+                    anchor_list.extend([None] * (len(trace_list) - len(anchor_list)))
+                elif len(anchor_list) > len(trace_list):
+                    anchor_list = anchor_list[:len(trace_list)]
             else:
-                anchor_list = None
+                # QA / 普通 GRPO 没有 anchor 是正常情况
+                anchor_list = [None] * len(trace_list)
 
             final_reward = self._fillna_reward(rollout)
             info = {
