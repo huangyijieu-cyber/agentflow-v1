@@ -109,15 +109,16 @@ class AgentModeDaemon:
         mini_batch_size,
         pad_token_id,
         reward_fillna_value=0.0,
-        llm_timeout_seconds=1200 * 10,
+        llm_timeout_seconds=None,
         enable_rollout_validation=True,
         max_empty_retries=2,
     ):
         # Server and Task Configuration
         self.server_port = port
-        self.llm_timeout_seconds = llm_timeout_seconds
+        self.llm_timeout_seconds = float(llm_timeout_seconds if llm_timeout_seconds is not None
+                                         else os.getenv("AGENTFLOW_LLM_REQUEST_TIMEOUT_S", "300"))
         self.server = AgentFlowServer(
-            host="127.0.0.1", port=self.server_port, task_timeout_seconds=self.llm_timeout_seconds
+            host="127.0.0.1", port=self.server_port, task_timeout_seconds=12000
         )
         self.proxy_port = _find_available_port()  # Run proxy on a different port
 
@@ -133,6 +134,7 @@ class AgentModeDaemon:
         self.backend_llm_server_addresses: List[str] = []
         self._total_tasks_queued = 0
         self._completed_rollouts: Dict[str, Rollout] = {}
+        self._failed_rollouts: Dict[str, Rollout] = {}
         self._task_id_to_original_sample: Dict[str, Dict] = {}
         self._server_thread: Optional[threading.Thread] = None
         self._proxy_thread: Optional[threading.Thread] = None
@@ -384,6 +386,11 @@ class AgentModeDaemon:
             # For training, each sample is rolled out multiple times
             for j in range(rollouts_per_sample):
                 task_metadata = {"data_id": data_id, "is_train": is_train}
+                if not is_train:
+                    timeout = float(os.getenv("AGENTFLOW_VAL_TASK_TIMEOUT_S", "1200"))
+                    if timeout <= 0:
+                        raise ValueError("AGENTFLOW_VAL_TASK_TIMEOUT_S must be positive")
+                    task_metadata["validation_timeout_s"] = timeout
 
                 # Data ID is different from Rollout ID, as one data can have multiple rollouts.
                 rollout_id = await self.server.queue_task(
@@ -529,19 +536,20 @@ class AgentModeDaemon:
         original_task_count = self._total_tasks_queued
         retried_rollout_ids = set()
         start_time = time.time()
-        last_progress_time = start_time
-        last_completed_count = 0
+        deadline_expired = False
 
         # Dynamic timeout: base time per task + buffer for complexity
         estimated_total_time = original_task_count * avg_task_time_sec * 1.5  # 50% buffer
         min_timeout = 600  # At least 10 minutes
         max_timeout = 3600  # At most 1 hour
         dynamic_timeout = max(min_timeout, min(max_timeout, estimated_total_time))
-        profile_timeout = None
-        if not self.is_train and profiling_enabled():
-            profile_timeout = int(os.environ.get("AGENTFLOW_PROFILE_VAL_TIMEOUT_S", "3600"))
-            if profile_timeout <= 0:
-                raise ValueError("AGENTFLOW_PROFILE_VAL_TIMEOUT_S must be positive")
+        batch_timeout = None
+        if not self.is_train:
+            env = ("AGENTFLOW_PROFILE_VAL_TIMEOUT_S" if profiling_enabled()
+                   else "AGENTFLOW_VAL_BATCH_TIMEOUT_S")
+            batch_timeout = float(os.environ.get(env, "3600"))
+            if batch_timeout <= 0:
+                raise ValueError(f"{env} must be positive")
 
         logger.info(f"Starting {original_task_count} {'training' if self.is_train else 'validation'} tasks")
         logger.info(f"Estimated completion time: {dynamic_timeout/60:.1f} minutes (avg {avg_task_time_sec}s per task)")
@@ -552,51 +560,36 @@ class AgentModeDaemon:
             completed_count = len(self._completed_rollouts)
             completion_rate = completed_count / original_task_count if original_task_count > 0 else 0
 
-            # Check completion conditions
-            # if completed_count >= self._total_tasks_queued:
-            if completed_count >= original_task_count:
-                logger.info("All tasks completed")
+            failed_count = len(self._failed_rollouts)
+            if completed_count + failed_count >= original_task_count:
+                logger.info(f"All tasks settled: {completed_count} completed, {failed_count} failed")
                 break
-            if profile_timeout is not None and elapsed >= profile_timeout:
-                logger.warning(
-                    "Timing profile stopped after %ss: %s/%s validation tasks completed",
-                    profile_timeout, completed_count, original_task_count,
-                )
-                break
-
-            # Smart early exit: if >90% done and no progress for 2 minutes
-            # if completion_rate >= 0.9 and (current_time - last_progress_time) > 120:
-            #     logger.info(f"Early completion: {completion_rate:.1%} tasks done ({completed_count}/{original_task_count})")
-            #     break
-
-            # # Dynamic timeout check
-            # if elapsed > dynamic_timeout:
-            #     logger.info(f"Timeout after {elapsed/60:.1f} minutes. Completed {completion_rate:.1%} ({completed_count}/{original_task_count})")
-            #     break
-
-            # No progress timeout (5 minutes for training, 3 minutes for validation)
-            # no_progress_limit = 600  # 10 miniutes
-            # if (current_time - last_progress_time) > no_progress_limit:
-            #     logger.warning(f"No progress for {no_progress_limit/60:.1f} minutes. Completed {completion_rate:.1%}")
-            #     if not self.is_train and completion_rate >= 0.5:  # Accept if validation or >50% training done
-            #         logger.warning("Accepting current results")
-            #         break
+            if batch_timeout is not None and elapsed >= batch_timeout:
+                deadline_expired = True
+                pending = (set(self._task_id_to_original_sample)
+                           - set(self._completed_rollouts) - set(self._failed_rollouts))
+                await self.server.fail_validation_tasks(
+                    pending, f"Validation batch deadline reached after {batch_timeout:g}s")
 
             completed_batch = await self.server.retrieve_completed_rollouts()
 
-            # Update progress tracking
-            if completed_count > last_completed_count:
-                last_progress_time = current_time
-                last_completed_count = completed_count
-
             new_retries = 0
             for rollout in completed_batch:
-                self._validate_data(rollout)
-
                 # Check if this rollout is from our current session
                 if rollout.rollout_id not in self._task_id_to_original_sample:
                     logger.warning(f"Skipping orphaned rollout {rollout.rollout_id} (not from current session)")
                     continue
+
+                if not self.is_train and rollout.metadata.get("execution_status") == "failed":
+                    self._failed_rollouts[rollout.rollout_id] = rollout
+                    logger.error(f"Validation failed: {rollout.rollout_id}: "
+                                 f"{rollout.metadata.get('error_type')}: "
+                                 f"{rollout.metadata.get('error_message')}")
+                    continue
+                if rollout.rollout_id in self._failed_rollouts:
+                    logger.warning(f"Ignoring late rollout {rollout.rollout_id}")
+                    continue
+                self._validate_data(rollout)
 
                 # Only retry during training and if this rollout hasn't been retried before
                 if (self.is_train and
@@ -625,6 +618,20 @@ class AgentModeDaemon:
                 else:
                     self._completed_rollouts[rollout.rollout_id] = rollout
 
+            if deadline_expired:
+                # Also settle missing/unclaimed records if no worker is alive.
+                pending = (set(self._task_id_to_original_sample)
+                           - set(self._completed_rollouts) - set(self._failed_rollouts))
+                for rollout_id in pending:
+                    self._failed_rollouts[rollout_id] = Rollout(rollout_id=rollout_id, metadata={
+                        "execution_status": "failed", "error_type": "ValidationBatchTimeout",
+                        "error_message": f"No result before the {batch_timeout:g}s batch deadline",
+                    })
+                    logger.error(f"Validation failed: {rollout_id}: no result before batch deadline")
+
+            completed_count = len(self._completed_rollouts)
+            failed_count = len(self._failed_rollouts)
+            completion_rate = completed_count / original_task_count if original_task_count else 0
             if verbose and (elapsed % 30 < 5 or new_retries > 0):  # Log every 30s or when retries happen
                 eta_minutes = (dynamic_timeout - elapsed) / 60
                 if self.is_train:
@@ -633,7 +640,12 @@ class AgentModeDaemon:
                     logger.info(f"[{elapsed/60:.1f}m] Progress: {completion_rate:.1%} ({completed_count}/{original_task_count}), "
                           f"Valid: {valid_rollouts}, Retries: {new_retries}, ETA: {eta_minutes:.1f}m")
                 else:
-                    logger.info(f"[{elapsed/60:.1f}m] Validation: {completion_rate:.1%} ({completed_count}/{original_task_count})")
+                    logger.info(f"[{elapsed/60:.1f}m] Validation: {completed_count} completed, "
+                                f"{failed_count} failed, {original_task_count - completed_count - failed_count} pending "
+                                f"(total {original_task_count})")
+
+            if completed_count + failed_count >= original_task_count:
+                break
 
             # Adaptive sleep based on progress
             if len(completed_batch) > 0 or new_retries > 0:
@@ -650,7 +662,7 @@ class AgentModeDaemon:
 
         logger.info(f"Finished after {final_elapsed/60:.1f} minutes. "
               f"Completion rate: {final_rate:.1%} ({len(self._completed_rollouts)}/{original_task_count}), "
-              f"Valid rollouts: {valid_rollouts}")
+              f"Valid rollouts: {valid_rollouts}, Failed tasks: {len(self._failed_rollouts)}")
 
     def run_until_all_finished(self, verbose=True):
         """Synchronously waits for all queued tasks to be completed and reported."""
@@ -674,15 +686,6 @@ class AgentModeDaemon:
         # timeout = 500
         try:
             future.result()  # Wait indefinitely for all tasks to complete
-        except concurrent.futures.TimeoutError:
-            # 记录部分完成的任务数
-            completed = len(self._completed_rollouts)
-            logger.error(
-                f"Task completion timed out after {timeout} seconds. Completed {completed}/{self._total_tasks_queued} tasks."
-            )
-            # 尝试取消 future（协程可能不支持取消，但尝试无害）
-            future.cancel()
-            raise TimeoutError(f"Waiting for tasks timed out after {timeout}s")
         except Exception as e:
             logger.error(f"Error while waiting for tasks to finish: {e}")
             completed = len(self._completed_rollouts)
@@ -948,6 +951,7 @@ class AgentModeDaemon:
         """Resets the internal state of the daemon for the next run."""
         self.backend_llm_server_addresses = []
         self._completed_rollouts.clear()
+        self._failed_rollouts.clear()
         self._task_id_to_original_sample.clear()
         self._total_tasks_queued = 0
         self._empty_rollout_counts.clear()  # Clear retry counters

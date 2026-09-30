@@ -138,7 +138,8 @@ def summarize_profiles(profiles: Iterable[dict[str, Any]], expected_count: int) 
 
 
 def write_validation_report(
-    rollouts: Iterable[Any], output_dir: str | Path, expected_count: int, run_name: str
+    rollouts: Iterable[Any], output_dir: str | Path, expected_count: int, run_name: str,
+    failed_rollouts: Iterable[Any] = (),
 ) -> tuple[Path, Path, dict[str, Any]]:
     records = []
     completed_count = 0
@@ -158,6 +159,13 @@ def write_validation_report(
     summary["completed_count"] = completed_count
     summary["valid_completed_count"] = valid_count
     summary["missing_timing_count"] = completed_count - len(records)
+    failures = [{"rollout_id": str(rollout.rollout_id),
+                 "error_type": rollout.metadata.get("error_type"),
+                 "error_message": rollout.metadata.get("error_message")}
+                for rollout in failed_rollouts]
+    summary["failed_count"] = len(failures)
+    summary["failures"] = failures
+    summary["settled_count"] = completed_count + len(failures)
     summary["generated_at"] = datetime.now(timezone.utc).isoformat()
     summary["hostname"] = socket.gethostname()
 

@@ -151,6 +151,7 @@ class AgentFlowTrainer(RayPPOTrainer):
 
         # Check if we have any completed rollouts, with more detailed error reporting
         completed_count = len(self.agent_mode_daemon._completed_rollouts)
+        failed_count = len(self.agent_mode_daemon._failed_rollouts)
         valid_count = len([r for r in self.agent_mode_daemon._completed_rollouts.values()
                           if r.triplets and len(r.triplets) > 0])
         original_count = self.agent_mode_daemon._total_tasks_queued
@@ -163,6 +164,7 @@ class AgentFlowTrainer(RayPPOTrainer):
                 output_dir,
                 profile_limit,
                 run_name,
+                failed_rollouts=self.agent_mode_daemon._failed_rollouts.values(),
             )
             self.timing_report_paths = (detail_path, summary_path)
             print(f"Timing profile: {timing_summary['profiled_count']}/{profile_limit} rollouts, "
@@ -179,6 +181,7 @@ class AgentFlowTrainer(RayPPOTrainer):
 
         completion_rate = completed_count / original_count if original_count > 0 else 0
         print(f"Validation summary: {completed_count}/{original_count} total rollouts ({completion_rate:.1%}), {valid_count} valid rollouts")
+        print(f"Validation failures: {failed_count}/{original_count}; failures are excluded from reward/timing means")
 
         # More lenient validation acceptance
         if completed_count == 0:
@@ -196,6 +199,8 @@ class AgentFlowTrainer(RayPPOTrainer):
             print(f"Validation proceeding with {valid_count} valid rollouts ({valid_count/completed_count:.1%} of completed)")
 
         test_metrics = self.agent_mode_daemon.get_test_metrics()
+        test_metrics["val/completed_count"] = completed_count
+        test_metrics["val/failed_count"] = failed_count
 
         self.agent_mode_daemon.clear_data_and_server()
         self.async_rollout_manager.sleep()

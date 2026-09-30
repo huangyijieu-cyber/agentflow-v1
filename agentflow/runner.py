@@ -205,50 +205,54 @@ class AgentRunner(ParallelWorkerBase):
         rollout_id = task.rollout_id
 
         resources_id = task.resources_id
-        resources_update = None
-        if resources_id:
-            logger.info("#2. get_resources_by_id_async")
-            resources_update = await self.client.get_resources_by_id_async(resources_id)
-        else:
-            logger.debug(f"{self._log_prefix(rollout_id)} No 'resources_id'. Fetching latest resources.")
-            resources_update = await self.client.get_latest_resources_async()
-        
+        start_time = time.monotonic()
 
-        if not resources_update:
-            logger.info("#3. not resources_update")
-            logger.error(f"{self._log_prefix(rollout_id)} Failed to fetch resources. Skipping.")
-            return False
-
-        rollout_obj = Rollout(rollout_id=task.rollout_id)  # Default empty rollout
+        async def execute_task():
+            nonlocal resources_id
+            if resources_id:
+                resources_update = await self.client.get_resources_by_id_async(resources_id)
+            else:
+                resources_update = await self.client.get_latest_resources_async()
+            if not resources_update:
+                raise RuntimeError("Failed to fetch rollout resources")
+            resources_id = resources_update.resources_id
+            rollout_method = (self.agent.training_rollout_async if task.mode == "train"
+                              else self.agent.validation_rollout_async)
+            result = await rollout_method(task.input, rollout_id, resources_update.resources)
+            return self._to_rollout_object(result, rollout_id)
 
         try:
-            # with self.tracer.trace_context(name=f"rollout_{rollout_id}"):
-                start_time = time.time()
-                rollout_method = (
-                    self.agent.training_rollout_async if task.mode == "train" else self.agent.validation_rollout_async
-                )
-                # Pass the task input, not the whole task object
-                result = await rollout_method(task.input, task.rollout_id, resources_update.resources)
-                # print("result in run_async:", result)
-                rollout_obj = self._to_rollout_object(result, task.rollout_id)
-                ## update resource_id
-                rollout_obj.metadata["resources_id"] = resources_id
-                # print("rollout_obj in run_async:", rollout_obj)
-                end_time = time.time()
-                logger.info(
-                    f"{self._log_prefix(rollout_id)} Completed in "
-                    f"{end_time - start_time:.2f}s. Reward: {rollout_obj.final_reward}"
-                )
-                print(f"[DEBUG] Posting rollout: {str(rollout_obj)[:200]}")
-                response = await self.client.post_rollout_async(rollout_obj)
-                print(f"[DEBUG] Post rollout response: {str(response)[:200]}")
+            if task.mode == "val":
+                timeout = float(task.metadata.get("validation_timeout_s",
+                                os.getenv("AGENTFLOW_VAL_TASK_TIMEOUT_S", "1200")))
+                if timeout <= 0:
+                    raise ValueError("Validation task timeout must be positive")
+                rollout_obj = await asyncio.wait_for(execute_task(), timeout=timeout)
+            else:
+                rollout_obj = await execute_task()
+        except Exception as error:
+            logger.exception(f"{self._log_prefix(rollout_id)} Rollout failed.")
+            rollout_obj = Rollout(rollout_id=rollout_id, metadata={
+                "execution_status": "failed",
+                "error_type": type(error).__name__,
+                "error_message": (str(error) or "Validation task exceeded its execution deadline")[:2000],
+            })
+
+        rollout_obj.metadata["resources_id"] = resources_id
+        rollout_obj.metadata["execution_elapsed_s"] = time.monotonic() - start_time
+        # Report failures through the same acknowledged channel as successes.
+        # Never fabricate a reward/triplet for a failed task.
+        try:
+            response = await self.client.post_rollout_async(rollout_obj)
+            if not response or response.get("status") not in {"ok", "success"}:
+                logger.error(f"{self._log_prefix(rollout_id)} Rollout report was not accepted: {response}")
+                return False
         except Exception:
-            logger.info("#4. except Exception")
-            import traceback
-            logger.error(f"detail:{traceback.print_exc()}")
-            logger.error(f"{self._log_prefix(rollout_id)} Exception during rollout.")
+            logger.exception(f"{self._log_prefix(rollout_id)} Failed to report rollout result.")
             return False
-        logger.info("#5. return true")
+        logger.info(f"{self._log_prefix(rollout_id)} Reported "
+                    f"{rollout_obj.metadata.get('execution_status', 'completed')} after "
+                    f"{rollout_obj.metadata['execution_elapsed_s']:.2f}s")
         return True
 
     async def iter_async(self) -> int:

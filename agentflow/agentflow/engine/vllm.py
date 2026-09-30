@@ -62,7 +62,8 @@ class ChatVLLM(EngineLM, CachedEngine):
             self.client = OpenAI(
                 base_url=self.base_url,
                 api_key=self.api_key,
-                timeout=1200 * 10
+                timeout=float(os.getenv("AGENTFLOW_LLM_REQUEST_TIMEOUT_S", "300")),
+                max_retries=0,  # _generate_text already owns the three attempts.
             )
         except Exception as e:
             raise ValueError(f"Failed to connect to VLLM server at {self.base_url}. Please ensure the server is running and try again.")

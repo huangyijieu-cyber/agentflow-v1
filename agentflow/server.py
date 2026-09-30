@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 import uuid
 import threading
@@ -136,6 +137,9 @@ class ServerDataStore:
         """
         """修复：防止重复提交覆盖"""
         async with self._results_lock:
+            if rollout.rollout_id in self._failed_tasks:
+                logger.warning(f"Ignoring late result for terminal failed task {rollout.rollout_id}")
+                return
             # 检查是否已存在（且未被取出）
             if rollout.rollout_id in self._completed_rollouts:
                 logger.warning(f"Rollout {rollout.rollout_id} already stored, ignoring duplicate")
@@ -147,7 +151,9 @@ class ServerDataStore:
                 # 可选：拒绝存储
                 # raise ValueError("Invalid rollout_id")
             
-            self._processing_tasks.pop(rollout.rollout_id, None)
+            task = self._processing_tasks.pop(rollout.rollout_id, None)
+            if task is not None and rollout.metadata.get("execution_status") == "failed":
+                self._failed_tasks[rollout.rollout_id] = task
             self._completed_rollouts[rollout.rollout_id] = rollout
             
             # 关键：记录存储时间，用于后续数据新鲜度检查
@@ -173,6 +179,35 @@ class ServerDataStore:
     def get_processing_tasks(self) -> Dict[str, Task]:
         """Returns a copy of currently processing tasks for timeout checking."""
         return self._processing_tasks.copy()
+
+    def _fail_task_locked(self, task: Task, message: str):
+        """Produce a terminal event; caller holds _results_lock."""
+        self._processing_tasks.pop(task.rollout_id, None)
+        self._failed_tasks[task.rollout_id] = task
+        self._completed_rollouts[task.rollout_id] = Rollout(
+            rollout_id=task.rollout_id,
+            metadata={"execution_status": "failed", "error_type": "TaskTimeout",
+                      "error_message": message, "resources_id": task.resources_id},
+        )
+        logger.error(f"Task {task.rollout_id} failed: {message}")
+
+    async def fail_validation_tasks(self, rollout_ids, message: str):
+        """Settle requested validation tasks, including ones never claimed."""
+        wanted = set(rollout_ids)
+        async with self._results_lock:
+            for task in list(self._processing_tasks.values()):
+                if task.mode == "val" and task.rollout_id in wanted:
+                    self._fail_task_locked(task, message)
+            remaining = []
+            while not self._task_queue.empty():
+                task = self._task_queue.get_nowait()
+                if task.mode == "val" and task.rollout_id in wanted:
+                    if task.rollout_id not in self._failed_tasks and task.rollout_id not in self._completed_rollouts:
+                        self._fail_task_locked(task, message)
+                else:
+                    remaining.append(task)
+            for task in remaining:
+                self._task_queue.put_nowait(task)
 
     async def requeue_task(self, task: Task):
         # 步骤1：在锁内原子性检查并移除，防止并发重复处理
@@ -308,6 +343,13 @@ class AgentFlowServer:
         stale_tasks = []
 
         for rollout_id, task in processing_tasks.items():
+            if task.mode == "val":
+                timeout = float(task.metadata.get("validation_timeout_s",
+                                os.getenv("AGENTFLOW_VAL_TASK_TIMEOUT_S", "1200")))
+                if task.last_claim_time is not None and current_time - task.last_claim_time > timeout:
+                    await self._store.fail_validation_tasks(
+                        [rollout_id], f"Validation execution exceeded {timeout:g}s after claim")
+                continue
             if task.last_claim_time and current_time - task.last_claim_time > self._task_timeout_seconds:
                 stale_tasks.append(task)
 
@@ -458,3 +500,7 @@ class AgentFlowServer:
         if not self._store:
             raise RuntimeError("Store not initialized. The server may not be running.")
         return await self._store.retrieve_completed_rollouts()
+
+    async def fail_validation_tasks(self, rollout_ids, message: str):
+        if self._store:
+            await self._store.fail_validation_tasks(rollout_ids, message)

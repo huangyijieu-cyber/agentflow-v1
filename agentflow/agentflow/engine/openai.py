@@ -111,12 +111,16 @@ class ChatOpenAI(EngineLM, CachedEngine):
         if not self.is_local_model:
             self.client = OpenAI(
                 api_key=os.getenv("OPENAI_API_KEY"),
+                timeout=float(os.getenv("AGENTFLOW_LLM_REQUEST_TIMEOUT_S", "300")),
+                max_retries=0,
             )
         else:
             base_url = kwargs.get("base_url", "None")
             print(f"local model url:{base_url}")
             self.client = OpenAI(
-                base_url=base_url
+                base_url=base_url,
+                timeout=float(os.getenv("AGENTFLOW_LLM_REQUEST_TIMEOUT_S", "300")),
+                max_retries=0,
             )
             
 
