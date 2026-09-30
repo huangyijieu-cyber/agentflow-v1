@@ -309,7 +309,7 @@ Rules:
         return next_step
 
 
-    def generate_final_output(self, question: str, image: str, memory: Memory) -> str:
+    def generate_final_output(self, question: str, image: str, memory: Memory, max_tokens: int = 2048) -> str:
         image_info = self.get_image_info(image)
         if self.is_multimodal:
             prompt_generate_final_output = f"""
@@ -377,7 +377,7 @@ Instructions:
                 print(f"Error reading image file: {str(e)}")
 
         # final_output = self.llm_engine_mm(input_data)
-        final_output = self.llm_engine(input_data[0], temperature=self.temperature, usage_by="[planner] generate final output")
+        final_output = self.llm_engine(input_data[0], max_tokens=max_tokens, temperature=self.temperature, usage_by="[planner] generate final output")
         # final_output = self.llm_engine_fixed(input_data)
 
         self.logs.append({"prompt": input_data[0], "response": final_output})
