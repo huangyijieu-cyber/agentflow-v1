@@ -144,7 +144,7 @@ class InfoSeekRewardTests(unittest.TestCase):
     def test_gigpo_critic_token_scores_use_only_final_reward(self):
         choose = self.daemon["_training_token_scores"]
         self.assertEqual(choose([1.0, 0.0], [2.0, 1.0], "gigpo"), [1.0, 0.0])
-        self.assertEqual(choose([1.0, 0.0], [2.0, 1.0], "grpo"), [2.0, 1.0])
+        self.assertEqual(choose([1.0, 0.0], [2.0, 1.0], "grpo"), [1.0, 0.0])
 
 
 class GiGPOAdvantageTests(unittest.TestCase):

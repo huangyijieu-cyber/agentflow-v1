@@ -239,94 +239,43 @@ def compute_advantage(
                 config.pf_ppo.get("reweight_method"),
                 config.pf_ppo.get("weight_pow"),
             )
-    elif adv_estimator == AdvantageEstimator.GRPO:
-        # ### Dr.GRPO =================
-        # # Initialize the mask for GRPO calculation
-        # grpo_calculation_mask = data.batch["response_mask"]
-        
-        # ## DR.GRPO without norm
-        # if not norm_adv_by_std_in_grpo: 
-        #     token_level_rewards = data.batch["token_level_rewards"] / grpo_calculation_mask.sum(dim=-1, keepdim=True).clamp(min=1)
-        # else:
-        #     token_level_rewards = data.batch["token_level_rewards"]
-
-        # # Call compute_grpo_outcome_advantage with parameters matching its definition
-        # advantages, returns = core_algos.compute_grpo_outcome_advantage(
-        #     token_level_rewards=token_level_rewards,
-        #     response_mask=grpo_calculation_mask,
-        #     index=data.non_tensor_batch["uid"],
-        #     norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-        # )
-        # data.batch["advantages"] = advantages
-        # data.batch["returns"] = returns
-
-        ## ================ GRPO-ORIGIN ==========================
-        # Initialize the mask for GRPO calculation
-        grpo_calculation_mask = data.batch["response_mask"]
-
-        # # Call compute_grpo_outcome_advantage with parameters matching its definition
-        # advantages, returns = core_algos.compute_grpo_outcome_advantage(
-        #     token_level_rewards=token_level_rewards,
-        #     response_mask=grpo_calculation_mask,
-        #     index=data.non_tensor_batch["uid"],
-        #     norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-        # )
-
-        ## episode grpo
-        advantages, returns = core_gigpo.compute_grpo_outcome_advantage_agent(
-            token_level_rewards=token_level_rewards,
-            response_mask=grpo_calculation_mask,
-            index=data.non_tensor_batch["uid"],
-            traj_index=data.non_tensor_batch['traj_uid'],
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo
+    elif adv_estimator in (AdvantageEstimator.GRPO, "grpo", "gigpo"):
+        # Both estimators start with exactly the same final-answer GRPO
+        # advantage. Never use the aggregate (outcome + subgoal) reward here.
+        episode_token_rewards = token_level_rewards
+        if "episode_reward_list" in data.non_tensor_batch:
+            episode_token_rewards = torch.zeros_like(token_level_rewards, dtype=torch.float32)
+            episode_token_rewards[:, 0] = torch.as_tensor(
+                data.non_tensor_batch["episode_reward_list"],
+                dtype=torch.float32, device=token_level_rewards.device,
             )
+        advantages, returns = core_gigpo.compute_grpo_outcome_advantage_agent(
+            token_level_rewards=episode_token_rewards,
+            response_mask=data.batch["response_mask"],
+            index=data.non_tensor_batch["uid"],
+            traj_index=data.non_tensor_batch["traj_uid"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+
+        if adv_estimator == "gigpo":
+            # GiGPO adds only the grouped step component to the shared outcome
+            # advantage. Keep step centering and its weight unchanged.
+            step_advantages = core_gigpo.compute_gigpo_step_advantage(
+                step_rewards=torch.as_tensor(
+                    data.non_tensor_batch["step_reward_list"],
+                    dtype=torch.float32, device=token_level_rewards.device,
+                ),
+                response_mask=data.batch["response_mask"],
+                anchor_obs=data.non_tensor_batch["anchor_list"],
+                index=data.non_tensor_batch["uid"],
+                step_pair_mask=data.non_tensor_batch.get("gigpo_pair_mask_list"),
+                mode="mean_norm",
+            )
+            advantages = advantages + step_advantages
+            returns = advantages
 
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
-
-    elif adv_estimator == "gigpo":
-        device = data.batch['input_ids'].device
-
-        # InfoSeek + GiGPO:
-        #   episode reward = final-answer outcome only
-        #   step reward    = reward-to-go over unit subgoal hits and terminal outcome
-        episode_rewards_np = data.non_tensor_batch.get(
-            'episode_reward_list', data.non_tensor_batch['reward_list']
-        ).astype(np.float32)
-        step_rewards_np = data.non_tensor_batch.get(
-            'step_reward_list', data.non_tensor_batch['reward_list']
-        ).astype(np.float32)
-
-        episode_rewards = torch.tensor(episode_rewards_np, dtype=torch.float32, device=device)
-        step_rewards = torch.tensor(step_rewards_np, dtype=torch.float32, device=device)
-
-        # GiGPO's episode_norm_reward expects token-level tensors and sums them back
-        # to one scalar per turn. Put the episode outcome once in each turn tensor.
-        episode_token_level_rewards = torch.zeros_like(token_level_rewards, dtype=torch.float32)
-        episode_token_level_rewards[:, 0] = episode_rewards
-
-        # default parameters for gigpo
-        step_advantage_w = 1.0
-        gigpo_mode = "mean_norm"   ## "mean_std_norm" (bad) | "mean_norm"
-        gigpo_enable_similarity = False
-        gigpo_similarity_thresh = 0.95
-        compute_cross_step_data = False
-        advantages, returns = core_gigpo.compute_gigpo_outcome_advantage(
-            token_level_rewards=episode_token_level_rewards, # final-answer episode reward
-            step_rewards=step_rewards, # discounted future subgoal hits + terminal outcome
-            response_mask=data.batch['response_mask'],
-            anchor_obs=data.non_tensor_batch['anchor_list'],
-            index=data.non_tensor_batch['uid'],
-            traj_index=data.non_tensor_batch['traj_uid'],
-            step_pair_mask=data.non_tensor_batch.get('gigpo_pair_mask_list', None),
-            step_advantage_w=step_advantage_w,
-            mode=gigpo_mode,
-            enable_similarity=gigpo_enable_similarity,
-            similarity_thresh=gigpo_similarity_thresh,
-            compute_mean_std_cross_steps=compute_cross_step_data
-            )
-        data.batch['advantages'] = advantages
-        data.batch['returns'] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)

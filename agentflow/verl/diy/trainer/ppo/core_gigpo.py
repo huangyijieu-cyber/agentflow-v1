@@ -162,33 +162,47 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
     # Compute episode relative advantages (Eq. 3 in the paper).
     episode_advantages = episode_norm_reward(token_level_rewards, response_mask, index, traj_index, epsilon, remove_std, compute_mean_std_cross_steps)
     
-    # Anchor state grouping (Eq. 6 in the paper).
+    step_advantages = compute_gigpo_step_advantage(
+        step_rewards, response_mask, anchor_obs, index, step_pair_mask,
+        epsilon, mode, enable_similarity, similarity_thresh,
+    )
+    scores = episode_advantages + step_advantage_w * step_advantages
+    return scores, scores
+
+
+def compute_gigpo_step_advantage(
+    step_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    anchor_obs: np.ndarray,
+    index: np.ndarray,
+    step_pair_mask: np.ndarray = None,
+    epsilon: float = 1e-6,
+    mode: str = "mean_norm",
+    enable_similarity: bool = False,
+    similarity_thresh: float = 0.95,
+):
+    """Compute only GiGPO's step component, to add to shared GRPO advantages."""
+    if mode not in ("mean_norm", "mean_std_norm"):
+        raise ValueError(f"Unknown mode: {mode}")
     step_group_uids = build_step_group(anchor_obs, index, enable_similarity, similarity_thresh)
-
-    # Compute step relative advantages (Eq. 7 in the paper).
-    step_advantages = step_norm_reward(step_rewards, response_mask, step_group_uids, epsilon, remove_std)
-
+    step_advantages = step_norm_reward(
+        step_rewards, response_mask, step_group_uids, epsilon,
+        remove_std=(mode == "mean_norm"),
+    )
     if step_pair_mask is None:
         step_pair_mask = np.ones(len(step_group_uids), dtype=bool)
     else:
         step_pair_mask = np.asarray(step_pair_mask, dtype=bool)
-
     group_sizes = Counter(step_group_uids.tolist())
     pairable_mask = np.array([
         bool(step_pair_mask[i]) and group_sizes[step_group_uids[i]] > 1
         for i in range(len(step_group_uids))
     ], dtype=bool)
-
-    # Joint advantage rules for this AgentFlow adaptation:
-    #   1) answer turns (step_pair_mask=False): episode advantage only;
-    #   2) analysis/tool groups with >=2 turns: episode + step advantage;
-    #   3) analysis/tool singleton groups: episode advantage only.
-    # Pairing controls only the step component, never the episode component.
-    pair_mask_t = torch.tensor(pairable_mask, dtype=torch.bool, device=step_advantages.device).unsqueeze(-1)
-    scores = episode_advantages + step_advantage_w * torch.where(
-        pair_mask_t, step_advantages, torch.zeros_like(step_advantages)
-    )
-    return scores, scores
+    # Answer turns and singleton groups contribute no step advantage.
+    pair_mask_t = torch.tensor(
+        pairable_mask, dtype=torch.bool, device=step_advantages.device
+    ).unsqueeze(-1)
+    return torch.where(pair_mask_t, step_advantages, torch.zeros_like(step_advantages))
 
 
 def episode_norm_reward(token_level_rewards: torch.Tensor,
@@ -248,8 +262,9 @@ def episode_norm_reward(token_level_rewards: torch.Tensor,
                 id2mean[idx] = id2score[idx][0].clone()
                 id2std[idx] = torch.ones_like(id2mean[idx])
             elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
-                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
+                group_scores = torch.stack(id2score[idx])
+                id2mean[idx] = group_scores.mean()
+                id2std[idx] = group_scores.std()
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
@@ -394,8 +409,9 @@ def step_norm_reward(step_rewards: torch.Tensor,
                 id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
                 id2std[idx] = torch.tensor(1.0)
             elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
-                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
+                group_scores = torch.stack(id2score[idx])
+                id2mean[idx] = group_scores.mean()
+                id2std[idx] = group_scores.std()
             else:
                 print(f"id2score: {id2score}")
                 print(f"len(id2score[idx]): {len(id2score[idx])}")
@@ -427,38 +443,13 @@ def compute_grpo_outcome_advantage_agent(
     Agent-aware GRPO: 按 (data_id, traj_id) 去重，确保每个 rollout 只贡献一个 episode reward 到组内统计。
     计算完成后，advantage 广播回该 rollout 的所有 turns。
     """
-    scores = token_level_rewards.sum(dim=-1)
-
-    id2score = defaultdict(list)
-    id2mean = {}
-    id2std = {}
-    seen_pairs = set()
-
-    with torch.no_grad():
-        bsz = scores.shape[0]
-        for i in range(bsz):
-            # 关键：按 (uid, traj_uid) 去重，每个 rollout 只算一次 episode reward
-            pair = (index[i], traj_index[i])
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-            id2score[index[i]].append(scores[i])
-
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0, device=scores.device)
-                id2std[idx] = torch.tensor(1.0, device=scores.device)
-            elif len(id2score[idx]) > 1:
-                scores_tensor = torch.stack(id2score[idx])
-                id2mean[idx] = torch.mean(scores_tensor)
-                id2std[idx] = torch.std(scores_tensor)
-            else:
-                raise ValueError(f"no score in prompt index: {idx}")
-
-        for i in range(bsz):
-            if norm_adv_by_std_in_grpo:
-                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
-            else:
-                scores[i] = scores[i] - id2mean[index[i]]
-        scores = scores.unsqueeze(-1) * response_mask
-    return scores, scores
+    advantages = episode_norm_reward(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        traj_index=traj_index,
+        epsilon=epsilon,
+        remove_std=not norm_adv_by_std_in_grpo,
+        compute_mean_std_cross_steps=False,
+    )
+    return advantages, advantages

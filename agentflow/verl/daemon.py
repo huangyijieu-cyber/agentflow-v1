@@ -44,8 +44,8 @@ def _gigpo_return_to_go(
 
 
 def _training_token_scores(episode_rewards: list, aggregate_rewards: list, adv_estimator: str) -> list:
-    """Use final-answer scores for GiGPO's critic while preserving legacy GRPO."""
-    return episode_rewards if adv_estimator == "gigpo" else aggregate_rewards
+    """Share final-answer scores between GRPO and GiGPO."""
+    return episode_rewards if adv_estimator in ("grpo", "gigpo") else aggregate_rewards
 
 
 def get_left_padded_ids_and_attention_mask(ids: List[int], max_length: int, pad_token_id: int):
@@ -962,8 +962,8 @@ class AgentModeDaemon:
         attention_mask = torch.cat([input_attention_mask, response_attention_mask], dim=-1)
         position_ids = torch.clamp(torch.cumsum(attention_mask, dim=-1) - 1, min=0)
         is_drop_mask = torch.BoolTensor(is_drop_list).to(device)
-        # GiGPO's critic/token-level score measures final outcome only. Keep
-        # legacy aggregate scores for other advantage estimators.
+        # GRPO and GiGPO share final-outcome token scores. Process rewards
+        # enter the policy advantage only through GiGPO's step component.
         score_values = _training_token_scores(
             episode_reward_list, reward_list, self.train_information.get("adv_estimator", "")
         )

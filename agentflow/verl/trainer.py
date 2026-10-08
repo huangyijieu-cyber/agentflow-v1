@@ -725,7 +725,7 @@ class AgentFlowTrainer(RayPPOTrainer):
         metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
         # The generic metric averages per-turn token scores. Count each retained
         # rollout once so critic/score/mean reflects its final-answer reward.
-        if self.config.algorithm.adv_estimator == "gigpo":
+        if self.config.algorithm.adv_estimator in ("grpo", "gigpo"):
             final_by_traj = {
                 str(traj_uid): float(final_reward)
                 for traj_uid, final_reward in zip(
