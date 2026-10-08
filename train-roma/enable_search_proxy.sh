@@ -5,8 +5,16 @@
 # 训练机 -> EC2 -> Windows -> 公司代理 -> Internet
 # ==============================
 
-: "${PROXY_TOKEN:?Set PROXY_TOKEN before sourcing this script}"
-: "${PROXY_HOST:?Set PROXY_HOST before sourcing this script}"
+# ---------- Private proxy settings (optional, untracked) ----------
+_AGENTFLOW_PROXY_ENV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proxy.local.env"
+if [[ -f "$_AGENTFLOW_PROXY_ENV" ]]; then
+    # shellcheck source=/dev/null
+    source "$_AGENTFLOW_PROXY_ENV"
+fi
+unset _AGENTFLOW_PROXY_ENV
+
+: "${PROXY_TOKEN:?Set PROXY_TOKEN or configure train-roma/proxy.local.env}"
+: "${PROXY_HOST:?Set PROXY_HOST or configure train-roma/proxy.local.env}"
 PROXY_PORT="${PROXY_PORT:-18090}"
 
 # ---------- HTTP/HTTPS Proxy ----------
