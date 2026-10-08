@@ -5,25 +5,9 @@
 # 训练机 -> EC2 -> Windows -> 公司代理 -> Internet
 # ==============================
 
-# ---------- Proxy credentials: environment > shared /data > local fallback ----------
-# ModelArts workers using the same persistent /data mount can share one secret file.
-_AGENTFLOW_SHARED_PROXY_ENV="/data/agentflow/proxy.env"
-_AGENTFLOW_LOCAL_PROXY_ENV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proxy.local.env"
-
-if [[ -z "${PROXY_TOKEN:-}" || -z "${PROXY_HOST:-}" ]]; then
-    if [[ -r "$_AGENTFLOW_SHARED_PROXY_ENV" ]]; then
-        # shellcheck source=/dev/null
-        source "$_AGENTFLOW_SHARED_PROXY_ENV"
-    elif [[ -r "$_AGENTFLOW_LOCAL_PROXY_ENV" ]]; then
-        # shellcheck source=/dev/null
-        source "$_AGENTFLOW_LOCAL_PROXY_ENV"
-    fi
-fi
-unset _AGENTFLOW_SHARED_PROXY_ENV _AGENTFLOW_LOCAL_PROXY_ENV
-
-: "${PROXY_TOKEN:?Set PROXY_TOKEN once in shared /data/agentflow/proxy.env}"
-: "${PROXY_HOST:?Set PROXY_HOST once in shared /data/agentflow/proxy.env}"
-PROXY_PORT="${PROXY_PORT:-18090}"
+PROXY_TOKEN="tEc3gNapEHePEOg9AZAHaYVZciZHhaWW8GnVeAOTpk9GYWvA_rKz7M-7rlER7lWB"
+PROXY_HOST="7.150.10.123"
+PROXY_PORT="18090"
 
 # ---------- HTTP/HTTPS Proxy ----------
 export HTTP_PROXY="http://agentflow:${PROXY_TOKEN}@${PROXY_HOST}:${PROXY_PORT}"
@@ -36,7 +20,7 @@ export NO_PROXY="127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 export no_proxy="$NO_PROXY"
 
 # ---------- 当前 v3 Search Gateway ----------
-export SEARCH_GATEWAY_BASE_URL="${SEARCH_GATEWAY_BASE_URL:-http://${PROXY_HOST}/agentflow-search}"
+export SEARCH_GATEWAY_BASE_URL="http://7.150.10.123/agentflow-search"
 export SEARCH_GATEWAY_TOKEN="$PROXY_TOKEN"
 
 # ---------- Wikimedia API identity (shared by all workers) ----------
