@@ -1,5 +1,7 @@
+import os
 import time
 import requests
+from urllib.parse import urlsplit
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
@@ -105,6 +107,13 @@ class Web_Search_Tool(BaseTool):
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
         }
+
+        # Wikimedia pages must identify AgentFlow rather than pretend to be Chrome.
+        wiki_host = (urlsplit(url).hostname or "").lower()
+        if wiki_host == "wikipedia.org" or wiki_host.endswith(".wikipedia.org"):
+            headers["User-Agent"] = os.getenv(
+                "WIKIMEDIA_USER_AGENT", "AgentFlowResearchBot/1.0 (https://github.com/huangyijieu-cyber/agentflow-v1/issues)"
+            )
 
         # Session.get bypasses Wikipedia's global requests.get retry patch.
         # This keeps one Web RAG fetch within four HTTP requests even for wiki URLs.
