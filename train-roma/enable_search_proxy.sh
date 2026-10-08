@@ -5,16 +5,24 @@
 # 训练机 -> EC2 -> Windows -> 公司代理 -> Internet
 # ==============================
 
-# ---------- Private proxy settings (optional, untracked) ----------
-_AGENTFLOW_PROXY_ENV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proxy.local.env"
-if [[ -f "$_AGENTFLOW_PROXY_ENV" ]]; then
-    # shellcheck source=/dev/null
-    source "$_AGENTFLOW_PROXY_ENV"
-fi
-unset _AGENTFLOW_PROXY_ENV
+# ---------- Proxy credentials: environment > shared /data > local fallback ----------
+# ModelArts workers using the same persistent /data mount can share one secret file.
+_AGENTFLOW_SHARED_PROXY_ENV="/data/agentflow/proxy.env"
+_AGENTFLOW_LOCAL_PROXY_ENV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proxy.local.env"
 
-: "${PROXY_TOKEN:?Set PROXY_TOKEN or configure train-roma/proxy.local.env}"
-: "${PROXY_HOST:?Set PROXY_HOST or configure train-roma/proxy.local.env}"
+if [[ -z "${PROXY_TOKEN:-}" || -z "${PROXY_HOST:-}" ]]; then
+    if [[ -r "$_AGENTFLOW_SHARED_PROXY_ENV" ]]; then
+        # shellcheck source=/dev/null
+        source "$_AGENTFLOW_SHARED_PROXY_ENV"
+    elif [[ -r "$_AGENTFLOW_LOCAL_PROXY_ENV" ]]; then
+        # shellcheck source=/dev/null
+        source "$_AGENTFLOW_LOCAL_PROXY_ENV"
+    fi
+fi
+unset _AGENTFLOW_SHARED_PROXY_ENV _AGENTFLOW_LOCAL_PROXY_ENV
+
+: "${PROXY_TOKEN:?Set PROXY_TOKEN once in shared /data/agentflow/proxy.env}"
+: "${PROXY_HOST:?Set PROXY_HOST once in shared /data/agentflow/proxy.env}"
 PROXY_PORT="${PROXY_PORT:-18090}"
 
 # ---------- HTTP/HTTPS Proxy ----------
