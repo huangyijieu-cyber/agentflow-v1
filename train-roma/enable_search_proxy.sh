@@ -23,11 +23,15 @@ export no_proxy="$NO_PROXY"
 export SEARCH_GATEWAY_BASE_URL="http://7.150.10.123/agentflow-search"
 export SEARCH_GATEWAY_TOKEN="$PROXY_TOKEN"
 
+# ---------- Wikimedia API identity (shared by all workers) ----------
+export WIKIMEDIA_USER_AGENT="${WIKIMEDIA_USER_AGENT:-AgentFlowResearchBot/1.0 (https://github.com/huangyijieu-cyber/agentflow-v1/issues)}"
+
 # ---------- Python requests / Wikipedia 兼容 ----------
 PROXY_PY_DIR="/tmp/agentflow_search_proxy"
 mkdir -p "$PROXY_PY_DIR"
 
 cat > "$PROXY_PY_DIR/sitecustomize.py" <<'PY'
+import os
 import requests
 import requests.adapters as adapters
 from urllib.parse import urlsplit, urlunsplit
@@ -83,7 +87,7 @@ def _request_with_web_user_agent(self, method, url, **kwargs):
         kwargs.setdefault("verify", False)
 
         headers = dict(kwargs.get("headers") or {})
-        headers.setdefault("User-Agent", "AgentFlow-WebSearch/1.0")
+        headers["User-Agent"] = os.environ["WIKIMEDIA_USER_AGENT"]
         kwargs["headers"] = headers
 
     return _original_session_request(self, method, url, **kwargs)
