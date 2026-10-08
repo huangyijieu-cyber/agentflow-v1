@@ -86,3 +86,6 @@ nohup.out
 # Local process state and notebook autosaves
 *.pid
 .ipynb_checkpoints/
+
+# Local search proxy credentials (never commit)
+train-roma/proxy.local.env
