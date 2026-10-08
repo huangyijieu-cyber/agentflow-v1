@@ -83,12 +83,12 @@ class Memory:
         self.actions = {}
         self.files = []
 
-    def get_actions(self, max_steps: int = 3, max_result_chars: Optional[int] = None,
+    def get_actions(self, max_steps: int = 3, max_result_chars: Optional[int] = 2000,
                     max_command_chars: int = 500) -> Dict[str, Dict[str, Any]]:
-        """Recent actions with complete summaries; raw records remain untouched.
+        """Recent actions with bounded result text; raw records remain untouched.
 
         render_prompt enforces a token budget on the entire model input. The
-        optional character limit is retained only for explicit legacy callers.
+        Pass max_result_chars=None explicitly for an unbounded diagnostic view.
         """
         if not self.actions or max_steps <= 0:
             return {}
@@ -137,11 +137,11 @@ class Memory:
         return {"query": result.get("query"), key: compact}
 
     def render_prompt(self, template, engine, output_tokens=2048, budget=None):
-        """Fit recent history into the *whole* prompt, keeping the latest result.
+        """Fit bounded recent history into the whole receiving model's prompt.
 
         Older results are replaced by small action records first, then dropped
-        if needed. The latest summary is never sliced. If it alone cannot fit,
-        report a configuration error rather than silently discarding evidence.
+        if needed. Then shorten the latest result with an explicit marker.
+        Raw actions remain intact. Instructions and output budget are preserved.
         """
         if MEMORY_PLACEHOLDER not in template:
             raise ValueError("Memory placeholder missing from prompt template")
@@ -172,11 +172,45 @@ class Memory:
             if budget.fits(prompt, output_tokens):
                 print("[Memory budget] Dropped older action records; latest summary retained")
                 return prompt
+        if actions:
+            latest = actions[next(reversed(actions))]
+            original_result = latest.get("result", "")
+            result_text = str(original_result)
+            marker = "...[truncated to fit context budget]"
+            latest["result"] = marker
+            minimal_prompt = render()
+            if budget.fits(minimal_prompt, output_tokens):
+                # Search actual serialized prompts, not an additive estimate of
+                # token counts. Retain a verified fitting candidate even when
+                # tokenization at prefix boundaries is not monotonic.
+                best = minimal_prompt
+                kept = 0
+                lo, hi = 1, len(result_text)
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    latest["result"] = result_text[:mid] + marker
+                    candidate = render()
+                    if budget.fits(candidate, output_tokens):
+                        best, kept = candidate, mid
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                # A remote tokenizer can become unavailable during the search;
+                # recheck with the current counter before returning.
+                if budget.fits(best, output_tokens):
+                    print(f"[Memory budget] Latest result shortened to {kept} characters "
+                          f"plus marker; output_reserved={output_tokens}; raw result retained")
+                    return best
+                if budget.fits(minimal_prompt, output_tokens):
+                    print("[Memory budget] Latest result omitted with truncation marker; raw result retained")
+                    return minimal_prompt
+            latest["result"] = original_result
+            prompt = render()
         if getattr(budget, "tokenizer_mode", None) == "utf8-upper-bound":
             # An upper bound above a limit does NOT establish that the actual
             # token count is above it. Let the serving model validate its input.
-            print("[Memory budget] Exact token count unavailable; preserving the latest "
-                  "complete result and letting the model server validate context length. "
+            print("[Memory budget] Exact token count unavailable and fixed prompt exceeds "
+                  "the byte estimate; retaining the 2000-character result cap for server validation. "
                   "Configure AGENTFLOW_AGENT_TOKENIZER_PATH for exact local counting.")
             return prompt
         input_tokens = budget.count(getattr(budget, "system_prompt", "") + "\n" + prompt)
@@ -185,8 +219,8 @@ class Memory:
             f"margin={getattr(budget, 'margin', 0)}, limit={budget.limit}, "
             f"counting={getattr(budget, 'tokenizer_mode', 'provided-tokenizer')}, "
             f"model={getattr(budget, 'model', 'unknown')}, memory_steps={len(actions)}. "
-            "Check this model's serving limit or reduce the tool summary length; "
-            "no summary was truncated."
+            "The prompt still cannot fit with the latest tool result replaced by a truncation marker. "
+            "Reduce question/instruction/action-metadata length or adjust the serving/output budget."
         )
 
     def get_all_actions(self) -> Dict[str, Dict[str, Any]]:

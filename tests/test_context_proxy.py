@@ -124,7 +124,9 @@ class ProxyTests(unittest.TestCase):
             long_text = "information " * 1500 + "TAIL_EVIDENCE"
             memory.add_action(1, "Web_RAG_Search_Tool", "goal", "command", [long_text])
             prompt = memory.render_prompt(MEMORY_PLACEHOLDER, engine, budget=budget)
-            self.assertIn(long_text, prompt)
+            self.assertIn("[truncated]", prompt)
+            self.assertNotIn("TAIL_EVIDENCE", prompt)
+            self.assertEqual(memory.get_all_actions()["Action Step 1"]["result"], [long_text])
             self.assertTrue(budget.fits(prompt, 2048))
 
 

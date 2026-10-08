@@ -317,14 +317,16 @@ class ContextTests(unittest.TestCase):
             result = "information " * 1000 + "TAIL"
             memory.add_action(1, "Web_RAG_Search_Tool", "goal", "command", [result])
             prompt = memory.render_prompt(MEMORY_PLACEHOLDER, None, budget=budget)
-            self.assertIn(result, prompt)
+            self.assertIn("[truncated]", prompt)
+            self.assertNotIn("TAIL", prompt)
+            self.assertEqual(memory.get_all_actions()["Action Step 1"]["result"], [result])
             self.assertEqual(budget.tokenizer_mode, "utf8-upper-bound")
 
 
 class MemoryTests(unittest.TestCase):
     def test_summary_tail_survives_prompt_and_raw_record_is_unchanged(self):
         memory = Memory()
-        summary = "Evidence " * 500 + "TAIL_FACT"
+        summary = "Evidence " * 100 + "TAIL_FACT"
         memory.add_action(1, "Web_RAG_Search_Tool", "goal", "command", [summary])
         raw = copy.deepcopy(memory.get_all_actions())
         prompt = memory.render_prompt("Question\n" + MEMORY_PLACEHOLDER, None,
@@ -337,9 +339,9 @@ class MemoryTests(unittest.TestCase):
         memory = Memory()
         result = {"query": "query", "relevant_pages (to the query)": [
             {"title": "One", "url": "url1", "abstract": "REDUNDANT",
-             "retrieved_information": "A" * 2500 + "TAIL_ONE"},
+             "retrieved_information": "A" * 250 + "TAIL_ONE"},
             {"title": "Two", "url": "url2", "abstract": "REDUNDANT",
-             "retrieved_information": "B" * 2500 + "TAIL_TWO"},
+             "retrieved_information": "B" * 250 + "TAIL_TWO"},
         ], "other_pages (may be irrelevant to the query)": [{"title": "OTHER"}]}
         memory.add_action(1, "Wikipedia_RAG_Search_Tool", "goal", "cmd", [result])
         raw = copy.deepcopy(memory.get_all_actions())
@@ -362,11 +364,63 @@ class MemoryTests(unittest.TestCase):
         self.assertTrue(Budget(3000).fits(prompt, 300))
         self.assertEqual(memory.get_all_actions(), raw)
 
-    def test_latest_too_large_raises_instead_of_cutting(self):
+    def test_latest_too_large_is_shortened_to_whole_prompt_budget(self):
         memory = Memory()
         memory.add_action(1, "Web_RAG_Search_Tool", "goal", "cmd", "x" * 5000)
-        with self.assertRaisesRegex(ContextBudgetError, "no summary was truncated"):
-            memory.render_prompt(MEMORY_PLACEHOLDER, None, budget=Budget(3000))
+        raw = copy.deepcopy(memory.get_all_actions())
+        budget = Budget(3000)
+        prompt = memory.render_prompt(MEMORY_PLACEHOLDER, None, budget=budget)
+        self.assertIn("[truncated to fit context budget]", prompt)
+        self.assertIn("x" * 100, prompt)
+        self.assertTrue(budget.fits(prompt, 2048))
+        self.assertEqual(memory.get_all_actions(), raw)
+
+    def test_default_cap_covers_all_tools_and_preserves_raw_results(self):
+        for tool in ("Web_RAG_Search_Tool", "Wikipedia_RAG_Search_Tool", "Yibu_Brave_Search_Tool"):
+            with self.subTest(tool=tool):
+                memory = Memory()
+                result = [{"summary": "证据\\\"\n" * 1000, "sources": ["url"]}]
+                memory.add_action(1, tool, "goal", "cmd", result)
+                raw = copy.deepcopy(memory.get_all_actions())
+                visible = memory.get_actions()["Action Step 1"]["result"]
+                self.assertEqual(visible, str(result)[:2000] + "...[truncated]")
+                self.assertEqual(memory.get_actions(max_result_chars=None)["Action Step 1"]["result"], result)
+                self.assertEqual(memory.get_all_actions(), raw)
+
+    def test_reported_overflow_sizes_fit_after_latest_result_shortening(self):
+        class ServingBudget(Budget):
+            margin = 256
+            def fits(self, prompt, output_tokens):
+                return self.count(prompt) + output_tokens + self.margin <= self.limit
+        for input_size in (8706, 8986):
+            with self.subTest(input_size=input_size):
+                memory = Memory()
+                memory.add_action(1, "Web_RAG_Search_Tool", "goal", "cmd", "证据" * 900)
+                raw = copy.deepcopy(memory.get_all_actions())
+                template = "i" * (input_size - len(str(memory.get_actions()))) + MEMORY_PLACEHOLDER
+                budget = ServingBudget(10752)
+                original = template.replace(MEMORY_PLACEHOLDER, str(memory.get_actions()))
+                self.assertEqual(budget.count(original), input_size)
+                self.assertFalse(budget.fits(original, 2048))
+                prompt = memory.render_prompt(template, None, budget=budget)
+                self.assertTrue(budget.fits(prompt, 2048))
+                self.assertIn("truncated to fit context budget", prompt)
+                self.assertEqual(memory.get_all_actions(), raw)
+
+    def test_fixed_prompt_too_large_still_reports_configuration_problem(self):
+        memory = Memory()
+        memory.add_action(1, "tool", "goal", "cmd", "evidence")
+        with self.assertRaisesRegex(ContextBudgetError, "question/instruction/action-metadata"):
+            memory.render_prompt("fixed" * 1000 + MEMORY_PLACEHOLDER, None, budget=Budget(3000))
+
+    def test_unknown_tokenizer_does_not_reject_oversized_fixed_byte_estimate(self):
+        budget = Budget(3000)
+        budget.tokenizer_mode = "utf8-upper-bound"
+        memory = Memory()
+        memory.add_action(1, "tool", "goal", "cmd", "x" * 5000)
+        prompt = memory.render_prompt("fixed" * 1000 + MEMORY_PLACEHOLDER, None, budget=budget)
+        self.assertIn("[truncated]", prompt)
+        self.assertNotIn("x" * 2001, prompt)
 
     def test_overwritten_step_is_the_latest_action(self):
         memory = Memory()
@@ -432,7 +486,7 @@ class ToolIntegrationTests(unittest.TestCase):
         self.assertEqual(len(engine.calls), 3)  # Two page summaries + one combined summary.
         self.assertLessEqual(WikiResultSummarizer(engine)._size(result), WIKI_RESULT_TOKENS)
 
-    def test_planner_and_verifier_receive_complete_latest_summary(self):
+    def test_planner_and_verifier_receive_capped_summary_and_raw_tail_is_kept(self):
         planner_module = importlib.import_module("agentflow.models.planner")
         verifier_module = importlib.import_module("agentflow.models.verifier")
         engine = EvidenceEngine(Budget(20000))
@@ -451,10 +505,13 @@ class ToolIntegrationTests(unittest.TestCase):
         verifier.verificate_context("q", None, "analysis", memory, 1, trace)
         self.assertEqual(len(engine.calls), 4)
         for prompt, _ in engine.calls:
-            self.assertIn(summary, prompt)
+            self.assertIn(summary[:1000], prompt)
+            self.assertIn("[truncated]", prompt)
+            self.assertNotIn("FACT_999", prompt)
             self.assertNotIn(MEMORY_PLACEHOLDER, prompt)
-        self.assertIn(summary, trace["action_predictor_2_prompt"])
-        self.assertIn(summary, trace["verifier_1_prompt"])
+        self.assertIn("[truncated]", trace["action_predictor_2_prompt"])
+        self.assertIn("[truncated]", trace["verifier_1_prompt"])
+        self.assertEqual(memory.get_all_actions()["Action Step 1"]["result"], [summary])
 
 
 if __name__ == "__main__":
