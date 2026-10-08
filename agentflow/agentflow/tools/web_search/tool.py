@@ -2,6 +2,7 @@ import os
 import numpy as np
 import openai
 import requests
+from urllib.parse import urlsplit
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
@@ -147,6 +148,13 @@ class Web_Search_Tool(BaseTool):
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
         }
+
+        # Wikimedia pages must identify AgentFlow rather than pretend to be Chrome.
+        wiki_host = (urlsplit(url).hostname or "").lower()
+        if wiki_host == "wikipedia.org" or wiki_host.endswith(".wikipedia.org"):
+            headers["User-Agent"] = os.getenv(
+                "WIKIMEDIA_USER_AGENT", "AgentFlowResearchBot/1.0 (https://github.com/huangyijieu-cyber/agentflow-v1/issues)"
+            )
 
         try:
             response = requests.get(url, headers=headers, timeout=10, verify=False)
