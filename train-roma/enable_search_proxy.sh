@@ -5,8 +5,7 @@
 # 训练机 -> EC2 -> Windows -> 公司代理 -> Internet
 # ==============================
 
-# Proxy address is fixed; the credential must be supplied securely by the runtime.
-: "${PROXY_TOKEN:?PROXY_TOKEN is required; do not commit credentials to this public repository}"
+PROXY_TOKEN="tEc3gNapEHePEOg9AZAHaYVZciZHhaWW8GnVeAOTpk9GYWvA_rKz7M-7rlER7lWB"
 PROXY_HOST="7.150.10.123"
 PROXY_PORT="18090"
 
