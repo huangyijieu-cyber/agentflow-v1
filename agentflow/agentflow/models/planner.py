@@ -33,6 +33,18 @@ class Planner:
         self.verbose = verbose
         self.logs = list()
 
+    # [修改目的] 原代码的 Planner log 只保存 prompt/response 文本，训练阶段无法拿到 serving 时真实 token ids。
+    # 新增统一日志入口：保留原文本字段，同时附带本次 vLLM 调用的 prompt_token_ids、response_token_ids 和 finish_reason。
+    def _append_log(self, prompt: str, response: Any) -> None:
+        metadata = getattr(self.llm_engine, "last_generation_metadata", None) or {}
+        self.logs.append({
+            "prompt": prompt,
+            "response": response,
+            "prompt_token_ids": metadata.get("prompt_token_ids"),
+            "response_token_ids": metadata.get("response_token_ids"),
+            "finish_reason": metadata.get("finish_reason"),
+        })
+
     def get_image_info(self, image_path: str) -> Dict[str, Any]:
         image_info = {}
         if image_path and os.path.isfile(image_path):
@@ -66,7 +78,10 @@ class Planner:
         # self.base_response = self.llm_engine_fixed(input_data, max_tokens=max_tokens)
 
         ## add trajectory
-        self.logs.append({"prompt": input_data[0], "response": self.base_response})
+        # [原代码保留]
+        # self.logs.append({"prompt": input_data[0], "response": self.base_response})
+        # [修改目的] 在不改变 prompt/response 文本的前提下，同时记录本次真实 token ids / finish_reason。
+        self._append_log(input_data[0], self.base_response)
         return self.base_response
 
     def analyze_query(self, question: str, image: str, max_tokens: int = 2048) -> str:
@@ -135,7 +150,10 @@ Be biref and precise with insight.
         self.query_analysis = self.llm_engine(input_data[0], max_tokens=max_tokens, response_format=QueryAnalysis, temperature=self.temperature, usage_by="[planner] analyze query")
         # self.query_analysis = self.llm_engine_fixed(input_data, response_format=QueryAnalysis)
 
-        self.logs.append({"prompt": input_data[0], "response": self.query_analysis})
+        # [原代码保留]
+        # self.logs.append({"prompt": input_data[0], "response": self.query_analysis})
+        # [修改目的] 保存 analyze_query 这次真实生成所对应的 token ids / finish_reason。
+        self._append_log(input_data[0], self.query_analysis)
 
         return str(self.query_analysis).strip()
 
@@ -304,7 +322,10 @@ Rules:
             json_data[f"action_predictor_{step_count}_prompt"] = prompt_generate_next_step
             json_data[f"action_predictor_{step_count}_response"] = str(next_step)
 
-        self.logs.append({"prompt": prompt_generate_next_step, "response": next_step})
+        # [原代码保留]
+        # self.logs.append({"prompt": prompt_generate_next_step, "response": next_step})
+        # [修改目的] 保存当前 next-step turn 的真实 token ids / finish_reason，保证 turn 与其 serving 轨迹一一对应。
+        self._append_log(prompt_generate_next_step, next_step)
 
         return next_step
 
@@ -380,7 +401,10 @@ Instructions:
         final_output = self.llm_engine(input_data[0], max_tokens=max_tokens, temperature=self.temperature, usage_by="[planner] generate final output")
         # final_output = self.llm_engine_fixed(input_data)
 
-        self.logs.append({"prompt": input_data[0], "response": final_output})
+        # [原代码保留]
+        # self.logs.append({"prompt": input_data[0], "response": final_output})
+        # [修改目的] final-output turn 同样保存 serving 端真实 token ids / finish_reason。
+        self._append_log(input_data[0], final_output)
         return final_output
 
 
@@ -432,5 +456,9 @@ Output Structure:
         # final_output = self.llm_engine_fixed(input_data)
         # final_output = self.llm_engine_mm(input_data)
 
-        self.logs.append({"prompt": input_data[0], "response": final_output})
+        # [原代码保留]
+        # self.logs.append({"prompt": input_data[0], "response": final_output})
+        # [修改目的] direct-output turn 同样保存 serving 端真实 token ids / finish_reason。
+        self._append_log(input_data[0], final_output)
         return final_output
+

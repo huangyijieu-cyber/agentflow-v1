@@ -238,6 +238,7 @@ class AgentFlowTrainer(RayPPOTrainer):
             turn_indices = history_batch.non_tensor_batch["turn_index_list"]
             rollout_ids = history_batch.non_tensor_batch["rollout_id_list"]
             old_log_probs = history_batch.batch["old_log_probs"]
+            is_drop_mask = history_batch.batch.get("is_drop_mask")
 
             scores = token_level_scores.sum(dim=-1)
             lengths = response_mask.sum(dim=-1)
@@ -260,6 +261,9 @@ class AgentFlowTrainer(RayPPOTrainer):
 
             with torch.no_grad():
                 for i in range(bsz):
+                    # 排除超长 prompt：响应来自完整上下文，不能用于截断上下文下的 SLiC。
+                    if is_drop_mask is not None and bool(is_drop_mask[i].item()):
+                        continue
                     uid = str(uids[i])
                     turn = str(turn_indices[i])
                     ## replay collection
@@ -955,3 +959,4 @@ class AgentFlowTrainer(RayPPOTrainer):
 
                 progress_bar.update(1)
                 self.global_steps += 1
+

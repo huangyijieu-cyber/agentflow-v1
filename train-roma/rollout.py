@@ -334,10 +334,30 @@ class RolloutAgent(LitAgent):
 
         # print(f"Return reward value, Rollout data saved to: {save_path}")
 
-        def encode_logs(tokenizer, logs):
-            return [Triplet(prompt = {"token_ids": tokenizer.encode(log["prompt"], add_special_tokens=False)},
-                                response = {"token_ids": tokenizer.encode(log["response"], add_special_tokens=False)},
-                                reward = None) for log in logs]
+        # Keep the exact serving token sequences, including the chat template
+        # and special tokens, instead of rebuilding them from decoded text.
+        def encode_logs(logs):
+            triplets = []
+            for turn_index, log in enumerate(logs):
+                prompt_ids = log.get("prompt_token_ids")
+                response_ids = log.get("response_token_ids")
+                finish_reason = log.get("finish_reason")
+
+                if prompt_ids is None or response_ids is None:
+                    raise RuntimeError(
+                        f"Planner turn {turn_index} is missing exact vLLM token ids. "
+                        "Refusing to train/evaluate on re-tokenized text."
+                    )
+
+                triplets.append(
+                    Triplet(
+                        prompt={"token_ids": list(prompt_ids)},
+                        response={"token_ids": list(response_ids)},
+                        reward=None,
+                        metadata={"finish_reason": finish_reason},
+                    )
+                )
+            return triplets
 
 
         ## planner logs
@@ -352,7 +372,7 @@ class RolloutAgent(LitAgent):
             rollout_package = Rollout(
                 rollout_id = rollout_id,
                 final_reward = reward_value,
-                triplets = await asyncio.to_thread(encode_logs, self.tokenizer, planner_logs),
+                triplets = encode_logs(planner_logs),
                 metadata = metadata
             )
         except Exception as e:
