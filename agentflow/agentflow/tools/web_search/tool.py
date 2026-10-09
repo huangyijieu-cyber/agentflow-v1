@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 import openai
 import requests
@@ -7,6 +8,12 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from agentflow.tools.base import BaseTool
+from agentflow.tools.network_retry import (
+    MAX_NETWORK_RETRIES,
+    MAX_RETRY_WAIT_SECONDS,
+    RETRYABLE_HTTP_STATUSES,
+    retry_wait_seconds,
+)
 from agentflow.engine.factory import create_llm_engine
 
 load_dotenv()
@@ -156,17 +163,40 @@ class Web_Search_Tool(BaseTool):
                 "WIKIMEDIA_USER_AGENT", "AgentFlowResearchBot/1.0 (https://github.com/huangyijieu-cyber/agentflow-v1/issues)"
             )
 
-        try:
-            response = requests.get(url, headers=headers, timeout=10, verify=False)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'html.parser')
-            text = soup.get_text(separator='\n', strip=True)
-            text = text[:self.max_window_size] # Limit the text to max_window_size characters
-            return text
-        except requests.RequestException as e:
-            return f"Error fetching URL: {str(e)}"
-        except Exception as e:
-            return f"Error extracting text: {str(e)}"
+        # Session.get bypasses Wikipedia's global requests.get retry patch.
+        # This keeps one Web RAG fetch within four HTTP requests even for wiki URLs.
+        with requests.Session() as session:
+            for attempt in range(MAX_NETWORK_RETRIES + 1):
+                try:
+                    response = session.get(url, headers=headers, timeout=10, verify=False)
+                    if response.status_code in RETRYABLE_HTTP_STATUSES and attempt < MAX_NETWORK_RETRIES:
+                        wait_time = retry_wait_seconds(
+                            attempt,
+                            status_code=response.status_code,
+                            retry_after=response.headers.get("Retry-After"),
+                        )
+                        if wait_time <= MAX_RETRY_WAIT_SECONDS:
+                            print(f"[Web RAG HTTP] {response.status_code}; retrying in {wait_time:.1f}s "
+                                  f"({attempt + 1}/{MAX_NETWORK_RETRIES})")
+                            response.close()
+                            time.sleep(wait_time)
+                            continue
+                    response.raise_for_status()
+                    soup = BeautifulSoup(response.content, 'html.parser')
+                    text = soup.get_text(separator='\n', strip=True)
+                    return text[:self.max_window_size]
+                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                    if attempt < MAX_NETWORK_RETRIES:
+                        wait_time = retry_wait_seconds(attempt)
+                        print(f"[Web RAG Network] {type(e).__name__}; retrying in {wait_time:.1f}s "
+                              f"({attempt + 1}/{MAX_NETWORK_RETRIES})")
+                        time.sleep(wait_time)
+                        continue
+                    return f"Error fetching URL: {str(e)}"
+                except requests.RequestException as e:
+                    return f"Error fetching URL: {str(e)}"
+                except Exception as e:
+                    return f"Error extracting text: {str(e)}"
 
     def _chunk_website_content(self, content):
         """
