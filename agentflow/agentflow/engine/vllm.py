@@ -47,6 +47,7 @@ class ChatVLLM(EngineLM, CachedEngine):
         self.use_cache = use_cache
         self.system_prompt = system_prompt
         self.is_multimodal = is_multimodal
+        self.temperature = kwargs.get("temperature", 0.7)
 
         # [修改目的] 保存当前一次 vLLM 调用的真实 token ids / finish_reason，供 Planner 日志和 RL Triplet 使用。
         # 原代码没有这个字段，因此 rollout 完成后只剩文本，训练阶段只能重新 tokenize。
@@ -149,8 +150,8 @@ class ChatVLLM(EngineLM, CachedEngine):
         # presence_penalty = 0
 
 
-        ## fixed parameters
-        temperature = 0.7
+        # 调用方传入的训练／验证温度优先；未传时使用引擎默认值，保留显式 0.0。
+        temperature = kwargs.get("temperature", self.temperature)
         top_p = 1.0
         presence_penalty = 0
         print(f"post by _generate_text, temperature: {temperature}")

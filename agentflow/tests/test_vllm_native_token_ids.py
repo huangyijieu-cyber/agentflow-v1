@@ -45,24 +45,50 @@ def payload():
 class NativeTokenTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.initialize = staticmethod(extract(
+            'agentflow/agentflow/engine/vllm.py', '__init__',
+            {'os': os, 'OpenAI': OpenAI, 'DEFAULT_SYSTEM_PROMPT': 'system'}))
         cls.generate = staticmethod(extract('agentflow/agentflow/engine/vllm.py', '_generate_text', {'os': os}))
         cls.append = staticmethod(extract('agentflow/agentflow/models/planner.py', '_append_log', {'Any': Any}))
         triplet = extract('agentflow/agent_types.py', 'Triplet', dict(Any=Any, Dict=Dict, Optional=Optional, BaseModel=BaseModel, Field=Field))
         cls.encode = staticmethod(extract('train-roma/rollout.py', 'encode_logs', {'Triplet': triplet}))
 
-    def run_chain(self, data):
+    def run_chain(self, data, engine_kwargs=None, **generation_kwargs):
         requests = []
         def respond(request):
             requests.append(json.loads(request.content))
             return httpx.Response(200, json=data)
         with OpenAI(api_key='test', base_url='http://serving.test/v1', max_retries=0,
                     http_client=httpx.Client(transport=httpx.MockTransport(respond))) as client:
-            engine = NS(client=client, model_string='test', system_prompt='system', use_cache=False)
+            engine = NS()
+            with patch.dict(self.initialize.__globals__, {'OpenAI': lambda **kw: client}):
+                self.initialize(engine, model_string='test', system_prompt='system',
+                                use_cache=False, **(engine_kwargs or {}))
             with contextlib.redirect_stdout(io.StringIO()):
-                text = self.generate(engine, 'question', max_tokens=16)
+                text = self.generate(engine, 'question', max_tokens=16, **generation_kwargs)
             planner = NS(llm_engine=engine, logs=[])
             self.append(planner, 'question', text)
         return requests, engine, planner, text
+
+    def test_request_uses_training_or_validation_temperature(self):
+        for temperature in (0.0, 0.7, 0.25):
+            with self.subTest(temperature=temperature):
+                requests, _, _, _ = self.run_chain(payload(), temperature=temperature)
+                self.assertEqual(requests[0]['temperature'], temperature)
+                self.assertEqual(requests[0]['top_p'], 1.0)
+
+    def test_request_inherits_engine_temperature_when_not_overridden(self):
+        for engine_kwargs, expected in (({}, 0.7), ({'temperature': 0.0}, 0.0),
+                                        ({'temperature': 0.4}, 0.4)):
+            with self.subTest(engine_kwargs=engine_kwargs):
+                requests, engine, _, _ = self.run_chain(payload(), engine_kwargs=engine_kwargs)
+                self.assertEqual(engine.temperature, expected)
+                self.assertEqual(requests[0]['temperature'], expected)
+
+    def test_call_temperature_overrides_engine_temperature(self):
+        requests, _, _, _ = self.run_chain(payload(), engine_kwargs={'temperature': 0.4},
+                                           temperature=0.0)
+        self.assertEqual(requests[0]['temperature'], 0.0)
 
     def test_native_http_to_planner_to_triplet_keeps_eos(self):
         requests, engine, planner, text = self.run_chain(payload())
@@ -83,6 +109,7 @@ class NativeTokenTests(unittest.TestCase):
         completions = NS(create=lambda **kw: response)
         engine = NS(client=NS(chat=NS(completions=completions)))
         engine.model_string, engine.system_prompt, engine.use_cache = 'test', 'system', False
+        engine.temperature = 0.7
         with contextlib.redirect_stdout(io.StringIO()):
             self.generate(engine, 'question')
         self.assertEqual(engine.last_generation_metadata['response_token_ids'], [17, 151645])
