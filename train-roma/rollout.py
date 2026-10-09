@@ -549,10 +549,37 @@ class RolloutAgent(LitAgent):
 
         # print(f"Return reward value, Rollout data saved to: {save_path}")
 
-        def encode_logs(tokenizer, logs):
-            return [Triplet(prompt = {"token_ids": tokenizer.encode(log["prompt"], add_special_tokens=False)},
-                                response = {"token_ids": tokenizer.encode(log["response"], add_special_tokens=False)},
-                                reward = None) for log in logs]
+        # [原代码保留]
+        # def encode_logs(tokenizer, logs):
+        #     return [Triplet(
+        #         prompt={"token_ids": tokenizer.encode(log["prompt"], add_special_tokens=False)},
+        #         response={"token_ids": tokenizer.encode(log["response"], add_special_tokens=False)},
+        #         reward=None,
+        #     ) for log in logs]
+        # [修改目的] 使用 serving 端真实 token ids，保留聊天模板、实际生成的 EOS
+        # 及 finish_reason；缺失时明确报错，不用文本重新编码替代真实轨迹。
+        def encode_logs(logs):
+            triplets = []
+            for turn_index, log in enumerate(logs):
+                prompt_ids = log.get("prompt_token_ids")
+                response_ids = log.get("response_token_ids")
+                finish_reason = log.get("finish_reason")
+
+                if prompt_ids is None or response_ids is None:
+                    raise RuntimeError(
+                        f"Planner turn {turn_index} is missing exact vLLM token ids. "
+                        "Refusing to train/evaluate on re-tokenized text."
+                    )
+
+                triplets.append(
+                    Triplet(
+                        prompt={"token_ids": list(prompt_ids)},
+                        response={"token_ids": list(response_ids)},
+                        reward=None,
+                        metadata={"finish_reason": finish_reason},
+                    )
+                )
+            return triplets
 
 
         ## planner logs
@@ -585,7 +612,9 @@ class RolloutAgent(LitAgent):
             rollout_package = Rollout(
                 rollout_id = rollout_id,
                 final_reward = reward_value,
-                triplets = await asyncio.to_thread(encode_logs, self.tokenizer, planner_logs),
+                # [原代码保留] triplets = await asyncio.to_thread(encode_logs, self.tokenizer, planner_logs),
+                # [修改目的] 直接构造真实 token Triplet，保留上面的 InfoSeek/GiGPO metadata。
+                triplets = encode_logs(planner_logs),
                 metadata = metadata
             )
         except Exception as e:
