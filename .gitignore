@@ -89,3 +89,9 @@ nohup.out
 
 # Local search proxy credentials (never commit)
 train-roma/proxy.local.env
+
+# Shared search cache credentials and persistent runtime data
+train-roma/search-cache.local.env
+**/search-service.env
+**/search-cache-data/
+!agentflow/agentflow/search_service/core.py

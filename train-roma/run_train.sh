@@ -117,6 +117,10 @@ cd "${ROOT_PATH}/agentflow"
 python -m pip install --no-deps -e . --no-build-isolation
 cd ..
 
+# Fail before rollout if the explicitly enabled shared search service is down.
+if [[ "${SEARCH_CACHE_ENABLED:-0}" == "1" || -n "${SEARCH_CACHE_ENV_FILE:-}" || -f "${ROOT_PATH}/train-roma/search-cache.local.env" ]]; then
+    source "${ROOT_PATH}/train-roma/enable_search_cache.sh" || exit 1
+fi
 
 ## 执行脚本 (连接， 服务端， 客户端)
 echo "Run all scripts!"

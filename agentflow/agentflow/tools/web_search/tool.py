@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from agentflow.tools.base import BaseTool
+from agentflow.tools.search_gateway import SearchGatewayClient, SearchGatewayError, search_cache_enabled
 from agentflow.tools.network_retry import (
     MAX_NETWORK_RETRIES,
     MAX_RETRY_WAIT_SECONDS,
@@ -144,6 +145,15 @@ class Web_Search_Tool(BaseTool):
             str: The extracted text.
         """
         url = url.replace("arxiv.org/pdf", "arxiv.org/abs")
+
+        if search_cache_enabled():
+            try:
+                with SearchGatewayClient.from_env() as gateway:
+                    return gateway.fetch(url, max_length=self.max_window_size)["text"]
+            except SearchGatewayError as error:
+                # execute() returns Error content before embedding or summarization.
+                # Do not fall back to direct requests or add another retry loop.
+                return f"Error fetching URL: {error}"
 
         # Add headers to mimic a real browser request
         # NOTE: this is a workaround to avoid being blocked by the website

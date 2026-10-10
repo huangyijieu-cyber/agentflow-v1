@@ -8,6 +8,11 @@ from agentflow.tools.network_retry import (
     RETRYABLE_HTTP_STATUSES,
     retry_wait_seconds,
 )
+from agentflow.tools.search_gateway import (
+    SearchGatewayClient,
+    SearchGatewayError,
+    search_cache_enabled,
+)
 
 # 1. 全局禁用 SSL 证书验证
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -38,7 +43,8 @@ def _patched_api_request(method, url, **kwargs):
 
 def _patched_session_request(self, method, url, **kwargs):
     """Patch requests.Session.request"""
-    kwargs['verify'] = False
+    # Preserve explicit TLS verification on shared-service requests.
+    kwargs.setdefault('verify', False)
     return _original_session_request(self, method, url, **kwargs)
 
 
@@ -341,6 +347,21 @@ class Wikipedia_Search_Tool(BaseTool):
                 - search_results: List of search result titles
                 - pages_data: List of dictionaries containing page info (title, text, url, error)
         """
+
+        if search_cache_enabled():
+            try:
+                with SearchGatewayClient.from_env() as gateway:
+                    return gateway.wikipedia_search(
+                        query=query,
+                        max_length=max_length,
+                        max_pages=max_pages,
+                        language="en",
+                    )["results"]
+            except SearchGatewayError as error:
+                if error.status_code == 429 or error.upstream_status_code == 429:
+                    raise WikipediaRateLimitError(str(error)) from error
+                # Service owns retries; do not silently search directly here.
+                raise
 
         search_results = wikipedia.search(query)
 

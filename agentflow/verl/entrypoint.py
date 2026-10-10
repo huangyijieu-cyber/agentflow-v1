@@ -15,6 +15,19 @@ def main(config):
     run_ppo(config)
 
 
+def _search_cache_env_vars():
+    """Propagate explicitly configured search routing to Ray actors."""
+    names = (
+        "SEARCH_CACHE_ENABLED", "SEARCH_CACHE_BASE_URL", "SEARCH_CACHE_TOKEN",
+        "SEARCH_CACHE_CONNECT_TIMEOUT_SECONDS", "SEARCH_CACHE_READ_TIMEOUT_SECONDS",
+        "SEARCH_GATEWAY_BASE_URL", "SEARCH_GATEWAY_TOKEN", "GATEWAY_TOKEN",
+        "SEARCH_GATEWAY_CONNECT_TIMEOUT", "SEARCH_GATEWAY_READ_TIMEOUT",
+    )
+    if os.environ.get("SEARCH_CACHE_ENABLED", "").lower() not in {"1", "true", "yes", "on"}:
+        return {"SEARCH_CACHE_ENABLED": "0"}
+    return {name: os.environ[name] for name in names if name in os.environ}
+
+
 def run_ppo(config) -> None:
     if not ray.is_initialized():
         # this is for local ray cluster
@@ -27,6 +40,7 @@ def run_ppo(config) -> None:
         ):
             if name in os.environ:
                 env_vars[name] = os.environ[name]
+        env_vars.update(_search_cache_env_vars())
         ray.init(
             runtime_env={"env_vars": env_vars}
             # runtime_env={
@@ -36,7 +50,10 @@ def run_ppo(config) -> None:
             # To fix the omiga config issue, you can try not commenting this line if your speed is not that satisfying, while it may cause Error for cpu matching. 
         )
 
-    runner = TaskRunner.remote()
+    # Covers an already initialized/external Ray cluster as well as local init.
+    runner = TaskRunner.options(
+        runtime_env={"env_vars": _search_cache_env_vars()}
+    ).remote()
 
 
     # ray.get(runner.run.remote(config))

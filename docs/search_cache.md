@@ -1,0 +1,181 @@
+# 统一搜索与共享缓存
+
+本分支从 `main` 创建。统一服务运行在开发服务器，默认缓存目录为
+`/home/ma-user/work/code-rl/cache`。训练机调用开发服务；缓存未命中时，开发服务沿用
+EC2 → 个人主机 → Internet 的出口。模型选页、embedding、RAG 摘要和 reward 仍在训练机。
+
+```text
+训练任务 A / B / C
+       ↓ HTTP（内网直连或 SSH 转发）
+开发服务器：搜索服务 → SQLite 持久缓存
+       ↓ 未命中：合并请求 / 限速 / 重试
+EC2 → 个人主机 → Wikipedia / Yibu / 网页
+```
+
+## 开发服务器启动
+
+SSH 地址是 `ssh://ma-user@7.150.11.99:31753`。`31753` 是 SSH 入口端口，不能当作 HTTP
+服务端口。搜索服务默认监听开发服务器的 `127.0.0.1:8091`，可通过 SSH 转发使用；若训练机
+能内网直连，也可以将监听地址设成对应内网 IP 或 `0.0.0.0`，并配置平台端口映射。
+
+在开发服务器上的仓库根目录执行：
+
+```bash
+mkdir -p /home/ma-user/work/code-rl/cache
+cp train-roma/search-service.env.example /home/ma-user/work/code-rl/cache/search-service.env
+chmod 600 /home/ma-user/work/code-rl/cache/search-service.env
+```
+
+编辑该文件，填写随机共享令牌 `SEARCH_SERVICE_TOKEN` 和 Yibu 密钥
+`YIBU_BRAVE_API_KEY`。训练机只需要共享服务令牌，不需要 Yibu 密钥。
+安装服务的轻量依赖后启动：
+
+```bash
+python3 -m pip install requests beautifulsoup4
+bash train-roma/run_search_cache.sh
+```
+
+脚本默认读取上述 env 文件，并 source 当前仓库的 `enable_search_proxy.sh` 设置现有出口。
+若已在服务环境中配置好 `HTTP_PROXY` / `HTTPS_PROXY`，在 env 文件设置
+`SEARCH_SERVICE_USE_PROXY=0`。服务端读取代理变量，训练端服务客户端禁用环境代理。
+
+长期运行可以使用平台的后台进程管理器或：
+
+```bash
+nohup bash train-roma/run_search_cache.sh > /home/ma-user/work/code-rl/cache/service.log 2>&1 &
+```
+
+同一缓存目录只允许一个服务进程运行，锁文件防止多进程分别执行限速。
+服务只需 CPU 和磁盘，不需启动训练 SDK、vLLM 或 embedding 服务。
+若需要多进程/多副本，需先把请求合并和限速状态迁移到共享协调组件。
+
+## 训练机接入
+
+**方式一：SSH 转发。** 每个训练节点均需可用的 SSH 授权，并各自启动转发：
+
+```bash
+bash train-roma/open_search_cache_tunnel.sh > /tmp/search-cache-tunnel.log 2>&1 &
+```
+
+默认等价于从该训练节点转发本机 `127.0.0.1:8091` 到开发服务器的
+`127.0.0.1:8091`，SSH 目标为 `ma-user@7.150.11.99:31753`。
+脚本使用 `BatchMode=yes`，需要事先配置 SSH 密钥授权；不会将密码写进仓库。
+目标、SSH 端口和本地端口分别由 `SEARCH_CACHE_SSH_TARGET`、`SEARCH_CACHE_SSH_PORT`、
+`SEARCH_CACHE_LOCAL_PORT` 配置。
+
+**方式二：内网直连。** 设置 `SEARCH_CACHE_BASE_URL` 为训练节点实际能够访问的 HTTP
+地址，不需要 SSH 转发。SSH 地址本身无法确认 HTTP 端口是否已对训练机开放。
+
+复制训练端示例，填入与服务端相同的令牌：
+
+```bash
+cp train-roma/search-cache.env.example train-roma/search-cache.local.env
+chmod 600 train-roma/search-cache.local.env
+```
+
+或者在平台给每个训练节点注入以下环境变量：
+
+```bash
+export SEARCH_CACHE_ENABLED=1
+export SEARCH_CACHE_BASE_URL=http://127.0.0.1:8091
+export SEARCH_CACHE_TOKEN='与服务端相同的共享令牌'
+```
+
+`run_distribute_train.sh`、`run_train.sh`、`run_train_forever.sh` 检测到启用配置或本地 env
+文件后，会在训练前加载并检查服务。直接启动 Python 时，先执行：
+
+```bash
+source train-roma/enable_search_cache.sh
+```
+
+多节点时每个节点均需设置；使用 localhost 时每个节点均需转发。
+VERL 的 Ray 入口会显式向 actor 传递客户端配置。直接调用其它已有 Ray 任务时，也应在
+启动 Ray 前注入这些变量。
+
+没有显式开启 `SEARCH_CACHE_ENABLED` 时，三个工具使用 `main` 原来的网络逻辑。
+现有 `enable_search_proxy.sh` 设置的旧 `SEARCH_GATEWAY_BASE_URL` 不会自行开启共享缓存。
+启用后的服务失败不会自动直连外网，也不会多层叠加重试。
+
+## 各工具缓存边界
+
+| 工具 | 缓存内容 | key 与有效期 |
+| --- | --- | --- |
+| Wiki 候选 | 完整、有序标题列表 | API 站点/语言、query、实际参数、版本；默认 7 天 |
+| Wiki 页面 | 页面身份、正文、URL | 站点/语言、标题身份或 pageid、参数、版本；默认 7 天 |
+| Web RAG | 当前 BeautifulSoup 规则解析出的网页文本 | 完整实际 URL、影响内容的 headers、解析版本与长度；默认 24 小时 |
+| Yibu/Brave | 完整、有序上游 JSON，包括所有搜索结果和 snippets | endpoint、query、count、地区/语言/freshness、版本；默认 24 小时，带 freshness 为 15 分钟 |
+| Base Generator / Python Coder | 不做全局结果缓存 | 非上述网络检索路径 |
+
+真实零结果短缓存 5 分钟；429、超时、未知响应、5xx 不作为成功内容缓存。
+Wiki 单页失败保留当前占位结果，但失败页面不入正常缓存；成功页面可以复用。
+Wiki API 正文和 HTML 解析文本属于不同缓存类型，不能互相替代。
+TTL 配置名称见 `providers.py`；所有 TTL 受 `SEARCH_CACHE_MAX_TTL` 上限约束。
+
+缓存不改变候选排序、重复项、字段顺序和模型使用的文本长度。
+从缓存读取时重新构造独立对象，避免 Wiki 原地加入摘要污染其他 query。
+query 相关的选页、段落排序和摘要在训练机重新执行。
+subreward 和已命中 subgoal 状态不共享；按原工具 observation 及当前 reward 规则逐轨迹计算。
+返回的 `meta` 不拼入 observation，不能因为 reward 只看前 2000 字符就截断原始网页输入。
+
+## 重复请求、限速与失败
+
+显式 batch 按规范化后的完整请求 key 去重，再按原始位置还原结果：
+
+```text
+[A, B, A, C, B] → 获取 [A, B, C] → 返回 [结果A, 结果B, 结果A, 结果C, 结果B]
+```
+
+不同批次或训练任务同时获取相同原始数据时，通过 single-flight 共用一个获取任务。
+每个等待者得到独立副本。失败由同一获取任务重试；等待者不会分别访问上游。
+训练 rollout 按原逻辑逐步产生 query，不需要等待所有轨迹凑齐。
+
+Wiki 默认最多 150 次实际 HTTP attempt/分钟、3 个并发；Wiki HTML 与 API 共用该桶。
+Yibu 默认节流配置只是服务端初始设置，并不表示你的账户有相应额度，请按账户额度调整。
+普通网页按目标域名分开限制。所有实际重试也计入额度。
+429 按 `Retry-After` 对对应桶统一 cooldown。
+
+队列、worker 和整体截止时间有上限，避免任务无限堆积。队列满返回结构化失败。
+服务故障、代理故障和上游错误可以通过 error code、upstream 和 request ID 区分。
+过期成功结果刷新失败时不静默返回旧内容。
+
+## 接口与指标
+
+所有接口使用 `Authorization: Bearer <共享令牌>`，支持 gzip 响应。
+
+| 接口 | 用途 |
+| --- | --- |
+| GET `/healthz` | 服务就绪检查 |
+| GET `/metrics` | 缓存、合并、上游请求、失败和缓存容量统计 |
+| POST `/v1/search/wikipedia` | query / max_pages / max_length / language → results |
+| POST `/v1/search/brave` | query / count / country / search_lang / ui_lang / freshness → data |
+| POST `/v1/fetch` | url / max_length → text |
+| POST `/v1/batch` | requests 列表 → 相同长度、相同顺序的成功或失败项 |
+
+客户端可通过 `SearchGatewayClient.from_env().batch(...)` 显式提交 batch。
+现有工具的单请求调用也使用共享缓存和跨请求合并。
+
+开发服务器向训练机发送结果仍消耗带宽，缓存命中仅避免再次访问个人主机出口。
+保留当前截断规则并采用 gzip，不擅自减少候选数或缩短 RAG 输入。
+实际收益应分别看 query、页面和 URL 命中率，以及真实上游请求数。
+
+默认配置可在 `search-service.env.example` 修改：缓存有效载荷上限 2 GiB，16 个执行
+worker，128 个排队任务，单次逻辑请求期限 120 秒，最大上游响应 20 MiB。
+SQLite 文件和 WAL 还会有索引/空闲页等开销，磁盘占用不等于有效载荷大小。
+冷批次中大量不同 query 可能因额度等待而超时；按观测调整服务期限、队列与训练并发。
+
+当前出口有自签代理证书，provider 默认沿用 `main` 的 TLS 设置。
+有受信 CA 时可以设置 `SEARCH_SERVICE_VERIFY_TLS=1` 或 `SEARCH_SERVICE_CA_BUNDLE`。
+训练客户端连接 HTTPS 共享服务时会校验证书。
+
+## 离线验证
+
+在仓库根目录运行：
+
+```bash
+python3 -m unittest discover -s agentflow/tests -p 'test_search_*' -v
+bash -n train-roma/run_search_cache.sh train-roma/enable_search_cache.sh train-roma/open_search_cache_tunnel.sh
+```
+
+测试覆盖持久化、过期、并发合并、重复 batch 映射、错误不缓存、限速和三个工具的接入。
+真实部署还需检查开发服务器端口可达性、代理出口、Yibu 账户额度，再用少量 rollout
+检查 observation 和奖励，最后增加多任务并发。本地离线测试不代表已经完成远程部署。
