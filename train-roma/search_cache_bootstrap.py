@@ -35,7 +35,7 @@ class BootstrapError(RuntimeError):
     """A bounded diagnostic which never includes credentials or command output."""
 
 
-def validate_ssh_identity_file(value):
+def validate_ssh_identity_file(value, *, allow_shared_permissions=False):
     """Resolve/check key metadata only; never read or alter the private key."""
     if not value:
         return ""
@@ -51,7 +51,7 @@ def validate_ssh_identity_file(value):
         raise BootstrapError("SEARCH_CACHE_SSH_IDENTITY_FILE does not name an accessible key file") from None
     if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o444 or not os.access(path, os.R_OK):
         raise BootstrapError("SEARCH_CACHE_SSH_IDENTITY_FILE must be a readable regular file")
-    if info.st_mode & 0o077:
+    if info.st_mode & 0o077 and not allow_shared_permissions:
         raise BootstrapError(
             "SSH identity file has group/other permissions; restrict it before training: "
             f"chmod 600 {shlex.quote(str(path))}"
@@ -96,6 +96,8 @@ class Config:
     ssh_target: str = "ma-user@7.150.11.99"
     ssh_port: int = 31753
     ssh_identity_file: str = ""
+    ssh_auto_prepare: bool = False
+    ssh_known_hosts_file: str = ""
     remote_repo: str = "/home/ma-user/work/code-rl"
     cache_dir: str = "/home/ma-user/work/code-rl/cache"
     remote_port: int = 8091
@@ -153,6 +155,8 @@ class Config:
             auto_start=_flag(env, "SEARCH_CACHE_AUTO_START", True), auto_tunnel=auto_tunnel,
             ssh_target=ssh_target, ssh_port=_number(env, "SEARCH_CACHE_SSH_PORT", 31753, port=True),
             ssh_identity_file=str(env.get("SEARCH_CACHE_SSH_IDENTITY_FILE", "")),
+            ssh_auto_prepare=_flag(env, "SEARCH_CACHE_SSH_AUTO_PREPARE", False),
+            ssh_known_hosts_file=str(env.get("SEARCH_CACHE_SSH_KNOWN_HOSTS_FILE", "")),
             remote_repo=remote_repo, cache_dir=cache_dir,
             remote_port=_number(env, "SEARCH_SERVICE_PORT", 8091, port=True), local_port=local_port,
             local_host="127.0.0.1" if target.hostname == "localhost" else target.hostname,
@@ -204,12 +208,16 @@ def probe_health(config, *, timeout):
         return False
 
 
-def run_command(command, *, timeout):
-    # SSH never receives service/upstream credentials through argv or SendEnv.
-    env = {key: value for key, value in os.environ.items() if key not in {
+def _ssh_environment():
+    return {key: value for key, value in os.environ.items() if key not in {
         "SEARCH_CACHE_TOKEN", "SEARCH_SERVICE_TOKEN", "SEARCH_GATEWAY_TOKEN", "GATEWAY_TOKEN",
         "BRAVE_API_KEY", "YIBU_BRAVE_API_KEY", "OPENAI_API_KEY",
     }}
+
+
+def run_command(command, *, timeout):
+    # SSH never receives service/upstream credentials through argv or SendEnv.
+    env = _ssh_environment()
     # A background OpenSSH master inherits its parent's descriptors. PIPE would
     # leave communicate() waiting for EOF until that persistent master exits.
     capture = "-fN" not in command and "-O" not in command
@@ -227,16 +235,26 @@ def run_command(command, *, timeout):
         raise BootstrapError("SSH search cache bootstrap could not start") from None
 
 
-def ssh_options(config):
-    options = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+def ssh_options(config, *, deadline=None):
+    identity, known_hosts = prepare_ssh_files(config, deadline=deadline)
+    host_checking = "accept-new" if config.ssh_auto_prepare and not config.ssh_known_hosts_file else "yes"
+    options = ["ssh", "-T", "-o", "BatchMode=yes", "-o", f"StrictHostKeyChecking={host_checking}",
                "-o", "SendEnv=-*", "-o", f"ConnectTimeout={max(1, math.ceil(config.connect_timeout))}",
                "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
                "-p", str(config.ssh_port)]
     # Validate lazily: a healthy existing service/tunnel needs no SSH key.
-    identity = validate_ssh_identity_file(config.ssh_identity_file)
     if identity:
         options.extend(["-i", identity, "-o", "IdentitiesOnly=yes"])
+    if known_hosts:
+        options.extend(["-o", _known_hosts_option(known_hosts)])
     return options
+
+
+def _known_hosts_option(path):
+    # -o values are parsed again as ssh_config; one argv item does not preserve
+    # spaces in UserKnownHostsFile's list syntax. Quote for that second parser.
+    value = str(path).replace("\\", "\\\\").replace('"', '\\"')
+    return f'UserKnownHostsFile="{value}"'
 
 
 def remote_command(config, startup_timeout):
@@ -271,12 +289,36 @@ def _runtime_directory(config):
     return path
 
 
-@contextlib.contextmanager
-def node_lock(config, deadline):
-    directory = _runtime_directory(config)
-    lock_path = directory / f"port-{config.local_port}.lock"
+def _check_private_artifact(info):
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise BootstrapError("SSH runtime files must be regular private files owned by the training user")
+
+
+def _check_existing_artifact(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    _check_private_artifact(info)  # Also rejects symlinks without following them.
+
+
+def _open_private_artifact(path):
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            _check_private_artifact(os.fstat(descriptor))
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+    except OSError:
+        raise BootstrapError("SSH runtime file is inaccessible or is a symlink") from None
+
+
+@contextlib.contextmanager
+def _private_lock(path, deadline):
+    descriptor = _open_private_artifact(path)
     try:
         while True:
             try:
@@ -284,10 +326,81 @@ def node_lock(config, deadline):
                 break
             except BlockingIOError:
                 time.sleep(min(0.1, _remaining(deadline)))
-        yield directory
+        yield
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+def _pinned_known_hosts(value):
+    if not value:
+        return ""
+    try:
+        path = Path(value).expanduser()
+        path = (REPO_ROOT / path if not path.is_absolute() else path).resolve()
+        info = path.stat()
+    except (OSError, RuntimeError, ValueError):
+        raise BootstrapError("SEARCH_CACHE_SSH_KNOWN_HOSTS_FILE must name an accessible file") from None
+    if (not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o444
+            or not os.access(path, os.R_OK) or info.st_mode & 0o022):
+        raise BootstrapError("Pinned SSH known_hosts must be readable and not writable by group/other users")
+    return str(path)
+
+
+def prepare_ssh_files(config, *, deadline=None):
+    """Prepare only local SSH files. Source key mounts are never modified."""
+    identity = validate_ssh_identity_file(
+        config.ssh_identity_file, allow_shared_permissions=config.ssh_auto_prepare
+    )
+    pinned = _pinned_known_hosts(config.ssh_known_hosts_file)
+    if not config.ssh_auto_prepare:
+        return identity, pinned
+    directory = _runtime_directory(config)
+    with _private_lock(directory / "ssh-files.lock", deadline or time.monotonic() + config.bootstrap_timeout):
+        if identity:
+            destination = directory / ("identity-" + hashlib.sha256(identity.encode()).hexdigest()[:20])
+            _check_existing_artifact(destination)
+            source_descriptor = None
+            temporary_path = None
+            try:
+                source_descriptor = os.open(identity, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                if not stat.S_ISREG(os.fstat(source_descriptor).st_mode):
+                    raise BootstrapError("SSH identity source is no longer a regular file")
+                with os.fdopen(source_descriptor, "rb") as source:
+                    source_descriptor = None
+                    content = source.read(1024 * 1024 + 1)
+                if not content or len(content) > 1024 * 1024:
+                    raise BootstrapError("SSH identity source is empty or exceeds the size limit")
+                descriptor, temporary_path = tempfile.mkstemp(prefix="identity-tmp-", dir=directory)
+                with os.fdopen(descriptor, "wb") as output:
+                    os.fchmod(output.fileno(), 0o600)
+                    output.write(content)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temporary_path, destination)
+                temporary_path = None
+            except OSError:
+                raise BootstrapError("Could not prepare a private runtime copy of the SSH identity") from None
+            finally:
+                if source_descriptor is not None:
+                    os.close(source_descriptor)
+                if temporary_path is not None:
+                    Path(temporary_path).unlink(missing_ok=True)
+            identity = str(destination)
+        if not pinned:
+            hosts_path = directory / "known_hosts"
+            descriptor = _open_private_artifact(hosts_path)
+            os.close(descriptor)
+            pinned = str(hosts_path)
+    return identity, pinned
+
+
+@contextlib.contextmanager
+def node_lock(config, deadline):
+    directory = _runtime_directory(config)
+    lock_path = directory / f"port-{config.local_port}.lock"
+    with _private_lock(lock_path, deadline):
+        yield directory
 
 
 def _socket_path(config, directory):
@@ -324,7 +437,7 @@ def bootstrap(config, *, runner=run_command, probe=probe_health):
         metadata = {"reused": True}
         if config.auto_start:
             startup_timeout = min(config.service_startup_timeout, max(1, _remaining(deadline) - config.connect_timeout))
-            command = ssh_options(config) + ["-o", "ControlMaster=no", "-o", "ControlPath=none",
+            command = ssh_options(config, deadline=deadline) + ["-o", "ControlMaster=no", "-o", "ControlPath=none",
                                               config.ssh_target, remote_command(config, startup_timeout)]
             result = runner(command, timeout=min(_remaining(deadline), startup_timeout + config.connect_timeout + 5))
             if result.returncode != 0:
@@ -346,14 +459,14 @@ def bootstrap(config, *, runner=run_command, probe=probe_health):
         if config.auto_tunnel:
             control_path = _socket_path(config, directory)
             if control_path.exists():
-                check = runner(ssh_options(config) + ["-S", str(control_path), "-O", "check", config.ssh_target],
+                check = runner(ssh_options(config, deadline=deadline) + ["-S", str(control_path), "-O", "check", config.ssh_target],
                                timeout=min(config.connect_timeout + 2, _remaining(deadline)))
                 if check.returncode == 0:
                     raise BootstrapError("Existing SSH cache tunnel is running but the service is unreachable; check forwarding and service binding")
                 control_path.unlink(missing_ok=True)
             bind_host = f"[{config.local_host}]" if ":" in config.local_host else config.local_host
             forward = f"{bind_host}:{config.local_port}:{_forward_destination(config)}:{config.remote_port}"
-            command = ssh_options(config) + ["-M", "-S", str(control_path), "-fN",
+            command = ssh_options(config, deadline=deadline) + ["-M", "-S", str(control_path), "-fN",
                                               "-o", "ControlPersist=yes", "-o", "ExitOnForwardFailure=yes",
                                               "-L", forward, config.ssh_target]
             result = runner(command, timeout=min(config.connect_timeout + 10, _remaining(deadline)))
@@ -369,8 +482,29 @@ def bootstrap(config, *, runner=run_command, probe=probe_health):
         raise BootstrapError("Search cache did not become reachable; check HTTP routing and service binding")
 
 
+def manual_tunnel():
+    env = dict(os.environ)
+    env.setdefault("SEARCH_CACHE_BASE_URL", f"http://127.0.0.1:{env.get('SEARCH_CACHE_LOCAL_PORT', '8091')}")
+    # A manual tunnel does not make HTTP requests or need the service token.
+    env["SEARCH_CACHE_TOKEN"] = "manual-tunnel-not-an-authentication-token"
+    config = Config.from_env(env)
+    deadline = time.monotonic() + config.bootstrap_timeout
+    with node_lock(config, deadline):
+        command = ssh_options(config, deadline=deadline)
+    bind = f"[{config.local_host}]" if ":" in config.local_host else config.local_host
+    command += ["-N", "-o", "ExitOnForwardFailure=yes", "-L",
+                f"{bind}:{config.local_port}:{_forward_destination(config)}:{config.remote_port}",
+                config.ssh_target]
+    os.execvpe(command[0], command, _ssh_environment())
+
+
 def main():
     try:
+        if sys.argv[1:] == ["--manual-tunnel"]:
+            manual_tunnel()
+            return 0  # os.execvp only returns if replaced during a test.
+        if sys.argv[1:]:
+            raise BootstrapError("Unsupported search cache bootstrap arguments")
         result = bootstrap(Config.from_env())
     except (BootstrapError, OSError) as error:
         # OSError may include a path; tokens and subprocess output are never shown.
