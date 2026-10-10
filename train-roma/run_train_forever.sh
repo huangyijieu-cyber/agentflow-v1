@@ -213,6 +213,10 @@ cd ..
 
 # =============== 启动服务并进入监控 ===============
 
+if [[ "${SEARCH_CACHE_ENABLED:-0}" == "1" || -n "${SEARCH_CACHE_ENV_FILE:-}" || -f "${ROOT_PATH}/train-roma/search-cache.local.env" ]]; then
+    source "${ROOT_PATH}/train-roma/enable_search_cache.sh" || exit 1
+fi
+
 # 首次启动服务
 start_services
 

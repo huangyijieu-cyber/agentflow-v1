@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from copy import deepcopy
 from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urlsplit
 
@@ -9,7 +10,29 @@ import requests
 
 
 DEFAULT_CONNECT_TIMEOUT = 5.0
-DEFAULT_READ_TIMEOUT = 60.0
+DEFAULT_READ_TIMEOUT = 600.0
+
+
+def search_cache_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Only opt in explicitly; an existing EC2 gateway URL is not sufficient."""
+    env = os.environ if environ is None else environ
+    return str(env.get("SEARCH_CACHE_ENABLED", "0")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _gateway_environment(env: Mapping[str, str]) -> Dict[str, Any]:
+    return {
+        "base_url": env.get("SEARCH_CACHE_BASE_URL") or env.get("SEARCH_GATEWAY_BASE_URL", ""),
+        "token": (env.get("SEARCH_CACHE_TOKEN") or env.get("GATEWAY_TOKEN")
+                  or env.get("SEARCH_GATEWAY_TOKEN", "")),
+        "connect_timeout": env.get("SEARCH_CACHE_CONNECT_TIMEOUT_SECONDS") or env.get(
+            "SEARCH_GATEWAY_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT
+        ),
+        "read_timeout": env.get("SEARCH_CACHE_READ_TIMEOUT_SECONDS") or env.get(
+            "SEARCH_GATEWAY_READ_TIMEOUT", DEFAULT_READ_TIMEOUT
+        ),
+    }
 
 
 class SearchGatewayError(RuntimeError):
@@ -22,11 +45,15 @@ class SearchGatewayError(RuntimeError):
         code: str = "search_gateway_error",
         status_code: Optional[int] = None,
         request_id: Optional[str] = None,
+        upstream_status_code: Optional[int] = None,
+        retry_after: Optional[str] = None,
     ):
         self.message = " ".join(str(message).split())[:500]
         self.code = code
         self.status_code = status_code
         self.request_id = request_id
+        self.upstream_status_code = upstream_status_code
+        self.retry_after = retry_after
 
         details = [code]
 
@@ -65,17 +92,9 @@ def _positive_float(value: Any, name: str) -> float:
 
 class SearchGatewayClient:
     """
-    AgentFlow -> EC2 -> Windows Search Gateway Client.
+    Client for the shared search/cache service; never retries or falls back.
 
-    兼容两种调用：
-
-        SearchGatewayClient()
-
-    和：
-
-        SearchGatewayClient.from_env()
-
-    后续 Tool 逐步迁移到 from_env()。
+    Construct per tool invocation so requests.Session is not shared by workers.
     """
 
     def __init__(
@@ -87,27 +106,21 @@ class SearchGatewayClient:
         read_timeout: Optional[float] = None,
         session: Optional[requests.Session] = None,
     ):
-        # 为当前服务器 v1 保留无参构造兼容性
+        config = _gateway_environment(os.environ)
         if base_url is None:
-            base_url = os.environ.get("SEARCH_GATEWAY_BASE_URL", "")
+            base_url = config["base_url"]
 
         if token is None:
-            token = os.environ.get("SEARCH_GATEWAY_TOKEN", "")
+            token = config["token"]
 
         self.base_url = self._validate_base_url(base_url)
         self.token = self._validate_token(token)
 
         if connect_timeout is None:
-            connect_timeout = os.environ.get(
-                "SEARCH_GATEWAY_CONNECT_TIMEOUT",
-                DEFAULT_CONNECT_TIMEOUT,
-            )
+            connect_timeout = config["connect_timeout"]
 
         if read_timeout is None:
-            read_timeout = os.environ.get(
-                "SEARCH_GATEWAY_READ_TIMEOUT",
-                DEFAULT_READ_TIMEOUT,
-            )
+            read_timeout = config["read_timeout"]
 
         self.connect_timeout = _positive_float(
             connect_timeout,
@@ -138,32 +151,27 @@ class SearchGatewayClient:
 
         env = os.environ if environ is None else environ
 
-        base_url = env.get("SEARCH_GATEWAY_BASE_URL", "")
-        token = env.get("SEARCH_GATEWAY_TOKEN", "")
+        config = _gateway_environment(env)
+        base_url = config["base_url"]
+        token = config["token"]
 
         if not base_url:
             raise SearchGatewayConfigurationError(
-                "SEARCH_GATEWAY_BASE_URL is required",
+                "SEARCH_CACHE_BASE_URL or SEARCH_GATEWAY_BASE_URL is required",
                 code="missing_gateway_configuration",
             )
 
         if not token:
             raise SearchGatewayConfigurationError(
-                "SEARCH_GATEWAY_TOKEN is required",
+                "SEARCH_CACHE_TOKEN or GATEWAY_TOKEN is required",
                 code="missing_gateway_configuration",
             )
 
         return cls(
             base_url=base_url,
             token=token,
-            connect_timeout=env.get(
-                "SEARCH_GATEWAY_CONNECT_TIMEOUT",
-                DEFAULT_CONNECT_TIMEOUT,
-            ),
-            read_timeout=env.get(
-                "SEARCH_GATEWAY_READ_TIMEOUT",
-                DEFAULT_READ_TIMEOUT,
-            ),
+            connect_timeout=config["connect_timeout"],
+            read_timeout=config["read_timeout"],
             session=session,
         )
 
@@ -236,6 +244,8 @@ class SearchGatewayClient:
                 self.connect_timeout,
                 self.read_timeout,
             ),
+            "verify": True,
+            "allow_redirects": False,
         }
 
         if payload is not None:
@@ -268,6 +278,7 @@ class SearchGatewayClient:
         if not 200 <= response.status_code < 300:
             message = "Search gateway rejected the request"
             code = f"gateway_http_{response.status_code}"
+            upstream_status_code = None
 
             # 只解析结构化错误。
             # 不直接把整个任意 response body 打进训练日志。
@@ -275,6 +286,7 @@ class SearchGatewayClient:
                 data = response.json()
 
                 if isinstance(data, dict):
+                    request_id = request_id or data.get("request_id")
                     error = data.get("error")
                     detail = data.get("detail")
 
@@ -283,6 +295,7 @@ class SearchGatewayClient:
                             message = str(error["message"])
                         if error.get("code"):
                             code = str(error["code"])
+                        upstream_status_code = error.get("upstream_status") or error.get("status")
 
                     elif isinstance(detail, str):
                         message = detail
@@ -290,6 +303,7 @@ class SearchGatewayClient:
                     elif isinstance(detail, dict):
                         upstream = str(detail.get("upstream") or "").strip()
                         upstream_status = detail.get("status")
+                        upstream_status_code = upstream_status
                         detail_message = detail.get("message")
                         detail_code = detail.get("code")
 
@@ -311,15 +325,20 @@ class SearchGatewayClient:
             except (TypeError, ValueError):
                 pass
 
-            raise SearchGatewayError(
+            error = SearchGatewayError(
                 message,
                 code=code,
                 status_code=response.status_code,
                 request_id=request_id,
+                upstream_status_code=upstream_status_code,
+                retry_after=response.headers.get("Retry-After"),
             )
+            response.close()
+            raise error
 
         try:
-            return response.json()
+            # Protect cached objects from mutation by each rollout's local RAG.
+            return deepcopy(response.json())
 
         except (TypeError, ValueError) as exc:
             raise SearchGatewayError(
@@ -328,6 +347,8 @@ class SearchGatewayClient:
                 status_code=response.status_code,
                 request_id=request_id,
             ) from exc
+        finally:
+            response.close()
 
     def health(self) -> Dict[str, Any]:
         result = self._request(
@@ -343,7 +364,16 @@ class SearchGatewayClient:
 
         return result
 
-    def fetch(self, url: str) -> Dict[str, Any]:
+    def metrics(self) -> Dict[str, Any]:
+        result = self._request("GET", "metrics")
+        if not isinstance(result, dict):
+            raise SearchGatewayError(
+                "Gateway metrics response must be a JSON object",
+                code="invalid_gateway_response",
+            )
+        return result
+
+    def fetch(self, url: str, *, max_length: int = 1000000) -> Dict[str, Any]:
         target = str(url or "").strip()
 
         parsed = urlsplit(target)
@@ -362,6 +392,7 @@ class SearchGatewayClient:
             "v1/fetch",
             payload={
                 "url": target,
+                "max_length": int(max_length),
             },
         )
 
@@ -385,9 +416,9 @@ class SearchGatewayClient:
         language: str = "en",
     ) -> Dict[str, Any]:
 
-        query = str(query or "").strip()
+        query = str(query or "")
 
-        if not query:
+        if not query.strip():
             raise SearchGatewayError(
                 "Wikipedia query must not be empty",
                 code="invalid_request",
@@ -413,6 +444,11 @@ class SearchGatewayClient:
         if (
             not isinstance(result, dict)
             or not isinstance(result.get("results"), list)
+            or any(
+                not isinstance(page, dict)
+                or not {"title", "url", "abstract"}.issubset(page)
+                for page in result.get("results", [])
+            )
         ):
             raise SearchGatewayError(
                 "Wikipedia gateway response is missing results",
@@ -436,7 +472,7 @@ class SearchGatewayClient:
         payload = dict(kwargs)
 
         if query is not None:
-            payload["query"] = str(query).strip()
+            payload["query"] = str(query)
 
         if not payload.get("query"):
             raise SearchGatewayError(
@@ -456,7 +492,45 @@ class SearchGatewayClient:
                 code="invalid_gateway_response",
             )
 
+        # The new service wraps raw provider JSON; older gateways return it raw.
+        if "data" in result and "meta" in result:
+            if not isinstance(result["data"], dict):
+                raise SearchGatewayError(
+                    "Brave gateway data must be a JSON object",
+                    code="invalid_gateway_response",
+                )
+            return result["data"]
         return result
+
+    def batch(self, requests: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        if not isinstance(requests, list) or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("tool"), str)
+            or not isinstance(item.get("params"), dict)
+            for item in requests
+        ):
+            raise SearchGatewayError(
+                "Batch requests must contain tool and params",
+                code="invalid_request",
+            )
+        result = self._request("POST", "v1/batch", payload={"requests": requests})
+        items = result.get("results") if isinstance(result, dict) else None
+        if (
+            not isinstance(items, list)
+            or len(items) != len(requests)
+            or any(
+                not isinstance(item, dict)
+                or type(item.get("ok")) is not bool
+                or (item["ok"] and "data" not in item)
+                or (not item["ok"] and "error" not in item)
+                for item in items
+            )
+        ):
+            raise SearchGatewayError(
+                "Gateway batch response must preserve request count and per-item status",
+                code="invalid_gateway_response",
+            )
+        return items
 
     def close(self):
         self.session.close()

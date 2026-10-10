@@ -6,6 +6,7 @@ import requests
 from dotenv import load_dotenv
 
 from agentflow.tools.base import BaseTool
+from agentflow.tools.search_gateway import SearchGatewayClient, SearchGatewayError, search_cache_enabled
 from agentflow.tools.network_retry import (
     MAX_NETWORK_RETRIES,
     MAX_RETRY_WAIT_SECONDS,
@@ -74,7 +75,7 @@ class Brave_Search_Tool(BaseTool):
         )
 
         self.api_key = os.getenv("BRAVE_API_KEY") or os.getenv("YIBU_BRAVE_API_KEY")
-        if not self.api_key:
+        if not self.api_key and not search_cache_enabled():
             raise Exception(
                 "Yibu Brave API key not found. Please set BRAVE_API_KEY "
                 "or YIBU_BRAVE_API_KEY."
@@ -154,6 +155,17 @@ class Brave_Search_Tool(BaseTool):
             params["ui_lang"] = ui_lang
         if freshness:
             params["freshness"] = freshness
+
+        if search_cache_enabled():
+            try:
+                with SearchGatewayClient.from_env() as gateway:
+                    data = gateway.brave_search(
+                        query=query,
+                        **{key: value for key, value in params.items() if key != "q"},
+                    )
+                return self._format_results(query, data, params["count"])
+            except SearchGatewayError as error:
+                return f"Yibu Brave Search gateway request failed. Last error: {error}"
 
         headers = {
             "Accept": "application/json",
