@@ -38,6 +38,9 @@ class ManualTunnelIdentityTests(unittest.TestCase):
         self.env = dict(os.environ, PATH=str(binary_dir) + os.pathsep + os.environ.get("PATH", ""),
                         TEST_SSH_ARGV_OUTPUT=str(self.output), HOME=self.directory.name)
         self.env.pop("SEARCH_CACHE_SSH_IDENTITY_FILE", None)
+        self.env.pop("SEARCH_CACHE_SSH_AUTO_PREPARE", None)
+        self.env.pop("SEARCH_CACHE_SSH_KNOWN_HOSTS_FILE", None)
+        self.env["SEARCH_CACHE_RUNTIME_DIR"] = str(Path(self.directory.name) / "runtime")
 
     def run_tunnel(self, identity=None):
         if identity is not None:
@@ -75,6 +78,32 @@ class ManualTunnelIdentityTests(unittest.TestCase):
         self.assertIn("chmod 600", result.stderr)
         self.assertFalse(self.output.exists())
         self.assertEqual(self.key.stat().st_mode & 0o777, 0o644)
+
+    def test_auto_prepare_handles_readonly_source_and_automatic_first_host(self):
+        self.key.chmod(0o444)
+        self.env["SEARCH_CACHE_SSH_AUTO_PREPARE"] = "1"
+        result = self.run_tunnel("pem/dummy identity.pem")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads(self.output.read_text())
+        prepared = Path(args[args.index("-i") + 1])
+        self.assertNotEqual(prepared, self.key.resolve())
+        self.assertEqual(prepared.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.key.stat().st_mode & 0o777, 0o444)
+        self.assertIn("StrictHostKeyChecking=accept-new", args)
+        self.assertTrue(any(item.startswith("UserKnownHostsFile=") for item in args))
+        self.assertEqual(result.stdout, "")
+
+    def test_auto_prepare_with_explicit_pin_is_strict(self):
+        self.env["SEARCH_CACHE_SSH_AUTO_PREPARE"] = "1"
+        self.env["SEARCH_CACHE_SSH_KNOWN_HOSTS_FILE"] = "pem/public known hosts"
+        hosts = self.key.parent / "public known hosts"
+        hosts.write_text("dummy public host pin")
+        hosts.chmod(0o444)
+        result = self.run_tunnel("pem/dummy identity.pem")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads(self.output.read_text())
+        self.assertIn("StrictHostKeyChecking=yes", args)
+        self.assertIn('UserKnownHostsFile="' + str(hosts.resolve()) + '"', args)
 
 
 if __name__ == "__main__":

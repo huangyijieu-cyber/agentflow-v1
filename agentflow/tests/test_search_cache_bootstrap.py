@@ -1,12 +1,15 @@
 """No SSH/network operations: exercise the actual training bootstrap with stubs."""
 import importlib.util
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
+import stat
 import tempfile
 import threading
 import time
@@ -142,6 +145,140 @@ class BootstrapTests(unittest.TestCase):
         options = bootstrap.ssh_options(self.config)
         self.assertNotIn("-i", options)
         self.assertNotIn("IdentitiesOnly=yes", options)
+
+    def prepared_config(self, **values):
+        key = Path(self.directory.name) / "readonly dummy.pem"
+        key.write_bytes(b"DUMMY FIXTURE KEY DATA")
+        key.chmod(0o444)
+        config = bootstrap.Config.from_env(dict(self.env, SEARCH_CACHE_SSH_IDENTITY_FILE=str(key),
+                                                SEARCH_CACHE_SSH_AUTO_PREPARE="1", **values))
+        return config, key
+
+    def test_auto_prepare_copies_readonly_source_to_private_runtime_and_records_hosts(self):
+        config, source = self.prepared_config()
+        options = bootstrap.ssh_options(config)
+        identity = Path(options[options.index("-i") + 1])
+        self.assertNotEqual(identity, source)
+        self.assertEqual(identity.read_bytes(), b"DUMMY FIXTURE KEY DATA")
+        self.assertEqual(identity.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(source.stat().st_mode & 0o777, 0o444)
+        self.assertIn("StrictHostKeyChecking=accept-new", options)
+        self.assertNotIn("StrictHostKeyChecking=no", options)
+        hosts_option = next(item for item in options if item.startswith("UserKnownHostsFile="))
+        hosts = Path(self.directory.name) / "known_hosts"
+        self.assertEqual(hosts_option, bootstrap._known_hosts_option(hosts))
+        self.assertEqual(hosts.stat().st_mode & 0o777, 0o600)
+        hosts.write_text("[development.test]:31753 ssh-ed25519 DUMMY-PIN\n")
+        self.assertEqual(bootstrap.ssh_options(config), options)
+        self.assertIn("DUMMY-PIN", hosts.read_text())
+        self.assertFalse(any("DUMMY FIXTURE KEY DATA" in option for option in options))
+
+    def test_explicit_pinned_known_hosts_remains_strict_even_in_auto_prepare_mode(self):
+        config, _ = self.prepared_config(SEARCH_CACHE_SSH_KNOWN_HOSTS_FILE="known hosts.pin")
+        pinned = Path(self.directory.name) / "known hosts.pin"
+        pinned.write_text("dummy public host fingerprint\n")
+        pinned.chmod(0o444)
+        with patch.object(bootstrap, "REPO_ROOT", Path(self.directory.name)):
+            options = bootstrap.ssh_options(config)
+        self.assertIn("StrictHostKeyChecking=yes", options)
+        self.assertIn(bootstrap._known_hosts_option(pinned.resolve()), options)
+        self.assertNotIn("StrictHostKeyChecking=accept-new", options)
+        self.assertEqual(pinned.stat().st_mode & 0o777, 0o444)
+        self.assertFalse((Path(self.directory.name) / "known_hosts").exists())
+
+    def test_pinned_known_hosts_also_works_without_auto_prepare(self):
+        pinned = Path(self.directory.name) / "known_hosts.pin"
+        pinned.write_text("dummy public host pin")
+        pinned.chmod(0o644)
+        config = bootstrap.Config.from_env(dict(self.env, SEARCH_CACHE_SSH_KNOWN_HOSTS_FILE=str(pinned)))
+        options = bootstrap.ssh_options(config)
+        self.assertIn("StrictHostKeyChecking=yes", options)
+        self.assertIn(bootstrap._known_hosts_option(pinned.resolve()), options)
+
+    @unittest.skipUnless(shutil.which("ssh"), "OpenSSH config parser is unavailable")
+    def test_known_hosts_path_is_quoted_for_openssh_config_parser_without_network(self):
+        # -G only prints parsed configuration; it never connects or reads a key.
+        path = Path(self.directory.name) / 'folder with spaces' / 'host "quoted" pin'
+        option = bootstrap._known_hosts_option(path)
+        self.assertTrue(option.startswith('UserKnownHostsFile="'))
+        parsed = subprocess.run(["ssh", "-G", "-F", "/dev/null", "-o", option, "example.invalid"],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                timeout=5, check=False)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        host_line = next(line for line in parsed.stdout.splitlines() if line.startswith("userknownhostsfile "))
+        self.assertEqual(host_line, "userknownhostsfile " + str(path))
+
+    def test_warm_reuse_bypasses_automatic_key_preparation_and_missing_pin(self):
+        config = bootstrap.Config.from_env(dict(self.env, SEARCH_CACHE_SSH_AUTO_PREPARE="1",
+                                                SEARCH_CACHE_SSH_IDENTITY_FILE="missing.pem",
+                                                SEARCH_CACHE_SSH_KNOWN_HOSTS_FILE="missing-known-hosts"))
+        with patch.object(bootstrap, "prepare_ssh_files", side_effect=AssertionError("warm reuse must not prepare")):
+            self.assertTrue(bootstrap.bootstrap(config, probe=Mock(return_value=True))["reused"])
+
+    def test_parallel_preparation_is_atomic_and_reuses_a_single_host_file(self):
+        config, source = self.prepared_config()
+        results, errors = [], []
+        def prepare():
+            try:
+                results.append(bootstrap.ssh_options(config))
+            except Exception as error:
+                errors.append(error)
+        threads = [threading.Thread(target=prepare) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 6)
+        self.assertTrue(all(options == results[0] for options in results))
+        identity = Path(results[0][results[0].index("-i") + 1])
+        self.assertEqual(identity.read_bytes(), source.read_bytes())
+        self.assertFalse(list(Path(self.directory.name).glob("identity-tmp-*")))
+
+    def test_runtime_symlink_permissive_or_foreign_owned_artifacts_are_rejected(self):
+        config, source = self.prepared_config()
+        source_path = str(source.resolve())
+        identity = Path(self.directory.name) / ("identity-" + hashlib.sha256(source_path.encode()).hexdigest()[:20])
+        identity.symlink_to(source)
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.ssh_options(config)
+        identity.unlink()
+        hosts = Path(self.directory.name) / "known_hosts"
+        hosts.symlink_to(source)
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.ssh_options(config)
+        hosts.unlink()
+        hosts.write_text("existing public pin")
+        hosts.chmod(0o644)
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.ssh_options(config)
+        self.assertEqual(hosts.read_text(), "existing public pin")
+        self.assertEqual(source.stat().st_mode & 0o777, 0o444)
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap._check_private_artifact(type("Info", (), {
+                "st_mode": stat.S_IFREG | 0o600, "st_uid": os.getuid() + 1,
+            })())
+
+    def test_auto_prepare_control_start_and_tunnel_all_use_prepared_identity(self):
+        config, source = self.prepared_config()
+        bootstrap._socket_path(config, Path(self.directory.name)).touch()
+        healthy, calls = [False], []
+        def runner(command, *, timeout):
+            calls.append(command)
+            if "-O" in command:
+                return completed(returncode=255)
+            if "-fN" in command:
+                healthy[0] = True
+                return completed()
+            return completed('{"status":"ok","port":8091,"reused":true}')
+        bootstrap.bootstrap(config, runner=runner, probe=lambda *_a, **_k: healthy[0])
+        self.assertEqual(len(calls), 3)
+        for command in calls:
+            self.assertIn("StrictHostKeyChecking=accept-new", command)
+            key = Path(command[command.index("-i") + 1])
+            self.assertNotEqual(key, source)
+            self.assertEqual(key.stat().st_mode & 0o777, 0o600)
 
     def test_cold_service_starts_remote_then_forward_with_bounded_ssh(self):
         calls, healthy = [], [False]

@@ -31,13 +31,17 @@ _agentflow_enable_search_cache() {
     esac
     export SEARCH_CACHE_BASE_URL="${SEARCH_CACHE_BASE_URL:-http://127.0.0.1:${SEARCH_CACHE_LOCAL_PORT:-8091}}"
     if [[ -z "${SEARCH_CACHE_TOKEN:-}" ]]; then
-        echo "Set SEARCH_CACHE_TOKEN (or use ${env_file})." >&2
+        echo "Set SEARCH_CACHE_TOKEN in ${env_file} on the development server before the platform copies this repository to training nodes." >&2
         return 1
     fi
     export SEARCH_CACHE_ENABLED=1
     export SEARCH_CACHE_BASE_URL SEARCH_CACHE_TOKEN
     export SEARCH_CACHE_CONNECT_TIMEOUT_SECONDS="${SEARCH_CACHE_CONNECT_TIMEOUT_SECONDS:-5}"
     export SEARCH_CACHE_READ_TIMEOUT_SECONDS="${SEARCH_CACHE_READ_TIMEOUT_SECONDS:-600}"
+    # The platform copies this checkout to each training node. Prepare local
+    # SSH runtime files automatically; no chmod/login is needed on the node.
+    export SEARCH_CACHE_SSH_AUTO_PREPARE="${SEARCH_CACHE_SSH_AUTO_PREPARE:-1}"
+    export SEARCH_CACHE_SSH_IDENTITY_FILE="${SEARCH_CACHE_SSH_IDENTITY_FILE-pem/h50065774.pem}"
 
     # The bootstrap is stdlib-only: it can reuse/start the development service
     # and manage the node's SSH forward before any models or Ray workers start.

@@ -57,11 +57,13 @@ class StartupShellTests(unittest.TestCase):
             'SEARCH_CACHE_TOKEN=file-token\nSEARCH_CACHE_BASE_URL=http://file:1234\n'
             'SEARCH_CACHE_AUTO_START=1\nSEARCH_CACHE_AUTO_TUNNEL=1\nSEARCH_SERVICE_PORT=8091\n'
             'SEARCH_CACHE_SSH_IDENTITY_FILE=pem/file.pem\n'
+            'SEARCH_CACHE_SSH_AUTO_PREPARE=1\n'
         )
         overrides = {
             "SEARCH_CACHE_TOKEN": "platform-token", "SEARCH_CACHE_BASE_URL": "http://127.0.0.1:9001",
             "SEARCH_CACHE_AUTO_START": "0", "SEARCH_CACHE_AUTO_TUNNEL": "0", "SEARCH_SERVICE_PORT": "9002",
             "SEARCH_CACHE_SSH_IDENTITY_FILE": "pem/platform key.pem",
+            "SEARCH_CACHE_SSH_AUTO_PREPARE": "0",
         }
         result = self.source(env=overrides)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -81,6 +83,13 @@ class StartupShellTests(unittest.TestCase):
         result = self.source(env={"SEARCH_CACHE_TOKEN": "test-token", "SEARCH_CACHE_LOCAL_PORT": "9123"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.captured()["SEARCH_CACHE_BASE_URL"], "http://127.0.0.1:9123")
+        self.assertEqual(self.captured()["SEARCH_CACHE_SSH_AUTO_PREPARE"], "1")
+        self.assertEqual(self.captured()["SEARCH_CACHE_SSH_IDENTITY_FILE"], "pem/h50065774.pem")
+
+    def test_explicit_empty_identity_keeps_ssh_agent_available(self):
+        result = self.source(env={"SEARCH_CACHE_TOKEN": "test-token", "SEARCH_CACHE_SSH_IDENTITY_FILE": ""})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.captured()["SEARCH_CACHE_SSH_IDENTITY_FILE"], "")
 
     def test_missing_token_fails_before_bootstrap(self):
         result = self.source()
