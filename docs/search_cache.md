@@ -12,6 +12,44 @@ EC2 → 个人主机 → Internet 的出口。模型选页、embedding、RAG 摘
 EC2 → 个人主机 → Wikipedia / Yibu / 网页
 ```
 
+## 跟随训练自动启动（推荐）
+
+使用更新后的 `cache` 分支代码，训练启动脚本会自动执行：
+
+```text
+本训练节点健康检查
+→ 已就绪：直接复用
+→ 未就绪：SSH 到开发服务器
+→ 远端启动锁 + 健康检查，已有服务复用，否则启动一次
+→ 本节点建立/复用 SSH 转发
+→ 认证检查成功后启动 Ray / rollout / 训练
+```
+
+多个训练任务同时开始时，开发服务器的启动锁避免重复创建服务，本节点锁避免重复创建
+同端口的 SSH 转发。服务独立于训练进程常驻，训练结束不会关闭它或清空缓存。
+开发服务器重启后，下次训练会再次检查并启动服务；本方案不是 systemd 守护或运行中自动重启。
+
+首次准备仍需要：开发服务器上已放好本分支代码、Python 依赖、服务令牌和 Yibu 密钥；
+训练节点已有可用的 SSH 免密授权及已确认的 host key。之后不必每次手动运行服务启动命令。
+不把 SSH 密码放入脚本，不自动覆盖或 pull 开发服务器的工作区。
+
+训练端复制 `search-cache.env.example` 为 `search-cache.local.env`，填写共享令牌。
+默认 SSH 目标为 `ma-user@7.150.11.99:31753`，默认远端仓库根目录
+`SEARCH_CACHE_REMOTE_REPO_DIR=/home/ma-user/work/code-rl`；若实际源码不在这里，修改这个值。
+缓存数据目录仍是 `/home/ma-user/work/code-rl/cache`，两种目录不能混淆。
+示例默认 `SEARCH_CACHE_AUTO_START=1` 和 `SEARCH_CACHE_AUTO_TUNNEL=1`。
+然后照常启动已有训练脚本即可，无须另起终端启动缓存服务或转发。
+
+直接内网 HTTP 访问时，设置对应 `SEARCH_CACHE_BASE_URL` 和
+`SEARCH_CACHE_AUTO_TUNNEL=0`，同时在训练端设置 `SEARCH_SERVICE_HOST` 为开发服务器的
+可达内网接口（或 `0.0.0.0`）。自动启动仍通过 SSH 执行，远端监听地址以训练端该配置为准。
+如果由平台另外管理服务，设 `SEARCH_CACHE_AUTO_START=0` 禁用远端启动；已有服务仍可自动建隧道。
+两项都设为 0 时仅做健康检查。
+自动启动、SSH 和就绪等待都有截止时间，失败时训练不会继续使用直连搜索。
+
+`train-roma/search_cache_bootstrap.py` 是训练端管理入口；
+`train-roma/ensure_search_cache_service.sh` 是开发服务器的幂等启动入口。
+
 ## 开发服务器启动
 
 SSH 地址是 `ssh://ma-user@7.150.11.99:31753`。`31753` 是 SSH 入口端口，不能当作 HTTP
@@ -51,7 +89,8 @@ nohup bash train-roma/run_search_cache.sh > /home/ma-user/work/code-rl/cache/ser
 
 ## 训练机接入
 
-**方式一：SSH 转发。** 每个训练节点均需可用的 SSH 授权，并各自启动转发：
+**方式一：SSH 转发。** 推荐使用前面的自动启动配置，每个节点会自动建立连接。
+手动管理时，先设置 `SEARCH_CACHE_AUTO_START=0`、`SEARCH_CACHE_AUTO_TUNNEL=0`，再启动转发：
 
 ```bash
 bash train-roma/open_search_cache_tunnel.sh > /tmp/search-cache-tunnel.log 2>&1 &
@@ -88,11 +127,14 @@ export SEARCH_CACHE_TOKEN='与服务端相同的共享令牌'
 source train-roma/enable_search_cache.sh
 ```
 
+平台/job 显式设置的 `SEARCH_CACHE_*` / `SEARCH_SERVICE_*` 变量优先于训练端 env 文件。
+显式设置 `SEARCH_CACHE_ENABLED=0` 时，即使存在该文件也不会启动共享服务或隧道。
+
 多节点时每个节点均需设置；使用 localhost 时每个节点均需转发。
 VERL 的 Ray 入口会显式向 actor 传递客户端配置。直接调用其它已有 Ray 任务时，也应在
 启动 Ray 前注入这些变量。
 
-没有显式开启 `SEARCH_CACHE_ENABLED` 时，三个工具使用 `main` 原来的网络逻辑。
+没有启用配置且不存在训练端 env 文件时，三个工具使用 `main` 原来的网络逻辑。
 现有 `enable_search_proxy.sh` 设置的旧 `SEARCH_GATEWAY_BASE_URL` 不会自行开启共享缓存。
 启用后的服务失败不会自动直连外网，也不会多层叠加重试。
 
