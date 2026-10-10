@@ -30,7 +30,8 @@ EC2 → 个人主机 → Wikipedia / Yibu / 网页
 开发服务器重启后，下次训练会再次检查并启动服务；本方案不是 systemd 守护或运行中自动重启。
 
 首次准备仍需要：开发服务器上已放好本分支代码、Python 依赖、服务令牌和 Yibu 密钥；
-训练节点已有可用的 SSH 免密授权及已确认的 host key。之后不必每次手动运行服务启动命令。
+训练节点已有可用的 SSH 密钥认证及已确认的 host key。可以指定平台提供的 PEM 私钥，
+不要求私钥位于默认 `~/.ssh` 路径。之后不必每次手动运行服务启动命令。
 不把 SSH 密码放入脚本，不自动覆盖或 pull 开发服务器的工作区。
 
 训练端复制 `search-cache.env.example` 为 `search-cache.local.env`，填写共享令牌。
@@ -39,6 +40,26 @@ EC2 → 个人主机 → Wikipedia / Yibu / 网页
 缓存数据目录仍是 `/home/ma-user/work/code-rl/cache`，两种目录不能混淆。
 示例默认 `SEARCH_CACHE_AUTO_START=1` 和 `SEARCH_CACHE_AUTO_TUNNEL=1`。
 然后照常启动已有训练脚本即可，无须另起终端启动缓存服务或转发。
+
+使用 PEM 私钥时，在每个训练节点的 `search-cache.local.env` 中设置：
+
+```bash
+SEARCH_CACHE_SSH_IDENTITY_FILE=pem/h50065774.pem
+```
+
+该相对路径对应训练服务器仓库根目录下的 `pem/h50065774.pem`；也支持绝对路径，
+路径针对训练服务器，不是本机 Mac 的路径。密钥须已获该开发服务器账号授权，文件需单独提供给训练节点，
+不会通过 Git 上传，也不会自动复制。先将该文件权限设为 `600`：
+
+```bash
+# 在训练服务器的仓库根目录执行
+chmod 600 pem/h50065774.pem
+```
+
+代码通过 SSH `-i` 指定密钥，不读取或输出私钥内容。设置该项时使用 `IdentitiesOnly=yes`。
+若私钥本身带有口令，应在启动训练前用 `ssh-add` 加载到训练节点的 SSH agent；
+`BatchMode=yes` 不会交互询问私钥口令或账号密码。
+首次连接仍需确认并保存开发服务器 host key，自动启动保持 `StrictHostKeyChecking=yes`。
 
 直接内网 HTTP 访问时，设置对应 `SEARCH_CACHE_BASE_URL` 和
 `SEARCH_CACHE_AUTO_TUNNEL=0`，同时在训练端设置 `SEARCH_SERVICE_HOST` 为开发服务器的
@@ -98,7 +119,8 @@ bash train-roma/open_search_cache_tunnel.sh > /tmp/search-cache-tunnel.log 2>&1 
 
 默认等价于从该训练节点转发本机 `127.0.0.1:8091` 到开发服务器的
 `127.0.0.1:8091`，SSH 目标为 `ma-user@7.150.11.99:31753`。
-脚本使用 `BatchMode=yes`，需要事先配置 SSH 密钥授权；不会将密码写进仓库。
+脚本使用 `BatchMode=yes`，需要事先配置 SSH 密钥授权；可以用
+`SEARCH_CACHE_SSH_IDENTITY_FILE` 指定 PEM 文件，不会将密码写进仓库。
 目标、SSH 端口和本地端口分别由 `SEARCH_CACHE_SSH_TARGET`、`SEARCH_CACHE_SSH_PORT`、
 `SEARCH_CACHE_LOCAL_PORT` 配置。
 

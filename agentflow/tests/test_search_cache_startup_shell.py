@@ -56,10 +56,12 @@ class StartupShellTests(unittest.TestCase):
         self.env_file.write_text(
             'SEARCH_CACHE_TOKEN=file-token\nSEARCH_CACHE_BASE_URL=http://file:1234\n'
             'SEARCH_CACHE_AUTO_START=1\nSEARCH_CACHE_AUTO_TUNNEL=1\nSEARCH_SERVICE_PORT=8091\n'
+            'SEARCH_CACHE_SSH_IDENTITY_FILE=pem/file.pem\n'
         )
         overrides = {
             "SEARCH_CACHE_TOKEN": "platform-token", "SEARCH_CACHE_BASE_URL": "http://127.0.0.1:9001",
             "SEARCH_CACHE_AUTO_START": "0", "SEARCH_CACHE_AUTO_TUNNEL": "0", "SEARCH_SERVICE_PORT": "9002",
+            "SEARCH_CACHE_SSH_IDENTITY_FILE": "pem/platform key.pem",
         }
         result = self.source(env=overrides)
         self.assertEqual(result.returncode, 0, result.stderr)

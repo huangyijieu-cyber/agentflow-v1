@@ -17,6 +17,7 @@ from pathlib import Path
 import shlex
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -27,8 +28,35 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
 class BootstrapError(RuntimeError):
     """A bounded diagnostic which never includes credentials or command output."""
+
+
+def validate_ssh_identity_file(value):
+    """Resolve/check key metadata only; never read or alter the private key."""
+    if not value:
+        return ""
+    if any(ch in value for ch in "\x00\r\n"):
+        raise BootstrapError("SEARCH_CACHE_SSH_IDENTITY_FILE must be a valid single-line file path")
+    try:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = REPO_ROOT / path
+        path = path.resolve()
+        info = path.stat()
+    except (OSError, RuntimeError, ValueError):
+        raise BootstrapError("SEARCH_CACHE_SSH_IDENTITY_FILE does not name an accessible key file") from None
+    if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o444 or not os.access(path, os.R_OK):
+        raise BootstrapError("SEARCH_CACHE_SSH_IDENTITY_FILE must be a readable regular file")
+    if info.st_mode & 0o077:
+        raise BootstrapError(
+            "SSH identity file has group/other permissions; restrict it before training: "
+            f"chmod 600 {shlex.quote(str(path))}"
+        )
+    return str(path)
 
 
 def _flag(env, name, default):
@@ -67,6 +95,7 @@ class Config:
     auto_tunnel: bool = True
     ssh_target: str = "ma-user@7.150.11.99"
     ssh_port: int = 31753
+    ssh_identity_file: str = ""
     remote_repo: str = "/home/ma-user/work/code-rl"
     cache_dir: str = "/home/ma-user/work/code-rl/cache"
     remote_port: int = 8091
@@ -123,6 +152,7 @@ class Config:
             base_url=base, token=token,
             auto_start=_flag(env, "SEARCH_CACHE_AUTO_START", True), auto_tunnel=auto_tunnel,
             ssh_target=ssh_target, ssh_port=_number(env, "SEARCH_CACHE_SSH_PORT", 31753, port=True),
+            ssh_identity_file=str(env.get("SEARCH_CACHE_SSH_IDENTITY_FILE", "")),
             remote_repo=remote_repo, cache_dir=cache_dir,
             remote_port=_number(env, "SEARCH_SERVICE_PORT", 8091, port=True), local_port=local_port,
             local_host="127.0.0.1" if target.hostname == "localhost" else target.hostname,
@@ -198,10 +228,15 @@ def run_command(command, *, timeout):
 
 
 def ssh_options(config):
-    return ["ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-            "-o", "SendEnv=-*", "-o", f"ConnectTimeout={max(1, math.ceil(config.connect_timeout))}",
-            "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
-            "-p", str(config.ssh_port)]
+    options = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+               "-o", "SendEnv=-*", "-o", f"ConnectTimeout={max(1, math.ceil(config.connect_timeout))}",
+               "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
+               "-p", str(config.ssh_port)]
+    # Validate lazily: a healthy existing service/tunnel needs no SSH key.
+    identity = validate_ssh_identity_file(config.ssh_identity_file)
+    if identity:
+        options.extend(["-i", identity, "-o", "IdentitiesOnly=yes"])
+    return options
 
 
 def remote_command(config, startup_timeout):
