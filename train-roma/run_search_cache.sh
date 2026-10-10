@@ -3,13 +3,23 @@
 set -euo pipefail
 
 _search_repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+_search_requested_dir="${SEARCH_CACHE_DIR:-}"
+_search_requested_host="${SEARCH_SERVICE_HOST:-}"
+_search_requested_port="${SEARCH_SERVICE_PORT:-}"
+_search_requested_python="${SEARCH_SERVICE_PYTHON:-}"
 export SEARCH_CACHE_DIR="${SEARCH_CACHE_DIR:-/home/ma-user/work/code-rl/cache}"
 _search_env_file="${SEARCH_SERVICE_ENV_FILE:-${SEARCH_CACHE_DIR}/search-service.env}"
-if [[ -f "${_search_env_file}" ]]; then
+if [[ "${SEARCH_SERVICE_ENV_LOADED:-0}" != "1" && -f "${_search_env_file}" ]]; then
     set -a
     source "${_search_env_file}"
     set +a
 fi
+# The bootstrap has already loaded the env file. Explicit startup location
+# settings must agree with the SSH forward even if the file has other defaults.
+if [[ -n "${_search_requested_dir}" ]]; then export SEARCH_CACHE_DIR="${_search_requested_dir}"; fi
+if [[ -n "${_search_requested_host}" ]]; then export SEARCH_SERVICE_HOST="${_search_requested_host}"; fi
+if [[ -n "${_search_requested_port}" ]]; then export SEARCH_SERVICE_PORT="${_search_requested_port}"; fi
+if [[ -n "${_search_requested_python}" ]]; then export SEARCH_SERVICE_PYTHON="${_search_requested_python}"; fi
 
 if [[ -z "${SEARCH_SERVICE_TOKEN:-${SEARCH_CACHE_TOKEN:-}}" ]]; then
     echo "Set SEARCH_SERVICE_TOKEN or put it in ${_search_env_file}." >&2

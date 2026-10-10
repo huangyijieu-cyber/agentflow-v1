@@ -1,16 +1,37 @@
 #!/usr/bin/env bash
 # Source on EVERY training node before starting Ray and the rollout server.
 _agentflow_enable_search_cache() {
-    local repo_dir env_file
+    local repo_dir env_file name index original_flags
+    local -a supplied_names supplied_values
     repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
     env_file="${SEARCH_CACHE_ENV_FILE:-${repo_dir}/train-roma/search-cache.local.env}"
+    supplied_names=()
+    supplied_values=()
+    # Platform/job environment settings take precedence over the local file.
+    # Preserve values in memory; never echo secrets or put them in arguments.
+    while IFS= read -r name; do
+        supplied_names+=("${name}")
+        supplied_values+=("${!name}")
+    done < <(compgen -A variable SEARCH_CACHE_ || true; compgen -A variable SEARCH_SERVICE_ || true)
+    original_flags="$-"
     if [[ -f "${env_file}" ]]; then
         set -a
         source "${env_file}"
-        set +a
+        if [[ "${original_flags}" != *a* ]]; then set +a; fi
     fi
-    if [[ -z "${SEARCH_CACHE_BASE_URL:-}" || -z "${SEARCH_CACHE_TOKEN:-}" ]]; then
-        echo "Set SEARCH_CACHE_BASE_URL and SEARCH_CACHE_TOKEN (or use ${env_file})." >&2
+    for ((index=0; index<${#supplied_names[@]}; index++)); do
+        printf -v "${supplied_names[index]}" '%s' "${supplied_values[index]}"
+        export "${supplied_names[index]}"
+    done
+    case "${SEARCH_CACHE_ENABLED:-1}" in
+        0|false|FALSE|False|no|NO|off|OFF)
+            export SEARCH_CACHE_ENABLED=0
+            return 0
+            ;;
+    esac
+    export SEARCH_CACHE_BASE_URL="${SEARCH_CACHE_BASE_URL:-http://127.0.0.1:${SEARCH_CACHE_LOCAL_PORT:-8091}}"
+    if [[ -z "${SEARCH_CACHE_TOKEN:-}" ]]; then
+        echo "Set SEARCH_CACHE_TOKEN (or use ${env_file})." >&2
         return 1
     fi
     export SEARCH_CACHE_ENABLED=1
@@ -18,32 +39,10 @@ _agentflow_enable_search_cache() {
     export SEARCH_CACHE_CONNECT_TIMEOUT_SECONDS="${SEARCH_CACHE_CONNECT_TIMEOUT_SECONDS:-5}"
     export SEARCH_CACHE_READ_TIMEOUT_SECONDS="${SEARCH_CACHE_READ_TIMEOUT_SECONDS:-600}"
 
-    # Only this preflight subprocess uses the lightweight source package.
-    # Do not change the training process's package resolution.
-    (
-        cd "${repo_dir}/agentflow" || exit 1
-        PYTHONPATH="${repo_dir}/agentflow${PYTHONPATH:+:${PYTHONPATH}}" \
-        "${SEARCH_CACHE_PYTHON:-python3}" - <<'PY'
-import os
-import sys
-from agentflow.tools.search_gateway import SearchGatewayClient, SearchGatewayError
-
-try:
-    with SearchGatewayClient(
-        base_url=os.environ["SEARCH_CACHE_BASE_URL"],
-        token=os.environ["SEARCH_CACHE_TOKEN"],
-        connect_timeout=5,
-        read_timeout=10,
-    ) as client:
-        status = client.health()
-    if status.get("status") != "ok":
-        raise RuntimeError("Search cache service is not ready")
-except (SearchGatewayError, RuntimeError) as exc:
-    print(f"Search cache preflight failed: {exc}", file=sys.stderr)
-    sys.exit(1)
-print("[OK] Shared search cache connected; tool requests will use the service.")
-PY
-    )
+    # The bootstrap is stdlib-only: it can reuse/start the development service
+    # and manage the node's SSH forward before any models or Ray workers start.
+    # It never installs a cache service on this training node.
+    "${SEARCH_CACHE_PYTHON:-python3}" "${repo_dir}/train-roma/search_cache_bootstrap.py"
 }
 
 _agentflow_enable_search_cache

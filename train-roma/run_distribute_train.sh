@@ -86,7 +86,7 @@ python -m pip install --user --no-deps -e . --no-build-isolation
 cd ..
 
 # Enable before Ray starts on each node so tools inherit the shared service.
-if [[ "${SEARCH_CACHE_ENABLED:-0}" == "1" || -n "${SEARCH_CACHE_ENV_FILE:-}" || -f "${ROOT_PATH}/train-roma/search-cache.local.env" ]]; then
+if [[ "${SEARCH_CACHE_ENABLED:-}" =~ ^(1|true|True|TRUE|yes|YES|on|ON)$ ]] || { [[ -z "${SEARCH_CACHE_ENABLED+x}" ]] && [[ -n "${SEARCH_CACHE_ENV_FILE:-}" || -f "${ROOT_PATH}/train-roma/search-cache.local.env" ]]; }; then
     source "${ROOT_PATH}/train-roma/enable_search_cache.sh" || exit 1
 fi
 
