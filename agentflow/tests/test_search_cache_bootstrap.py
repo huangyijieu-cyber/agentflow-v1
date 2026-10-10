@@ -73,6 +73,76 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue(result["reused"])
         runner.assert_not_called()
 
+    def test_explicit_identity_applies_to_remote_start_tunnel_and_control_commands(self):
+        key = Path(self.directory.name) / "dummy identity.pem"
+        key.write_text("dummy fixture, not a private key")
+        key.chmod(0o600)
+        config = bootstrap.Config.from_env(dict(self.env, SEARCH_CACHE_SSH_IDENTITY_FILE=str(key)))
+        bootstrap._socket_path(config, Path(self.directory.name)).touch()
+        healthy, calls = [False], []
+        def runner(command, *, timeout):
+            calls.append(command)
+            if "-O" in command:
+                return completed(returncode=255)
+            if "-fN" in command:
+                healthy[0] = True
+                return completed()
+            return completed('{"status":"ok","port":8091,"reused":true}')
+        bootstrap.bootstrap(config, runner=runner, probe=lambda *_a, **_k: healthy[0])
+        self.assertEqual(len(calls), 3)
+        for command in calls:
+            self.assertEqual(command[command.index("-i") + 1], str(key.resolve()))
+            self.assertIn("IdentitiesOnly=yes", command)
+            self.assertIn("BatchMode=yes", command)
+            self.assertIn("StrictHostKeyChecking=yes", command)
+        self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+
+    def test_identity_relative_paths_are_repo_rooted_and_tilde_expands(self):
+        key = Path(self.directory.name) / "pem" / "dummy with spaces.pem"
+        key.parent.mkdir()
+        key.write_text("dummy fixture")
+        key.chmod(0o400)
+        config = bootstrap.Config.from_env(dict(self.env, SEARCH_CACHE_SSH_IDENTITY_FILE="pem/dummy with spaces.pem"))
+        with patch.object(bootstrap, "REPO_ROOT", Path(self.directory.name)), patch.dict(
+            os.environ, {"HOME": self.directory.name}
+        ):
+            options = bootstrap.ssh_options(config)
+            self.assertEqual(options[options.index("-i") + 1], str(key.resolve()))
+            self.assertEqual(bootstrap.validate_ssh_identity_file("~/pem/dummy with spaces.pem"), str(key.resolve()))
+        self.assertEqual(key.stat().st_mode & 0o777, 0o400)
+
+    def test_missing_unreadable_directory_or_permissive_identity_fails_before_ssh(self):
+        key = Path(self.directory.name) / "dummy.pem"
+        key.write_text("dummy fixture")
+        runner = Mock(side_effect=AssertionError("invalid key must not invoke SSH"))
+        for path in (str(Path(self.directory.name) / "missing.pem"), self.directory.name):
+            config = bootstrap.Config.from_env(dict(self.env, SEARCH_CACHE_SSH_IDENTITY_FILE=path))
+            with self.assertRaises(bootstrap.BootstrapError):
+                bootstrap.bootstrap(config, runner=runner, probe=Mock(return_value=False))
+        key.chmod(0o644)
+        config = bootstrap.Config.from_env(dict(self.env, SEARCH_CACHE_SSH_IDENTITY_FILE=str(key)))
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "chmod 600"):
+            bootstrap.bootstrap(config, runner=runner, probe=Mock(return_value=False))
+        self.assertEqual(key.stat().st_mode & 0o777, 0o644)
+        key.chmod(0o600)
+        with patch.object(bootstrap.os, "access", return_value=False), self.assertRaisesRegex(
+            bootstrap.BootstrapError, "readable regular file"
+        ):
+            bootstrap.bootstrap(config, runner=runner, probe=Mock(return_value=False))
+        runner.assert_not_called()
+
+    def test_warm_reuse_does_not_require_configured_key_to_exist(self):
+        config = bootstrap.Config.from_env(dict(self.env, SEARCH_CACHE_SSH_IDENTITY_FILE="pem/no-longer-present.pem"))
+        runner = Mock(side_effect=AssertionError("warm reuse must not invoke SSH"))
+        result = bootstrap.bootstrap(config, runner=runner, probe=Mock(return_value=True))
+        self.assertTrue(result["reused"])
+        runner.assert_not_called()
+
+    def test_unconfigured_identity_preserves_ssh_agent_and_default_key_selection(self):
+        options = bootstrap.ssh_options(self.config)
+        self.assertNotIn("-i", options)
+        self.assertNotIn("IdentitiesOnly=yes", options)
+
     def test_cold_service_starts_remote_then_forward_with_bounded_ssh(self):
         calls, healthy = [], [False]
         def runner(command, *, timeout):
