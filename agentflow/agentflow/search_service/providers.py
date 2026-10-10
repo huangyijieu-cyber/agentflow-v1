@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 
-from .core import GatewayFailure
+from .core import CACHE_TTL_SECONDS, GatewayFailure
 
 
 WIKIMEDIA_USER_AGENT = (
@@ -115,16 +115,6 @@ def prepare(tool: str, params: Dict[str, Any]) -> Dict[str, Any]:
     raise _invalid("unknown retrieval tool")
 
 
-def _ttl(name, default):
-    try:
-        value = float(os.getenv(name, str(default)))
-    except ValueError as exc:
-        raise GatewayFailure(f"Invalid server setting {name}", code="configuration_error", status_code=500) from exc
-    if value < 0 or value != value or value == float("inf"):
-        raise GatewayFailure(f"Invalid server setting {name}", code="configuration_error", status_code=500)
-    return value
-
-
 def _tls_verify():
     """Keep the existing proxy's TLS behavior, with an explicit CA override."""
     ca_bundle = os.getenv("SEARCH_SERVICE_CA_BUNDLE")
@@ -191,8 +181,6 @@ def _only_wiki_page(data):
 def _wikipedia(params, service):
     language = params["language"]
     endpoint = f"https://{language}.wikipedia.org/w/api.php"
-    wiki_ttl = _ttl("SEARCH_CACHE_WIKI_TTL", 7 * 86400)
-    empty_ttl = _ttl("SEARCH_CACHE_EMPTY_TTL", 300)
 
     def search():
         data = _wiki_request(service, endpoint, {
@@ -205,7 +193,7 @@ def _wikipedia(params, service):
 
     titles = service.cached(
         "wikipedia_search", {"endpoint": endpoint, "query": params["query"], "srlimit": 10, "srprop": "", "version": 1},
-        search, lambda value: wiki_ttl if value else empty_ttl,
+        search, CACHE_TTL_SECONDS,
     )
     if not titles:
         return {"results": [{
@@ -233,7 +221,7 @@ def _wikipedia(params, service):
 
             resolved = service.cached(
                 "wikipedia_page_identity", {"endpoint": endpoint, "title": title, "redirects": True, "version": 1},
-                identity, wiki_ttl,
+                identity, CACHE_TTL_SECONDS,
             )
 
             def content():
@@ -249,7 +237,7 @@ def _wikipedia(params, service):
 
             text = service.cached(
                 "wikipedia_page_text", {"endpoint": endpoint, "pageid": resolved["pageid"], "explaintext": True, "version": 1},
-                content, wiki_ttl,
+                content, CACHE_TTL_SECONDS,
             )
             limit = params["max_length"]
             if limit != -1 and len(text) > limit:
@@ -306,12 +294,7 @@ def _brave(params, service):
         _brave_results(data)
         return data
 
-    def lifetime(data):
-        if not _brave_results(data):
-            return _ttl("SEARCH_CACHE_EMPTY_TTL", 300)
-        return _ttl("SEARCH_CACHE_BRAVE_FRESH_TTL", 900) if params.get("freshness") else _ttl("SEARCH_CACHE_BRAVE_TTL", 86400)
-
-    data = service.cached("brave_search", {"endpoint": endpoint, "params": effective, "version": 1}, fetch, lifetime)
+    data = service.cached("brave_search", {"endpoint": endpoint, "params": effective, "version": 1}, fetch, CACHE_TTL_SECONDS)
     return {"data": data}
 
 
@@ -337,7 +320,7 @@ def _fetch(params, service):
 
     text = service.cached(
         "web_text", {"url": url, "headers": headers, "parser": "html.parser", "separator": "\n", "strip": True, "max_chars": 1000000, "version": 1},
-        fetch, lambda value: _ttl("SEARCH_CACHE_WEB_TTL", 86400) if value else _ttl("SEARCH_CACHE_EMPTY_TTL", 300),
+        fetch, CACHE_TTL_SECONDS,
     )
     return {"text": text[:params["max_length"]]}
 

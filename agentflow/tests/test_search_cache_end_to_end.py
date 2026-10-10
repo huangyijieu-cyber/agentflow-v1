@@ -71,7 +71,8 @@ class LocalPipelineTests(unittest.TestCase):
 
     def start_service(self):
         self.service = SearchService(ServiceConfig(
-            cache_dir=self.temp.name, token="test-shared-token", max_retries=0,
+            cache_dir=self.temp.name, db_path=str(Path(self.temp.name) / "cache.sqlite3"),
+            token="test-shared-token", max_retries=0,
             workers=8, queue_size=32, request_timeout=5,
             wiki_rpm=100000, brave_rpm=100000, web_rpm=100000,
         ))

@@ -3,6 +3,7 @@ import gzip
 import http.client
 import io
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -13,7 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from agentflow.search_service.core import GatewayFailure, SearchService, ServiceConfig
+from agentflow.search_service.core import DEFAULT_CACHE_DB_PATH, GatewayFailure, SearchService, ServiceConfig
 from agentflow.search_service.server import ServiceHTTPServer, main
 
 
@@ -56,7 +57,8 @@ class ServiceHTTPTests(unittest.TestCase):
         self.addCleanup(self.stop)
 
     def start(self):
-        self.service = SearchService(ServiceConfig(cache_dir=self.directory.name, token="secret-test-token"), self.providers)
+        self.service = SearchService(ServiceConfig(cache_dir=self.directory.name,
+            db_path=str(Path(self.directory.name) / "cache.sqlite3"), token="secret-test-token"), self.providers)
         self.server = ServiceHTTPServer(("127.0.0.1", 0), self.service)
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         self.thread.start()
@@ -93,6 +95,27 @@ class ServiceHTTPTests(unittest.TestCase):
             self.assertEqual(status, 401)
             self.assertEqual(body["error"]["code"], "unauthorized")
         self.assertEqual(self.providers.calls, 0)
+
+    def test_metrics_database_failure_returns_json_and_recovers(self):
+        with patch.object(self.service.cache, "stats", side_effect=sqlite3.DatabaseError("database disk image is malformed")):
+            with self.assertLogs("search_service", level="ERROR") as logs:
+                status, headers, body = self.request("/metrics")
+            self.assertEqual(status, 503)
+            self.assertEqual(body["error"]["code"], "cache_database_error")
+            self.assertEqual(body["request_id"], headers["X-Request-ID"])
+            self.assertNotIn("malformed", json.dumps(body))
+            self.assertTrue(any("malformed" in line for line in logs.output))
+            self.assertEqual(self.request("/healthz")[0], 200)
+            self.assertEqual(self.request("/metrics", auth=False)[0], 401)
+        self.assertEqual(self.request("/metrics")[0], 200)
+
+    def test_metrics_unexpected_failure_returns_json(self):
+        with patch.object(self.service, "metrics_snapshot", side_effect=RuntimeError("internal detail")):
+            with self.assertLogs("search_service", level="ERROR"):
+                status, _, body = self.request("/metrics")
+        self.assertEqual(status, 500)
+        self.assertEqual(body["error"]["code"], "internal_error")
+        self.assertNotIn("internal detail", json.dumps(body))
 
     def test_all_tool_protocols_preserve_complete_multiple_results(self):
         status, headers, body = self.request("/v1/search/wikipedia", {"query": "A"})
@@ -184,6 +207,13 @@ class ServiceHTTPTests(unittest.TestCase):
 
 
 class ServerConfigurationTests(unittest.TestCase):
+    def test_database_default_is_independent_of_state_directory(self):
+        config = ServiceConfig.from_env({"SEARCH_CACHE_DIR": "/mounted/s3/state"})
+        self.assertEqual(config.db_path, "/var/tmp/agentflow-search-cache/search_cache.sqlite3")
+        self.assertEqual(ServiceConfig().db_path, DEFAULT_CACHE_DB_PATH)
+        custom = ServiceConfig.from_env({"SEARCH_CACHE_DB_PATH": "/local/custom/cache.sqlite3"})
+        self.assertEqual(custom.db_path, "/local/custom/cache.sqlite3")
+
     def test_missing_token_is_rejected_before_starting_service(self):
         with patch.dict("os.environ", {}, clear=True), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
             main(["--port", "0"])

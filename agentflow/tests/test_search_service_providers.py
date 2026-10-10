@@ -137,14 +137,14 @@ class WikipediaTests(unittest.TestCase):
         extracts = [call for call in service.requests if call[3]["params"].get("prop") == "extracts"]
         self.assertEqual(len(extracts), 1)
 
-    def test_empty_result_is_short_cached_with_original_placeholder(self):
+    def test_empty_result_is_cached_seven_days_with_original_placeholder(self):
         service = Service(lambda upstream, method, url, kwargs: wiki_response(kwargs, titles=()))
         params = prepare("wikipedia", {"query": "no hits"})
         result = execute("wikipedia", params, service)
         self.assertEqual(result, {"results": [{"title": None, "url": None, "abstract": None, "error": "No results found for query: no hits"}]})
         execute("wikipedia", params, service)
         self.assertEqual(len(service.requests), 1)
-        self.assertEqual(list(service.ttls.values()), [300])
+        self.assertEqual(list(service.ttls.values()), [604800])
 
     def test_partial_failure_keeps_position_and_is_not_cached_as_success(self):
         attempts = {"failed": False}
@@ -228,15 +228,15 @@ class BraveTests(unittest.TestCase):
         self.assertEqual(len(service.requests), 2)
         self.assertEqual(service.requests[0][3]["params"], {"q": "A", "count": 2, "country": "US", "search_lang": "en", "ui_lang": "en-US", "freshness": "pw"})
         self.assertNotIn("offline-test-token", str(service.entries))
-        self.assertEqual(set(service.ttls.values()), {900})
+        self.assertEqual(set(service.ttls.values()), {604800})
 
-    def test_explicit_empty_is_short_cached(self):
+    def test_explicit_empty_is_cached_seven_days(self):
         service = Service(lambda *args: Response({"organic_results": []}))
         params = prepare("brave", {"query": "A"})
         execute("brave", params, service)
         execute("brave", params, service)
         self.assertEqual(len(service.requests), 1)
-        self.assertEqual(set(service.ttls.values()), {300})
+        self.assertEqual(set(service.ttls.values()), {604800})
 
     def test_unknown_or_error_json_is_not_cached(self):
         for data in ({"message": "not authorized"}, {"error": {"message": "error"}, "web": {"results": []}}, {"web": {"results": [None]}}, [1, 2]):
@@ -255,6 +255,27 @@ class BraveTests(unittest.TestCase):
 
 
 class FetchTests(unittest.TestCase):
+    def test_all_successful_cache_stages_use_seven_days_including_empty(self):
+        with patch.dict(os.environ, {
+            "SEARCH_CACHE_WIKI_TTL": "1", "SEARCH_CACHE_EMPTY_TTL": "1",
+            "SEARCH_CACHE_WEB_TTL": "1", "SEARCH_CACHE_BRAVE_TTL": "1",
+            "SEARCH_CACHE_BRAVE_FRESH_TTL": "1", "YIBU_BRAVE_API_KEY": "test-key",
+        }):
+            cases = [
+                ("wikipedia", {"query": "A"}, lambda *args: wiki_response(args[3])),
+                ("wikipedia", {"query": "empty"}, lambda *args: wiki_response(args[3], titles=())),
+                ("brave", {"query": "A"}, lambda *args: Response({"web": {"results": [{"title": "A"}]}})),
+                ("brave", {"query": "A", "freshness": "pd"}, lambda *args: Response({"web": {"results": []}})),
+                ("fetch", {"url": "https://example.org/page"}, lambda *args: Response(content=b"<p>text</p>")),
+                ("fetch", {"url": "https://example.org/empty"}, lambda *args: Response(content=b"<html></html>")),
+            ]
+            for tool, params, responder in cases:
+                with self.subTest(tool=tool, params=params):
+                    service = Service(responder)
+                    execute(tool, prepare(tool, params), service)
+                    self.assertTrue(service.ttls)
+                    self.assertEqual(set(service.ttls.values()), {604800})
+
     def test_different_return_limits_share_full_text_cache(self):
         service = Service(lambda *args: Response(content=b"<p>abcdef</p>"))
         short = prepare("fetch", {"url": "https://example.org/page", "max_length": 2})

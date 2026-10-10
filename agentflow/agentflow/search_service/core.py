@@ -29,6 +29,10 @@ from urllib.parse import urljoin, urlsplit
 import requests
 
 
+CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_CACHE_DB_PATH = "/var/tmp/agentflow-search-cache/search_cache.sqlite3"
+
+
 class GatewayFailure(RuntimeError):
     """A bounded, structured failure; its message must not contain credentials."""
 
@@ -75,7 +79,7 @@ class ServiceConfig:
     max_body_bytes: int = 8 * 1024 * 1024
     max_upstream_bytes: int = 20 * 1024 * 1024
     cache_max_bytes: int = 2 * 1024 * 1024 * 1024
-    cache_max_ttl: float = 7 * 86400.0
+    cache_max_ttl: float = float(CACHE_TTL_SECONDS)
     wiki_rpm: float = 150.0
     wiki_concurrency: int = 3
     brave_rpm: float = 180.0
@@ -85,7 +89,7 @@ class ServiceConfig:
     max_retries: int = 3
     connect_timeout: float = 5.0
     read_timeout: float = 20.0
-    db_path: str | None = None
+    db_path: str | None = DEFAULT_CACHE_DB_PATH
 
     def __post_init__(self):
         for name in ("workers", "max_batch", "max_body_bytes", "max_upstream_bytes",
@@ -128,7 +132,7 @@ class ServiceConfig:
                 raise ValueError(f"invalid {name}") from exc
         values["cache_dir"] = env.get("SEARCH_CACHE_DIR", defaults.cache_dir)
         values["token"] = env.get("SEARCH_SERVICE_TOKEN") or env.get("SEARCH_CACHE_TOKEN", "")
-        values["db_path"] = env.get("SEARCH_CACHE_DB_PATH") or None
+        values["db_path"] = env.get("SEARCH_CACHE_DB_PATH") or defaults.db_path
         return cls(**values)
 
 
@@ -147,36 +151,46 @@ class Metrics:
 
 
 class SQLiteCache:
-    """Each operation has its own connection; transactions replace values atomically."""
+    """Serialize local DB operations; successful reads renew each entry's TTL."""
 
     def __init__(self, path, *, max_bytes, max_ttl):
         self.path = str(path)
         self.max_bytes = max_bytes
         self.max_ttl = max_ttl
+        # Cache hits also write expiry/access times. Serializing connections
+        # avoids unnecessary writer contention and overlapping WAL checkpoints.
+        self._db_lock = threading.RLock()
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("""CREATE TABLE IF NOT EXISTS entries (
                 namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
                 expires REAL NOT NULL, accessed REAL NOT NULL, size INTEGER NOT NULL,
+                ttl REAL NOT NULL DEFAULT 604800,
                 PRIMARY KEY(namespace, key))""")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(entries)")}
+            if "ttl" not in columns:
+                # Healthy databases created before sliding expiry remain usable.
+                conn.execute("ALTER TABLE entries ADD COLUMN ttl REAL NOT NULL DEFAULT 604800")
             conn.execute("CREATE INDEX IF NOT EXISTS entries_expiry ON entries(expires)")
             conn.execute("CREATE INDEX IF NOT EXISTS entries_access ON entries(accessed)")
 
     @contextmanager
     def connect(self):
-        conn = sqlite3.connect(self.path, timeout=5.0)
-        conn.execute("PRAGMA busy_timeout=5000")
-        try:
-            with conn:
-                yield conn
-        finally:
-            conn.close()
+        with self._db_lock:
+            conn = sqlite3.connect(self.path, timeout=5.0)
+            try:
+                conn.execute("PRAGMA busy_timeout=5000")
+                with conn:
+                    yield conn
+            finally:
+                conn.close()
 
     def get(self, namespace, key):
-        now = time.time()
         with self.connect() as conn:
-            row = conn.execute("SELECT value, expires FROM entries WHERE namespace=? AND key=?",
+            conn.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            row = conn.execute("SELECT value, expires, ttl FROM entries WHERE namespace=? AND key=?",
                                (namespace, key)).fetchone()
             if row is None:
                 return None
@@ -184,8 +198,8 @@ class SQLiteCache:
                 conn.execute("DELETE FROM entries WHERE namespace=? AND key=? AND expires<=?",
                              (namespace, key, now))
                 return None
-            conn.execute("UPDATE entries SET accessed=? WHERE namespace=? AND key=?",
-                         (now, namespace, key))
+            conn.execute("UPDATE entries SET accessed=?, expires=? WHERE namespace=? AND key=?",
+                         (now, now + min(row[2], self.max_ttl), namespace, key))
         return row[0]
 
     def put(self, namespace, key, value_json, ttl):
@@ -196,14 +210,17 @@ class SQLiteCache:
         size = len(value_json.encode("utf-8"))
         if size > self.max_bytes:
             return False
-        now = time.time()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            lifetime = min(float(ttl), self.max_ttl)
             conn.execute("DELETE FROM entries WHERE expires<=?", (now,))
-            conn.execute("""INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?)
+            conn.execute("""INSERT INTO entries (namespace, key, value, expires, accessed, size, ttl)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(namespace, key) DO UPDATE SET value=excluded.value,
-                expires=excluded.expires, accessed=excluded.accessed, size=excluded.size""",
-                (namespace, key, value_json, now + min(float(ttl), self.max_ttl), now, size))
+                expires=excluded.expires, accessed=excluded.accessed, size=excluded.size,
+                ttl=excluded.ttl""",
+                (namespace, key, value_json, now + lifetime, now, size, lifetime))
             total = conn.execute("SELECT COALESCE(SUM(size),0) FROM entries").fetchone()[0]
             if total > self.max_bytes:
                 for old_namespace, old_key, old_size in conn.execute(
@@ -312,7 +329,9 @@ class SearchService:
         self._closed = False
         cache_dir = Path(config.cache_dir).expanduser()
         cache_dir.mkdir(parents=True, exist_ok=True)
-        db_path = Path(config.db_path or cache_dir / "search_cache.sqlite3").expanduser().resolve()
+        # The state/config directory may be an object-store mount (e.g. s3fs).
+        # SQLite and its WAL/SHM files must live on a local filesystem.
+        db_path = Path(config.db_path or DEFAULT_CACHE_DB_PATH).expanduser().resolve()
         db_path.parent.mkdir(parents=True, exist_ok=True)
         # Lock the actual DB identity, including --db-path outside cache_dir.
         self._process_lock = db_path.with_name(db_path.name + ".service.lock").open("a+")

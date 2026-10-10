@@ -1,6 +1,7 @@
 """Offline persistence/concurrency/real local HTTP tests for the search service."""
 import json
 import socket
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -8,12 +9,13 @@ import time
 import unittest
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from agentflow.search_service.core import GatewayFailure, SearchService, ServiceConfig, SQLiteCache, json_dumps
+from agentflow.search_service.core import CACHE_TTL_SECONDS, GatewayFailure, SearchService, ServiceConfig, SQLiteCache, json_dumps
 
 
 class FakeProviders:
@@ -59,14 +61,44 @@ class SQLiteCacheTests(unittest.TestCase):
         self.assertEqual(restored, value)
         self.assertEqual(list(restored[0]), ["z", "a"])
 
-    def test_expiry_uses_server_clock_and_ttl_is_capped(self):
+    def test_hits_renew_capped_ttl_and_expired_entries_are_not_revived(self):
         with patch("agentflow.search_service.core.time.time", return_value=1000):
             self.cache.put("wiki", "one", '"old"', 10000)
         with patch("agentflow.search_service.core.time.time", return_value=1029):
             self.assertEqual(self.cache.get("wiki", "one"), '"old"')
-        with patch("agentflow.search_service.core.time.time", return_value=1030):
+        # The hit at 1029 extends expiry from 1030 to 1059.
+        with patch("agentflow.search_service.core.time.time", return_value=1031):
+            self.assertEqual(self.cache.get("wiki", "one"), '"old"')
+        with patch("agentflow.search_service.core.time.time", return_value=1061):
             self.assertIsNone(self.cache.get("wiki", "one"))
         self.assertEqual(self.cache.stats()["entries"], 0)
+
+    def test_stats_do_not_renew_ttl_or_refresh_other_entries(self):
+        with patch("agentflow.search_service.core.time.time", return_value=1000):
+            self.cache.put("wiki", "hit", '"hit"', 20)
+            self.cache.put("wiki", "idle", '"idle"', 20)
+        with patch("agentflow.search_service.core.time.time", return_value=1010):
+            self.assertEqual(self.cache.stats()["entries"], 2)
+            self.assertEqual(self.cache.get("wiki", "hit"), '"hit"')
+        restart = SQLiteCache(self.path, max_bytes=100000, max_ttl=30)
+        with patch("agentflow.search_service.core.time.time", return_value=1021):
+            self.assertIsNone(restart.get("wiki", "idle"))
+            self.assertEqual(restart.get("wiki", "hit"), '"hit"')
+
+    def test_healthy_legacy_schema_gets_seven_day_sliding_expiry(self):
+        path = Path(self.directory.name) / "legacy.sqlite3"
+        with closing(sqlite3.connect(path)) as conn, conn:
+            conn.execute("""CREATE TABLE entries (
+                namespace TEXT, key TEXT, value TEXT, expires REAL,
+                accessed REAL, size INTEGER, PRIMARY KEY(namespace, key))""")
+            conn.execute("INSERT INTO entries VALUES ('wiki','old','\"value\"',2000,1000,7)")
+        cache = SQLiteCache(path, max_bytes=100000, max_ttl=CACHE_TTL_SECONDS)
+        with patch("agentflow.search_service.core.time.time", return_value=1500):
+            self.assertEqual(cache.get("wiki", "old"), '"value"')
+        with cache.connect() as conn:
+            expires, ttl = conn.execute("SELECT expires, ttl FROM entries").fetchone()
+        self.assertEqual((expires, ttl), (1500 + CACHE_TTL_SECONDS, CACHE_TTL_SECONDS))
+        cache.put("wiki", "new", '"new"', CACHE_TTL_SECONDS)
 
     def test_capacity_evicts_oldest_without_partial_writes(self):
         cache = SQLiteCache(self.path, max_bytes=12, max_ttl=100)
@@ -102,7 +134,8 @@ class SearchServiceCoreTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.providers = FakeProviders()
-        self.service = SearchService(ServiceConfig(cache_dir=self.directory.name, token="test-token", workers=16), self.providers)
+        self.service = SearchService(ServiceConfig(cache_dir=self.directory.name,
+            db_path=str(Path(self.directory.name) / "cache.sqlite3"), token="test-token", workers=16), self.providers)
         self.addCleanup(self.service.close)
 
     def wait_for_waiters(self, count):
@@ -172,7 +205,8 @@ class SearchServiceCoreTests(unittest.TestCase):
 
     def test_queue_is_bounded_and_waiting_deadline_is_enforced(self):
         self.service.close()
-        self.service = SearchService(ServiceConfig(cache_dir=self.directory.name, token="test-token", workers=1, queue_size=1), self.providers)
+        self.service = SearchService(ServiceConfig(cache_dir=self.directory.name,
+            db_path=str(Path(self.directory.name) / "cache.sqlite3"), token="test-token", workers=1, queue_size=1), self.providers)
         self.addCleanup(self.service.close)
         self.providers.release.clear()
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -264,7 +298,9 @@ class UpstreamBudgetTests(unittest.TestCase):
         self.addCleanup(self.upstream.server_close)
         self.addCleanup(self.upstream.shutdown)
         self.base_url = f"http://127.0.0.1:{self.upstream.server_port}"
-        config = ServiceConfig(cache_dir=self.directory.name, token="test", wiki_rpm=100000, web_rpm=100000,
+        config = ServiceConfig(cache_dir=self.directory.name,
+                               db_path=str(Path(self.directory.name) / "cache.sqlite3"),
+                               token="test", wiki_rpm=100000, web_rpm=100000,
                                max_retries=1, request_timeout=2)
         self.service = SearchService(config, FakeProviders())
         self.addCleanup(self.service.close)

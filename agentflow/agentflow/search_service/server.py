@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -132,15 +133,25 @@ class ServiceRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         request_id = uuid.uuid4().hex
-        path = urlsplit(self.path).path
-        if not self._authenticated():
-            self._error(GatewayFailure("Bearer authentication required", code="unauthorized", status_code=401), request_id)
-        elif path == "/healthz":
-            self._send_json(200, {"status": "ok"}, request_id=request_id)
-        elif path == "/metrics":
-            self._send_json(200, self.server.service.metrics_snapshot(), request_id=request_id)
-        else:
-            self._error(GatewayFailure("Endpoint not found", code="not_found", status_code=404), request_id)
+        try:
+            path = urlsplit(self.path).path
+            if not self._authenticated():
+                self._error(GatewayFailure("Bearer authentication required", code="unauthorized", status_code=401), request_id)
+            elif path == "/healthz":
+                self._send_json(200, {"status": "ok"}, request_id=request_id)
+            elif path == "/metrics":
+                self._send_json(200, self.server.service.metrics_snapshot(), request_id=request_id)
+            else:
+                self._error(GatewayFailure("Endpoint not found", code="not_found", status_code=404), request_id)
+        except sqlite3.Error:
+            LOG.exception("Cache database failure during GET; request_id=%s", request_id)
+            self._error(GatewayFailure("Cache database is unavailable; inspect the service log",
+                                       code="cache_database_error", status_code=503), request_id)
+        except (TimeoutError, OSError):
+            self.server.service.metrics.add("client_disconnects")
+        except Exception:
+            LOG.exception("Search service GET failed; request_id=%s", request_id)
+            self._error(GatewayFailure("Internal search service error", code="internal_error", status_code=500), request_id)
 
     def _read_body(self):
         if self.headers.get("Transfer-Encoding"):
@@ -236,7 +247,8 @@ def main(argv=None):
         service.close()
         raise
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    LOG.info("Search service listening on %s:%s; cache directory %s", args.host, server.server_port, config.cache_dir)
+    LOG.info("Search service listening on %s:%s; state directory %s; database %s",
+             args.host, server.server_port, config.cache_dir, service.cache.path)
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

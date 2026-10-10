@@ -1,14 +1,15 @@
 # 统一搜索与共享缓存
 
 `ideacache` 分支从 `idea` 创建，迁入 `cache` 分支的共享搜索与一键启动功能，
-保留 `idea` 的 InfoSeek 判分、subreward 和 GiGPO 逻辑。统一服务运行在开发服务器，默认缓存目录为
-`/home/ma-user/work/code-rl/cache`。训练机调用开发服务；缓存未命中时，开发服务沿用
+保留 `idea` 的 InfoSeek 判分、subreward 和 GiGPO 逻辑。统一服务运行在开发服务器，配置、日志和 PID 默认放在
+`/home/ma-user/work/code-rl/cache`；SQLite 数据库默认放在本地临时目录
+`/var/tmp/agentflow-search-cache/search_cache.sqlite3`。训练机调用开发服务；缓存未命中时，开发服务沿用
 EC2 → 个人主机 → Internet 的出口。模型选页、embedding、RAG 摘要和 reward 仍在训练机。
 
 ```text
 训练任务 A / B / C
        ↓ HTTP（内网直连或 SSH 转发）
-开发服务器：搜索服务 → SQLite 持久缓存
+开发服务器：搜索服务 → 本地临时盘 SQLite 缓存
        ↓ 未命中：合并请求 / 限速 / 重试
 EC2 → 个人主机 → Wikipedia / Yibu / 网页
 ```
@@ -116,9 +117,29 @@ bash train-roma/run_search_cache.sh
 nohup bash train-roma/run_search_cache.sh > /home/ma-user/work/code-rl/cache/service.log 2>&1 &
 ```
 
-同一缓存目录只允许一个服务进程运行，锁文件防止多进程分别执行限速。
+同一数据库只允许一个服务进程运行，数据库旁的锁文件防止多进程分别执行限速。
 服务只需 CPU 和磁盘，不需启动训练 SDK、vLLM 或 embedding 服务。
 若需要多进程/多副本，需先把请求合并和限速状态迁移到共享协调组件。
+
+### 数据库存放与升级
+
+`SEARCH_CACHE_DIR` 继续保存 env、日志、PID 等服务文件。`SEARCH_CACHE_DB_PATH` 单独指定数据库，
+默认 `/var/tmp/agentflow-search-cache/search_cache.sqlite3`；WAL、SHM 和数据库锁也放在其旁边。
+该目录必须位于开发服务器本地文件系统，不能把 SQLite/WAL 直接放在 `fuse.s3fs` 上。
+可用 `findmnt -T /var/tmp -o TARGET,FSTYPE` 确认挂载类型。
+
+本地文件仍在时，服务重启可以复用缓存；容器重建或临时目录被清理后会重新积累。
+不做 S3 快照，也不自动复制原先已经损坏的数据库。
+
+升级已有服务时，在现有服务端 env 中确认以下两项，不要用示例覆盖已有令牌和密钥：
+
+```bash
+SEARCH_CACHE_DB_PATH=/var/tmp/agentflow-search-cache/search_cache.sqlite3
+SEARCH_CACHE_MAX_TTL=604800
+```
+
+同步代码后必须重启开发服务器上的共享搜索服务。只重启训练会复用仍在运行的旧服务，
+不会应用新路径或新有效期。启动日志会打印实际数据库路径；切换新数据库后缓存从零积累。
 
 ## 训练机接入
 
@@ -177,16 +198,24 @@ VERL 的 Ray 入口会显式向 actor 传递客户端配置。直接调用其它
 
 | 工具 | 缓存内容 | key 与有效期 |
 | --- | --- | --- |
-| Wiki 候选 | 完整、有序标题列表 | API 站点/语言、query、实际参数、版本；默认 7 天 |
-| Wiki 页面 | 页面身份、正文、URL | 站点/语言、标题身份或 pageid、参数、版本；默认 7 天 |
-| Web RAG | 当前 BeautifulSoup 规则解析出的网页文本 | 完整实际 URL、影响内容的 headers、解析版本与长度；默认 24 小时 |
-| Yibu/Brave | 完整、有序上游 JSON，包括所有搜索结果和 snippets | endpoint、query、count、地区/语言/freshness、版本；默认 24 小时，带 freshness 为 15 分钟 |
+| Wiki 候选 | 完整、有序标题列表 | API 站点/语言、query、实际参数、版本；7 天，命中续期 |
+| Wiki 页面 | 页面身份、正文、URL | 站点/语言、标题身份或 pageid、参数、版本；7 天，命中续期 |
+| Web RAG | 当前 BeautifulSoup 规则解析出的网页文本 | 完整实际 URL、影响内容的 headers、解析版本与长度；7 天，命中续期 |
+| Yibu/Brave | 完整、有序上游 JSON，包括所有搜索结果和 snippets | endpoint、query、count、地区/语言/freshness、版本；包括 freshness 搜索均为 7 天，命中续期 |
 | Base Generator / Python Coder | 不做全局结果缓存 | 非上述网络检索路径 |
 
-真实零结果短缓存 5 分钟；429、超时、未知响应、5xx 不作为成功内容缓存。
+成功响应中的真实零结果也缓存 7 天；429、超时、未知响应、5xx 不作为成功内容缓存。
 Wiki 单页失败保留当前占位结果，但失败页面不入正常缓存；成功页面可以复用。
 Wiki API 正文和 HTML 解析文本属于不同缓存类型，不能互相替代。
-TTL 配置名称见 `providers.py`；所有 TTL 受 `SEARCH_CACHE_MAX_TTL` 上限约束。
+
+每条记录写入时设置 `expires = 当前时间 + 604800 秒`；在未过期时命中，
+只将该条记录改为 `expires = 命中时间 + 604800 秒`。连续 7 天没有命中才会过期，
+已过期记录不能靠读取续期，必须重新访问上游。查询 `/metrics` 不续期，容量上限仍可提前淘汰记录。
+候选列表、页面身份、页面正文、网页文本各自独立续期，不会因一个 query 命中而刷新整个库。
+
+各工具统一使用 7 天，不再读取旧的 `SEARCH_CACHE_WIKI_TTL`、`SEARCH_CACHE_WEB_TTL`、
+`SEARCH_CACHE_BRAVE_TTL`、`SEARCH_CACHE_BRAVE_FRESH_TTL`、`SEARCH_CACHE_EMPTY_TTL`。
+保留总上限 `SEARCH_CACHE_MAX_TTL`，默认和示例均为 `604800`；设置得更低会缩短有效期。
 
 缓存不改变候选排序、重复项、字段顺序和模型使用的文本长度。
 从缓存读取时重新构造独立对象，避免 Wiki 原地加入摘要污染其他 query。
@@ -231,6 +260,9 @@ Yibu 默认节流配置只是服务端初始设置，并不表示你的账户有
 客户端可通过 `SearchGatewayClient.from_env().batch(...)` 显式提交 batch。
 现有工具的单请求调用也使用共享缓存和跨请求合并。
 
+`/metrics` 读取数据库失败时返回 HTTP 503 和 `cache_database_error`，详细异常写入服务日志，
+避免未捕获异常造成空响应。`/healthz` 仅检查进程能否响应，不执行数据库完整性检查。
+
 开发服务器向训练机发送结果仍消耗带宽，缓存命中仅避免再次访问个人主机出口。
 保留当前截断规则并采用 gzip，不擅自减少候选数或缩短 RAG 输入。
 实际收益应分别看 query、页面和 URL 命中率，以及真实上游请求数。
@@ -253,6 +285,7 @@ python3 -m unittest discover -s agentflow/tests -p 'test_search_*' -v
 bash -n train-roma/run_search_cache.sh train-roma/enable_search_cache.sh train-roma/open_search_cache_tunnel.sh
 ```
 
-测试覆盖持久化、过期、并发合并、重复 batch 映射、错误不缓存、限速和三个工具的接入。
+测试覆盖持久化、命中续期、过期后重新获取、旧表结构兼容、并发合并、重复 batch 映射、
+错误不缓存、指标接口数据库异常、限速和三个工具的接入。
 真实部署还需检查开发服务器端口可达性、代理出口、Yibu 账户额度，再用少量 rollout
 检查 observation 和奖励，最后增加多任务并发。本地离线测试不代表已经完成远程部署。
