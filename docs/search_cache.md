@@ -1,6 +1,7 @@
 # 统一搜索与共享缓存
 
-本分支从 `main` 创建。统一服务运行在开发服务器，默认缓存目录为
+`ideacache` 分支从 `idea` 创建，迁入 `cache` 分支的共享搜索与一键启动功能，
+保留 `idea` 的 InfoSeek 判分、subreward 和 GiGPO 逻辑。统一服务运行在开发服务器，默认缓存目录为
 `/home/ma-user/work/code-rl/cache`。训练机调用开发服务；缓存未命中时，开发服务沿用
 EC2 → 个人主机 → Internet 的出口。模型选页、embedding、RAG 摘要和 reward 仍在训练机。
 
@@ -14,7 +15,7 @@ EC2 → 个人主机 → Wikipedia / Yibu / 网页
 
 ## 跟随训练自动启动（推荐）
 
-使用更新后的 `cache` 分支代码，训练启动脚本会自动执行：
+使用 `ideacache` 分支代码，训练启动脚本会自动执行：
 
 ```text
 本训练节点健康检查

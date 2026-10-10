@@ -3,7 +3,7 @@ import ast
 import os
 from pathlib import Path
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 class SearchCacheRuntimeEnvTests(unittest.TestCase):
@@ -15,6 +15,15 @@ class SearchCacheRuntimeEnvTests(unittest.TestCase):
         scope = {"os": os}
         exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
         cls.select_env = staticmethod(scope[node.name])
+        cls.ppo_node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_ppo")
+
+    def run_ppo_with_fake_ray(self, initialized):
+        ray, task_runner = Mock(), Mock()
+        ray.is_initialized.return_value = initialized
+        scope = {"os": os, "ray": ray, "TaskRunner": task_runner, "_search_cache_env_vars": self.select_env}
+        exec(compile(ast.Module(body=[self.ppo_node], type_ignores=[]), "entrypoint.py", "exec"), scope)
+        scope["run_ppo"](None)
+        return ray, task_runner
 
     def test_enabled_forwards_client_config_without_upstream_credentials(self):
         env = {"SEARCH_CACHE_ENABLED": "1", "SEARCH_CACHE_BASE_URL": "http://service:8091",
@@ -33,6 +42,22 @@ class SearchCacheRuntimeEnvTests(unittest.TestCase):
                "SEARCH_GATEWAY_TOKEN": "shared"}
         with patch.dict(os.environ, env, clear=True):
             self.assertEqual(self.select_env(), env)
+
+    def test_local_ray_initialization_keeps_idea_device_setting_and_cache_routing(self):
+        env = {"SEARCH_CACHE_ENABLED": "1", "SEARCH_CACHE_BASE_URL": "http://service:8091", "SEARCH_CACHE_TOKEN": "shared"}
+        with patch.dict(os.environ, env, clear=True):
+            ray, task_runner = self.run_ppo_with_fake_ray(False)
+        self.assertEqual(ray.init.call_args.kwargs["runtime_env"]["env_vars"], {
+            "ASCEND_RT_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7", **env,
+        })
+        task_runner.options.assert_called_once_with(runtime_env={"env_vars": env})
+
+    def test_already_initialized_ray_still_receives_cache_configuration(self):
+        env = {"SEARCH_CACHE_ENABLED": "1", "SEARCH_CACHE_BASE_URL": "http://service:8091", "SEARCH_CACHE_TOKEN": "shared"}
+        with patch.dict(os.environ, env, clear=True):
+            ray, task_runner = self.run_ppo_with_fake_ray(True)
+        ray.init.assert_not_called()
+        task_runner.options.assert_called_once_with(runtime_env={"env_vars": env})
 
 
 if __name__ == "__main__":

@@ -36,6 +36,10 @@ spec = importlib.util.spec_from_file_location("search_network_retry", TOOLS / "n
 retry = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(retry)
 
+gateway_spec = importlib.util.spec_from_file_location("search_gateway", TOOLS / "search_gateway.py")
+gateway = importlib.util.module_from_spec(gateway_spec)
+gateway_spec.loader.exec_module(gateway)
+
 
 def http_response(status, *, headers=None, content=b"", data=None):
     # Real requests status/JSON handling; only transport and response closing are mocked.
@@ -57,6 +61,9 @@ def retry_scope():
         RETRYABLE_HTTP_STATUSES=retry.RETRYABLE_HTTP_STATUSES,
         YIBU_RETRYABLE_HTTP_STATUSES=retry.YIBU_RETRYABLE_HTTP_STATUSES,
         retry_wait_seconds=retry.retry_wait_seconds,
+        SearchGatewayClient=gateway.SearchGatewayClient,
+        SearchGatewayError=gateway.SearchGatewayError,
+        search_cache_enabled=gateway.search_cache_enabled,
     )
 
 
@@ -148,6 +155,11 @@ class WikipediaRetryTests(unittest.TestCase):
 
 class WebRetryTests(unittest.TestCase):
     def setUp(self):
+        # These tests exercise direct transport retries, independently of the
+        # caller's shared search-service configuration.
+        cache_patch = patch.dict(os.environ, {"SEARCH_CACHE_ENABLED": "0"})
+        cache_patch.start()
+        self.addCleanup(cache_patch.stop)
         self.scope = retry_scope()
         self.scope.update(os=os, urlsplit=urlsplit, BeautifulSoup=BeautifulSoup)
         self.fetch = production_function("web_search/tool.py", "_get_website_content", self.scope)
@@ -201,6 +213,9 @@ class WebRetryTests(unittest.TestCase):
 
 class BraveRetryTests(unittest.TestCase):
     def setUp(self):
+        cache_patch = patch.dict(os.environ, {"SEARCH_CACHE_ENABLED": "0"})
+        cache_patch.start()
+        self.addCleanup(cache_patch.stop)
         self.scope = retry_scope()
         self.scope.update(Any=object, Dict=dict, List=list, Optional=Optional)
         self.search = production_function("brave_search/tool.py", "_execute_search", self.scope)
