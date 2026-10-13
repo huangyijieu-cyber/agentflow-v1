@@ -15,10 +15,7 @@ from bs4 import BeautifulSoup
 from .core import GatewayFailure
 
 
-WIKIMEDIA_USER_AGENT = (
-    "AgentFlowResearchBot/1.0 "
-    "(https://github.com/huangyijieu-cyber/agentflow-v1/issues)"
-)
+WIKIMEDIA_USER_AGENT = "AgentFlowResearchBot/1.0"
 BRAVE_ENDPOINT = "https://yibuapi.com/brave/v1/web/search"
 WEB_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
