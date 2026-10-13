@@ -135,7 +135,7 @@ import wikipedia
 
 # Set the Wikimedia identity for the wikipedia library even without the proxy launcher.
 wikipedia.set_user_agent(
-    os.getenv("WIKIMEDIA_USER_AGENT", "AgentFlowResearchBot/1.0 (https://github.com/huangyijieu-cyber/agentflow-v1/issues)")
+    os.getenv("WIKIMEDIA_USER_AGENT", "AgentFlowResearchBot/1.0")
 )
 from pydantic import BaseModel
 
