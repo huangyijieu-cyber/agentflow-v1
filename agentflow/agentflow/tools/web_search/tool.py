@@ -170,7 +170,7 @@ class Web_Search_Tool(BaseTool):
         wiki_host = (urlsplit(url).hostname or "").lower()
         if wiki_host == "wikipedia.org" or wiki_host.endswith(".wikipedia.org"):
             headers["User-Agent"] = os.getenv(
-                "WIKIMEDIA_USER_AGENT", "AgentFlowResearchBot/1.0 (https://github.com/huangyijieu-cyber/agentflow-v1/issues)"
+                "WIKIMEDIA_USER_AGENT", "AgentFlowResearchBot/1.0"
             )
 
         # Session.get bypasses Wikipedia's global requests.get retry patch.
