@@ -37,6 +37,9 @@ class Service:
         self.ttls = {}
         self.cooldowns = []
 
+    def check_url_allowed(self, url):
+        pass
+
     def notify_cooldown(self, upstream, url, delay):
         self.cooldowns.append((upstream, url, delay))
 
@@ -175,6 +178,49 @@ class WikipediaTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 429)
         self.assertEqual(len(service.requests), 2)
         self.assertFalse(any(key[0] == "wikipedia_page_identity" for key in service.entries))
+
+    def test_blocked_page_redirect_is_not_hidden_as_a_partial_success(self):
+        def respond(upstream, method, url, kwargs):
+            if kwargs["params"].get("prop") == "info|pageprops":
+                raise GatewayFailure("网站死亡", code="domain_blocked", status_code=410)
+            return wiki_response(kwargs)
+        service = Service(respond)
+        with self.assertRaises(GatewayFailure) as raised:
+            execute("wikipedia", prepare("wikipedia", {"query": "A"}), service)
+        self.assertEqual(raised.exception.code, "domain_blocked")
+        self.assertEqual(len(service.requests), 2)
+        self.assertFalse(any(key[0] == "wikipedia_page_identity" for key in service.entries))
+
+    def test_shared_network_failure_stops_page_loop_and_preserves_cause(self):
+        for code, upstream_status in (("upstream_proxy_error", 407), ("upstream_timeout", None),
+                                     ("upstream_network_error", None), ("upstream_http_error", 502)):
+            with self.subTest(code=code):
+                def respond(upstream, method, url, kwargs):
+                    if kwargs["params"].get("prop") == "info|pageprops":
+                        raise GatewayFailure("original failure", code=code, upstream_status=upstream_status)
+                    return wiki_response(kwargs)
+                service = Service(respond)
+                with self.assertRaises(GatewayFailure) as raised:
+                    execute("wikipedia", prepare("wikipedia", {"query": "A"}), service)
+                self.assertEqual(raised.exception.code, code)
+                self.assertEqual(raised.exception.upstream_status, upstream_status)
+                self.assertEqual(len(service.requests), 2)  # search + first identity; no next page
+                self.assertFalse(any(key[0] == "wikipedia_page_identity" for key in service.entries))
+
+    def test_all_provider_endpoints_are_checked_before_cache_access(self):
+        for tool, params in (("wikipedia", {"query": "A"}),
+                             ("brave", {"query": "A"}),
+                             ("fetch", {"url": "https://dead.test/page"})):
+            with self.subTest(tool=tool):
+                service = Service(lambda *args: self.fail("must not access upstream"))
+                with patch.object(service, "check_url_allowed", side_effect=GatewayFailure(
+                    "网站死亡", code="domain_blocked", status_code=410
+                )), patch.object(service, "cached") as cached:
+                    with self.assertRaises(GatewayFailure) as raised:
+                        execute(tool, prepare(tool, params), service)
+                    self.assertEqual(raised.exception.code, "domain_blocked")
+                    cached.assert_not_called()
+                self.assertEqual(service.requests, [])
 
     def test_api_rate_limit_in_json_is_failure_not_page_placeholder(self):
         for code in ("ratelimited", "maxlag"):

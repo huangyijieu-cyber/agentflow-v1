@@ -7,12 +7,13 @@ import tempfile
 import threading
 import time
 import unittest
+import requests
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agentflow.search_service.core import CACHE_TTL_SECONDS, GatewayFailure, SearchService, ServiceConfig, SQLiteCache, json_dumps
@@ -61,15 +62,15 @@ class SQLiteCacheTests(unittest.TestCase):
         self.assertEqual(restored, value)
         self.assertEqual(list(restored[0]), ["z", "a"])
 
-    def test_hits_renew_capped_ttl_and_expired_entries_are_not_revived(self):
+    def test_hits_keep_original_capped_expiry_and_do_not_revive_expired_entries(self):
         with patch("agentflow.search_service.core.time.time", return_value=1000):
             self.cache.put("wiki", "one", '"old"', 10000)
         with patch("agentflow.search_service.core.time.time", return_value=1029):
             self.assertEqual(self.cache.get("wiki", "one"), '"old"')
-        # The hit at 1029 extends expiry from 1030 to 1059.
-        with patch("agentflow.search_service.core.time.time", return_value=1031):
-            self.assertEqual(self.cache.get("wiki", "one"), '"old"')
-        with patch("agentflow.search_service.core.time.time", return_value=1061):
+        with self.cache.connect() as conn:
+            self.assertEqual(conn.execute("SELECT expires, accessed FROM entries").fetchone(), (1030, 1029))
+        # Even a hit one second before expiry does not extend the original TTL.
+        with patch("agentflow.search_service.core.time.time", return_value=1030):
             self.assertIsNone(self.cache.get("wiki", "one"))
         self.assertEqual(self.cache.stats()["entries"], 0)
 
@@ -83,9 +84,9 @@ class SQLiteCacheTests(unittest.TestCase):
         restart = SQLiteCache(self.path, max_bytes=100000, max_ttl=30)
         with patch("agentflow.search_service.core.time.time", return_value=1021):
             self.assertIsNone(restart.get("wiki", "idle"))
-            self.assertEqual(restart.get("wiki", "hit"), '"hit"')
+            self.assertIsNone(restart.get("wiki", "hit"))
 
-    def test_healthy_legacy_schema_gets_seven_day_sliding_expiry(self):
+    def test_healthy_legacy_schema_preserves_existing_expiry(self):
         path = Path(self.directory.name) / "legacy.sqlite3"
         with closing(sqlite3.connect(path)) as conn, conn:
             conn.execute("""CREATE TABLE entries (
@@ -97,8 +98,23 @@ class SQLiteCacheTests(unittest.TestCase):
             self.assertEqual(cache.get("wiki", "old"), '"value"')
         with cache.connect() as conn:
             expires, ttl = conn.execute("SELECT expires, ttl FROM entries").fetchone()
-        self.assertEqual((expires, ttl), (1500 + CACHE_TTL_SECONDS, CACHE_TTL_SECONDS))
+        self.assertEqual((expires, ttl), (2000, CACHE_TTL_SECONDS))
         cache.put("wiki", "new", '"new"', CACHE_TTL_SECONDS)
+
+    def test_hits_update_lru_without_extending_expiry(self):
+        cache = SQLiteCache(self.path, max_bytes=16, max_ttl=100)
+        with patch("agentflow.search_service.core.time.time", return_value=100):
+            cache.put("a", "old", '"123456"', 100)
+        with patch("agentflow.search_service.core.time.time", return_value=101):
+            cache.put("a", "idle", '"abcdef"', 100)
+        with patch("agentflow.search_service.core.time.time", return_value=102):
+            self.assertEqual(cache.get("a", "old"), '"123456"')
+        with patch("agentflow.search_service.core.time.time", return_value=103):
+            cache.put("a", "new", '"uvwxyz"', 100)
+            self.assertIsNone(cache.get("a", "idle"))
+            self.assertEqual(cache.get("a", "old"), '"123456"')
+        with cache.connect() as conn:
+            self.assertEqual(conn.execute("SELECT expires FROM entries WHERE key='old'").fetchone()[0], 200)
 
     def test_capacity_evicts_oldest_without_partial_writes(self):
         cache = SQLiteCache(self.path, max_bytes=12, max_ttl=100)
@@ -225,6 +241,79 @@ class SearchServiceCoreTests(unittest.TestCase):
         self.assertNotIn("queued", self.providers.calls)
 
 
+class NetworkFailureTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.factory = MagicMock()
+        self.session = self.factory.return_value.__enter__.return_value
+        self.service = SearchService(ServiceConfig(
+            cache_dir=directory.name, db_path=str(Path(directory.name) / "cache.sqlite3"),
+            wiki_rpm=100000, request_timeout=5, max_retries=3,
+        ), FakeProviders(), session_factory=self.factory)
+        self.addCleanup(self.service.close)
+
+    def test_proxy_auth_failure_returns_original_status_without_retry_or_secrets(self):
+        self.session.request.side_effect = requests.exceptions.ProxyError(
+            "Cannot connect to http://secret-token@proxy.test:80; Tunnel connection failed: 407 Proxy Authentication Required"
+        )
+        with patch.object(self.service, "_sleep") as sleep, self.assertRaises(GatewayFailure) as caught:
+            self.service.request("wikipedia", "GET", "https://en.wikipedia.org/page")
+        error = caught.exception
+        self.assertEqual((error.code, error.upstream_status, error.attempts), ("upstream_proxy_error", 407, 1))
+        self.assertFalse(error.retryable)
+        self.assertNotIn("secret-token", json.dumps(error.as_dict()))
+        self.assertEqual(self.session.request.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_transient_proxy_failure_keeps_its_type_after_bounded_retries(self):
+        self.session.request.side_effect = requests.exceptions.ProxyError("Tunnel connection failed: 502 Bad Gateway")
+        with patch.object(self.service, "_sleep"), self.assertRaises(GatewayFailure) as caught:
+            self.service.request("wikipedia", "GET", "https://en.wikipedia.org/page")
+        self.assertEqual((caught.exception.code, caught.exception.upstream_status, caught.exception.attempts),
+                         ("upstream_proxy_error", 502, 4))
+        self.assertEqual(self.session.request.call_count, 4)
+        self.assertEqual(self.service.metrics.snapshot()["upstream_errors/upstream_proxy_error"], 4)
+
+    def test_known_proxy_error_is_not_replaced_when_retry_budget_is_exhausted(self):
+        self.service._local.deadline = time.monotonic() + 0.1
+        self.session.request.side_effect = requests.exceptions.ProxyError("Tunnel connection failed: 504 Gateway Time-out")
+        with patch.object(self.service, "_sleep") as sleep, self.assertRaises(GatewayFailure) as caught:
+            self.service.request("wikipedia", "GET", "https://en.wikipedia.org/page")
+        self.assertEqual((caught.exception.code, caught.exception.upstream_status), ("upstream_proxy_error", 504))
+        self.assertEqual(self.session.request.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_http407_response_is_a_nonretryable_proxy_error(self):
+        response = MagicMock(status_code=407, headers={})
+        self.session.request.return_value = response
+        with self.assertRaises(GatewayFailure) as caught:
+            self.service.request("wikipedia", "GET", "https://en.wikipedia.org/page")
+        self.assertEqual((caught.exception.code, caught.exception.upstream_status), ("upstream_proxy_error", 407))
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(self.session.request.call_count, 1)
+        response.close.assert_called()
+
+    def test_http_timeout_is_distinct_from_other_connection_errors(self):
+        for exception, code, status in ((requests.ReadTimeout("read"), "upstream_timeout", 504),
+                                        (requests.ConnectionError("connect"), "upstream_network_error", 502)):
+            with self.subTest(code=code):
+                self.service.config.max_retries = 0
+                self.session.request.side_effect = exception
+                with self.assertRaises(GatewayFailure) as caught:
+                    self.service.request("wikipedia", "GET", "https://en.wikipedia.org/page")
+                self.assertEqual((caught.exception.code, caught.exception.status_code), (code, status))
+
+    def test_tls_failure_is_explicit_and_not_retried(self):
+        self.session.request.side_effect = requests.exceptions.SSLError("certificate secret")
+        with self.assertRaises(GatewayFailure) as caught:
+            self.service.request("wikipedia", "GET", "https://en.wikipedia.org/page")
+        self.assertEqual(caught.exception.code, "upstream_tls_error")
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(self.session.request.call_count, 1)
+        self.assertNotIn("secret", str(caught.exception))
+
+
 class _LocalUpstream(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -325,6 +414,45 @@ class UpstreamBudgetTests(unittest.TestCase):
             self.service.request("wikipedia", "GET", self.base_url + "/permanent")
         self.assertEqual(error.exception.upstream_status, 403)
         self.assertEqual(self.upstream.counts["/permanent"], 1)
+
+    def test_blocked_domain_never_opens_a_session_or_attempts_http(self):
+        self.service.config.blocked_domains = ("127.0.0.1",)
+        with patch.object(self.service, "_session_factory") as session_factory:
+            for _ in range(2):
+                with self.assertRaises(GatewayFailure) as error:
+                    self.service.request("web:127.0.0.1", "GET", self.base_url + "/ok")
+                self.assertEqual(error.exception.code, "domain_blocked")
+                self.assertEqual(error.exception.status_code, 410)
+                self.assertFalse(error.exception.retryable)
+                self.assertIn("网站死亡", str(error.exception))
+            session_factory.assert_not_called()
+        self.assertEqual(self.upstream.paths, [])
+        self.assertEqual(self.service.metrics.snapshot().get("upstream_attempts", 0), 0)
+        self.assertEqual(self.service.metrics.snapshot()["blocked_domain_requests"], 2)
+
+    def test_blacklist_matches_subdomains_case_idna_and_domain_boundaries(self):
+        self.service.config.blocked_domains = ServiceConfig(
+            blocked_domains=("Example.ORG.", "例子.测试")
+        ).blocked_domains
+        for url in ("https://EXAMPLE.org/page", "https://deep.sub.example.org./page",
+                    "https://例子.测试/page", "https://xn--fsqu00a.xn--0zwm56d/page"):
+            with self.assertRaises(GatewayFailure) as error:
+                self.service.check_url_allowed(url)
+            self.assertEqual(error.exception.code, "domain_blocked")
+        for url in ("https://notexample.org", "https://example.org.other.test",
+                    "https://allowed.test/path?url=https://example.org"):
+            self.service.check_url_allowed(url)
+
+    def test_redirect_to_blocked_domain_stops_without_requesting_or_retrying_target(self):
+        self.service.config.blocked_domains = ("localhost",)
+        with self.assertRaises(GatewayFailure) as error:
+            self.service.request("web:127.0.0.1", "GET", self.base_url + "/redirect")
+        self.assertEqual(error.exception.code, "domain_blocked")
+        self.assertFalse(error.exception.retryable)
+        self.assertEqual(self.upstream.counts, {"/redirect": 1})
+        self.assertEqual(self.service.metrics.snapshot()["upstream_attempts"], 1)
+        # The blocked redirect also releases its initial upstream slot.
+        self.service.request("web:127.0.0.1", "GET", self.base_url + "/ok")
 
     def test_redirects_count_as_separate_attempts_and_strip_cross_host_auth(self):
         response = self.service.request("web:127.0.0.1", "GET", self.base_url + "/redirect",

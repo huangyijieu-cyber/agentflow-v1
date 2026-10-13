@@ -12,14 +12,16 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import requests
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "agentflow"))
 
 from agentflow.search_service.core import SearchService, ServiceConfig
 from agentflow.search_service.server import ServiceHTTPServer
-from agentflow.tools.search_gateway import SearchGatewayClient
+from agentflow.tools.search_gateway import SearchGatewayClient, SearchGatewayError
 
 
 class LocalPipelineTests(unittest.TestCase):
@@ -136,6 +138,27 @@ class LocalPipelineTests(unittest.TestCase):
                 self.assertEqual(len(results), 2)
                 self.assertTrue(all(not r["ok"] for r in results))
         self.assertEqual(self.calls["bad"], 2)
+
+    def test_proxy407_survives_real_service_and_client_without_retry_or_cache(self):
+        self.service.config.max_retries = 3
+        factory = MagicMock()
+        upstream_request = factory.return_value.__enter__.return_value.request
+        upstream_request.side_effect = requests.exceptions.ProxyError(
+            "Tunnel connection failed: 407 Proxy Authentication Required"
+        )
+        started = time.monotonic()
+        with patch.object(self.service, "_session_factory", factory), self.client() as client:
+            with self.assertRaises(SearchGatewayError) as caught:
+                client.fetch(self.upstream_url + "/page")
+        self.assertLess(time.monotonic() - started, 2)
+        error = caught.exception
+        self.assertEqual((error.code, error.upstream_status_code, error.attempts),
+                         ("upstream_proxy_error", 407, 1))
+        self.assertFalse(error.retryable)
+        self.assertTrue(error.is_shared_failure)
+        self.assertEqual(upstream_request.call_count, 1)
+        self.assertEqual(self.service.cache.stats()["entries"], 0)
+        self.assertEqual(self.service.metrics.snapshot()["requests_failed/upstream_proxy_error"], 1)
 
     def test_same_page_different_lengths_share_raw_text_and_preflight_connects(self):
         with self.client() as client:

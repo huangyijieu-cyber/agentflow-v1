@@ -2,7 +2,7 @@
 """Measure configured boundaries and the highest tested stable network load.
 
 No deployed service, database, environment file or training process is changed.
-Real probes require --mode upstream/all; --mode local never contacts Internet.
+Real probes require --mode upstream/all/confirm; local never contacts Internet.
 """
 from __future__ import annotations
 
@@ -126,7 +126,7 @@ def assess_stage(stage, *, duration, min_samples, short=False):
         reasons.append("target_not_reached")
     if stage.get("aborted_reason"):
         reasons.append(stage["aborted_reason"])
-    return {"passed": not reasons, "reasons": reasons}
+    return {"passed": not reasons, "reasons": list(dict.fromkeys(reasons))}
 
 
 def select_rate_result(stages, grid):
@@ -254,38 +254,50 @@ def wiki_dispatch(probes):
     return call
 
 
-def burst_sweep(call, label, args, control, sustainable_rpm, *, progress=None):
+def burst_sweep(call, label, args, control, sustainable_rpm, *, progress=None, minute_allowance=None):
     rows = []
     maximum = None
     for concurrency in args.concurrency_steps:
         # A burst larger than the validated minute allowance would conflate
         # RPM and concurrent-call capacity. Leave that region unmeasured.
-        if concurrency > sustainable_rpm:
+        if concurrency > (minute_allowance if minute_allowance is not None else sustainable_rpm):
             return {"stages": rows, "highest_stable_burst_concurrency": maximum,
                     "status": "minute_allowance_prevents_larger_burst"}
         if control.allowance(concurrency * args.burst_rounds) < concurrency * args.burst_rounds:
             break
         reached = True
         passed = True
+        uncertain = False
         for round_index in range(args.burst_rounds):
-            if not rest_for_window(control, args.cooldown, label) or not control.enough_time(args.request_timeout + 5):
-                return {"stages": rows, "highest_stable_burst_concurrency": maximum, "status": "test_budget"}
-            row = probe_stage(control.wrap(call), duration=5, concurrency=concurrency,
-                              rpm=1e6, max_requests=concurrency, latency_limit=args.latency_limit,
-                              stop_event=control.stop_event)
-            row["phase"] = "burst"
-            row["round"] = round_index + 1
-            row["assessment"] = assess_stage(row, duration=5, min_samples=concurrency, short=True)
-            if not row.get("concurrency_reached"):
-                row["assessment"]["passed"] = False
-                row["assessment"]["reasons"].append("concurrency_not_exercised")
-                reached = False
-            rows.append(row)
-            if progress:
-                progress(rows, maximum)
-            stage_line(label, "burst", row)
-            if row.get("aborted_reason") == "interrupted":
-                raise KeyboardInterrupt
+            for attempt in range(args.burst_trial_attempts):
+                if control.allowance(concurrency) < concurrency or not rest_for_window(control, args.cooldown, label) or not control.enough_time(args.request_timeout + 5):
+                    return {"stages": rows, "highest_stable_burst_concurrency": maximum, "status": "test_budget"}
+                row = probe_stage(control.wrap(call), duration=5, concurrency=concurrency,
+                                  rpm=1e6, max_requests=concurrency, latency_limit=args.latency_limit,
+                                  stop_event=control.stop_event)
+                row["phase"] = "burst"
+                row["round"] = round_index + 1
+                row["trial_attempt"] = attempt + 1
+                row["assessment"] = assess_stage(row, duration=5, min_samples=concurrency, short=True)
+                if not row.get("concurrency_reached"):
+                    row["assessment"]["passed"] = False
+                    row["assessment"]["reasons"].append("concurrency_not_exercised")
+                rows.append(row)
+                if progress:
+                    progress(rows, maximum)
+                stage_line(label, "burst", row)
+                if row.get("aborted_reason") == "interrupted":
+                    raise KeyboardInterrupt
+                transient = not row["rate_limited"] and bool(row["error_codes"]) and all(
+                    code in {"upstream_network_error", "upstream_http_error", "upstream_timeout", "upstream_proxy_error"}
+                    for code in row["error_codes"])
+                retryable_statuses = {"500", "502", "503", "504"}
+                if {"upstream_http_error", "upstream_proxy_error"} & row["error_codes"].keys():
+                    transient = transient and set(row.get("status_counts", {})) <= retryable_statuses | {"200"}
+                if row["assessment"]["passed"] or not transient:
+                    break
+                uncertain = True
+            reached = reached and bool(row.get("concurrency_reached"))
             passed = passed and row["assessment"]["passed"]
             if not row["assessment"]["passed"]:
                 if row["rate_limited"]:
@@ -296,7 +308,8 @@ def burst_sweep(call, label, args, control, sustainable_rpm, *, progress=None):
         else:
             return {"stages": rows, "highest_stable_burst_concurrency": maximum,
                     "first_failed_burst_concurrency": concurrency,
-                    "status": "failure_boundary_observed" if reached else "concurrency_not_exercised"}
+                    "status": "concurrency_not_exercised" if not reached else
+                              ("inconclusive_network_failure" if uncertain and not row["rate_limited"] else "failure_boundary_observed")}
     return {"stages": rows, "highest_stable_burst_concurrency": maximum,
             "status": "tested_ceiling_passed_upper_bound_not_found" if maximum == max(args.concurrency_steps) else "test_budget"}
 
@@ -366,6 +379,129 @@ def mixed_confirmation(plans, args, control, *, progress=None):
     return {"rounds": rounds, "confirmed": {}, "stopped": "confirmation_failed"}
 
 
+def wiki_confirmation_sweep(plans, args, control, *, ceiling=None, progress=None, allow_initial_downgrade=True):
+    """Verify the aggregate workload; isolated HTML throughput is only a seed."""
+    rounds = []
+    confirmed = {}
+    attempted = []
+    initial_args = args if allow_initial_downgrade else argparse.Namespace(**dict(vars(args), confirmation_rounds=1))
+    initial = mixed_confirmation(plans, initial_args, control,
+        progress=lambda rows: progress(rows) if progress else None)
+    rounds.extend(initial["rounds"])
+    if not initial["confirmed"]:
+        return initial
+    confirmed = initial["confirmed"]
+    if "wiki" not in confirmed:
+        return initial
+    base = confirmed["wiki"]["rpm"]
+    candidates = [rpm for rpm in args.wiki_confirm_steps if rpm > base and (ceiling is None or rpm <= ceiling)]
+    # Keep the other buckets fixed at their jointly verified load. Increasing
+    # Wiki must not secretly reduce Brave and then claim an improved pair.
+    fixed = {name: dict(plans[name], **setting) for name, setting in confirmed.items()}
+    single_args = argparse.Namespace(**dict(vars(args), confirmation_rounds=1))
+    stop = initial["stopped"]
+    for rpm in candidates:
+        trial = {name: dict(plan) for name, plan in fixed.items()}
+        trial["wiki"]["rpm"] = rpm
+        before = len(rounds)
+        def save(rows):
+            if progress:
+                progress(rounds[:before] + rows)
+        outcome = mixed_confirmation(trial, single_args, control, progress=save)
+        for row in outcome["rounds"]:
+            row["wiki_rpm_candidate"] = rpm
+        rounds.extend(outcome["rounds"])
+        if not outcome["rounds"]:
+            stop = "test_budget"
+            break
+        attempted.append(rpm)
+        if not outcome["confirmed"]:
+            stop = "higher_joint_load_failed"
+            break
+        confirmed = outcome["confirmed"]
+        fixed = {name: dict(trial[name], **setting) for name, setting in confirmed.items()}
+        stop = "tested_ceiling_passed_upper_bound_not_found"
+    if progress:
+        progress(rounds)
+    return {"rounds": rounds, "confirmed": confirmed, "stopped": stop,
+            "wiki_extra_candidates_attempted": attempted,
+            "scope": "joint fixed-Brave workload; HTML isolated rate is not an aggregate quota"}
+
+
+def network_settings(confirmed):
+    result = {}
+    for name, prefix in (("wiki", "WIKI"), ("brave", "BRAVE")):
+        if name in confirmed:
+            result["SEARCH_" + prefix + "_RPM"] = confirmed[name]["rpm"]
+            result["SEARCH_" + prefix + "_CONCURRENCY"] = confirmed[name]["concurrency"]
+    web = [value for name, value in confirmed.items() if name.startswith("web:")]
+    if web:
+        result.update(SEARCH_WEB_RPM=min(value["rpm"] for value in web),
+                      SEARCH_WEB_CONCURRENCY=min(value["concurrency"] for value in web))
+    return result
+
+
+def store_confirmation(report, args, confirmed, *, full_windows=True):
+    values = network_settings(confirmed)
+    report["background_training"] = args.background_training
+    if not full_windows:
+        report["smoke_network_settings"] = values
+        report["confirmed_network_settings"] = {}
+    elif args.background_training:
+        report["confirmed_additional_load"] = confirmed
+        report["confirmed_network_settings"] = {}
+        report["measurement_scope"] = "additional headroom while training runs; not total shared-service capacity"
+    else:
+        report["confirmed_network_settings"] = values
+        report["measurement_scope"] = "tested load; requires an isolated exit to interpret as total capacity"
+
+
+def run_resume_confirmation(args, control, report, checkpoint):
+    """Reuse previous calibration, only repeat joint Wiki/Brave load."""
+    if not args.resume_report:
+        raise ValueError("confirm mode requires --resume-report")
+    source = json.loads(Path(args.resume_report).read_text(encoding="utf-8"))
+    known = source.get("joint_confirmation", {}).get("confirmed", {})
+    if not known or set(known) - {"wiki", "brave"}:
+        raise ValueError("resume currently requires a jointly confirmed Wiki/Brave report")
+    for setting in known.values():
+        rpm, concurrency = setting.get("rpm"), setting.get("concurrency")
+        if isinstance(rpm, bool) or not isinstance(rpm, (int, float)) or not math.isfinite(rpm) or rpm <= 0:
+            raise ValueError("invalid saved RPM")
+        if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency <= 0:
+            raise ValueError("invalid saved concurrency")
+    queries = load_queries(args.queries_file, args.query_key)
+    report["arguments"]["tools"] = ",".join(sorted(known))
+    probes, plans = {}, {}
+    report["resume_source"] = {"started_at": source.get("started_at"), "previous_joint_settings": known,
+                               "initial_downgrade_allowed": False}
+    report["unmeasured"].append("resume: no new isolated API, burst, worker, queue or Web-host tests")
+    with ExitStack() as stack:
+        labels = list(WIKI_KINDS) if "wiki" in known else []
+        if "brave" in known:
+            labels.append("brave")
+        for label in labels:
+            query_set = ARTICLE_TITLES if label in {"wiki_identity", "wiki_extract"} else queries
+            cap = known["wiki" if label in WIKI_KINDS else "brave"]["concurrency"]
+            probes[label] = stack.enter_context(UpstreamProbe(label, query_set, [],
+                timeout=args.request_timeout, max_concurrency=max(cap, max(args.concurrency_steps))))
+        if "wiki" in known:
+            plans["wiki"] = dict(known["wiki"], call=wiki_dispatch(probes))
+        if "brave" in known:
+            plans["brave"] = dict(known["brave"], call=probes["brave"].call)
+        def save(rows):
+            report["joint_confirmation"] = {"rounds": list(rows), "confirmed": {}, "stopped": "running"}
+            checkpoint()
+        report["joint_confirmation"] = wiki_confirmation_sweep(plans, args, control, progress=save,
+                                                               allow_initial_downgrade=False)
+        report["transport_metrics_final"] = {label: probe.metrics() for label, probe in probes.items()}
+        store_confirmation(report, args, report["joint_confirmation"]["confirmed"],
+                           full_windows=args.confirmation_duration >= 120)
+        report["request_budget"] = {"logical_calls_used": control.used_requests,
+                                    "logical_calls_remaining": control.remaining_requests}
+        checkpoint()
+
+
 def run_upstream(args, control, report, checkpoint):
     queries = load_queries(args.queries_file, args.query_key)
     groups = load_url_groups(args.urls_file, args.queries_file)
@@ -424,7 +560,8 @@ def run_upstream(args, control, report, checkpoint):
             if all(value.get("highest_stable_rpm") for value in values):
                 plans["wiki"] = {"call": wiki_dispatch(probes),
                     "rpm": min(value["highest_stable_rpm"] for value in values),
-                    "concurrency": max(value["smallest_passing_concurrency_cap"] for value in values)}
+                    "concurrency": max(value["smallest_passing_concurrency_cap"] for value in values),
+                    "burst_allowance": min(value["highest_stable_rpm"] for value in values[:3])}
             else:
                 report["unmeasured"].append("wiki aggregate: all four HTTP varieties need a stable baseline")
         for label in kinds:
@@ -442,7 +579,8 @@ def run_upstream(args, control, report, checkpoint):
                 def save_burst(rows, maximum):
                     bursts[label] = {"stages": list(rows), "highest_stable_burst_concurrency": maximum, "status": "running"}
                     checkpoint()
-                bursts[label] = burst_sweep(plan["call"], label, args, control, plan["rpm"], progress=save_burst)
+                bursts[label] = burst_sweep(plan["call"], label, args, control, plan["rpm"], progress=save_burst,
+                                           minute_allowance=plan.get("burst_allowance"))
                 observed = bursts[label].get("highest_stable_burst_concurrency")
                 if observed is not None:
                     plan["concurrency"] = max(plan["concurrency"], observed)
@@ -460,29 +598,15 @@ def run_upstream(args, control, report, checkpoint):
             def save_joint(rounds):
                 report["joint_confirmation"] = {"rounds": list(rounds), "confirmed": {}, "stopped": "running"}
                 checkpoint()
-            report["joint_confirmation"] = mixed_confirmation(plans, args, control, progress=save_joint)
+            report["joint_confirmation"] = wiki_confirmation_sweep(plans, args, control,
+                ceiling=wiki_api_ceiling, progress=save_joint)
         else:
             report["joint_confirmation"] = {"rounds": [], "confirmed": {},
                                               "stopped": "skipped" if plans else "no_stable_baselines"}
         report["transport_metrics_final"] = {label: probe.metrics() for label, probe in probes.items()}
         confirmed = report["joint_confirmation"]["confirmed"]
-        recommendation = {}
-        if "wiki" in confirmed:
-            recommendation.update(SEARCH_WIKI_RPM=confirmed["wiki"]["rpm"],
-                                  SEARCH_WIKI_CONCURRENCY=confirmed["wiki"]["concurrency"])
-        if "brave" in confirmed:
-            recommendation.update(SEARCH_BRAVE_RPM=confirmed["brave"]["rpm"],
-                                  SEARCH_BRAVE_CONCURRENCY=confirmed["brave"]["concurrency"])
-        web = [value for name, value in confirmed.items() if name.startswith("web:")]
-        if web:
-            # The current service has one Web configuration applied per host.
-            recommendation.update(SEARCH_WEB_RPM=min(value["rpm"] for value in web),
-                                  SEARCH_WEB_CONCURRENCY=min(value["concurrency"] for value in web))
-        if args.duration >= 60 and args.confirmation_duration >= 120:
-            report["confirmed_network_settings"] = recommendation
-        else:
-            report["smoke_network_settings"] = recommendation
-            report["confirmed_network_settings"] = {}
+        store_confirmation(report, args, confirmed,
+                           full_windows=args.duration >= 60 and args.confirmation_duration >= 120)
         report["request_budget"] = {"logical_calls_used": control.used_requests,
                                     "logical_calls_remaining": control.remaining_requests,
                                     "redirects_are_additional_http_attempts": True}
@@ -546,13 +670,34 @@ def render_summary(report):
               "- Connection capacity remains workers + queue + 16; admission capacity remains workers + queue.",
               "- Minute-scale tests are necessary for RPM. A short successful run is only a smoke test.",
               "- Results share the current proxy exit and API account with other running traffic.", ""]
+    if "joint_confirmation" in report:
+        lines += ["## Joint mixed-load trials", "",
+                  "| Wiki RPM | Brave RPM | Wiki successful/sent | Brave successful/sent | Wiki p95 | Brave p95 | Pass |",
+                  "|---:|---:|---|---|---:|---:|---|"]
+        for trial in report["joint_confirmation"].get("rounds", []):
+            settings, results = trial["settings"], trial["results"]
+            wiki, brave = results.get("wiki", {}), results.get("brave", {})
+            passed = all(row.get("assessment", {}).get("passed") for row in results.values()) and bool(results)
+            lines.append(f"| {settings.get('wiki', {}).get('rpm')} | {settings.get('brave', {}).get('rpm')} | "
+                         f"{wiki.get('succeeded')}/{wiki.get('sent')} | {brave.get('succeeded')}/{brave.get('sent')} | "
+                         f"{wiki.get('latency_p95')} | {brave.get('latency_p95')} | {passed} |")
+        lines += ["", f"Stop reason: {report['joint_confirmation'].get('stopped')}", ""]
+    if report.get("background_training"):
+        lines += ["## Additional load with background training", "",
+                  "This is measured spare capacity during this run, not the total shared-service quota.",
+                  "Do not copy it directly into the global service configuration.", "", "```json",
+                  json.dumps(report.get("confirmed_additional_load", {}), ensure_ascii=False, indent=2), "```", ""]
     return "\n".join(lines)
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--mode", choices=("local", "upstream", "all"), default="local")
-    parser.add_argument("--tools", default="wiki,brave,web")
+    parser.add_argument("--mode", choices=("local", "upstream", "all", "confirm"), default="local")
+    parser.add_argument("--resume-report", help="confirm mode: reuse a previous jointly passing Wiki/Brave report")
+    parser.add_argument("--background-training", action="store_true", help="label results as additional headroom, never export global quota settings")
+    parser.add_argument("--wiki-confirm-steps", type=number_grid, default=number_grid("60,120,150,180,200"),
+                        help="aggregate Wiki RPM candidates in joint confirmation; other buckets remain fixed")
+    parser.add_argument("--tools", default="wiki,brave,web", help="upstream/all provider selection; confirm reuses saved jointly confirmed buckets")
     parser.add_argument("--queries-file", help="txt/json/jsonl search queries; optional")
     parser.add_argument("--query-key", help="dot-separated query field, e.g. data.query")
     parser.add_argument("--urls-file", help="real training URLs, one per line or json/jsonl; grouped by hostname")
@@ -571,6 +716,7 @@ def build_parser():
     parser.add_argument("--request-timeout", type=float, default=30, help="raw upstream probe deadline, seconds")
     parser.add_argument("--cooldown", type=float, default=65, help="quiet interval before bursts/confirmation and after throttling")
     parser.add_argument("--burst-rounds", type=int, default=2)
+    parser.add_argument("--burst-trial-attempts", type=int, default=3, help="repeat a whole burst after transient 5xx/network failure; raw HTTP retries remain zero")
     parser.add_argument("--skip-bursts", action="store_true")
     parser.add_argument("--confirmation-duration", type=float, default=120)
     parser.add_argument("--confirmation-rounds", type=int, default=3)
@@ -584,8 +730,12 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.mode == "confirm" and not args.resume_report:
+        parser.error("--mode confirm requires --resume-report")
+    if args.mode == "confirm" and args.skip_confirmation:
+        parser.error("--mode confirm cannot be combined with --skip-confirmation")
     for name in ("clients", "max_web_hosts", "payload_bytes", "min_samples", "burst_rounds",
-                 "confirmation_rounds", "request_budget"):
+                 "confirmation_rounds", "request_budget", "burst_trial_attempts"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     for name in ("local_duration", "duration", "latency_limit", "request_timeout", "cooldown",
@@ -627,6 +777,10 @@ def main(argv=None):
             say(f"[LOAD] Real proxy traffic; <= {args.request_budget} logical calls; no retries or persistent cache.")
             control = RunControl(args.max_runtime, args.request_budget)
             run_upstream(args, control, report, checkpoint)
+        if args.mode == "confirm":
+            say("[RUN] Reusing saved calibration; testing only current joint Wiki/Brave mixed load")
+            control = RunControl(args.max_runtime, args.request_budget)
+            run_resume_confirmation(args, control, report, checkpoint)
         report["status"] = "completed"
     except KeyboardInterrupt:
         report["status"] = "interrupted"
@@ -647,6 +801,10 @@ def main(argv=None):
         say("[CONFIRMED] Highest jointly passing tested network settings (no headroom discount):")
         for key, value in settings.items():
             say(f"{key}={value:g}")
+    elif report.get("confirmed_additional_load"):
+        say("[HEADROOM] Passing additional load while training runs; NOT a total service quota:")
+        for name, setting in report["confirmed_additional_load"].items():
+            say(f"{name}: extra {setting['rpm']:g} RPM, passing concurrency cap {setting['concurrency']}")
     elif args.mode != "local":
         say("[UNCONFIRMED] No jointly confirmed network configuration; inspect independent stage results.")
     return exit_code

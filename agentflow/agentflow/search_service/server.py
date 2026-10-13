@@ -200,6 +200,15 @@ class ServiceRequestHandler(BaseHTTPRequestHandler):
         try:
             if not self._authenticated():
                 raise GatewayFailure("Bearer authentication required", code="unauthorized", status_code=401)
+            requested_budget = self.headers.get("X-Search-Timeout-Seconds")
+            if requested_budget is not None:
+                try:
+                    requested_budget = float(requested_budget)
+                except (TypeError, ValueError):
+                    raise GatewayFailure("Invalid search timeout budget", code="invalid_request", status_code=400)
+                if not math.isfinite(requested_budget) or requested_budget <= 0:
+                    raise GatewayFailure("Invalid search timeout budget", code="invalid_request", status_code=400)
+                deadline = min(deadline, time.monotonic() + requested_budget)
             path = urlsplit(self.path).path
             endpoints = {"/v1/search/wikipedia": "wikipedia", "/v1/search/brave": "brave", "/v1/fetch": "fetch"}
             if path not in endpoints and path != "/v1/batch":

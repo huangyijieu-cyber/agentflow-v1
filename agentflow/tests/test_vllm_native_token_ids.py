@@ -8,6 +8,7 @@ import json
 import os
 import re
 import string
+import sys
 import tempfile
 import unicodedata
 import unittest
@@ -24,6 +25,8 @@ from pydantic import BaseModel, Field
 from filelock import FileLock
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'agentflow'))
+from agentflow.tools.execution_context import tool_sdk_client
 
 
 def extract(path, name, scope):
@@ -48,7 +51,8 @@ class NativeTokenTests(unittest.TestCase):
         cls.initialize = staticmethod(extract(
             'agentflow/agentflow/engine/vllm.py', '__init__',
             {'os': os, 'OpenAI': OpenAI, 'DEFAULT_SYSTEM_PROMPT': 'system'}))
-        cls.generate = staticmethod(extract('agentflow/agentflow/engine/vllm.py', '_generate_text', {'os': os}))
+        cls.generate = staticmethod(extract('agentflow/agentflow/engine/vllm.py', '_generate_text',
+                                          {'os': os, 'tool_sdk_client': tool_sdk_client, 'OpenAI': OpenAI}))
         cls.append = staticmethod(extract('agentflow/agentflow/models/planner.py', '_append_log', {'Any': Any}))
         triplet = extract('agentflow/agent_types.py', 'Triplet', dict(Any=Any, Dict=Dict, Optional=Optional, BaseModel=BaseModel, Field=Field))
         cls.encode = staticmethod(extract('train-roma/rollout.py', 'encode_logs', {'Triplet': triplet}))

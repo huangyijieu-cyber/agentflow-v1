@@ -16,6 +16,10 @@ from agentflow.tools.network_retry import (
     retry_wait_seconds,
 )
 from agentflow.engine.factory import create_llm_engine
+from agentflow.tools.execution_context import (
+    ToolExecutionError, check_api_result, current_context, ensure_tool_context,
+    owned_api_client, run_bounded,
+)
 
 load_dotenv()
 
@@ -147,13 +151,10 @@ class Web_Search_Tool(BaseTool):
         url = url.replace("arxiv.org/pdf", "arxiv.org/abs")
 
         if search_cache_enabled():
-            try:
-                with SearchGatewayClient.from_env() as gateway:
-                    return gateway.fetch(url, max_length=self.max_window_size)["text"]
-            except SearchGatewayError as error:
-                # execute() returns Error content before embedding or summarization.
-                # Do not fall back to direct requests or add another retry loop.
-                return f"Error fetching URL: {error}"
+            # Keep structured failures intact for callers such as Wiki RAG.
+            # execute() formats them for standalone Web calls before any RAG.
+            with SearchGatewayClient.from_env() as gateway:
+                return gateway.fetch(url, max_length=self.max_window_size)["text"]
 
         # Add headers to mimic a real browser request
         # NOTE: this is a workaround to avoid being blocked by the website
@@ -237,16 +238,14 @@ class Web_Search_Tool(BaseTool):
         Returns:
             list: A list of embeddings.
         """
-        try:
-            client = openai.OpenAI(base_url="http://127.0.0.1:19996/v1", api_key=os.getenv("OPENAI_API_KEY"))
-            embeddings = client.embeddings.create(
-                input=strings,
-                model=self.embeddings_model
-            )
-            res = [embedding.embedding for embedding in embeddings.data]
-            return res
-        except Exception as e:
-            raise Exception(f"Error embedding strings: {str(e)}")
+        def request_embeddings():
+            with owned_api_client(lambda timeout: openai.OpenAI(
+                base_url="http://127.0.0.1:19996/v1", api_key=os.getenv("OPENAI_API_KEY"),
+                timeout=timeout, max_retries=0,
+            )) as client:
+                embeddings = client.embeddings.create(input=strings, model=self.embeddings_model)
+                return [embedding.embedding for embedding in embeddings.data]
+        return run_bounded(request_embeddings, phase="web.embedding")
 
     def _cosine_similarity(self, a, b):
         """
@@ -283,39 +282,44 @@ class Web_Search_Tool(BaseTool):
             reference_information=reference_information
         )
         
-        summary = self.llm_engine(summary_prompt, temperature=self.temperature)
-        return summary
+        summary = run_bounded(
+            lambda: self.llm_engine(summary_prompt, temperature=self.temperature), phase="web.summary"
+        )
+        return check_api_result(summary, "web.summary")
 
-    def execute(self, query, url):
-        # try:
-            # step 1: get content from the website
+    def execute(self, query, url, *, raise_network_errors=False):
+        with ensure_tool_context():
+            try:
+                return self._execute(query, url, raise_network_errors=raise_network_errors)
+            except ToolExecutionError as error:
+                if raise_network_errors:
+                    raise
+                return f"Error processing Web RAG: {error}"
+
+    def _execute(self, query, url, *, raise_network_errors=False):
+        try:
             website_content = self._get_website_content(url)
-            
-            if website_content.startswith("Error"):
-                return website_content
+        except SearchGatewayError as error:
+            if raise_network_errors:
+                raise
+            return f"Error fetching URL: {error}"
 
-            # step 2: chunk the content
-            chunks = self._chunk_website_content(website_content)
-            
-            if not chunks:
-                return "Error: No content could be extracted from the website."
+        if website_content.startswith("Error"):
+            return website_content
 
-            # step 3: embed the chunks
-            embeddings = self._embed_strings([query] + chunks)
-            query_embedding = embeddings[0]
-            chunk_embeddings = embeddings[1:]
+        chunks = self._chunk_website_content(website_content)
+        if not chunks:
+            return "Error: No content could be extracted from the website."
 
-            # step 4: rank the chunks
-            ranked_chunks = self._rank_chunks(query_embedding, chunk_embeddings)
-            top_chunks = [chunks[i] for i in ranked_chunks[:self.top_k]]
-
-            # step 5: summarize the top chunks
-            reference_string = self._concatenate_chunks(top_chunks)
-            summary = self._construct_final_output(query, reference_string)
-
-            return summary
-        # except Exception as e:
-        #     return f"Error processing request: {str(e)}"
+        embeddings = self._embed_strings([query] + chunks)
+        current_context().check()
+        query_embedding = embeddings[0]
+        chunk_embeddings = embeddings[1:]
+        ranked_chunks = self._rank_chunks(query_embedding, chunk_embeddings)
+        top_chunks = [chunks[i] for i in ranked_chunks[:self.top_k]]
+        current_context().check()
+        reference_string = self._concatenate_chunks(top_chunks)
+        return self._construct_final_output(query, reference_string)
 
     def get_metadata(self):
         metadata = super().get_metadata()

@@ -13,6 +13,7 @@ import json
 import math
 import os
 import random
+import re
 import socket
 import sqlite3
 import threading
@@ -31,6 +32,24 @@ import requests
 
 CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_CACHE_DB_PATH = "/var/tmp/agentflow-search-cache/search_cache.sqlite3"
+
+
+def _blocked_domain(value):
+    if not isinstance(value, str):
+        raise ValueError("SEARCH_BLOCKED_DOMAINS must contain domain names")
+    domain = value.strip().rstrip(".").lower()
+    if domain.startswith("*."):
+        domain = domain[2:]
+    try:
+        domain = domain.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError("invalid domain in SEARCH_BLOCKED_DOMAINS") from exc
+    if not domain or len(domain) > 253 or any(
+        not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+        for label in domain.split(".")
+    ):
+        raise ValueError("SEARCH_BLOCKED_DOMAINS requires domains without URLs, ports or paths")
+    return domain
 
 
 class GatewayFailure(RuntimeError):
@@ -72,7 +91,7 @@ def json_clone(value: Any) -> Any:
 class ServiceConfig:
     cache_dir: str = "/home/ma-user/work/code-rl/cache"
     token: str = ""
-    workers: int = 16
+    workers: int = 32
     queue_size: int = 128
     request_timeout: float = 120.0
     max_batch: int = 128
@@ -80,18 +99,22 @@ class ServiceConfig:
     max_upstream_bytes: int = 20 * 1024 * 1024
     cache_max_bytes: int = 2 * 1024 * 1024 * 1024
     cache_max_ttl: float = float(CACHE_TTL_SECONDS)
-    wiki_rpm: float = 150.0
-    wiki_concurrency: int = 3
-    brave_rpm: float = 180.0
-    brave_concurrency: int = 8
+    wiki_rpm: float = 120.0
+    wiki_concurrency: int = 32
+    brave_rpm: float = 240.0
+    brave_concurrency: int = 16
     web_rpm: float = 120.0
     web_concurrency: int = 4
     max_retries: int = 3
     connect_timeout: float = 5.0
     read_timeout: float = 20.0
     db_path: str | None = DEFAULT_CACHE_DB_PATH
+    blocked_domains: tuple[str, ...] = ()
 
     def __post_init__(self):
+        if not isinstance(self.blocked_domains, (tuple, list)):
+            raise ValueError("blocked_domains must be a list or tuple of domain names")
+        self.blocked_domains = tuple(dict.fromkeys(_blocked_domain(value) for value in self.blocked_domains))
         for name in ("workers", "max_batch", "max_body_bytes", "max_upstream_bytes",
                      "cache_max_bytes", "wiki_concurrency", "brave_concurrency",
                      "web_concurrency"):
@@ -133,6 +156,7 @@ class ServiceConfig:
         values["cache_dir"] = env.get("SEARCH_CACHE_DIR", defaults.cache_dir)
         values["token"] = env.get("SEARCH_SERVICE_TOKEN") or env.get("SEARCH_CACHE_TOKEN", "")
         values["db_path"] = env.get("SEARCH_CACHE_DB_PATH") or defaults.db_path
+        values["blocked_domains"] = tuple(filter(None, re.split(r"[,\s]+", env.get("SEARCH_BLOCKED_DOMAINS", ""))))
         return cls(**values)
 
 
@@ -151,13 +175,13 @@ class Metrics:
 
 
 class SQLiteCache:
-    """Serialize local DB operations; successful reads renew each entry's TTL."""
+    """Serialize local DB operations; reads update LRU access, never expiry."""
 
     def __init__(self, path, *, max_bytes, max_ttl):
         self.path = str(path)
         self.max_bytes = max_bytes
         self.max_ttl = max_ttl
-        # Cache hits also write expiry/access times. Serializing connections
+        # Cache hits also write access times. Serializing connections
         # avoids unnecessary writer contention and overlapping WAL checkpoints.
         self._db_lock = threading.RLock()
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -170,7 +194,7 @@ class SQLiteCache:
                 PRIMARY KEY(namespace, key))""")
             columns = {row[1] for row in conn.execute("PRAGMA table_info(entries)")}
             if "ttl" not in columns:
-                # Healthy databases created before sliding expiry remain usable.
+                # Keep healthy legacy schemas usable without changing expiry.
                 conn.execute("ALTER TABLE entries ADD COLUMN ttl REAL NOT NULL DEFAULT 604800")
             conn.execute("CREATE INDEX IF NOT EXISTS entries_expiry ON entries(expires)")
             conn.execute("CREATE INDEX IF NOT EXISTS entries_access ON entries(accessed)")
@@ -190,7 +214,7 @@ class SQLiteCache:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             now = time.time()
-            row = conn.execute("SELECT value, expires, ttl FROM entries WHERE namespace=? AND key=?",
+            row = conn.execute("SELECT value, expires FROM entries WHERE namespace=? AND key=?",
                                (namespace, key)).fetchone()
             if row is None:
                 return None
@@ -198,8 +222,8 @@ class SQLiteCache:
                 conn.execute("DELETE FROM entries WHERE namespace=? AND key=? AND expires<=?",
                              (namespace, key, now))
                 return None
-            conn.execute("UPDATE entries SET accessed=?, expires=? WHERE namespace=? AND key=?",
-                         (now, now + min(row[2], self.max_ttl), namespace, key))
+            conn.execute("UPDATE entries SET accessed=? WHERE namespace=? AND key=?",
+                         (now, namespace, key))
         return row[0]
 
     def put(self, namespace, key, value_json, ttl):
@@ -293,6 +317,14 @@ def _retry_after(header):
         return None
 
 
+def _proxy_http_status(error):
+    # Inspect internally, but never expose a raw exception that may contain
+    # proxy credentials, signed URLs, or request headers.
+    match = re.search(r"(?:Tunnel connection failed:\s*|HTTP(?:/\d(?:\.\d)?)?\s+)([45]\d{2})\b",
+                      str(error), re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
 def _abort_response(response):
     """Interrupt a slow response at its overall deadline, including slow trickles.
 
@@ -371,6 +403,24 @@ class SearchService:
         if self.remaining() <= 0:
             raise GatewayFailure("Search request deadline exceeded", code="deadline_exceeded",
                                  status_code=504, retryable=True)
+
+    def check_url_allowed(self, url):
+        """Reject listed hosts and subdomains before cache reads or HTTP attempts."""
+        if not self.config.blocked_domains:
+            return
+        hostname = (urlsplit(url).hostname or "").rstrip(".").lower()
+        hostname = hostname.encode("idna").decode("ascii")
+        if any(hostname == domain or hostname.endswith("." + domain)
+               for domain in self.config.blocked_domains):
+            self._note("blocked_domain_requests")
+            raise GatewayFailure(f"网站死亡：{hostname}（域名黑名单）",
+                                 code="domain_blocked", status_code=410, retryable=False)
+
+    def _prepare(self, tool, params):
+        prepared = self.providers.prepare(tool, params)
+        if tool == "fetch":
+            self.check_url_allowed(prepared["url"])
+        return prepared
 
     def _note(self, field, count=1):
         self.metrics.add(field, count)
@@ -459,6 +509,7 @@ class SearchService:
         parsed = urlsplit(url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
             raise GatewayFailure("Invalid upstream URL", code="invalid_request", status_code=400)
+        self.check_url_allowed(url)
         current_url, current_method = url, method.upper()
         options_base = dict(kwargs)
         options_base.pop("allow_redirects", None)
@@ -477,6 +528,7 @@ class SearchService:
                     delay = None
                     was_429 = False
                     watchdog = None
+                    failure = None
                     try:
                         remaining = self.remaining()
                         options = dict(options_base)
@@ -499,6 +551,7 @@ class SearchService:
                             redirect_parts = urlsplit(next_url)
                             if redirect_parts.scheme not in {"http", "https"} or not redirect_parts.hostname or redirect_parts.username or redirect_parts.password:
                                 raise GatewayFailure("Invalid upstream redirect", code="upstream_redirect_error", upstream=name)
+                            self.check_url_allowed(next_url)
                             if redirect_parts.netloc != urlsplit(current_url).netloc:
                                 headers = dict(options_base.get("headers", {}))
                                 options_base["headers"] = {k: v for k, v in headers.items() if k.lower() not in {"authorization", "cookie", "host"}}
@@ -521,11 +574,13 @@ class SearchService:
                             delay = float(2 ** attempt)
                         if not 200 <= status < 300:
                             failure = GatewayFailure(
-                                f"Upstream returned HTTP {status}", code="upstream_http_error",
+                                f"Upstream returned HTTP {status}",
+                                code="upstream_proxy_error" if status == 407 else "upstream_http_error",
                                 status_code=429 if status == 429 else 502, retryable=status in retry_statuses,
                                 upstream=name, upstream_status=status, retry_after=delay if was_429 else None,
                                 attempts=total_attempts,
                             )
+                            self.metrics.add("upstream_errors/" + failure.code)
                             if status not in retry_statuses or attempt == self.config.max_retries:
                                 raise failure
                         else:
@@ -541,14 +596,38 @@ class SearchService:
                             response._content_consumed = True
                             self.check_deadline()
                             return response
+                    except requests.exceptions.ProxyError as exc:
+                        status = _proxy_http_status(exc)
+                        retryable = status not in {400, 401, 403, 407}
+                        failure = GatewayFailure(
+                            "Upstream proxy connection failed" + (f" (HTTP {status})" if status else ""),
+                            code="upstream_proxy_error", status_code=502, retryable=retryable,
+                            upstream=name, upstream_status=status, attempts=total_attempts,
+                        )
+                        self.metrics.add("upstream_errors/upstream_proxy_error")
+                        if not retryable or attempt == self.config.max_retries or self.remaining() <= 0:
+                            raise failure from exc
+                        delay = float(2 ** attempt)
+                    except requests.exceptions.SSLError as exc:
+                        self.metrics.add("upstream_errors/upstream_tls_error")
+                        raise GatewayFailure("Upstream TLS connection failed", code="upstream_tls_error",
+                                             status_code=502, retryable=False, upstream=name,
+                                             attempts=total_attempts) from exc
                     except (requests.Timeout, requests.ConnectionError) as exc:
-                        self.check_deadline()
-                        if attempt == self.config.max_retries:
-                            raise GatewayFailure("Upstream network request failed", code="upstream_network_error",
-                                                 status_code=502, retryable=True, upstream=name, attempts=total_attempts) from exc
+                        timed_out = isinstance(exc, requests.Timeout)
+                        failure = GatewayFailure(
+                            "Upstream HTTP request timed out" if timed_out else "Upstream network connection failed",
+                            code="upstream_timeout" if timed_out else "upstream_network_error",
+                            status_code=504 if timed_out else 502, retryable=True,
+                            upstream=name, attempts=total_attempts,
+                        )
+                        self.metrics.add("upstream_errors/" + failure.code)
+                        if attempt == self.config.max_retries or self.remaining() <= 0:
+                            raise failure from exc
                         delay = float(2 ** attempt)
                     except requests.RequestException as exc:
                         self.check_deadline()
+                        self.metrics.add("upstream_errors/upstream_request_error")
                         raise GatewayFailure("Upstream request failed", code="upstream_request_error",
                                              status_code=502, upstream=name, attempts=total_attempts) from exc
                     finally:
@@ -559,6 +638,8 @@ class SearchService:
                         budget.release()
                     # 429 waits happen through the shared bucket; don't sleep twice.
                     if delay is not None and not was_429:
+                        if failure is not None and delay >= self.remaining():
+                            raise failure
                         self._sleep(delay)
                 if next_url is None:
                     break
@@ -586,8 +667,9 @@ class SearchService:
             result["meta"] = meta
             self.metrics.add("requests_succeeded")
             return result
-        except GatewayFailure:
+        except GatewayFailure as exc:
             self.metrics.add("requests_failed")
+            self.metrics.add("requests_failed/" + exc.code)
             raise
         except Exception as exc:
             self.metrics.add("requests_failed")
@@ -623,7 +705,7 @@ class SearchService:
         deadline = deadline or time.monotonic() + self.config.request_timeout
         request_id = request_id or uuid.uuid4().hex
         self.metrics.add("logical_requests")
-        prepared = self.providers.prepare(tool, params)
+        prepared = self._prepare(tool, params)
         return self._wait(self._submit(tool, prepared, deadline, request_id), deadline)
 
     def batch(self, requests_list, *, deadline=None, request_id=None):
@@ -639,7 +721,7 @@ class SearchService:
                 if not isinstance(item, dict) or set(item) - {"tool", "params"}:
                     raise GatewayFailure("Invalid batch entry", code="invalid_request", status_code=400)
                 tool, params = item.get("tool"), item.get("params")
-                prepared = self.providers.prepare(tool, params)
+                prepared = self._prepare(tool, params)
                 key = json_dumps([tool, prepared], canonical=True)
                 if key not in unique:
                     try:

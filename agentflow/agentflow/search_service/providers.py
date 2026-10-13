@@ -178,6 +178,7 @@ def _only_wiki_page(data):
 def _wikipedia(params, service):
     language = params["language"]
     endpoint = f"https://{language}.wikipedia.org/w/api.php"
+    service.check_url_allowed(endpoint)
 
     def search():
         data = _wiki_request(service, endpoint, {
@@ -242,7 +243,11 @@ def _wikipedia(params, service):
             # Keep the searched title and exact original field insertion order.
             pages.append({"title": title, "url": resolved["url"], "abstract": text})
         except GatewayFailure as exc:
-            if exc.status_code == 429 or exc.code in {"rate_limited", "queue_full", "deadline_exceeded"}:
+            if exc.status_code == 429 or exc.code in {
+                "rate_limited", "queue_full", "deadline_exceeded", "domain_blocked",
+                "upstream_proxy_error", "upstream_tls_error", "upstream_timeout",
+                "upstream_network_error", "upstream_request_error",
+            } or exc.upstream_status in {407, 500, 502, 503, 504}:
                 raise
             partial = True
             pages.append({
@@ -272,6 +277,7 @@ def _brave_results(data):
 
 def _brave(params, service):
     endpoint = _url(os.getenv("BRAVE_YIBU_BASE_URL", BRAVE_ENDPOINT))
+    service.check_url_allowed(endpoint)
     effective = {"q": params["query"], "count": params["count"]}
     for name in ("country", "search_lang", "ui_lang", "freshness"):
         if name in params:
@@ -297,6 +303,7 @@ def _brave(params, service):
 
 def _fetch(params, service):
     url = params["url"]
+    service.check_url_allowed(url)
     hostname = (urlsplit(url).hostname or "").lower()
     headers = dict(WEB_HEADERS)
     is_wiki = hostname == "wikipedia.org" or hostname.endswith(".wikipedia.org")

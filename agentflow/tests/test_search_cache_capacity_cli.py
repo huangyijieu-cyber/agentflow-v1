@@ -168,7 +168,9 @@ class CapacityCliTests(unittest.TestCase):
         self.assertEqual(settings["SEARCH_WEB_RPM"], 30)
         self.assertEqual(settings["SEARCH_WEB_CONCURRENCY"], 1)
         self.assertTrue(report["coverage"]["all_requested_buckets_confirmed"])
-        self.assertEqual(len(report["joint_confirmation"]["rounds"]), 2)
+        self.assertEqual(len(report["joint_confirmation"]["rounds"]), 3)
+        self.assertEqual(report["joint_confirmation"]["confirmed"]["wiki"]["rpm"], 60)
+        self.assertEqual(report["joint_confirmation"]["confirmed"]["brave"]["rpm"], 30)
 
     def test_short_windows_never_export_sustained_network_configuration(self):
         report = self._run_fake_network(short=True)
@@ -198,6 +200,124 @@ class CapacityCliTests(unittest.TestCase):
                                     progress=lambda rows, grid: snapshots.append(list(rows)))
         self.assertEqual(len(snapshots), 1)
         self.assertEqual(snapshots[0][0]["offered_rpm"], 60)
+
+    def test_transient_502_does_not_declare_burst_concurrency_one_a_limit(self):
+        args = capacity.build_parser().parse_args(["--concurrency-steps", "1", "--burst-rounds", "1"])
+        for code, status in (("upstream_http_error", "502"), ("upstream_proxy_error", "502"),
+                             ("upstream_timeout", "504")):
+            with self.subTest(code=code):
+                bad = stage(concurrency=1)
+                bad.update(sent=1, succeeded=0, success_rate=0, concurrency_reached=True,
+                           error_codes={code: 1}, status_counts={status: 1})
+                good = stage(concurrency=1)
+                good.update(sent=1, succeeded=1, concurrency_reached=True, status_counts={"200": 1})
+                with patch.object(capacity, "probe_stage", side_effect=[bad, good]), \
+                     patch.object(capacity, "rest_for_window", return_value=True), patch.object(capacity, "say"):
+                    result = capacity.burst_sweep(lambda index: None, "brave", args, capacity.RunControl(1000, 1000), 240)
+                self.assertEqual(result["highest_stable_burst_concurrency"], 1)
+                self.assertEqual(len(result["stages"]), 2)
+                self.assertEqual(result["stages"][1]["trial_attempt"], 2)
+
+    def test_proxy_auth_error_does_not_retry_the_whole_burst(self):
+        args = capacity.build_parser().parse_args(["--concurrency-steps", "1", "--burst-rounds", "1"])
+        bad = stage(concurrency=1)
+        bad.update(sent=1, succeeded=0, success_rate=0, concurrency_reached=True,
+                   error_codes={"upstream_proxy_error": 1}, status_counts={"407": 1})
+        with patch.object(capacity, "probe_stage", return_value=bad) as probe, \
+             patch.object(capacity, "rest_for_window", return_value=True), patch.object(capacity, "say"):
+            capacity.burst_sweep(lambda index: None, "brave", args, capacity.RunControl(1000, 1000), 240)
+        self.assertEqual(probe.call_count, 1)
+
+    def test_repeated_network_failures_are_inconclusive_not_a_physical_limit(self):
+        args = capacity.build_parser().parse_args(["--concurrency-steps", "1", "--burst-rounds", "1", "--burst-trial-attempts", "2"])
+        def bad(*a, **kwargs):
+            row = stage(concurrency=1)
+            row.update(sent=1, succeeded=0, success_rate=0, concurrency_reached=True,
+                       error_codes={"upstream_http_error": 1}, status_counts={"502": 1})
+            return row
+        with patch.object(capacity, "probe_stage", side_effect=bad), \
+             patch.object(capacity, "rest_for_window", return_value=True), patch.object(capacity, "say"):
+            result = capacity.burst_sweep(lambda index: None, "brave", args, capacity.RunControl(1000, 1000), 240)
+        self.assertEqual(result["status"], "inconclusive_network_failure")
+        self.assertIsNone(result["highest_stable_burst_concurrency"])
+
+    def test_wiki_html_seed_does_not_prevent_testing_burst_64(self):
+        args = capacity.build_parser().parse_args(["--concurrency-steps", "64", "--burst-rounds", "1"])
+        good = stage(concurrency=64)
+        good.update(sent=64, succeeded=64, concurrency_reached=True)
+        with patch.object(capacity, "probe_stage", return_value=good), \
+             patch.object(capacity, "rest_for_window", return_value=True), patch.object(capacity, "say"):
+            result = capacity.burst_sweep(lambda index: None, "wiki", args, capacity.RunControl(1000, 1000),
+                                          60, minute_allowance=120)
+        self.assertEqual(result["highest_stable_burst_concurrency"], 64)
+
+    def test_mixed_wiki_sweep_holds_brave_fixed_and_retains_last_passing_pair(self):
+        args = capacity.build_parser().parse_args([])
+        attempts = []
+        def joint(plans, *a, **kwargs):
+            settings = {name: {"rpm": plan["rpm"], "concurrency": plan["concurrency"]} for name, plan in plans.items()}
+            attempts.append(settings)
+            passed = settings["wiki"]["rpm"] <= 150
+            result = {"wiki": stage(rpm=settings["wiki"]["rpm"], duration=120), "brave": stage(rpm=240, duration=120)}
+            result["wiki"]["assessment"]["passed"] = passed
+            return {"rounds": [{"settings": settings, "results": result}],
+                    "confirmed": settings if passed else {}, "stopped": "passed" if passed else "failed"}
+        plans = {"wiki": {"rpm": 60, "concurrency": 32, "call": lambda i: None},
+                 "brave": {"rpm": 240, "concurrency": 16, "call": lambda i: None}}
+        with patch.object(capacity, "mixed_confirmation", side_effect=joint):
+            result = capacity.wiki_confirmation_sweep(plans, args, capacity.RunControl(1000, 1000), ceiling=200)
+        self.assertEqual([row["wiki"]["rpm"] for row in attempts], [60, 120, 150, 180])
+        self.assertTrue(all(row["brave"]["rpm"] == 240 for row in attempts))
+        self.assertEqual(result["confirmed"]["wiki"]["rpm"], 150)
+        self.assertEqual(result["stopped"], "higher_joint_load_failed")
+
+    def test_background_measurement_does_not_export_global_quota(self):
+        args = capacity.build_parser().parse_args(["--background-training"])
+        report = {}
+        known = {"wiki": {"rpm": 60, "concurrency": 32}, "brave": {"rpm": 240, "concurrency": 16}}
+        capacity.store_confirmation(report, args, known)
+        self.assertEqual(report["confirmed_network_settings"], {})
+        self.assertEqual(report["confirmed_additional_load"], known)
+        self.assertTrue(report["background_training"])
+
+    def test_resume_baseline_failure_does_not_silently_lower_brave(self):
+        args = capacity.build_parser().parse_args([])
+        plans = {"wiki": {"rpm": 60, "concurrency": 32, "call": lambda i: None},
+                 "brave": {"rpm": 240, "concurrency": 16, "call": lambda i: None}}
+        failed = {"rounds": [], "confirmed": {}, "stopped": "confirmation_failed"}
+        with patch.object(capacity, "mixed_confirmation", return_value=failed) as mock:
+            result = capacity.wiki_confirmation_sweep(plans, args, capacity.RunControl(1000, 1000),
+                                                       allow_initial_downgrade=False)
+        self.assertEqual(mock.call_args.args[1].confirmation_rounds, 1)
+        self.assertEqual(mock.call_args.args[0]["brave"]["rpm"], 240)
+        self.assertEqual(result["confirmed"], {})
+
+    def test_resume_uses_only_saved_joint_settings_and_new_network_probes(self):
+        known = {"wiki": {"rpm": 60, "concurrency": 32}, "brave": {"rpm": 240, "concurrency": 16}}
+        opened = []
+        class FakeProbe:
+            def __init__(self, kind, *a, **kwargs):
+                opened.append(kind)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def call(self, index):
+                return capacity.ProbeOutcome(True, 200)
+            def metrics(self):
+                return {"upstream_attempts": 0}
+        with tempfile.TemporaryDirectory() as directory:
+            saved = Path(directory) / "report.json"
+            saved.write_text(json.dumps({"started_at": "previous-run", "joint_confirmation": {"confirmed": known}}))
+            args = capacity.build_parser().parse_args(["--mode", "confirm", "--resume-report", str(saved), "--background-training"])
+            report = {"arguments": vars(args), "unmeasured": []}
+            with patch.object(capacity, "UpstreamProbe", FakeProbe), \
+                 patch.object(capacity, "wiki_confirmation_sweep", return_value={"rounds": [], "confirmed": known, "stopped": "passed"}):
+                capacity.run_resume_confirmation(args, capacity.RunControl(1000, 1000), report, lambda: None)
+        self.assertEqual(opened, ["wiki_api", "wiki_identity", "wiki_extract", "wiki_html", "brave"])
+        self.assertEqual(report["confirmed_additional_load"], known)
+        self.assertNotIn("upstream", report)
+        self.assertEqual(report["arguments"]["tools"], "brave,wiki")
 
 
 if __name__ == "__main__":

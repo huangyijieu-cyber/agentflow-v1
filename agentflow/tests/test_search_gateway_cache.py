@@ -2,17 +2,22 @@
 import ast
 import importlib.util
 import os
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock, Mock, patch
 
 import requests
+import httpx
+import openai
 from bs4 import BeautifulSoup
 
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / "agentflow/agentflow/tools"
+sys.path.insert(0, str(ROOT / "agentflow"))
+from agentflow.tools import execution_context as execution
 spec = importlib.util.spec_from_file_location("cache_gateway_under_test", TOOLS / "search_gateway.py")
 gateway = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gateway)
@@ -95,7 +100,28 @@ class GatewayClientTests(unittest.TestCase):
         }, session=Session())
         self.assertEqual(client.base_url, "http://ec2.test")
         self.assertEqual(client.token, "legacy-token")
-        self.assertEqual(client.read_timeout, 600.0)
+        self.assertEqual(client.read_timeout, 150.0)
+
+    def test_proxy_failure_preserves_upstream_status_attempts_and_stops_shared_route(self):
+        client, session = self.client({"error": {
+            "code": "upstream_proxy_error", "message": "Upstream proxy connection failed (HTTP 407)",
+            "upstream_status": 407, "upstream": "wikipedia", "attempts": 1, "retryable": False,
+        }}, status=502)
+        with self.assertRaises(gateway.SearchGatewayError) as caught:
+            client.fetch("https://page.test")
+        error = caught.exception
+        self.assertEqual((error.code, error.upstream_status_code, error.attempts), ("upstream_proxy_error", 407, 1))
+        self.assertEqual(error.upstream, "wikipedia")
+        self.assertFalse(error.retryable)
+        self.assertTrue(error.is_shared_failure)
+        self.assertEqual(len(session.calls), 1)
+
+    def test_single_page_failure_is_not_mistaken_for_shared_outage(self):
+        for code, status in (("domain_blocked", 410), ("upstream_http_error", 404)):
+            error = gateway.SearchGatewayError("page unavailable", code=code, upstream_status_code=status)
+            self.assertFalse(error.is_shared_failure)
+        error = gateway.SearchGatewayError("service unavailable", code="gateway_http_503", status_code=503)
+        self.assertTrue(error.is_shared_failure)
 
     def test_auth_proxy_bypass_tls_and_no_redirect(self):
         client, session = self.client({"text": "body", "meta": {"cache": "hit"}})
@@ -158,6 +184,14 @@ class GatewayClientTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "gateway_unreachable")
         self.assertNotIn("secret", str(caught.exception))
 
+    def test_tool_remaining_time_reaches_rpc_and_socket_timeouts(self):
+        client, session = self.client({"text": "body"})
+        with execution.ensure_tool_context(timeout=0.2):
+            self.assertEqual(client.fetch("https://page.test")["text"], "body")
+        kwargs = session.calls[0][2]
+        self.assertLessEqual(float(kwargs["headers"]["X-Search-Timeout-Seconds"]), 0.2)
+        self.assertTrue(all(0 < value <= 0.2 for value in kwargs["timeout"]))
+
     def test_service_429_keeps_upstream_details_and_retry_after(self):
         client, _ = self.client({"error": {"code": "wikipedia_http_429", "message": "Wiki rate limited", "upstream_status": 429}, "request_id": "test-req"}, status=502, headers={"Retry-After": "11"})
         with self.assertRaises(gateway.SearchGatewayError) as caught:
@@ -190,7 +224,11 @@ class ToolIntegrationTests(unittest.TestCase):
             "retry_wait_seconds": Mock(return_value=0), "time": NS(sleep=Mock()),
             "create_llm_engine": lambda **kwargs: NS(), "TOOL_NAME": "test_tool",
             "LIMITATION": "", "LIMITATIONS": "", "BEST_PRACTICE": "", "BEST_PRACTICES": "",
+            "SUMMARIZE_PROMPT_TEMPLATE": "{query}\n{reference_information}",
         }
+        for name in ("ToolExecutionError", "check_api_result", "current_context", "ensure_tool_context",
+                     "owned_api_client", "run_bounded", "safe_failure"):
+            common[name] = getattr(execution, name)
         from typing import Any, Dict, List, Optional
         cls.brave_scope = dict(common, Any=Any, Dict=Dict, List=List, Optional=Optional,
                                DEFAULT_ENDPOINT="https://upstream.test/brave")
@@ -211,7 +249,7 @@ class ToolIntegrationTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.wiki_scope["wikipedia"].reset_mock()
-        self.wiki_scope["Web_Search_Tool"].reset_mock()
+        self.wiki_scope["Web_Search_Tool"].reset_mock(side_effect=True)
         self.wiki_scope["select_relevant_queries"].reset_mock()
 
     def service(self, response=None, error=None):
@@ -312,6 +350,80 @@ class ToolIntegrationTests(unittest.TestCase):
         tool._embed_strings.assert_called_once_with(["current query", "chunk"])
         tool._construct_final_output.assert_called_once_with("current query", "reference")
 
+    def test_embedding_api_error_is_visible_and_stops_before_summary(self):
+        client = NS(close=Mock(), embeddings=NS(create=Mock(side_effect=openai.APIConnectionError(
+            message="secret-api-key", request=httpx.Request("POST", "http://embedding.test")
+        ))))
+        constructor = Mock(return_value=client)
+        tool = self.Web.__new__(self.Web)
+        tool.embeddings_model = "test-model"
+        tool._get_website_content = Mock(return_value="page")
+        tool._chunk_website_content = Mock(return_value=["chunk"])
+        tool._construct_final_output = Mock()
+        with patch.dict(self.web_scope, {"openai": NS(OpenAI=constructor)}):
+            result = tool.execute("query", "https://page.test")
+        self.assertIn("api_connection_error", result)
+        self.assertIn("phase=web.embedding", result)
+        self.assertNotIn("secret", result)
+        self.assertEqual(constructor.call_args.kwargs["max_retries"], 0)
+        client.embeddings.create.assert_called_once()
+        client.close.assert_called_once()
+        tool._construct_final_output.assert_not_called()
+
+    def test_summary_sdk_error_keeps_http_status_instead_of_none(self):
+        error = openai.InternalServerError("secret-body", response=httpx.Response(
+            503, request=httpx.Request("POST", "http://model.test")), body={"secret": "prompt"})
+        tool = self.Web.__new__(self.Web)
+        tool.top_k, tool.temperature, tool.llm_engine = 1, 0, Mock(side_effect=error)
+        tool._get_website_content = Mock(return_value="page")
+        tool._chunk_website_content = Mock(return_value=["chunk"])
+        tool._embed_strings = Mock(return_value=[[1], [2]])
+        tool._rank_chunks = Mock(return_value=[0])
+        tool._concatenate_chunks = Mock(return_value="reference")
+        result = tool.execute("query", "https://page.test")
+        self.assertIn("api_http_error", result)
+        self.assertIn("phase=web.summary", result)
+        self.assertIn("HTTP=503", result)
+        self.assertNotIn("secret", result)
+
+    def test_wiki_propagates_embedding_failure_and_does_not_try_next_page(self):
+        pages = [{"title": title, "url": f"https://wiki.test/{title}", "abstract": title} for title in ["A", "B"]]
+        service, _ = self.service(Response({"results": pages}))
+        rag = self.wiki_scope["Web_Search_Tool"].return_value
+        rag.execute.side_effect = execution.ToolExecutionError(
+            "embedding failed", code="api_connection_error", phase="web.embedding"
+        )
+        tool = self.Wiki.__new__(self.Wiki)
+        tool.model_string, tool.llm_engine = "model", object()
+        with service, self.assertRaises(execution.ToolExecutionError) as caught:
+            tool.execute("query")
+        self.assertEqual(caught.exception.phase, "web.embedding")
+        self.assertEqual(rag.execute.call_count, 1)
+
+    def test_wiki_selection_sdk_timeout_does_not_turn_into_empty_selection(self):
+        scope = dict(self.wiki_scope, Select_Relevant_Queries=object)
+        select = extract(TOOLS / "wikipedia_search/tool.py", "select_relevant_queries", scope)
+        engine = NS(generate=Mock(side_effect=openai.APITimeoutError(
+            request=httpx.Request("POST", "http://model.test"))))
+        with self.assertRaises(execution.ToolExecutionError) as caught:
+            select("question", ["A", "B"], engine)
+        self.assertEqual(caught.exception.code, "api_timeout")
+        self.assertEqual(caught.exception.phase, "wiki.select_pages")
+
+    def test_wiki_other_page_exception_is_visible_and_does_not_become_none(self):
+        pages = [{"title": title, "url": f"https://wiki.test/{title}", "abstract": title} for title in ["A", "B"]]
+        service, _ = self.service(Response({"results": pages}))
+        rag = self.wiki_scope["Web_Search_Tool"].return_value
+        rag.execute.side_effect = [ValueError("secret-prompt"), "other page answer"]
+        tool = self.Wiki.__new__(self.Wiki)
+        tool.model_string, tool.llm_engine = "model", object()
+        with service:
+            result = tool.execute("query")
+        first, second = result["relevant_pages (to the query)"]
+        self.assertIn("type=ValueError", first["retrieved_information"])
+        self.assertNotIn("secret", first["retrieved_information"])
+        self.assertEqual(second["retrieved_information"], "other page answer")
+
     def test_disabled_wiki_keeps_library_search_and_original_truncation(self):
         os.environ["SEARCH_CACHE_ENABLED"] = "0"
         self.wiki_scope["wikipedia"].search.return_value = ["A", "B"]
@@ -325,7 +437,7 @@ class ToolIntegrationTests(unittest.TestCase):
         pages = [{"title": title, "url": f"https://wiki.test/{title}", "abstract": title} for title in ["A", "B", "C"]]
         service, _ = self.service(Response({"results": pages, "meta": {"cache": "hit"}}))
         rag = self.wiki_scope["Web_Search_Tool"].return_value
-        rag.execute.side_effect = lambda query, url: f"{query}:{url}"
+        rag.execute.side_effect = lambda query, url, **kwargs: f"{query}:{url}"
         tool = self.Wiki.__new__(self.Wiki)
         tool.model_string, tool.llm_engine = "local-model", object()
         with service:
@@ -337,6 +449,50 @@ class ToolIntegrationTests(unittest.TestCase):
         self.assertNotIn("meta", result)
         self.wiki_scope["wikipedia"].search.assert_not_called()
         self.wiki_scope["select_relevant_queries"].assert_called_once_with("current query", ["A", "B", "C"], tool.llm_engine)
+
+    def test_nested_web_returns_structured_failure_before_embedding_or_summary(self):
+        service, session = self.service(Response({"error": {
+            "code": "upstream_proxy_error", "message": "proxy failed", "upstream_status": 407,
+        }}, status=502))
+        tool = self.Web.__new__(self.Web)
+        tool.max_window_size = 100
+        tool._embed_strings = Mock(side_effect=AssertionError("must not embed error"))
+        with service, self.assertRaises(gateway.SearchGatewayError) as caught:
+            tool.execute("query", "https://page.test", raise_network_errors=True)
+        self.assertEqual(caught.exception.upstream_status_code, 407)
+        self.assertEqual(len(session.calls), 1)
+        tool._embed_strings.assert_not_called()
+
+    def test_wiki_stops_after_first_shared_proxy_failure_instead_of_next_page(self):
+        pages = [{"title": title, "url": f"https://wiki.test/{title}", "abstract": title} for title in ["A", "B"]]
+        service, _ = self.service(Response({"results": pages}))
+        rag = self.wiki_scope["Web_Search_Tool"].return_value
+        rag.execute.side_effect = gateway.SearchGatewayError(
+            "proxy failed", code="upstream_proxy_error", upstream_status_code=407
+        )
+        tool = self.Wiki.__new__(self.Wiki)
+        tool.model_string, tool.llm_engine = "local-model", object()
+        with service, self.assertRaises(gateway.SearchGatewayError) as caught:
+            tool.execute("query")
+        self.assertEqual(caught.exception.code, "upstream_proxy_error")
+        self.assertEqual(rag.execute.call_count, 1)
+        self.assertTrue(rag.execute.call_args.kwargs["raise_network_errors"])
+
+    def test_wiki_retains_single_page_error_and_tries_the_next_page(self):
+        pages = [{"title": title, "url": f"https://wiki.test/{title}", "abstract": title} for title in ["A", "B"]]
+        service, _ = self.service(Response({"results": pages}))
+        rag = self.wiki_scope["Web_Search_Tool"].return_value
+        rag.execute.side_effect = [gateway.SearchGatewayError(
+            "网站死亡", code="domain_blocked", status_code=410
+        ), "other page answer"]
+        tool = self.Wiki.__new__(self.Wiki)
+        tool.model_string, tool.llm_engine = "local-model", object()
+        with service:
+            result = tool.execute("query")
+        selected = result["relevant_pages (to the query)"]
+        self.assertIn("domain_blocked", selected[0]["retrieved_information"])
+        self.assertEqual(selected[1]["retrieved_information"], "other page answer")
+        self.assertEqual(rag.execute.call_count, 2)
 
     def test_wiki_gateway_failure_and_429_do_not_fallback_to_library(self):
         for response, error, exception in [

@@ -13,6 +13,10 @@ from agentflow.tools.search_gateway import (
     SearchGatewayError,
     search_cache_enabled,
 )
+from agentflow.tools.execution_context import (
+    ToolExecutionError, check_api_result, current_context, ensure_tool_context,
+    run_bounded, safe_failure,
+)
 
 # 1. 全局禁用 SSL 证书验证
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -256,10 +260,11 @@ Output:
             query_candidates=query_candidates
         )
 
-        response = llm_engine.generate(
-            prompt,
-            response_format=Select_Relevant_Queries
+        response = run_bounded(
+            lambda: llm_engine.generate(prompt, response_format=Select_Relevant_Queries),
+            phase="wiki.select_pages",
         )
+        response = check_api_result(response, "wiki.select_pages")
 
         # vLLM 引擎只返回原始字符串，这里需手动解析成结构
         if isinstance(response, str):
@@ -274,6 +279,8 @@ Output:
 
         return matched_queries, matched_query_ids
 
+    except ToolExecutionError:
+        raise
     except Exception as e:
         print(f"Error selecting relevant queries: {e}")
         return [], []
@@ -432,6 +439,10 @@ class Wikipedia_Search_Tool(BaseTool):
 
 
     def execute(self, query):
+        with ensure_tool_context():
+            return self._execute(query)
+
+    def _execute(self, query):
         """
         Searches Wikipedia based on the provided query and returns all matching pages.
 
@@ -490,11 +501,12 @@ class Wikipedia_Search_Tool(BaseTool):
         # For each relevant page, get detailed information using Web RAG
         print("model_string:", self.model_string)
 
-        web_rag_tool = Web_Search_Tool(
-            model_string=self.model_string
+        web_rag_tool = run_bounded(
+            lambda: Web_Search_Tool(model_string=self.model_string), phase="wiki.initialize_web"
         )
 
         for page in pages_data:
+            current_context().check()
 
             url = page["url"]
 
@@ -504,13 +516,25 @@ class Wikipedia_Search_Tool(BaseTool):
             try:
                 execution = web_rag_tool.execute(
                     query=query,
-                    url=url
+                    url=url,
+                    raise_network_errors=True,
                 )
 
                 page["retrieved_information"] = execution
 
+            except SearchGatewayError as error:
+                if error.is_shared_failure:
+                    # Repeating the failed shared route for every selected page
+                    # can turn a known proxy error into the outer 300s timeout.
+                    raise
+                # A single unavailable/blocked page must not erase its cause or
+                # prevent trying other independent pages.
+                page["retrieved_information"] = f"Error fetching URL: {error}"
+
+            except ToolExecutionError:
+                raise
             except Exception as e:
-                page["retrieved_information"] = None
+                page["retrieved_information"] = f"Error processing page: {safe_failure(e, 'wiki.page')}"
 
         return {
             "query": query,

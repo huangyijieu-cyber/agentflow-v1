@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
@@ -130,6 +131,60 @@ class ServiceHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["text"].startswith("https://test.invalid/page"))
 
+    def test_blacklisted_fetch_rejects_before_cache_and_worker_admission(self):
+        url = "https://dead.test/page"
+        self.assertEqual(self.request("/v1/fetch", {"url": url})[0], 200)
+        self.service.config.blocked_domains = ("dead.test",)
+        with patch.object(self.service.cache, "get", side_effect=AssertionError("cache must not be read")), \
+             patch.object(self.service, "_submit", side_effect=AssertionError("must not enter work queue")):
+            for _ in range(2):
+                status, headers, body = self.request("/v1/fetch", {"url": url})
+                self.assertEqual(status, 410)
+                self.assertEqual(body["error"]["code"], "domain_blocked")
+                self.assertIn("网站死亡", body["error"]["message"])
+                self.assertFalse(body["error"]["retryable"])
+                self.assertNotIn("Retry-After", headers)
+        self.assertEqual(self.providers.calls, 1)
+
+    def test_client_remaining_budget_limits_service_deadline(self):
+        original = self.providers.execute
+        def slow(*args):
+            time.sleep(0.1)
+            return original(*args)
+        started = time.monotonic()
+        with patch.object(self.providers, "execute", side_effect=slow):
+            status, _, body = self.request("/v1/fetch", {"url": "https://allowed.test"},
+                                           headers={"X-Search-Timeout-Seconds": "0.025"})
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(status, 504)
+        self.assertEqual(body["error"]["code"], "deadline_exceeded")
+
+    def test_invalid_budget_rejected_and_large_budget_cannot_extend_service_cap(self):
+        for value in ("nan", "inf", "-1", "0", "bad"):
+            status, _, body = self.request("/v1/fetch", {"url": "https://allowed.test"},
+                                           headers={"X-Search-Timeout-Seconds": value})
+            self.assertEqual(status, 400)
+            self.assertEqual(body["error"]["code"], "invalid_request")
+        with patch.object(self.service, "handle", return_value={"text": "ok"}) as handle:
+            started = time.monotonic()
+            self.request("/v1/fetch", {"url": "https://allowed.test"},
+                         headers={"X-Search-Timeout-Seconds": "9999"})
+        self.assertLessEqual(handle.call_args.kwargs["deadline"] - started, 120.01)
+
+    def test_batch_keeps_blocked_errors_in_place_and_executes_other_requests(self):
+        self.service.config.blocked_domains = ("dead.test",)
+        status, _, body = self.request("/v1/batch", {"requests": [
+            {"tool": "fetch", "params": {"url": "https://dead.test/page"}},
+            {"tool": "fetch", "params": {"url": "https://allowed.test/page"}},
+            {"tool": "fetch", "params": {"url": "https://sub.dead.test/page"}},
+        ]})
+        self.assertEqual(status, 200)
+        self.assertEqual([item["ok"] for item in body["results"]], [False, True, False])
+        for index in (0, 2):
+            self.assertEqual(body["results"][index]["error"]["code"], "domain_blocked")
+            self.assertFalse(body["results"][index]["error"]["retryable"])
+        self.assertEqual(self.providers.calls, 1)
+
     def test_restart_reads_persisted_cache_without_calling_provider(self):
         self.request("/v1/search/wikipedia", {"query": "persistent"})
         self.assertEqual(self.providers.calls, 1)
@@ -207,6 +262,18 @@ class ServiceHTTPTests(unittest.TestCase):
 
 
 class ServerConfigurationTests(unittest.TestCase):
+    def test_updated_capacity_defaults_and_blacklist_environment(self):
+        defaults = ServiceConfig.from_env({})
+        self.assertEqual((defaults.workers, defaults.queue_size), (32, 128))
+        self.assertEqual((defaults.wiki_rpm, defaults.wiki_concurrency), (120, 32))
+        self.assertEqual((defaults.brave_rpm, defaults.brave_concurrency), (240, 16))
+        self.assertEqual(defaults.blocked_domains, ())
+        config = ServiceConfig.from_env({"SEARCH_BLOCKED_DOMAINS": "Example.ORG., *.dead.test 例子.测试,example.org"})
+        self.assertEqual(config.blocked_domains, ("example.org", "dead.test", "xn--fsqu00a.xn--0zwm56d"))
+        for value in ("https://dead.test", "dead.test/path", "dead.test:80", "bad..test"):
+            with self.assertRaises(ValueError):
+                ServiceConfig.from_env({"SEARCH_BLOCKED_DOMAINS": value})
+
     def test_database_default_is_independent_of_state_directory(self):
         config = ServiceConfig.from_env({"SEARCH_CACHE_DIR": "/mounted/s3/state"})
         self.assertEqual(config.db_path, "/var/tmp/agentflow-search-cache/search_cache.sqlite3")
