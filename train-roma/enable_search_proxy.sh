@@ -5,8 +5,8 @@
 # 训练机 -> EC2 -> Windows -> 公司代理 -> Internet
 # ==============================
 
-PROXY_TOKEN="tEc3gNapEHePEOg9AZAHaYVZciZHhaWW8GnVeAOTpk9GYWvA_rKz7M-7rlER7lWB"
-PROXY_HOST="7.150.10.123"
+PROXY_TOKEN="${PROXY_TOKEN:?Please set PROXY_TOKEN in the environment}"
+PROXY_HOST="${PROXY_HOST:?Please set PROXY_HOST in the environment}"
 PROXY_PORT="18090"
 
 # ---------- HTTP/HTTPS Proxy ----------
@@ -20,7 +20,7 @@ export NO_PROXY="127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 export no_proxy="$NO_PROXY"
 
 # ---------- 当前 v3 Search Gateway ----------
-export SEARCH_GATEWAY_BASE_URL="http://7.150.10.123/agentflow-search"
+export SEARCH_GATEWAY_BASE_URL="${SEARCH_GATEWAY_BASE_URL:-http://${PROXY_HOST}/agentflow-search}"
 export SEARCH_GATEWAY_TOKEN="$PROXY_TOKEN"
 
 # ---------- Wikimedia API identity (shared by all workers) ----------
