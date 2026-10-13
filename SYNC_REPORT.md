@@ -1,6 +1,6 @@
 # V1 本地整合记录（2026-09-07）
 
-基准仓库：https://github.com/huangyijieu-cyber/agentflow-v1 ，基准提交 `4d9baa2`。
+基准版本：本地项目代码快照。
 
 以 Downloads/V1 中的文件为最新来源，同路径文件优先使用 V1；V1 缺失文件保留仓库版本。整理工作在本地独立副本进行，原 V1 未修改。
 
