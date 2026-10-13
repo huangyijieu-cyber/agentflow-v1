@@ -24,7 +24,7 @@ export SEARCH_GATEWAY_BASE_URL="http://7.150.10.123/agentflow-search"
 export SEARCH_GATEWAY_TOKEN="$PROXY_TOKEN"
 
 # ---------- Wikimedia API identity (shared by all workers) ----------
-export WIKIMEDIA_USER_AGENT="${WIKIMEDIA_USER_AGENT:-AgentFlowResearchBot/1.0 (https://github.com/huangyijieu-cyber/agentflow-v1/issues)}"
+export WIKIMEDIA_USER_AGENT="${WIKIMEDIA_USER_AGENT:-AgentFlowResearchBot/1.0}"
 
 # ---------- Python requests / Wikipedia 兼容 ----------
 PROXY_PY_DIR="/tmp/agentflow_search_proxy"
