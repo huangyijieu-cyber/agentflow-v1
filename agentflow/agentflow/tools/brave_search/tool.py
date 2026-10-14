@@ -1,5 +1,16 @@
+import argparse
+import fcntl
+import hashlib
+import json
 import os
+import socket
+import threading
 import time
+import uuid
+from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -37,6 +48,171 @@ BEST_PRACTICES = """
 3. Use count to request multiple candidates when the answer may require comparison.
 4. Follow up with Web_RAG_Search_Tool on specific URLs when detailed page content is needed.
 """
+
+
+_TOKENIZER_LOCK = threading.Lock()
+_WRITE_LOCK = threading.Lock()
+_WARNED = set()
+_CHINA_TZ = timezone(timedelta(hours=8))
+_TOKEN_CACHE_SIZE = 1024
+
+
+def yibu_timestamp():
+    return datetime.now(_CHINA_TZ).isoformat(timespec="milliseconds")
+
+
+def _warn_once(key, message):
+    with _WRITE_LOCK:
+        if key not in _WARNED:
+            _WARNED.add(key)
+            print(f"[Yibu Token Usage] {message}", flush=True)
+
+
+@lru_cache(maxsize=4)
+def _load_tokenizer(path):
+    if not path:
+        return None
+    try:
+        from transformers import AutoTokenizer
+        return AutoTokenizer.from_pretrained(
+            path, local_files_only=True, trust_remote_code=False,
+        )
+    except Exception as error:
+        _warn_once(("tokenizer", path),
+                   f"Local tokenizer unavailable ({type(error).__name__}); "
+                   "token counts will be null. Set AGENTFLOW_YIBU_TOKENIZER_PATH.")
+        return None
+
+
+class YibuTokenUsageRecorder:
+    def __init__(self, tokenizer=None, log_dir=None):
+        self.tokenizer = tokenizer
+        self.log_dir = log_dir
+        self._count_tokenizer = None
+        self._token_counts = OrderedDict()
+
+    def set_tokenizer(self, tokenizer):
+        """Reuse the tokenizer already loaded by the rollout worker."""
+        self.tokenizer = tokenizer
+
+    def _measure(self, query, output, response_body):
+        # Tokenizers can mutate their internal truncation/padding settings.
+        with _TOKENIZER_LOCK:
+            tokenizer = self.tokenizer
+            path = (os.getenv("AGENTFLOW_YIBU_TOKENIZER_PATH")
+                    or os.getenv("AGENTFLOW_AGENT_TOKENIZER_PATH")
+                    or os.getenv("BASE_MODEL") or os.getenv("MODEL_PATH"))
+            if tokenizer is None:
+                tokenizer = _load_tokenizer(path)
+            measurements = {
+                "token_count_source": "unavailable", "tokenizer": path,
+                "input_tokens": None, "output_tokens": None,
+                "response_body_tokens": None, "total_tokens": None,
+            }
+            if tokenizer is None:
+                _warn_once("no-tokenizer", "No local tokenizer: token counts are null, "
+                           "not character/byte estimates.")
+                return measurements
+
+            measurements["tokenizer"] = str(getattr(tokenizer, "name_or_path", None)
+                                           or path or type(tokenizer).__name__)
+            if self._count_tokenizer is not tokenizer:
+                self._token_counts.clear()
+                self._count_tokenizer = tokenizer
+            cache_hits = cache_misses = 0
+
+            def count(text):
+                nonlocal cache_hits, cache_misses
+                if text is None:
+                    return None
+                if not text:
+                    return 0
+                # Keep only a bounded number of fingerprints/counts in memory,
+                # not full query/result strings. Cache is specific to this tokenizer.
+                raw = text.encode("utf-8")
+                key = (len(raw), hashlib.sha256(raw).digest())
+                if key in self._token_counts:
+                    cache_hits += 1
+                    self._token_counts.move_to_end(key)
+                    return self._token_counts[key]
+                cache_misses += 1
+                tokens = len(tokenizer.encode(text, add_special_tokens=False))
+                self._token_counts[key] = tokens
+                if len(self._token_counts) > _TOKEN_CACHE_SIZE:
+                    self._token_counts.popitem(last=False)
+                return tokens
+
+            try:
+                input_tokens = count(query)
+                # Intermediate retry attempts have no tool output. Final failures
+                # include the exact error text returned to the Agent.
+                output_tokens = count(output) if output is not None else 0
+                measurements.update(
+                    token_count_source="local-tokenizer",
+                    input_tokens=input_tokens, output_tokens=output_tokens,
+                    response_body_tokens=count(response_body),
+                    total_tokens=input_tokens + output_tokens,
+                    count_cache_hits=cache_hits, count_cache_misses=cache_misses,
+                )
+            except Exception as error:
+                _warn_once(("encode", type(error).__name__),
+                           f"Token encoding failed ({type(error).__name__}); "
+                           "token counts will be null.")
+            return measurements
+
+    def _path(self):
+        log_dir = self.log_dir or os.getenv("AGENTFLOW_YIBU_TOKEN_USAGE_DIR")
+        if not log_dir:
+            log_dir = (str(Path(os.environ["LOG_DIR_PREFIX"]) / "task_logs" / "127.0.0.1_rank0")
+                       if os.getenv("LOG_DIR_PREFIX") else "rollout_data")
+        return Path(log_dir).expanduser() / "yibu_token.log"
+
+    def record(self, *, call_id, attempt, query, output, response, status,
+               elapsed_s, error=None, started_at=None):
+        """One record per actual HTTP attempt; instrumentation cannot retry a search."""
+        if os.getenv("AGENTFLOW_YIBU_TOKEN_USAGE", "1").lower() in {"0", "false", "no"}:
+            return
+        try:
+            finished = datetime.now(_CHINA_TZ)
+            response_body = response.text if response is not None else None
+            measurements = self._measure(query, output, response_body)
+            record = {
+                "event_id": f"{call_id}:{attempt}", "call_id": call_id,
+                "attempt": attempt,
+                "started_at": started_at or (finished - timedelta(seconds=elapsed_s)).isoformat(
+                    timespec="milliseconds"),
+                "finished_at": finished.isoformat(timespec="milliseconds"),
+                "timestamp_utc": finished.astimezone(timezone.utc).isoformat(),
+                "tool": "Yibu_Brave_Search_Tool", "status": status,
+                "http_status": response.status_code if response is not None else None,
+                "error_type": type(error).__name__ if error is not None else None,
+                "elapsed_s": round(elapsed_s, 6),
+                "hostname": socket.gethostname(), "pid": os.getpid(),
+                "input_text": query, "output_text": output,
+                "response_body_text": response_body,
+                **measurements,
+            }
+            # Preserve requested texts, but never authentication headers/API keys.
+            line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+            path = self._path()
+            with _WRITE_LOCK:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as log:
+                    # All rollout processes share one file. Flush before unlocking
+                    # so even long records cannot interleave across processes.
+                    fcntl.flock(log.fileno(), fcntl.LOCK_EX)
+                    try:
+                        log.write(line + "\n")
+                        log.flush()
+                    finally:
+                        fcntl.flock(log.fileno(), fcntl.LOCK_UN)
+                summary = {key: record[key] for key in (
+                    "event_id", "started_at", "status", "input_tokens", "output_tokens",
+                )}
+                print("[Yibu Token Usage] " + json.dumps(summary, ensure_ascii=False), flush=True)
+        except Exception as error:
+            _warn_once(("record", type(error).__name__),
+                       f"Could not record tokens ({type(error).__name__}); search result is preserved.")
 
 
 class Brave_Search_Tool(BaseTool):
@@ -83,6 +259,7 @@ class Brave_Search_Tool(BaseTool):
         self.endpoint = os.getenv("BRAVE_YIBU_BASE_URL", DEFAULT_ENDPOINT)
         self.max_retries = MAX_NETWORK_RETRIES
         self.timeout = 20
+        self.token_usage = YibuTokenUsageRecorder()
 
     @staticmethod
     def _as_text(value: Any) -> str:
@@ -162,8 +339,16 @@ class Brave_Search_Tool(BaseTool):
 
         last_error = None
         attempts_made = 0
+        call_id = uuid.uuid4().hex
         for attempt in range(self.max_retries + 1):
             attempts_made += 1
+            started_at = yibu_timestamp()
+            started = time.perf_counter()
+            response = None
+            output = None
+            retry_delay = None
+            attempt_error = None
+            status = "response_error"
             try:
                 response = requests.get(
                     self.endpoint,
@@ -179,26 +364,52 @@ class Brave_Search_Tool(BaseTool):
                         retry_after=response.headers.get("Retry-After"),
                     )
                     if wait_time <= MAX_RETRY_WAIT_SECONDS:
-                        print(f"[Yibu Brave HTTP] {response.status_code}; retrying in {wait_time:.1f}s "
-                              f"({attempt + 1}/{self.max_retries})")
-                        response.close()
-                        time.sleep(wait_time)
-                        continue
-                response.raise_for_status()
-                data = response.json()
-                return self._format_results(query, data, params["count"])
+                        retry_delay = wait_time
+                        status = "http_retry"
+                if retry_delay is None:
+                    response.raise_for_status()
+                    data = response.json()
+                    output = self._format_results(query, data, params["count"])
+                    status = "success"
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                 last_error = e
+                attempt_error = e
+                status = "network_error"
                 if attempt < self.max_retries:
-                    wait_time = retry_wait_seconds(attempt)
-                    print(f"[Yibu Brave Network] {type(e).__name__}; retrying in {wait_time:.1f}s "
-                          f"({attempt + 1}/{self.max_retries})")
-                    time.sleep(wait_time)
-                    continue
-                break
+                    retry_delay = retry_wait_seconds(attempt)
+                    status = "network_retry"
             except Exception as e:
                 last_error = e
-                break
+                attempt_error = e
+                if response is not None and response.status_code >= 400:
+                    status = "http_error"
+            finally:
+                if output is None and retry_delay is None:
+                    output = (
+                        f"Yibu Brave Search tried {attempts_made} "
+                        f"time{'s' if attempts_made != 1 else ''} but failed. "
+                        f"Last error: {last_error}"
+                    )
+                self.token_usage.record(
+                    call_id=call_id, attempt=attempt + 1, query=query,
+                    output=output, response=response, status=status,
+                    elapsed_s=time.perf_counter() - started, error=attempt_error,
+                    started_at=started_at,
+                )
+                if response is not None:
+                    response.close()
+
+            if output is not None:
+                return output
+            if retry_delay is not None:
+                reason = (str(response.status_code) if status == "http_retry"
+                          else type(attempt_error).__name__)
+                label = "HTTP" if status == "http_retry" else "Network"
+                print(f"[Yibu Brave {label}] {reason}; retrying in {retry_delay:.1f}s "
+                      f"({attempt + 1}/{self.max_retries})")
+                time.sleep(retry_delay)
+                continue
+            break
 
         return (
             f"Yibu Brave Search tried {attempts_made} "
@@ -225,6 +436,80 @@ class Brave_Search_Tool(BaseTool):
         )
 
 
+
+TOKEN_FIELDS = ("input_tokens", "output_tokens", "total_tokens", "response_body_tokens")
+
+
+def summarize(paths):
+    files = set()
+    for path in paths:
+        path = Path(path)
+        if path.is_dir():
+            files.update(path.rglob("yibu_tokens_*.jsonl"))
+            files.update(path.rglob("yibu_token.log"))
+        elif path.is_file():
+            files.add(path)
+        else:
+            raise FileNotFoundError(path)
+    groups = {}
+    seen = set()
+    calls = set()
+    duplicates = malformed = 0
+    for path in sorted(files):
+        with path.open(encoding="utf-8") as log:
+            for line in log:
+                try:
+                    record = json.loads(line)
+                    event_id = record["event_id"]
+                    key = (record["token_count_source"], record["tokenizer"])
+                    call_id = record["call_id"]
+                    if not isinstance(event_id, str) or not isinstance(call_id, str):
+                        raise ValueError("Invalid event identity")
+                    status = record["status"]
+                    if not isinstance(status, str):
+                        raise ValueError("Invalid status")
+                    tokens = {field: record[field] for field in TOKEN_FIELDS}
+                    if any(value is not None and (type(value) is not int or value < 0)
+                           for value in tokens.values()):
+                        raise ValueError("Invalid token count")
+                    hash(key)
+                except (ValueError, KeyError, TypeError):
+                    malformed += 1
+                    continue
+                if event_id in seen:
+                    duplicates += 1
+                    continue
+                seen.add(event_id)
+                calls.add(call_id)
+                if key not in groups:
+                    groups[key] = {
+                        "token_count_source": key[0], "tokenizer": key[1],
+                        "http_attempts": 0, "successful_attempts": 0,
+                        "sums": {field: 0 for field in TOKEN_FIELDS},
+                        "unknown_counts": {field: 0 for field in TOKEN_FIELDS},
+                    }
+                group = groups[key]
+                group["http_attempts"] += 1
+                group["successful_attempts"] += int(status == "success")
+                for field, value in tokens.items():
+                    if value is None:
+                        group["unknown_counts"][field] += 1
+                    else:
+                        group["sums"][field] += value
+    return {
+        "files": len(files), "search_calls": len(calls),
+        "http_attempts": len(seen), "duplicates_ignored": duplicates,
+        "malformed_lines": malformed, "groups": list(groups.values()),
+    }
+
+
 if __name__ == "__main__":
-    tool = Brave_Search_Tool()
-    print(tool.execute(query="How many studio albums were published by Mercedes Sosa between 2000 and 2009 (included)? You can use the latest 2022 version of english wikipedia.?", count=3))
+    parser = argparse.ArgumentParser(description="Yibu search and token-log summary")
+    parser.add_argument("--summarize", nargs="+", metavar="PATH",
+                        help="Summarize token log files or directories without calling Yibu")
+    args = parser.parse_args()
+    if args.summarize:
+        print(json.dumps(summarize(args.summarize), ensure_ascii=False, indent=2))
+    else:
+        tool = Brave_Search_Tool()
+        print(tool.execute(query="How many studio albums were published by Mercedes Sosa between 2000 and 2009 (included)? You can use the latest 2022 version of english wikipedia.?", count=3))
