@@ -291,9 +291,8 @@ class ServiceHTTPTests(unittest.TestCase):
 
 
 class ServerConfigurationTests(unittest.TestCase):
-    def test_active_capacity_defaults_and_blacklist_environment(self):
+    def test_blacklist_environment(self):
         defaults = ServiceConfig.from_env({})
-        self.assertEqual((defaults.brave_rpm, defaults.brave_concurrency), (240, 16))
         self.assertEqual(defaults.blocked_domains, ())
         config = ServiceConfig.from_env({"SEARCH_BLOCKED_DOMAINS": "Example.ORG., *.dead.test 例子.测试,example.org"})
         self.assertEqual(config.blocked_domains, ("example.org", "dead.test", "xn--fsqu00a.xn--0zwm56d"))
@@ -318,17 +317,18 @@ class ServerConfigurationTests(unittest.TestCase):
         self.assertEqual(config.token, "shared-test-token")
 
     def test_invalid_nonfinite_configuration_is_rejected(self):
-        for name in ("SEARCH_BRAVE_RPM", "SEARCH_SERVICE_REQUEST_TIMEOUT", "SEARCH_CACHE_MAX_TTL"):
+        for name in ("SEARCH_SERVICE_REQUEST_TIMEOUT", "SEARCH_CACHE_MAX_TTL"):
             with self.assertRaises(ValueError):
                 ServiceConfig.from_env({name: "nan"})
 
-    def test_obsolete_global_worker_and_wiki_settings_are_ignored(self):
-        names = ("SEARCH_SERVICE_WORKERS", "SEARCH_SERVICE_QUEUE_SIZE", "SEARCH_WIKI_RPM", "SEARCH_WIKI_CONCURRENCY")
+    def test_obsolete_global_worker_and_provider_settings_are_ignored(self):
+        names = ("SEARCH_SERVICE_WORKERS", "SEARCH_SERVICE_QUEUE_SIZE", "SEARCH_WIKI_RPM", "SEARCH_WIKI_CONCURRENCY",
+                 "SEARCH_BRAVE_RPM", "SEARCH_BRAVE_CONCURRENCY", "SEARCH_WEB_RPM", "SEARCH_WEB_CONCURRENCY")
         defaults = ServiceConfig.from_env({})
         for old_value in ("0", "1", "nan", "not-a-number"):
             config = ServiceConfig.from_env(dict.fromkeys(names, old_value))
-            self.assertEqual((config.workers, config.queue_size, config.wiki_rpm, config.wiki_concurrency),
-                             (defaults.workers, defaults.queue_size, defaults.wiki_rpm, defaults.wiki_concurrency))
+            self.assertEqual([getattr(config, field) for field in ("workers", "queue_size", "wiki_rpm", "wiki_concurrency", "brave_rpm", "brave_concurrency", "web_rpm", "web_concurrency")],
+                             [getattr(defaults, field) for field in ("workers", "queue_size", "wiki_rpm", "wiki_concurrency", "brave_rpm", "brave_concurrency", "web_rpm", "web_concurrency")])
 
 
 if __name__ == "__main__":

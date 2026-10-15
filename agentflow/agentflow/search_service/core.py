@@ -1,4 +1,4 @@
-"""Persistence, request coalescing, and upstream budgets for one service process.
+"""Persistence and request coalescing for one service process.
 
 No planner, embedding, or training dependencies are imported here. The service
 owns all network attempts (including retries); tool clients must not retry by
@@ -91,7 +91,7 @@ def json_clone(value: Any) -> Any:
 class ServiceConfig:
     cache_dir: str = "/home/ma-user/work/code-rl/cache"
     token: str = ""
-    # Legacy constructor fields: no pool/queue or Wiki-wide limiter uses them.
+    # Legacy constructor fields: no shared pool/queue or upstream limiter uses them.
     workers: int = 32
     queue_size: int = 128
     request_timeout: float = 120.0
@@ -100,7 +100,7 @@ class ServiceConfig:
     max_upstream_bytes: int = 20 * 1024 * 1024
     cache_max_bytes: int = 2 * 1024 * 1024 * 1024
     cache_max_ttl: float = float(CACHE_TTL_SECONDS)
-    # Retained only for callers constructing old configs; Wiki ignores these.
+    # Retained only for callers constructing old configs; all are ignored.
     wiki_rpm: float = 120.0
     wiki_concurrency: int = 32
     brave_rpm: float = 240.0
@@ -118,8 +118,7 @@ class ServiceConfig:
             raise ValueError("blocked_domains must be a list or tuple of domain names")
         self.blocked_domains = tuple(dict.fromkeys(_blocked_domain(value) for value in self.blocked_domains))
         for name in ("max_batch", "max_body_bytes", "max_upstream_bytes",
-                     "cache_max_bytes", "brave_concurrency",
-                     "web_concurrency"):
+                     "cache_max_bytes"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -127,8 +126,7 @@ class ServiceConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
-        for name in ("request_timeout", "cache_max_ttl", "brave_rpm",
-                     "web_rpm", "connect_timeout", "read_timeout"):
+        for name in ("request_timeout", "cache_max_ttl", "connect_timeout", "read_timeout"):
             value = getattr(self, name)
             if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be a finite positive number")
@@ -141,8 +139,6 @@ class ServiceConfig:
             "request_timeout": "SEARCH_SERVICE_REQUEST_TIMEOUT", "max_batch": "SEARCH_SERVICE_MAX_BATCH",
             "max_body_bytes": "SEARCH_SERVICE_MAX_BODY_BYTES", "max_upstream_bytes": "SEARCH_SERVICE_MAX_UPSTREAM_BYTES",
             "cache_max_bytes": "SEARCH_CACHE_MAX_BYTES", "cache_max_ttl": "SEARCH_CACHE_MAX_TTL",
-            "brave_rpm": "SEARCH_BRAVE_RPM", "brave_concurrency": "SEARCH_BRAVE_CONCURRENCY",
-            "web_rpm": "SEARCH_WEB_RPM", "web_concurrency": "SEARCH_WEB_CONCURRENCY",
             "max_retries": "SEARCH_SERVICE_MAX_RETRIES", "connect_timeout": "SEARCH_SERVICE_CONNECT_TIMEOUT",
             "read_timeout": "SEARCH_SERVICE_READ_TIMEOUT",
         }
@@ -175,18 +171,40 @@ class Metrics:
 
 
 class SQLiteCache:
-    """Serialize local DB operations; reads update LRU access, never expiry."""
+    """Reuse WAL readers; batch LRU touches into the next write or close."""
+
+    _MAX_READERS = 16
 
     def __init__(self, path, *, max_bytes, max_ttl):
         self.path = str(path)
         self.max_bytes = max_bytes
         self.max_ttl = max_ttl
-        # Cache hits also write access times. Serializing connections
-        # avoids unnecessary writer contention and overlapping WAL checkpoints.
-        self._db_lock = threading.RLock()
+        self._writer_lock = threading.RLock()
+        self._read_condition = threading.Condition()
+        self._idle_readers = []
+        self._reader_count = 0
+        self._active_readers = 0
+        self._closed = False
+        self._touch_lock = threading.Lock()
+        self._pending_touches = {}
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+        self._writer = self._open_connection()
+        try:
+            self._initialize()
+        except BaseException:
+            self._writer.close()
+            raise
+
+    def _open_connection(self):
+        conn = sqlite3.connect(self.path, timeout=5.0, check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    def _initialize(self):
+        # WAL mode must be set before opening an explicit write transaction.
+        conn = self._writer
+        conn.execute("PRAGMA journal_mode=WAL")
+        with conn:
             conn.execute("""CREATE TABLE IF NOT EXISTS entries (
                 namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
                 expires REAL NOT NULL, accessed REAL NOT NULL, size INTEGER NOT NULL,
@@ -199,34 +217,92 @@ class SQLiteCache:
             conn.execute("CREATE INDEX IF NOT EXISTS entries_expiry ON entries(expires)")
             conn.execute("CREATE INDEX IF NOT EXISTS entries_access ON entries(accessed)")
 
+    def _check_open(self):
+        with self._read_condition:
+            if self._closed:
+                raise RuntimeError("Search cache is closed")
+
     @contextmanager
-    def connect(self):
-        with self._db_lock:
-            conn = sqlite3.connect(self.path, timeout=5.0)
+    def _read_connection(self):
+        # Lease, rather than thread-local storage: producer threads are short
+        # lived and must not retain one connection for every past request.
+        with self._read_condition:
+            while not self._closed and not self._idle_readers and self._reader_count >= self._MAX_READERS:
+                self._read_condition.wait()
+            if self._closed:
+                raise RuntimeError("Search cache is closed")
+            conn = self._idle_readers.pop() if self._idle_readers else None
+            if conn is None:
+                self._reader_count += 1
+            self._active_readers += 1
+        try:
+            if conn is None:
+                conn = self._open_connection()
+            yield conn
+        finally:
+            with self._read_condition:
+                self._active_readers -= 1
+                if conn is None or self._closed:
+                    self._reader_count -= 1
+                    if conn is not None:
+                        conn.close()
+                else:
+                    self._idle_readers.append(conn)
+                self._read_condition.notify_all()
+
+    def _take_touches(self):
+        with self._touch_lock:
+            touches, self._pending_touches = self._pending_touches, {}
+        return touches
+
+    def _restore_touches(self, touches):
+        with self._touch_lock:
+            for key, accessed in touches.items():
+                self._pending_touches[key] = max(accessed, self._pending_touches.get(key, accessed))
+
+    @staticmethod
+    def _apply_touches(conn, touches):
+        if touches:
+            # Access time is monotonic per entry; a concurrent old read must
+            # not move the access time of a replacement value backwards.
+            conn.executemany("UPDATE entries SET accessed=MAX(accessed,?) "
+                             "WHERE namespace=? AND key=? AND expires>?",
+                             ((accessed, namespace, key, accessed)
+                              for (namespace, key), accessed in touches.items()))
+
+    @contextmanager
+    def connect(self, *, before_commit=None):
+        """Compatibility write interface; flush pending LRU touches atomically."""
+        with self._writer_lock:
+            self._check_open()
+            touches = self._take_touches()
             try:
-                conn.execute("PRAGMA busy_timeout=5000")
-                with conn:
+                with self._writer as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    self._apply_touches(conn, touches)
                     yield conn
-            finally:
-                conn.close()
+                    if before_commit is not None:
+                        before_commit()
+            except BaseException:
+                self._restore_touches(touches)
+                raise
 
     def get(self, namespace, key):
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._read_connection() as conn:
             now = time.time()
             row = conn.execute("SELECT value, expires FROM entries WHERE namespace=? AND key=?",
                                (namespace, key)).fetchone()
             if row is None:
                 return None
             if row[1] <= now:
-                conn.execute("DELETE FROM entries WHERE namespace=? AND key=? AND expires<=?",
-                             (namespace, key, now))
                 return None
-            conn.execute("UPDATE entries SET accessed=? WHERE namespace=? AND key=?",
-                         (now, namespace, key))
+            with self._touch_lock:
+                pair = (namespace, key)
+                self._pending_touches[pair] = max(now, self._pending_touches.get(pair, now))
         return row[0]
 
-    def put(self, namespace, key, value_json, ttl):
+    def put(self, namespace, key, value_json, ttl, *, before_commit=None):
+        self._check_open()
         if isinstance(ttl, bool) or not isinstance(ttl, (float, int)) or not math.isfinite(ttl):
             raise ValueError("cache ttl must be finite")
         if ttl <= 0:
@@ -234,8 +310,7 @@ class SQLiteCache:
         size = len(value_json.encode("utf-8"))
         if size > self.max_bytes:
             return False
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self.connect(before_commit=before_commit) as conn:
             now = time.time()
             lifetime = min(float(ttl), self.max_ttl)
             conn.execute("DELETE FROM entries WHERE expires<=?", (now,))
@@ -257,48 +332,91 @@ class SQLiteCache:
         return True
 
     def stats(self):
-        with self.connect() as conn:
+        with self._read_connection() as conn:
             row = conn.execute("SELECT COUNT(*),COALESCE(SUM(size),0) FROM entries WHERE expires>?",
                                (time.time(),)).fetchone()
         return {"entries": row[0], "bytes": row[1]}
 
+    def close(self):
+        with self._read_condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._read_condition.notify_all()
+            while self._active_readers:
+                self._read_condition.wait()
+            idle, self._idle_readers = self._idle_readers, []
+            self._reader_count -= len(idle)
+        for conn in idle:
+            conn.close()
+        with self._writer_lock:
+            touches = self._take_touches()
+            try:
+                with self._writer as conn:
+                    if touches:
+                        conn.execute("BEGIN IMMEDIATE")
+                        self._apply_touches(conn, touches)
+            finally:
+                self._writer.close()
 
-class _RequestBudget:
-    """Paced starts, bounded active requests, and a shared 429 cooldown."""
 
-    def __init__(self, rpm, concurrency):
-        self.interval = 60.0 / rpm
-        self.concurrency = concurrency
-        self.condition = threading.Condition()
-        self.active = 0
-        self.next_start = 0.0
-        self.cooldown_until = 0.0
+class _Flight:
+    """One actual producer, whose completion and budget outlive individual callers."""
 
-    def acquire(self, deadline):
-        with self.condition:
-            while True:
-                now = time.monotonic()
-                remaining = deadline - now
-                if remaining <= 0:
-                    raise GatewayFailure("Deadline expired while waiting for upstream budget",
-                                         code="deadline_exceeded", status_code=504, retryable=True)
-                ready = max(self.next_start, self.cooldown_until)
-                if self.active < self.concurrency and ready <= now:
-                    self.active += 1
-                    self.next_start = now + self.interval
-                    return
-                wait = max(0.001, ready - now) if self.active < self.concurrency else remaining
-                self.condition.wait(min(wait, remaining))
+    def __init__(self, deadline):
+        self.deadline = deadline
+        self.future = Future()
+        self.cancelled = threading.Event()
+        self._lock = threading.Lock()
+        self._aborters = {}
+        self.timer = None
 
-    def release(self):
-        with self.condition:
-            self.active -= 1
-            self.condition.notify_all()
+    def complete(self, *, value=None, error=None):
+        with self._lock:
+            if self.future.done():
+                return False
+            if error is None:
+                self.future.set_result(value)
+            else:
+                self.cancelled.set()
+                self.future.set_exception(error)
+            if self.timer is not None:
+                self.timer.cancel()
+            return True
 
-    def cooldown(self, delay):
-        with self.condition:
-            self.cooldown_until = max(self.cooldown_until, time.monotonic() + delay)
-            self.condition.notify_all()
+    def cancel(self, error):
+        if not self.complete(error=error):
+            return False
+        # Wake waiters before best-effort transport cleanup. Closing a mocked,
+        # third-party or OS-blocked transport must never block service.close().
+        with self._lock:
+            aborters = list(self._aborters.values())
+        for abort in aborters:
+            threading.Thread(target=self._abort, args=([abort],),
+                             name="search-abort", daemon=True).start()
+        return True
+
+    @staticmethod
+    def _abort(aborters):
+        for abort in aborters:
+            try:
+                abort()
+            except Exception:
+                pass
+
+    def register_abort(self, abort):
+        token = object()
+        with self._lock:
+            if not self.cancelled.is_set():
+                self._aborters[token] = abort
+                return token
+        # The deadline may have elapsed while a request was returning headers.
+        threading.Thread(target=self._abort, args=([abort],), daemon=True).start()
+        return token
+
+    def unregister_abort(self, token):
+        with self._lock:
+            self._aborters.pop(token, None)
 
 
 def _retry_after(header):
@@ -356,8 +474,6 @@ class SearchService:
         self._flights = {}
         self._flight_lock = threading.Lock()
         self._state_lock = threading.RLock()
-        self._budgets = {}
-        self._budget_lock = threading.Lock()
         self._session_factory = session_factory
         self._closed = False
         cache_dir = Path(config.cache_dir).expanduser()
@@ -381,24 +497,27 @@ class SearchService:
                 providers = default_providers
             self.providers = providers
         except BaseException:
+            if hasattr(self, "cache"):
+                self.cache.close()
             self._process_lock.close()
             raise
 
     def close(self):
-        # Never wait indefinitely for a blocked network thread. Cache access
-        # shares this lock, so old producers cannot write after DB ownership is
-        # released. Their daemon threads finish cooperatively at their deadline.
+        # Never join blocked network threads. Writes share this lifecycle lock;
+        # readers are short, independently leased operations drained by close().
         with self._state_lock:
             if self._closed:
                 return
             self._closed = True
             with self._flight_lock:
                 pending = list(self._flights.values())
-            for future in pending:
-                if not future.done():
-                    future.set_exception(self._closed_failure())
-            fcntl.flock(self._process_lock, fcntl.LOCK_UN)
-            self._process_lock.close()
+            for flight in pending:
+                flight.cancel(self._closed_failure())
+            try:
+                self.cache.close()
+            finally:
+                fcntl.flock(self._process_lock, fcntl.LOCK_UN)
+                self._process_lock.close()
 
     @staticmethod
     def _closed_failure():
@@ -414,6 +533,10 @@ class SearchService:
     def check_deadline(self):
         if self._closed:
             raise self._closed_failure()
+        flight = getattr(self._local, "flight", None)
+        if flight is not None and flight.cancelled.is_set():
+            # Preserve the terminal reason chosen by the watchdog/close().
+            flight.future.result()
         if self.remaining() <= 0:
             raise GatewayFailure("Search request deadline exceeded", code="deadline_exceeded",
                                  status_code=504, retryable=True)
@@ -449,9 +572,7 @@ class SearchService:
         deadline = self.deadline()
         key = hashlib.sha256(json_dumps(params, canonical=True).encode("utf-8")).hexdigest()
         flight_key = (namespace, key)
-        with self._state_lock:
-            self.check_deadline()
-            cached = self.cache.get(namespace, key) if persist else None
+        cached = self._cache_get(namespace, key) if persist else None
         if cached is not None:
             self._note("cache_hits")
             return json.loads(cached)
@@ -459,46 +580,77 @@ class SearchService:
         with self._state_lock:
             self.check_deadline()
             with self._flight_lock:
-                future = self._flights.get(flight_key)
-                owner = future is None
+                flight = self._flights.get(flight_key)
+                owner = flight is None
                 if owner:
-                    future = self._flights[flight_key] = Future()
+                    # A short-lived caller must not lend its remaining budget
+                    # to everyone sharing the same upstream operation. Nested
+                    # producers still cannot extend a parent producer's budget.
+                    producer_deadline = time.monotonic() + self.config.request_timeout
+                    parent = getattr(self._local, "flight", None)
+                    if parent is not None:
+                        producer_deadline = min(producer_deadline, parent.deadline)
+                    flight = self._flights[flight_key] = _Flight(producer_deadline)
             if owner:
                 # Lookup/coalescing is already complete. Only this unique miss
                 # gets an upstream execution thread; waiters do not get one.
                 context = getattr(self._local, "context", None)
                 thread = threading.Thread(
                     target=self._produce_cached,
-                    args=(namespace, key, flight_key, future, producer, ttl,
-                          persist, deadline, context),
+                    args=(namespace, key, flight_key, flight, producer, ttl,
+                          persist, context),
                     name="search-producer", daemon=True,
                 )
+                flight.timer = threading.Timer(
+                    max(0.0, flight.deadline - time.monotonic()),
+                    self._expire_flight, args=(flight,))
+                flight.timer.daemon = True
                 try:
+                    flight.timer.start()
                     thread.start()
-                except BaseException:
+                except BaseException as exc:
+                    flight.cancel(exc)
                     with self._flight_lock:
-                        if self._flights.get(flight_key) is future:
+                        if self._flights.get(flight_key) is flight:
                             self._flights.pop(flight_key)
                     raise
         if not owner:
             self._note("coalesced_waiters")
         try:
-            return json.loads(future.result(timeout=max(0.0, deadline - time.monotonic())))
+            return json.loads(flight.future.result(timeout=max(0.0, deadline - time.monotonic())))
         except TimeoutError:
             # A caller expiring must not cancel/pop a producer still serving
             # other callers, nor permit a second identical upstream operation.
             raise GatewayFailure("Deadline expired waiting for shared search result",
                                  code="deadline_exceeded", status_code=504, retryable=True) from None
 
-    def _produce_cached(self, namespace, key, flight_key, future, producer, ttl,
-                        persist, deadline, context):
-        self._local.deadline = deadline
+    def _cache_get(self, namespace, key):
+        self.check_deadline()
+        try:
+            cached = self.cache.get(namespace, key)
+        except RuntimeError:
+            self.check_deadline()  # A concurrent close must stay service_closed.
+            raise
+        self.check_deadline()
+        return cached
+
+    def _expire_flight(self, flight):
+        failure = GatewayFailure("Shared search producer deadline exceeded",
+                                 code="deadline_exceeded", status_code=504, retryable=True)
+        if flight.cancel(failure):
+            self.metrics.add("producer_deadlines_exceeded")
+        # Keep the flight registered until its real execution thread exits.
+        # New identical callers see the completed failure without duplicating IO.
+
+    def _produce_cached(self, namespace, key, flight_key, flight, producer, ttl,
+                        persist, context):
+        self._local.deadline = flight.deadline
+        self._local.flight = flight
         self._local.context = context
         try:
             # A previous owner may have completed between the first lookup and the lock.
-            with self._state_lock:
-                self.check_deadline()
-                cached = self.cache.get(namespace, key) if persist else None
+            self.check_deadline()
+            cached = self._cache_get(namespace, key) if persist else None
             if cached is None:
                 self.metrics.add("producer_executions")
                 value = producer()
@@ -507,49 +659,55 @@ class SearchService:
                 effective_ttl = ttl(value) if callable(ttl) else ttl
                 with self._state_lock:
                     self.check_deadline()
-                    if persist and self.cache.put(namespace, key, cached, effective_ttl):
+                    if persist and self.cache.put(namespace, key, cached, effective_ttl,
+                                                  before_commit=self.check_deadline):
                         self._note("cache_stores")
             with self._state_lock:
                 self.check_deadline()
-                if not future.done():
-                    future.set_result(cached)
+                flight.complete(value=cached)
         except BaseException as exc:
-            with self._state_lock:
-                if not future.done():
-                    future.set_exception(exc)
+            flight.complete(error=exc)
         finally:
+            flight.timer.cancel()
             with self._flight_lock:
-                if self._flights.get(flight_key) is future:
+                if self._flights.get(flight_key) is flight:
                     self._flights.pop(flight_key)
             self._local.__dict__.clear()
 
     def _budget(self, upstream, url):
         hostname = (urlsplit(url).hostname or "").lower()
         if upstream in {"wiki", "wikipedia"} or hostname.endswith(".wikipedia.org") or hostname == "wikipedia.org":
-            # Wiki has no service-wide RPM, active-request limit or cooldown.
+            # Classify metrics only; there are no service-wide upstream quotas.
             return "wikipedia", None
         elif upstream in {"brave", "yibu"}:
-            name, rpm, concurrency = "brave", self.config.brave_rpm, self.config.brave_concurrency
-        else:
-            name, rpm, concurrency = "web:" + hostname, self.config.web_rpm, self.config.web_concurrency
-        with self._budget_lock:
-            return name, self._budgets.setdefault(name, _RequestBudget(rpm, concurrency))
+            return "brave", None
+        return "web:" + hostname, None
 
     def _sleep(self, delay):
         if delay >= self.remaining():
             raise GatewayFailure("Retry wait exceeds search deadline", code="deadline_exceeded",
                                  status_code=504, retryable=True)
-        time.sleep(delay)
+        flight = getattr(self._local, "flight", None)
+        if flight is None:
+            time.sleep(delay)
+        else:
+            flight.cancelled.wait(delay)
+        self.check_deadline()
 
     def notify_cooldown(self, upstream, url, delay):
-        """Providers can report API-level throttling carried inside HTTP 200 JSON."""
+        """Compatibility hook; API throttling no longer pauses other requests."""
         if isinstance(delay, bool) or not isinstance(delay, (int, float)) or not math.isfinite(delay) or delay < 0:
             raise ValueError("cooldown must be finite and nonnegative")
-        name, budget = self._budget(upstream, url)
-        if budget is None:
-            return
-        budget.cooldown(float(delay))
-        self.metrics.add("api_cooldowns/" + name)
+
+    @contextmanager
+    def _abort_on_cancel(self, abort):
+        flight = getattr(self._local, "flight", None)
+        token = flight.register_abort(abort) if flight is not None and callable(abort) else None
+        try:
+            yield
+        finally:
+            if token is not None:
+                flight.unregister_abort(token)
 
     def request(self, upstream, method, url, **kwargs):
         owns_deadline = not hasattr(self._local, "deadline")
@@ -570,19 +728,17 @@ class SearchService:
         options_base = dict(kwargs)
         options_base.pop("allow_redirects", None)
         total_attempts = 0
-        with self._session_factory() as session:
+        with self._session_factory() as session, self._abort_on_cancel(getattr(session, "close", None)):
             # The server's existing proxy route is the only external network exit.
             session.trust_env = True
             for redirects in range(11):
-                name, budget = self._budget(upstream, current_url)
+                name, _ = self._budget(upstream, current_url)
                 retry_statuses = {429, 500, 502, 503, 504} | ({422} if name == "brave" else set())
                 next_url = None
                 last_failure = None
                 for attempt in range(self.config.max_retries + 1):
                     try:
                         self.check_deadline()
-                        if budget is not None:
-                            budget.acquire(self.deadline())
                     except GatewayFailure as exc:
                         if exc.code == "deadline_exceeded" and last_failure is not None:
                             raise last_failure from exc
@@ -591,7 +747,10 @@ class SearchService:
                     delay = None
                     was_429 = False
                     watchdog = None
+                    abort_token = None
+                    flight = getattr(self._local, "flight", None)
                     failure = None
+                    retry_after = None
                     try:
                         remaining = self.remaining()
                         options = dict(options_base)
@@ -604,6 +763,8 @@ class SearchService:
                         self.metrics.add("upstream_attempts/" + name)
                         total_attempts += 1
                         response = session.request(current_method, current_url, **options)
+                        if flight is not None:
+                            abort_token = flight.register_abort(lambda response=response: _abort_response(response))
                         watchdog = threading.Timer(self.remaining(), _abort_response, args=(response,))
                         watchdog.daemon = True
                         watchdog.start()
@@ -630,10 +791,8 @@ class SearchService:
                         if status == 429:
                             was_429 = True
                             self.metrics.add("upstream_429/" + name)
-                            delay = _retry_after(response.headers.get("Retry-After"))
-                            delay = (2 ** attempt) + random.uniform(0.0, 0.5) if delay is None else delay + 0.5
-                            if budget is not None:
-                                budget.cooldown(delay)
+                            retry_after = _retry_after(response.headers.get("Retry-After"))
+                            delay = (2 ** attempt) + random.uniform(0.0, 0.5) if retry_after is None else retry_after + 0.5
                         elif status in retry_statuses:
                             delay = float(2 ** attempt)
                         if not 200 <= status < 300:
@@ -645,7 +804,10 @@ class SearchService:
                                 attempts=total_attempts,
                             )
                             self.metrics.add("upstream_errors/" + failure.code)
-                            if status not in retry_statuses or attempt == self.config.max_retries:
+                            # Match the old Web/Yibu fast-fail policy. A long
+                            # Retry-After affects this request only, never peers.
+                            long_wait = was_429 and name != "wikipedia" and retry_after is not None and retry_after > 30
+                            if status not in retry_statuses or attempt == self.config.max_retries or long_wait:
                                 raise failure
                         else:
                             chunks, size = [], 0
@@ -697,14 +859,15 @@ class SearchService:
                     finally:
                         if watchdog is not None:
                             watchdog.cancel()
-                        if response is not None:
-                            response.close()
-                        if budget is not None:
-                            budget.release()
+                        try:
+                            if response is not None:
+                                response.close()
+                        finally:
+                            if flight is not None and abort_token is not None:
+                                flight.unregister_abort(abort_token)
                     last_failure = failure
-                    # Wiki retries back off only this request. Brave/Web 429s
-                    # continue waiting through their existing shared budgets.
-                    if delay is not None and (not was_429 or budget is None):
+                    # Every upstream's retry wait belongs to this request only.
+                    if delay is not None:
                         if failure is not None and delay >= self.remaining():
                             raise failure
                         try:

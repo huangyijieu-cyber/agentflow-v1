@@ -429,16 +429,12 @@ def wiki_confirmation_sweep(plans, args, control, *, ceiling=None, progress=None
 
 
 def network_settings(confirmed):
-    result = {}
-    for name, prefix in (("brave", "BRAVE"),):
-        if name in confirmed:
-            result["SEARCH_" + prefix + "_RPM"] = confirmed[name]["rpm"]
-            result["SEARCH_" + prefix + "_CONCURRENCY"] = confirmed[name]["concurrency"]
-    web = [value for name, value in confirmed.items() if name.startswith("web:")]
-    if web:
-        result.update(SEARCH_WEB_RPM=min(value["rpm"] for value in web),
-                      SEARCH_WEB_CONCURRENCY=min(value["concurrency"] for value in web))
-    return result
+    """Legacy report field: all provider-wide service limits were removed.
+
+    The measured values remain in joint_confirmation/confirmed_measured_load;
+    they control benchmark load only, never a production limiter setting.
+    """
+    return {}
 
 
 def store_confirmation(report, args, confirmed, *, full_windows=True):
@@ -446,7 +442,9 @@ def store_confirmation(report, args, confirmed, *, full_windows=True):
     report["background_training"] = args.background_training
     report["confirmed_measured_load" if full_windows else "smoke_measured_load"] = confirmed
     report["ignored_service_settings"] = ["SEARCH_SERVICE_WORKERS", "SEARCH_SERVICE_QUEUE_SIZE",
-                                           "SEARCH_WIKI_RPM", "SEARCH_WIKI_CONCURRENCY"]
+                                           "SEARCH_WIKI_RPM", "SEARCH_WIKI_CONCURRENCY",
+                                           "SEARCH_BRAVE_RPM", "SEARCH_BRAVE_CONCURRENCY",
+                                           "SEARCH_WEB_RPM", "SEARCH_WEB_CONCURRENCY"]
     if not full_windows:
         report["smoke_network_settings"] = values
         report["confirmed_network_settings"] = {}
@@ -588,9 +586,9 @@ def run_upstream(args, control, report, checkpoint):
                 if observed is not None:
                     plan["concurrency"] = max(plan["concurrency"], observed)
             checkpoint()
-        # SEARCH_WEB_* is one pair of settings applied to every hostname. Test
-        # that common pair, not different per-host caps later combined without
-        # validation. A slow domain may force the joint test to reduce RPM.
+        # Preserve the historical common offered Web workload in reports.
+        # These client-side probe caps no longer export SEARCH_WEB_* settings.
+        # A slow domain may force the joint test to reduce offered RPM.
         web_plans = [plan for label, plan in plans.items() if label.startswith("web:")]
         if web_plans:
             common_rpm = min(plan["rpm"] for plan in web_plans)
@@ -654,12 +652,12 @@ def render_summary(report):
                   "| Bucket | Highest exercised passing concurrency | Status |", "|---|---:|---|"]
         for name, result in report.get("burst_concurrency", {}).items():
             lines.append(f"| {name} | {result.get('highest_stable_burst_concurrency')} | {result['status']} |")
-        lines += ["", "## Settings passing simultaneous proxy load", "", "```ini"]
+        lines += ["", "## Legacy service settings (no longer exported)", "", "```ini"]
         for key, value in report.get("confirmed_network_settings", {}).items():
             lines.append(f"{key}={value:g}")
         lines += ["```", "",
-                  "An empty settings block means no applicable service settings were confirmed; Wiki measurements never export a service cap.",
-                  "Yibu/Web concurrency settings are passing caps. Wiki results describe offered test load only; the service has no Wiki RPM/concurrency/cooldown limit.",
+                  "The settings block is intentionally empty: no provider-wide service limiter remains. Raw jointly confirmed load is preserved separately.",
+                  "All concurrency/RPM values describe benchmark offered load only; the service has no provider-wide RPM/concurrency/cooldown limits.",
                   "Web values apply only to the tested hostnames. HTTP limits exclude LLM/embedding stages.", "",
                   "```json", json.dumps(report.get("coverage", {}), ensure_ascii=False, indent=2), "```", ""]
     lines += ["## Unmeasured or incomplete", ""]
@@ -755,7 +753,8 @@ def main(argv=None):
     report = {"schema_version": 1, "started_at": stamp, "status": "running", "arguments": vars(args),
               "unmeasured": [], "scope": "network cache service; no LLM/embedding or full agent training",
               "scheduler": {"shared_worker_queue": False, "derived_http_cap": False,
-                            "wiki_global_limits": False, "legacy_worker_argument_ignored": args.workers}}
+                            "wiki_global_limits": False, "brave_global_limits": False, "web_global_limits": False,
+                            "legacy_worker_argument_ignored": args.workers}}
     if args.duration < 60 or args.confirmation_duration < 120:
         report["unmeasured"].append("short windows selected: results are smoke tests, not sustained RPM ceilings")
     if args.skip_bursts:
@@ -812,7 +811,7 @@ def main(argv=None):
         for name, setting in report["confirmed_additional_load"].items():
             say(f"{name}: extra {setting['rpm']:g} RPM, passing concurrency cap {setting['concurrency']}")
     elif report.get("confirmed_measured_load"):
-        say("[MEASURED] Joint load recorded; no applicable service settings to export (Wiki limits are removed).")
+        say("[MEASURED] Joint load recorded; no applicable service settings to export (all provider limits are removed).")
     elif args.mode != "local":
         say("[UNCONFIRMED] No jointly confirmed network configuration; inspect independent stage results.")
     return exit_code

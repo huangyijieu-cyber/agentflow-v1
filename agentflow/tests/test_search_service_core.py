@@ -53,11 +53,13 @@ class SQLiteCacheTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / "cache.sqlite3"
         self.cache = SQLiteCache(self.path, max_bytes=100000, max_ttl=30)
+        self.addCleanup(self.cache.close)
 
     def test_restart_keeps_complete_ordered_values(self):
         value = [{"z": 1, "a": 2}, {"title": "second", "items": [4, 3, 2]}]
         self.cache.put("wiki", "one", json_dumps(value), 10)
         restart = SQLiteCache(self.path, max_bytes=100000, max_ttl=30)
+        self.addCleanup(restart.close)
         restored = json.loads(restart.get("wiki", "one"))
         self.assertEqual(restored, value)
         self.assertEqual(list(restored[0]), ["z", "a"])
@@ -82,6 +84,7 @@ class SQLiteCacheTests(unittest.TestCase):
             self.assertEqual(self.cache.stats()["entries"], 2)
             self.assertEqual(self.cache.get("wiki", "hit"), '"hit"')
         restart = SQLiteCache(self.path, max_bytes=100000, max_ttl=30)
+        self.addCleanup(restart.close)
         with patch("agentflow.search_service.core.time.time", return_value=1021):
             self.assertIsNone(restart.get("wiki", "idle"))
             self.assertIsNone(restart.get("wiki", "hit"))
@@ -94,6 +97,7 @@ class SQLiteCacheTests(unittest.TestCase):
                 accessed REAL, size INTEGER, PRIMARY KEY(namespace, key))""")
             conn.execute("INSERT INTO entries VALUES ('wiki','old','\"value\"',2000,1000,7)")
         cache = SQLiteCache(path, max_bytes=100000, max_ttl=CACHE_TTL_SECONDS)
+        self.addCleanup(cache.close)
         with patch("agentflow.search_service.core.time.time", return_value=1500):
             self.assertEqual(cache.get("wiki", "old"), '"value"')
         with cache.connect() as conn:
@@ -103,6 +107,7 @@ class SQLiteCacheTests(unittest.TestCase):
 
     def test_hits_update_lru_without_extending_expiry(self):
         cache = SQLiteCache(self.path, max_bytes=16, max_ttl=100)
+        self.addCleanup(cache.close)
         with patch("agentflow.search_service.core.time.time", return_value=100):
             cache.put("a", "old", '"123456"', 100)
         with patch("agentflow.search_service.core.time.time", return_value=101):
@@ -118,6 +123,7 @@ class SQLiteCacheTests(unittest.TestCase):
 
     def test_capacity_evicts_oldest_without_partial_writes(self):
         cache = SQLiteCache(self.path, max_bytes=12, max_ttl=100)
+        self.addCleanup(cache.close)
         with patch("agentflow.search_service.core.time.time", return_value=100):
             cache.put("a", "old", '"123456"', 100)
         with patch("agentflow.search_service.core.time.time", return_value=101):
@@ -371,11 +377,131 @@ class SearchServiceCoreTests(unittest.TestCase):
                 self.assertEqual(self.providers.calls["slow"], 1)
             finally:
                 self.providers.release.set()
-            with self.assertRaises(GatewayFailure) as caught:
-                waiter.result()
-            self.assertEqual(caught.exception.code, "deadline_exceeded")
+            self.assertEqual(waiter.result()["results"][0]["title"], "slow")
         self.assertEqual(self.providers.calls["slow"], 1)
+        self.assertEqual(self.service.cache.stats()["entries"], 1)
+
+    def test_producer_deadline_wakes_waiters_and_keeps_tombstone_until_actual_exit(self):
+        self.service.config.request_timeout = 0.15
+        self.providers.release.clear()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            owner = executor.submit(self.service.handle, "wikipedia", {"query": "stuck"},
+                                    deadline=time.monotonic() + 3)
+            try:
+                self.assertTrue(self.providers.started.wait(1))
+                waiter = executor.submit(self.service.handle, "wikipedia", {"query": "stuck"},
+                                         deadline=time.monotonic() + 3)
+                self.wait_for_waiters(1)
+                for future in (owner, waiter):
+                    with self.assertRaises(GatewayFailure) as caught:
+                        future.result(timeout=0.8)
+                    self.assertEqual(caught.exception.code, "deadline_exceeded")
+                    self.assertIn("producer", caught.exception.message)
+                self.assertEqual(len(self.service._flights), 1)
+                started = time.monotonic()
+                with self.assertRaises(GatewayFailure) as caught:
+                    self.service.handle("wikipedia", {"query": "stuck"}, deadline=started + 3)
+                self.assertEqual(caught.exception.code, "deadline_exceeded")
+                self.assertLess(time.monotonic() - started, 0.1)
+                self.assertEqual(self.providers.calls["stuck"], 1)
+                self.assertEqual(self.service.metrics.snapshot()["producer_deadlines_exceeded"], 1)
+            finally:
+                self.providers.release.set()
+        until = time.monotonic() + 1
+        while self.service._flights and time.monotonic() < until:
+            time.sleep(0.005)
+        self.assertFalse(self.service._flights)
         self.assertEqual(self.service.cache.stats()["entries"], 0)
+        self.service.config.request_timeout = 2
+        result = self.service.handle("wikipedia", {"query": "stuck"})
+        self.assertEqual(result["results"][0]["title"], "stuck")
+        self.assertEqual(self.providers.calls["stuck"], 2)
+
+    def test_expired_owner_without_waiters_still_allows_cache_fill(self):
+        self.providers.release.clear()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            owner = executor.submit(self.service.handle, "wikipedia", {"query": "fill"},
+                                    deadline=time.monotonic() + 0.05)
+            try:
+                self.assertTrue(self.providers.started.wait(1))
+                with self.assertRaises(GatewayFailure):
+                    owner.result(timeout=0.5)
+                self.assertEqual(len(self.service._flights), 1)
+            finally:
+                self.providers.release.set()
+        until = time.monotonic() + 1
+        while self.service._flights and time.monotonic() < until:
+            time.sleep(0.005)
+        self.assertEqual(self.service.handle("wikipedia", {"query": "fill"})["meta"]["cache_hits"], 1)
+        self.assertEqual(self.providers.calls["fill"], 1)
+
+    def test_blocked_transport_abort_does_not_delay_waiters_or_close(self):
+        self.service.config.request_timeout = 0.15
+        started, release, abort_started, abort_release = (threading.Event() for _ in range(4))
+        factory = MagicMock()
+        session = factory.return_value.__enter__.return_value
+
+        def request(*args, **kwargs):
+            started.set()
+            release.wait(2)
+            response = requests.Response()
+            response.status_code = 200
+            response._content = b"ok"
+            response._content_consumed = True
+            return response
+
+        def close():
+            abort_started.set()
+            abort_release.wait(2)
+
+        def execute(tool, params, service):
+            def produce():
+                service.request("brave", "GET", "https://example.test/search")
+                return {"results": []}
+            return service.cached("blocked-network", params, produce, 100)
+
+        session.request.side_effect = request
+        session.close.side_effect = close
+        with patch.object(self.service, "_session_factory", factory), patch.object(self.providers, "execute", side_effect=execute), ThreadPoolExecutor(max_workers=1) as executor:
+            owner = executor.submit(self.service.handle, "brave", {"query": "blocked"},
+                                    deadline=time.monotonic() + 3)
+            try:
+                self.assertTrue(started.wait(1))
+                with self.assertRaises(GatewayFailure) as caught:
+                    owner.result(timeout=0.8)
+                self.assertEqual(caught.exception.code, "deadline_exceeded")
+                self.assertTrue(abort_started.wait(0.5))
+                before = time.monotonic()
+                self.service.close()
+                self.assertLess(time.monotonic() - before, 0.5)
+            finally:
+                release.set()
+                abort_release.set()
+
+    def test_service_does_not_serialize_independent_cache_reads(self):
+        import hashlib
+        for query in ("slow-hit", "fast-hit"):
+            self.service.handle("wikipedia", {"query": query})
+        slow_key = hashlib.sha256(json_dumps({"query": "slow-hit"}, canonical=True).encode()).hexdigest()
+        entered, release = threading.Event(), threading.Event()
+        original = self.service.cache.get
+
+        def get(namespace, key):
+            if key == slow_key:
+                entered.set()
+                release.wait(2)
+            return original(namespace, key)
+
+        with patch.object(self.service.cache, "get", side_effect=get), ThreadPoolExecutor(max_workers=2) as executor:
+            slow = executor.submit(self.service.handle, "wikipedia", {"query": "slow-hit"})
+            try:
+                self.assertTrue(entered.wait(1))
+                fast = executor.submit(self.service.handle, "wikipedia", {"query": "fast-hit"})
+                self.assertEqual(fast.result(timeout=0.5)["meta"]["cache_hits"], 1)
+                self.assertFalse(slow.done())
+            finally:
+                release.set()
+            slow.result()
 
     def test_close_releases_waiters_without_allowing_late_producer_to_write(self):
         self.providers.release.clear()
@@ -396,9 +522,9 @@ class SearchServiceCoreTests(unittest.TestCase):
                 with patch.object(self.service.cache, "put", side_effect=AssertionError("closed producer must not write")) as put:
                     self.providers.release.set()
                     until = time.monotonic() + 1
-                    while self.service.metrics_snapshot()["inflight_keys"] and time.monotonic() < until:
+                    while self.service._flights and time.monotonic() < until:
                         time.sleep(0.005)
-                    self.assertEqual(self.service.metrics_snapshot()["inflight_keys"], 0)
+                    self.assertEqual(len(self.service._flights), 0)
                     put.assert_not_called()
                 self.assertEqual(replacement.cache.stats()["entries"], 0)
             finally:
@@ -458,6 +584,34 @@ class NetworkFailureTests(unittest.TestCase):
         self.assertEqual(self.session.request.call_count, 1)
         response.close.assert_called()
 
+    def test_long_web_and_yibu_retry_after_returns_429_without_sleep(self):
+        for upstream in ("brave", "yibu", "web:example.test"):
+            for retry_after in ("31", "300"):
+                with self.subTest(upstream=upstream, retry_after=retry_after):
+                    self.session.request.reset_mock()
+                    response = MagicMock(status_code=429, headers={"Retry-After": retry_after})
+                    self.session.request.return_value = response
+                    with patch.object(self.service, "_sleep") as sleep, self.assertRaises(GatewayFailure) as caught:
+                        self.service.request(upstream, "GET", "https://example.test/search")
+                    self.assertEqual(caught.exception.upstream_status, 429)
+                    self.assertEqual(caught.exception.attempts, 1)
+                    self.assertEqual(self.session.request.call_count, 1)
+                    sleep.assert_not_called()
+
+    def test_short_retry_after_only_backs_off_current_web_and_yibu_request(self):
+        for upstream in ("brave", "web:example.test"):
+            with self.subTest(upstream=upstream):
+                self.session.request.reset_mock()
+                limited = MagicMock(status_code=429, headers={"Retry-After": "0"})
+                recovered = MagicMock(status_code=200, headers={})
+                recovered.iter_content.return_value = [b"ok"]
+                self.session.request.side_effect = [limited, recovered]
+                with patch.object(self.service, "_sleep") as sleep:
+                    self.service.request(upstream, "GET", "https://example.test/search")
+                sleep.assert_called_once_with(0.5)
+                self.assertEqual(self.session.request.call_count, 2)
+                self.assertEqual(self.service._budget(upstream, "https://example.test/search")[1], None)
+
     def test_http_timeout_is_distinct_from_other_connection_errors(self):
         for exception, code, status in ((requests.ReadTimeout("read"), "upstream_timeout", 504),
                                         (requests.ConnectionError("connect"), "upstream_network_error", 502)):
@@ -483,11 +637,10 @@ class NetworkFailureTests(unittest.TestCase):
         self.session.request.return_value = response
         self.service.config.wiki_rpm = 1
         self.service.config.wiki_concurrency = 1
-        with patch("agentflow.search_service.core._RequestBudget.acquire",
-                   side_effect=AssertionError("Wikipedia must not acquire a global budget")):
-            for host in ("wikipedia.org", "en.wikipedia.org"):
-                result = self.service.request("web:" + host, "GET", "https://" + host + "/wiki/Moon")
-                self.assertIs(result, response)
+        for host in ("wikipedia.org", "en.wikipedia.org"):
+            self.assertEqual(self.service._budget("web:" + host, "https://" + host), ("wikipedia", None))
+            result = self.service.request("web:" + host, "GET", "https://" + host + "/wiki/Moon")
+            self.assertIs(result, response)
 
 
 class _LocalUpstream(BaseHTTPRequestHandler):
@@ -586,13 +739,14 @@ class UpstreamBudgetTests(unittest.TestCase):
         self.service.request("wikipedia", "GET", self.base_url + "/ok")
         self.assertLess(time.monotonic() - started, 0.25)
 
-    def test_brave_429_still_cools_down_independent_requests(self):
+    def test_brave_429_does_not_cool_down_independent_requests(self):
         self.service.config.max_retries = 0
         with self.assertRaises(GatewayFailure) as error:
             self.service.request("brave", "GET", self.base_url + "/429")
         self.assertEqual(error.exception.upstream_status, 429)
+        started = time.monotonic()
         self.service.request("brave", "GET", self.base_url + "/ok")
-        self.assertGreaterEqual(self.upstream.paths[1][1] - self.upstream.paths[0][1], 0.49)
+        self.assertLess(time.monotonic() - started, 0.25)
 
     def test_permanent_failure_does_not_retry(self):
         with self.assertRaises(GatewayFailure) as error:
@@ -663,19 +817,19 @@ class UpstreamBudgetTests(unittest.TestCase):
             self.service.request("wikipedia", "GET", self.base_url + "/large")
         self.assertEqual(error.exception.code, "upstream_too_large")
 
-    def test_web_attempt_start_still_obeys_per_host_rate_spacing(self):
-        self.service.config.web_rpm = 600
+    def test_web_attempt_start_ignores_legacy_per_host_rate_spacing(self):
+        self.service.config.web_rpm = 1
         self.service.request("web:127.0.0.1", "GET", self.base_url + "/ok")
+        started = time.monotonic()
         self.service.request("web:127.0.0.1", "GET", self.base_url + "/ok")
-        self.assertGreaterEqual(self.upstream.paths[1][1] - self.upstream.paths[0][1], 0.09)
+        self.assertLess(time.monotonic() - started, 0.25)
 
-    def test_web_concurrent_upstream_requests_still_obey_per_host_budget(self):
-        self.service.config.web_concurrency = 2
+    def test_web_concurrent_upstream_requests_ignore_legacy_per_host_budget(self):
+        self.service.config.web_concurrency = 1
         with ThreadPoolExecutor(max_workers=8) as executor:
             replies = list(executor.map(lambda _: self.service.request("web:127.0.0.1", "GET", self.base_url + "/hold"), range(8)))
         self.assertEqual(len(replies), 8)
-        self.assertLessEqual(self.upstream.maximum_active, 2)
-        self.assertEqual(self.upstream.maximum_active, 2)
+        self.assertGreater(self.upstream.maximum_active, 1)
 
     def test_wikipedia_ignores_legacy_global_rpm_and_concurrency(self):
         self.service.config.wiki_rpm = 1
@@ -696,12 +850,12 @@ class UpstreamBudgetTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.service.notify_cooldown("wikipedia", self.base_url, invalid)
 
-    def test_brave_api_level_cooldown_still_applies_to_other_requests(self):
-        self.service.notify_cooldown("brave", self.base_url, 0.08)
+    def test_brave_api_level_cooldown_does_not_delay_other_requests(self):
+        self.service.notify_cooldown("brave", self.base_url, 60)
         started = time.monotonic()
         self.service.request("brave", "GET", self.base_url + "/ok")
-        self.assertGreaterEqual(time.monotonic() - started, 0.07)
-        self.assertEqual(self.service.metrics.snapshot()["api_cooldowns/brave"], 1)
+        self.assertLess(time.monotonic() - started, 0.25)
+        self.assertNotIn("api_cooldowns/brave", self.service.metrics.snapshot())
 
 
 if __name__ == "__main__":

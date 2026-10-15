@@ -338,11 +338,11 @@ class _RecordingHandler(BaseHTTPRequestHandler):
 
 
 def probe_budget_rules(*, rpm=6000.0, concurrency=2, delay=0.05):
-    """Measure limiter enforcement against actual loopback HTTP, never production."""
+    """Verify removed shared limiters using loopback HTTP, never production."""
     scenarios = []
     for kind, hints, hosts in (("wiki_unlimited", ["wiki", "wikipedia"], ["127.0.0.1"]),
-                               ("brave_shared", ["brave", "yibu"], ["127.0.0.1"]),
-                               ("web_per_hostname", ["web"], ["127.0.0.1", "localhost"])):
+                               ("brave_unlimited", ["brave", "yibu"], ["127.0.0.1"]),
+                               ("web_unlimited_per_hostname", ["web"], ["127.0.0.1", "localhost"])):
         upstream = _RecordingUpstream(delay)
         thread = threading.Thread(target=upstream.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
@@ -354,7 +354,7 @@ def probe_budget_rules(*, rpm=6000.0, concurrency=2, delay=0.05):
                 def fetch(index):
                     host = hosts[index % len(hosts)]
                     hint = hints[index % len(hints)]
-                    group = host if kind == "web_per_hostname" else "shared"
+                    group = host if kind == "web_unlimited_per_hostname" else "shared"
                     response = service.request(hint, "GET", f"http://{host}:{upstream.server_port}/{group}", timeout=2)
                     response.close()
                 offered = max(8, concurrency * len(hosts) * 2)
@@ -367,45 +367,40 @@ def probe_budget_rules(*, rpm=6000.0, concurrency=2, delay=0.05):
                 for group in set(record[0] for record in records):
                     starts = sorted(record[1] for record in records if record[0] == group)
                     intervals[group] = [b - a for a, b in zip(starts, starts[1:])]
-                interval = 60 / rpm
-                # Arrival timestamps can differ slightly from budget-acquisition timestamps.
-                tolerance = max(0.004, interval * 0.25)
-                respects_rpm = all(gap >= interval - tolerance for gaps in intervals.values() for gap in gaps)
-                respects_concurrency = all(peak <= concurrency for peak in upstream.peak.values())
                 routing = {}
+                routes = [("request_hint_" + hint + "_" + host, hint, "http://" + host)
+                          for hint in hints for host in hosts]
                 if kind == "wiki_unlimited":
-                    for label, hint, url in (("wiki_alias", "wikipedia", "http://127.0.0.1"),
-                                             ("wiki_html_hostname", "web", "https://en.wikipedia.org/wiki/Test"),
-                                             ("other_wiki_language", "web", "https://zh.wikipedia.org/wiki/Test")):
-                        target_name, bucket = service._budget(hint, url)
-                        routing[label] = {"bucket": target_name, "unlimited": bucket is None}
-                if kind == "wiki_unlimited":
-                    verified = all(value["unlimited"] for value in routing.values()) and not service._budgets
-                else:
-                    verified = respects_rpm and respects_concurrency
+                    routes += [("wiki_html_hostname", "web", "https://en.wikipedia.org/wiki/Test"),
+                               ("other_wiki_language", "web", "https://zh.wikipedia.org/wiki/Test")]
+                for label, hint, url in routes:
+                    target_name, bucket = service._budget(hint, url)
+                    routing[label] = {"bucket": target_name, "unlimited": bucket is None}
+                bucket_names = sorted({value["bucket"] for value in routing.values() if not value["unlimited"]})
+                verified = not bucket_names
                 scenarios.append({"name": kind, "status": "verified" if verified else "failed",
-                                  "service_limit_applies": kind != "wiki_unlimited",
-                                  "legacy_wiki_limits_ignored": kind == "wiki_unlimited",
-                                  "configured_rpm": rpm if kind != "wiki_unlimited" else None,
-                                  "configured_concurrency_per_bucket": concurrency if kind != "wiki_unlimited" else None,
-                                  "expected_start_interval_seconds": interval if kind != "wiki_unlimited" else None,
-                                  "arrival_tolerance_seconds": tolerance,
+                                  "service_limit_applies": False,
+                                  "legacy_limits_ignored": {"rpm": rpm, "concurrency": concurrency},
+                                  "configured_rpm": None, "configured_concurrency_per_bucket": None,
+                                  "expected_start_interval_seconds": None,
                                   "min_start_intervals_seconds": {key: min(value) if value else None for key, value in intervals.items()},
                                   "peak_concurrency_by_group": dict(upstream.peak), "overall_peak_concurrency": upstream.total_peak,
                                   "offered_requests": offered, "elapsed_seconds": elapsed,
-                                  "bucket_names": sorted(service._budgets), "routing": routing})
+                                  "bucket_names": bucket_names, "routing": routing})
         finally:
             upstream.shutdown()
             upstream.server_close()
             thread.join(timeout=2)
-    return {"scope": "limiter_mechanism_only_not_production_quota", "scenarios": scenarios}
+    return {"scope": "removed_limiter_verification_not_production_quota", "scenarios": scenarios}
 
 
 def probe_deadline_behavior():
     gate = threading.Event()
     providers = SyntheticProviders(payload_bytes=32, delay=0, gate=gate)
     with _service_harness(workers=1, queue_size=1, request_timeout=0.15, providers=providers) as (service, _):
-        deadline = time.monotonic() + 0.15
+        # Give callers a longer wait so this exercises the producer watchdog,
+        # rather than releasing the gate just before its independent budget.
+        deadline = time.monotonic() + 1.5
         futures = [service._submit("brave", {"query": str(index)}, deadline, str(index))
                    for index in range(2)]
         active = _wait_until(lambda: providers.active == 2, seconds=0.08)
@@ -428,6 +423,7 @@ def probe_deadline_behavior():
                     future.result(timeout=2)
                 except GatewayFailure:
                     pass
+            _wait_until(lambda: providers.active == 0 and not service._flights, seconds=1)
         verified = (active and failures == ["deadline_exceeded", "deadline_exceeded"]
                     and still_running and executions_before_release == 2)
         return {"status": "verified" if verified else "failed", "scope": "current_deadline_cancellation_behavior",
@@ -487,4 +483,4 @@ def run_local_suite(*, workers, burst_size=256, duration=3.0, latency_limit=10.0
                                 "queue_size_upper_limit": None,
                                 "queue_note": "No shared queue or derived HTTP admission cap remains.",
                                 "production_rpm_upper_limit": None,
-                                "rpm_note": "Wiki has no service limiter; local Yibu/Web tests do not establish provider quotas."}}
+                                "rpm_note": "No provider has a service limiter; local tests do not establish upstream quotas."}}

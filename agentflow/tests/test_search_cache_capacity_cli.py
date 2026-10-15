@@ -23,18 +23,19 @@ def stage(rpm=120, concurrency=2, passed=True, duration=60):
 
 
 class CapacityCliTests(unittest.TestCase):
-    def test_network_settings_omit_removed_limits_and_preserve_wiki_measurement(self):
+    def test_network_settings_omit_all_removed_limits_and_preserve_raw_measurement(self):
         known = {"wiki": {"rpm": 150, "concurrency": 32},
                  "brave": {"rpm": 240, "concurrency": 16}}
         args = capacity.build_parser().parse_args([])
         report = {}
         capacity.store_confirmation(report, args, known)
         self.assertEqual(report["confirmed_measured_load"], known)
-        self.assertEqual(report["confirmed_network_settings"],
-                         {"SEARCH_BRAVE_RPM": 240, "SEARCH_BRAVE_CONCURRENCY": 16})
+        self.assertEqual(report["confirmed_network_settings"], {})
         self.assertEqual(set(report["ignored_service_settings"]),
                          {"SEARCH_SERVICE_WORKERS", "SEARCH_SERVICE_QUEUE_SIZE",
-                          "SEARCH_WIKI_RPM", "SEARCH_WIKI_CONCURRENCY"})
+                          "SEARCH_WIKI_RPM", "SEARCH_WIKI_CONCURRENCY",
+                          "SEARCH_BRAVE_RPM", "SEARCH_BRAVE_CONCURRENCY",
+                          "SEARCH_WEB_RPM", "SEARCH_WEB_CONCURRENCY"})
         self.assertEqual(capacity.network_settings({"wiki": known["wiki"]}), {})
 
     def test_grid_validation_and_sorting(self):
@@ -179,8 +180,9 @@ class CapacityCliTests(unittest.TestCase):
     def test_complete_orchestration_confirms_common_web_caps_after_downgrade(self):
         report = self._run_fake_network()
         settings = report["confirmed_network_settings"]
-        self.assertEqual(settings["SEARCH_WEB_RPM"], 30)
-        self.assertEqual(settings["SEARCH_WEB_CONCURRENCY"], 1)
+        self.assertEqual(settings, {})
+        self.assertEqual(report["confirmed_measured_load"]["web:fast.test"], {"rpm": 30, "concurrency": 1})
+        self.assertEqual(report["confirmed_measured_load"]["web:slow.test"], {"rpm": 30, "concurrency": 1})
         self.assertTrue(report["coverage"]["all_requested_buckets_confirmed"])
         self.assertEqual(len(report["joint_confirmation"]["rounds"]), 3)
         self.assertEqual(report["joint_confirmation"]["confirmed"]["wiki"]["rpm"], 60)
@@ -189,7 +191,8 @@ class CapacityCliTests(unittest.TestCase):
     def test_short_windows_never_export_sustained_network_configuration(self):
         report = self._run_fake_network(short=True)
         self.assertEqual(report["confirmed_network_settings"], {})
-        self.assertTrue(report["smoke_network_settings"])
+        self.assertEqual(report["smoke_network_settings"], {})
+        self.assertTrue(report["smoke_measured_load"])
 
     def test_missing_tool_is_not_hidden_by_other_confirmed_settings(self):
         report = self._run_fake_network(missing_brave=True)

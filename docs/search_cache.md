@@ -137,15 +137,11 @@ nohup bash train-roma/run_search_cache.sh > /home/ma-user/work/code-rl/cache/ser
 ```bash
 SEARCH_CACHE_DB_PATH=/var/tmp/agentflow-search-cache/search_cache.sqlite3
 SEARCH_CACHE_MAX_TTL=604800
-SEARCH_BRAVE_RPM=240
-SEARCH_BRAVE_CONCURRENCY=16
-SEARCH_WEB_RPM=120
-SEARCH_WEB_CONCURRENCY=4
 # SEARCH_BLOCKED_DOMAINS：复制 search-service.env.example 中完整的 325 项赋值。
 ```
 
-旧的 `SEARCH_SERVICE_WORKERS`、`SEARCH_SERVICE_QUEUE_SIZE`、`SEARCH_WIKI_RPM`、
-`SEARCH_WIKI_CONCURRENCY` 无需再设置；兼容读取已有配置，但不再形成执行、连接或 Wiki 限制。
+旧的 `SEARCH_SERVICE_WORKERS`、`SEARCH_SERVICE_QUEUE_SIZE`，以及
+`SEARCH_{WIKI,BRAVE,WEB}_{RPM,CONCURRENCY}` 均无需再设置；这些旧配置不再生效。
 
 同步代码后必须重启开发服务器上的共享搜索服务。只重启训练会复用仍在运行的旧服务，
 不会应用新路径或新有效期。启动日志会打印实际数据库路径；切换新数据库后缓存从零积累。
@@ -218,8 +214,8 @@ Wiki 单页失败保留当前占位结果，但失败页面不入正常缓存；
 Wiki API 正文和 HTML 解析文本属于不同缓存类型，不能互相替代。
 
 每条记录写入时设置 `expires = 写入时间 + 604800 秒`，之后命中不会修改 `expires`。
-命中只更新 `accessed`，用于容量不足时优先淘汰最近没有使用的记录；即使频繁命中，
-到达原定有效期也必须重新访问上游。查询 `/metrics` 不延长有效期，容量上限仍可提前淘汰记录。
+缓存读取允许并发，命中不再同步取得数据库写锁更新 `accessed`；LRU访问时间延后合并写回，
+用于容量不足时近似淘汰最近没有使用的记录。即使频繁命中，到达原定有效期也必须重新访问上游。查询 `/metrics` 不延长有效期，容量上限仍可提前淘汰记录。
 升级时已有健康记录保留当前的 `expires`，不会清库，也不会继续续期；不能追溯恢复旧记录此前的原始写入时间。
 
 各工具统一使用 7 天，不再读取旧的 `SEARCH_CACHE_WIKI_TTL`、`SEARCH_CACHE_WEB_TTL`、
@@ -250,15 +246,20 @@ subreward 和已命中 subgoal 状态不共享；按原工具 observation 及当
 旧的 32 worker、128 排队、160 未完成任务和 176 HTTP 连接数不再限制当前实现。
 每个唯一未命中请求独立执行；真实同时运行数仍受到机器资源和外部服务能力影响。
 
-Wiki API 和 Wiki HTML 不再使用服务内的全局 RPM、并发桶和共享 cooldown。
-某次 Wiki 请求遇到 429 时，仍按该请求的 Retry-After/退避规则在剩余总预算内有限重试，
-不会让其他 Wiki 请求统一等待。取消人工限制不改变 Wikipedia 自身的限流规则。
-Yibu 仍默认最多 240 次实际 HTTP attempt/分钟、16 个并发。
-普通网页仍按 hostname 分别限制为 120 次/分钟、4 个并发；重试也计入对应额度。
-这些是配置值，不代表官方配额或物理上限。Yibu/Web 的 429 仍按 Retry-After
-对对应桶统一 cooldown。
+Wiki API、Wiki HTML、Yibu和普通网页均不再使用服务内的全局RPM、并发桶或共享cooldown。
+每次请求只管理自己的重试和退避，不会让其他请求统一等待。Yibu/普通网页的429响应中，
+Retry-After超过30秒时直接返回上游429，不在服务内长时间睡眠；Wiki仍按自己的Retry-After
+和剩余预算处理。其余可重试故障仍受最大重试次数和剩余预算限制。
+取消人工限制不会取消Wikipedia、Yibu或网站自己的限流规则。
 
-每个逻辑请求仍受整体截止时间约束；等待重复请求、Yibu/Web 限速、网络和重试都计入预算。
+调用方等待期限和共享producer期限分开：每个新producer从创建时获得独立的
+`SEARCH_SERVICE_REQUEST_TIMEOUT`（默认120秒）预算，不继承最早等待者仅剩的几秒。
+每个调用方只等到自己的截止时间；其超时不会取消其他调用方共用的producer。
+producer到达自身截止时间时会唤醒等待者返回超时；如果底层线程尚未真正退出，
+仍保留该key的在途占位，后续相同请求不会启动重复上游调用。逾期结果不写入正常缓存。
+这一占位不代表还能成功返回，可能表示正在退出的底层调用。
+
+网络、重试及等待重复请求仍消耗各自对应预算。
 服务故障、代理故障和上游错误可以通过 error code、upstream 和 request ID 区分。
 过期成功结果刷新失败时不静默返回旧内容。
 
@@ -279,8 +280,9 @@ Wiki 候选页解析遇到共享网络失败时立即退出，不逐页重复失
 Web RAG 也将共享链路故障向上抛出。单个网页 404/黑名单错误则保留在该页结果中，
 允许继续处理其他页面，不把原因写成 `None`。失败内容不进入 embedding 或摘要。
 
-训练端 `SEARCH_CACHE_READ_TIMEOUT_SECONDS` 默认从 600 改为 150 秒。
-在已有 `train-roma/search-cache.local.env` 中也要更新该项，否则旧的显式 600 秒会覆盖默认值。
+Python客户端读取超时默认150秒，示例也显式设置 `SEARCH_CACHE_READ_TIMEOUT_SECONDS=150`。
+启动shell对未设置值仍有600秒回退；平台预置env或实际local.env的显式值会覆盖Python默认值，
+本次未改客户端超时配置，实际生效值应以训练进程env为准。
 服务仍以 120 秒为单次逻辑请求预算，150 秒留给传输和响应开销，并小于外层工具的 300 秒。
 客户端不重试共享服务请求，也不自动退回直连。
 
@@ -371,9 +373,10 @@ API 缓存之前检查实际端点，所有上游 HTTP 请求及重定向目标�
 
 默认配置可在 `search-service.env.example` 修改：缓存有效载荷上限 2 GiB，
 单次逻辑请求期限 120 秒，最大上游响应 20 MiB。服务期限、客户端连接超时及最大重试次数
-保持原值；客户端读取超时仍为 150 秒。当前没有公共 worker、queue 或派生 HTTP 连接容量配置。
+保持原值；Python客户端默认读取超时为150秒；实际以进程env为准，启动shell未显式设置时仍会注入600秒，
+本次未改该回退值。当前没有公共worker、queue、派生HTTP容量或上游共享限速配置。
 SQLite 文件和 WAL 还会有索引/空闲页等开销，磁盘占用不等于有效载荷大小。
-冷批次的大量不同 query 仍可能受真实上游限流、机器资源或 Yibu/Web 额度等待影响；
+冷批次的大量不同query仍可能受真实上游限流、机器资源和逐请求重试影响；
 缓存和合并只减少可复用请求，不能保证所有请求在预算内完成。
 
 当前出口有自签代理证书，provider 默认沿用 `main` 的 TLS 设置。
@@ -390,6 +393,6 @@ bash -n train-roma/run_search_cache.sh train-roma/enable_search_cache.sh train-r
 ```
 
 测试覆盖持久化、命中不续期、过期后重新获取、旧表结构兼容、并发合并、重复 batch 映射、
-错误不缓存、指标接口数据库异常、限速、黑名单及重定向拦截和三个工具的接入。
+错误不缓存、指标接口数据库异常、共享限速已取消、黑名单及重定向拦截和三个工具的接入。
 真实部署还需检查开发服务器端口可达性、代理出口、Yibu 账户额度，再用少量 rollout
 检查 observation 和奖励，最后增加多任务并发。本地离线测试不代表已经完成远程部署。

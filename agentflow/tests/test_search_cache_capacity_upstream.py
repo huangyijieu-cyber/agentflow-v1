@@ -118,7 +118,7 @@ class UpstreamProbeTests(unittest.TestCase):
         self.assertEqual(outcome.retry_after, 5)
         self.assertEqual(len(factory.requests), 1)
         self.assertTrue(response.closed)
-        self.assertEqual(probe.metrics()["api_cooldowns/wikipedia"], 1)
+        self.assertNotIn("api_cooldowns/wikipedia", probe.metrics())
 
     def test_wiki_http200_bad_shape_does_not_count_as_success(self):
         response = Response({"query": {"search": "wrong"}})

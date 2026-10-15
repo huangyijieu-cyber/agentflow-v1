@@ -55,24 +55,22 @@ class CapacityLocalTests(unittest.TestCase):
         self.assertEqual(result["cache_entries_after_expired_producer"], 0)
         self.assertLess(result["elapsed_wait_seconds"], 1)
 
-    def test_loopback_limiter_respects_shared_and_per_hostname_buckets_despite_proxy_env(self):
+    def test_loopback_requests_have_no_shared_limiter_despite_legacy_settings_and_proxy_env(self):
         # This URL must never actually be contacted by an offline diagnostic.
         with patch.dict(os.environ, {"HTTP_PROXY": "http://proxy.invalid:9",
                                      "HTTPS_PROXY": "http://proxy.invalid:9", "NO_PROXY": ""}):
             result = probe.probe_budget_rules()
-        self.assertEqual(result["scope"], "limiter_mechanism_only_not_production_quota")
+        self.assertEqual(result["scope"], "removed_limiter_verification_not_production_quota")
         wiki, brave, web = result["scenarios"]
         for item in result["scenarios"]:
             self.assertEqual(item["status"], "verified", item)
             self.assertEqual(item["offered_requests"], 8)
-            if item["service_limit_applies"]:
-                self.assertTrue(all(value <= 2 for value in item["peak_concurrency_by_group"].values()))
-        self.assertEqual(wiki["bucket_names"], [])
-        self.assertTrue(wiki["legacy_wiki_limits_ignored"])
-        self.assertTrue(all(value["unlimited"] for value in wiki["routing"].values()))
-        self.assertEqual(brave["bucket_names"], ["brave"])
-        self.assertEqual(set(web["bucket_names"]), {"web:127.0.0.1", "web:localhost"})
-        self.assertGreater(web["overall_peak_concurrency"], 2)
+            self.assertFalse(item["service_limit_applies"])
+            self.assertEqual(item["legacy_limits_ignored"], {"rpm": 6000.0, "concurrency": 2})
+            self.assertEqual(item["bucket_names"], [])
+            self.assertTrue(all(value["unlimited"] for value in item["routing"].values()))
+            self.assertIsNone(item["configured_rpm"])
+            self.assertIsNone(item["configured_concurrency_per_bucket"])
 
     def test_suite_report_is_json_and_does_not_claim_real_world_upper_limits(self):
         result = probe.run_local_suite(workers=[2], burst_size=4, duration=0, latency_limit=3,
