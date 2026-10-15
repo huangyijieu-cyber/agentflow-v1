@@ -7,10 +7,11 @@ from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urlsplit
 
 import requests
+from agentflow.tools.execution_context import current_context, run_bounded
 
 
 DEFAULT_CONNECT_TIMEOUT = 5.0
-DEFAULT_READ_TIMEOUT = 600.0
+DEFAULT_READ_TIMEOUT = 150.0
 
 
 def search_cache_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
@@ -47,6 +48,9 @@ class SearchGatewayError(RuntimeError):
         request_id: Optional[str] = None,
         upstream_status_code: Optional[int] = None,
         retry_after: Optional[str] = None,
+        upstream: Optional[str] = None,
+        attempts: Optional[int] = None,
+        retryable: Optional[bool] = None,
     ):
         self.message = " ".join(str(message).split())[:500]
         self.code = code
@@ -54,6 +58,9 @@ class SearchGatewayError(RuntimeError):
         self.request_id = request_id
         self.upstream_status_code = upstream_status_code
         self.retry_after = retry_after
+        self.upstream = upstream
+        self.attempts = attempts
+        self.retryable = retryable
 
         details = [code]
 
@@ -62,9 +69,25 @@ class SearchGatewayError(RuntimeError):
 
         if request_id:
             details.append(f"request_id={request_id}")
+        if upstream:
+            details.append(f"upstream={upstream}")
+        if attempts is not None:
+            details.append(f"attempts={attempts}")
 
         super().__init__(
             f"{self.message} ({', '.join(details)})"
+        )
+
+    @property
+    def is_shared_failure(self) -> bool:
+        """Do not continue fetching more pages through a failed shared route."""
+        return self.code in {
+            "gateway_unreachable", "gateway_request_error", "queue_full", "deadline_exceeded",
+            "upstream_proxy_error", "upstream_tls_error", "upstream_timeout",
+            "upstream_network_error", "upstream_request_error", "rate_limited",
+            "configuration_error", "missing_gateway_configuration", "invalid_gateway_configuration",
+        } or self.upstream_status_code in {407, 429, 500, 502, 503, 504} or (
+            self.status_code in {429, 500, 502, 503, 504} and self.upstream_status_code is None
         )
 
 
@@ -252,11 +275,21 @@ class SearchGatewayClient:
             kwargs["json"] = payload
 
         try:
-            response = self.session.request(
-                method,
-                url,
-                **kwargs,
-            )
+            context = current_context()
+            if context is not None:
+                context.check()
+                remaining = context.remaining()
+                headers["X-Search-Timeout-Seconds"] = str(remaining)
+                kwargs["timeout"] = (min(self.connect_timeout, remaining), min(self.read_timeout, remaining))
+                response = run_bounded(
+                    lambda: self.session.request(method, url, **kwargs),
+                    phase="search." + path.rsplit("/", 1)[-1],
+                    timeout=self.connect_timeout + self.read_timeout,
+                    abort=self.session.close,
+                    preserve_exceptions=(requests.RequestException,),
+                )
+            else:
+                response = self.session.request(method, url, **kwargs)
 
         except (
             requests.ConnectionError,
@@ -279,6 +312,7 @@ class SearchGatewayClient:
             message = "Search gateway rejected the request"
             code = f"gateway_http_{response.status_code}"
             upstream_status_code = None
+            upstream, attempts, retryable = None, None, None
 
             # 只解析结构化错误。
             # 不直接把整个任意 response body 打进训练日志。
@@ -296,6 +330,9 @@ class SearchGatewayClient:
                         if error.get("code"):
                             code = str(error["code"])
                         upstream_status_code = error.get("upstream_status") or error.get("status")
+                        upstream = error.get("upstream")
+                        attempts = error.get("attempts")
+                        retryable = error.get("retryable")
 
                     elif isinstance(detail, str):
                         message = detail
@@ -332,13 +369,19 @@ class SearchGatewayClient:
                 request_id=request_id,
                 upstream_status_code=upstream_status_code,
                 retry_after=response.headers.get("Retry-After"),
+                upstream=upstream,
+                attempts=attempts,
+                retryable=retryable,
             )
             response.close()
             raise error
 
         try:
             # Protect cached objects from mutation by each rollout's local RAG.
-            return deepcopy(response.json())
+            result = deepcopy(response.json())
+            if context is not None:
+                context.check()
+            return result
 
         except (TypeError, ValueError) as exc:
             raise SearchGatewayError(

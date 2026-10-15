@@ -27,10 +27,14 @@ export SEARCH_GATEWAY_TOKEN="$PROXY_TOKEN"
 export WIKIMEDIA_USER_AGENT="${WIKIMEDIA_USER_AGENT:-AgentFlowResearchBot/1.0}"
 
 # ---------- Python requests / Wikipedia 兼容 ----------
-PROXY_PY_DIR="/tmp/agentflow_search_proxy"
-mkdir -p "$PROXY_PY_DIR"
+# Root training startup and the SSH service user must not overwrite one
+# shared file. A private directory also isolates concurrent invocations.
+if ! PROXY_PY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agentflow_search_proxy.XXXXXXXX")"; then
+    echo "Cannot create the private search proxy runtime directory." >&2
+    return 1 2>/dev/null || exit 1
+fi
 
-cat > "$PROXY_PY_DIR/sitecustomize.py" <<'PY'
+if ! cat > "$PROXY_PY_DIR/sitecustomize.py" <<'PY'
 import os
 import requests
 import requests.adapters as adapters
@@ -94,6 +98,10 @@ def _request_with_web_user_agent(self, method, url, **kwargs):
 
 requests.sessions.Session.request = _request_with_web_user_agent
 PY
+then
+    echo "Cannot write search proxy compatibility code." >&2
+    return 1 2>/dev/null || exit 1
+fi
 
 export PYTHONPATH="$PROXY_PY_DIR:${PYTHONPATH:-}"
 

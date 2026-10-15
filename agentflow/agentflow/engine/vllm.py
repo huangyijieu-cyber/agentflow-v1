@@ -23,6 +23,7 @@ from tenacity import (
 )
 from .base import EngineLM, CachedEngine
 from openai import APIConnectionError, APITimeoutError
+from agentflow.tools.execution_context import ToolExecutionError, current_context, safe_failure, tool_sdk_client
 
 class ChatVLLM(EngineLM, CachedEngine):
     DEFAULT_SYSTEM_PROMPT = "You are a helpful, creative, and smart assistant."
@@ -92,9 +93,14 @@ class ChatVLLM(EngineLM, CachedEngine):
 
                 else:
                     raise ValueError("Unsupported content in list: only str or bytes are allowed.")
+        except ToolExecutionError:
+            self.last_generation_metadata = None
+            raise
         except (APIConnectionError, APITimeoutError) as e:
             # [修改目的] 本次请求失败时清空上一次调用留下的 metadata，避免错误复用旧 token ids。
             self.last_generation_metadata = None
+            if current_context() is not None:
+                raise safe_failure(e, current_context().phase) from e
             # 3 次重试后还是连不上 / 超时，打印日志，返回空字符串
             print(f"Traceback [ChatVLLM] Serving unreachable after retries: {e}")
             return ""  # ← 调用方拿到 str，不会 TypeError
@@ -102,6 +108,8 @@ class ChatVLLM(EngineLM, CachedEngine):
         except Exception as e:
             # [修改目的] 同上，异常路径必须清空 metadata，避免 Planner 误绑定上一轮 token ids。
             self.last_generation_metadata = None
+            if current_context() is not None:
+                raise safe_failure(e, current_context().phase) from e
             print(f"Error in generate method: {str(e)}")
             print(f"Error type: {type(e).__name__}")
             print(f"Error details: {e.args}")
@@ -193,29 +201,32 @@ class ChatVLLM(EngineLM, CachedEngine):
 
         # [修改目的] 保留完整服务端响应，先读取 vLLM 0.11 原生返回的真实 token ids 和 finish_reason；
         # 对 Planner 的最终返回值仍保持普通 str，不改变原有 Agent 逻辑。
-        raw_response = self.client.chat.completions.create(
-            model=self.model_string,
-            messages=[
-                {"role": "system", "content": sys_prompt_arg},
-                {"role": "user", "content": prompt},
-            ],
-            # frequency_penalty=kwargs.get("frequency_penalty", 1.2),
-            # stop=None,
-            presence_penalty=presence_penalty,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            top_p=top_p,
-            # top_k=top_k,  ## 都不存在入参
-            # min_p=min_p,  ## 都不存在入参
-            stream=False,
-            # extra_body={
-            #     "top_k": top_k,
-            #     "min_p": min_p
-            # }
-            # [修改目的] vLLM 0.11 仅在显式请求时返回本次 serving 的真实 token ids。
-            extra_body={"return_token_ids": True},
-            response_format=response_format_arg,
-        )
+        with tool_sdk_client(self.client, lambda timeout: OpenAI(
+            base_url=self.base_url, api_key=self.api_key, timeout=timeout, max_retries=0,
+        )) as request_client:
+            raw_response = request_client.chat.completions.create(
+                model=self.model_string,
+                messages=[
+                    {"role": "system", "content": sys_prompt_arg},
+                    {"role": "user", "content": prompt},
+                ],
+                # frequency_penalty=kwargs.get("frequency_penalty", 1.2),
+                # stop=None,
+                presence_penalty=presence_penalty,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                # top_k=top_k,  ## 都不存在入参
+                # min_p=min_p,  ## 都不存在入参
+                stream=False,
+                # extra_body={
+                #     "top_k": top_k,
+                #     "min_p": min_p
+                # }
+                # [修改目的] vLLM 0.11 仅在显式请求时返回本次 serving 的真实 token ids。
+                extra_body={"return_token_ids": True},
+                response_format=response_format_arg,
+            )
 
         # [修改目的] token ids 以 serving 端真实采样结果为唯一来源，不再通过文本 decode -> encode 重建。
         payload = raw_response.model_dump()
@@ -327,17 +338,20 @@ class ChatVLLM(EngineLM, CachedEngine):
         ## 提交为非流式
         print("post by _generate_multimodal")
         full_response = ""
-        response = self.client.chat.completions.create(
-            model=self.model_string,
-            messages=[
-                {"role": "system", "content": sys_prompt_arg},
-                {"role": "user", "content": formatted_content},
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            top_p=top_p,
-            stream=False,
-        )
+        with tool_sdk_client(self.client, lambda timeout: OpenAI(
+            base_url=self.base_url, api_key=self.api_key, timeout=timeout, max_retries=0,
+        )) as request_client:
+            response = request_client.chat.completions.create(
+                model=self.model_string,
+                messages=[
+                    {"role": "system", "content": sys_prompt_arg},
+                    {"role": "user", "content": formatted_content},
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                stream=False,
+            )
         response_text = response.choices[0].message.content
 
         ## 提交为流式

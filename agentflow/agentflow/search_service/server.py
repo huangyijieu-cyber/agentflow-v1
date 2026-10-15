@@ -9,7 +9,7 @@ import json
 import logging
 import math
 import os
-import threading
+import sqlite3
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -47,33 +47,7 @@ class ServiceHTTPServer(ThreadingHTTPServer):
         if not token or token != token.strip() or any(c.isspace() for c in token):
             raise ValueError("SEARCH_SERVICE_TOKEN (or SEARCH_CACHE_TOKEN) is required and must contain no whitespace")
         self.service = service
-        self._connections = threading.BoundedSemaphore(service.config.workers + service.config.queue_size + 16)
         super().__init__(address, ServiceRequestHandler)
-
-    def process_request(self, request, client_address):
-        if not self._connections.acquire(blocking=False):
-            body = b'{"error":{"code":"queue_full","message":"Search service is busy","retryable":true}}'
-            try:
-                request.settimeout(1.0)
-                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nConnection: close\r\nRetry-After: 1\r\nContent-Length: "
-                                + str(len(body)).encode("ascii") + b"\r\n\r\n" + body)
-            except OSError:
-                pass
-            finally:
-                self.service.metrics.add("connection_rejections")
-                self.shutdown_request(request)
-            return
-        try:
-            super().process_request(request, client_address)
-        except BaseException:
-            self._connections.release()
-            raise
-
-    def process_request_thread(self, request, client_address):
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self._connections.release()
 
 
 class ServiceRequestHandler(BaseHTTPRequestHandler):
@@ -132,15 +106,25 @@ class ServiceRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         request_id = uuid.uuid4().hex
-        path = urlsplit(self.path).path
-        if not self._authenticated():
-            self._error(GatewayFailure("Bearer authentication required", code="unauthorized", status_code=401), request_id)
-        elif path == "/healthz":
-            self._send_json(200, {"status": "ok"}, request_id=request_id)
-        elif path == "/metrics":
-            self._send_json(200, self.server.service.metrics_snapshot(), request_id=request_id)
-        else:
-            self._error(GatewayFailure("Endpoint not found", code="not_found", status_code=404), request_id)
+        try:
+            path = urlsplit(self.path).path
+            if not self._authenticated():
+                self._error(GatewayFailure("Bearer authentication required", code="unauthorized", status_code=401), request_id)
+            elif path == "/healthz":
+                self._send_json(200, {"status": "ok"}, request_id=request_id)
+            elif path == "/metrics":
+                self._send_json(200, self.server.service.metrics_snapshot(), request_id=request_id)
+            else:
+                self._error(GatewayFailure("Endpoint not found", code="not_found", status_code=404), request_id)
+        except sqlite3.Error:
+            LOG.exception("Cache database failure during GET; request_id=%s", request_id)
+            self._error(GatewayFailure("Cache database is unavailable; inspect the service log",
+                                       code="cache_database_error", status_code=503), request_id)
+        except (TimeoutError, OSError):
+            self.server.service.metrics.add("client_disconnects")
+        except Exception:
+            LOG.exception("Search service GET failed; request_id=%s", request_id)
+            self._error(GatewayFailure("Internal search service error", code="internal_error", status_code=500), request_id)
 
     def _read_body(self):
         if self.headers.get("Transfer-Encoding"):
@@ -189,6 +173,15 @@ class ServiceRequestHandler(BaseHTTPRequestHandler):
         try:
             if not self._authenticated():
                 raise GatewayFailure("Bearer authentication required", code="unauthorized", status_code=401)
+            requested_budget = self.headers.get("X-Search-Timeout-Seconds")
+            if requested_budget is not None:
+                try:
+                    requested_budget = float(requested_budget)
+                except (TypeError, ValueError):
+                    raise GatewayFailure("Invalid search timeout budget", code="invalid_request", status_code=400)
+                if not math.isfinite(requested_budget) or requested_budget <= 0:
+                    raise GatewayFailure("Invalid search timeout budget", code="invalid_request", status_code=400)
+                deadline = min(deadline, time.monotonic() + requested_budget)
             path = urlsplit(self.path).path
             endpoints = {"/v1/search/wikipedia": "wikipedia", "/v1/search/brave": "brave", "/v1/fetch": "fetch"}
             if path not in endpoints and path != "/v1/batch":
@@ -236,7 +229,8 @@ def main(argv=None):
         service.close()
         raise
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    LOG.info("Search service listening on %s:%s; cache directory %s", args.host, server.server_port, config.cache_dir)
+    LOG.info("Search service listening on %s:%s; state directory %s; database %s",
+             args.host, server.server_port, config.cache_dir, service.cache.path)
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

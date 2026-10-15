@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import sys
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -17,6 +18,8 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "agentflow"))
+from agentflow.tools.execution_context import tool_sdk_client
 
 
 def extract(path, name, scope):
@@ -38,7 +41,8 @@ def payload():
 class NativeTokenTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.generate = staticmethod(extract('agentflow/agentflow/engine/vllm.py', '_generate_text', {'os': os}))
+        cls.generate = staticmethod(extract('agentflow/agentflow/engine/vllm.py', '_generate_text',
+                                          {'os': os, 'tool_sdk_client': tool_sdk_client, 'OpenAI': OpenAI}))
         cls.append = staticmethod(extract('agentflow/agentflow/models/planner.py', '_append_log', {'Any': Any}))
         triplet = extract('agentflow/agent_types.py', 'Triplet', dict(Any=Any, Dict=Dict, Optional=Optional, BaseModel=BaseModel, Field=Field))
         cls.encode = staticmethod(extract('train-roma/rollout.py', 'encode_logs', {'Triplet': triplet}))

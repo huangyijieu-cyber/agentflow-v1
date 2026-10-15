@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 
-from .core import GatewayFailure
+from .core import CACHE_TTL_SECONDS, GatewayFailure
 
 
 WIKIMEDIA_USER_AGENT = "AgentFlowResearchBot/1.0"
@@ -112,16 +112,6 @@ def prepare(tool: str, params: Dict[str, Any]) -> Dict[str, Any]:
     raise _invalid("unknown retrieval tool")
 
 
-def _ttl(name, default):
-    try:
-        value = float(os.getenv(name, str(default)))
-    except ValueError as exc:
-        raise GatewayFailure(f"Invalid server setting {name}", code="configuration_error", status_code=500) from exc
-    if value < 0 or value != value or value == float("inf"):
-        raise GatewayFailure(f"Invalid server setting {name}", code="configuration_error", status_code=500)
-    return value
-
-
 def _tls_verify():
     """Keep the existing proxy's TLS behavior, with an explicit CA override."""
     ca_bundle = os.getenv("SEARCH_SERVICE_CA_BUNDLE")
@@ -188,8 +178,7 @@ def _only_wiki_page(data):
 def _wikipedia(params, service):
     language = params["language"]
     endpoint = f"https://{language}.wikipedia.org/w/api.php"
-    wiki_ttl = _ttl("SEARCH_CACHE_WIKI_TTL", 7 * 86400)
-    empty_ttl = _ttl("SEARCH_CACHE_EMPTY_TTL", 300)
+    service.check_url_allowed(endpoint)
 
     def search():
         data = _wiki_request(service, endpoint, {
@@ -202,7 +191,7 @@ def _wikipedia(params, service):
 
     titles = service.cached(
         "wikipedia_search", {"endpoint": endpoint, "query": params["query"], "srlimit": 10, "srprop": "", "version": 1},
-        search, lambda value: wiki_ttl if value else empty_ttl,
+        search, CACHE_TTL_SECONDS,
     )
     if not titles:
         return {"results": [{
@@ -230,7 +219,7 @@ def _wikipedia(params, service):
 
             resolved = service.cached(
                 "wikipedia_page_identity", {"endpoint": endpoint, "title": title, "redirects": True, "version": 1},
-                identity, wiki_ttl,
+                identity, CACHE_TTL_SECONDS,
             )
 
             def content():
@@ -246,7 +235,7 @@ def _wikipedia(params, service):
 
             text = service.cached(
                 "wikipedia_page_text", {"endpoint": endpoint, "pageid": resolved["pageid"], "explaintext": True, "version": 1},
-                content, wiki_ttl,
+                content, CACHE_TTL_SECONDS,
             )
             limit = params["max_length"]
             if limit != -1 and len(text) > limit:
@@ -254,7 +243,11 @@ def _wikipedia(params, service):
             # Keep the searched title and exact original field insertion order.
             pages.append({"title": title, "url": resolved["url"], "abstract": text})
         except GatewayFailure as exc:
-            if exc.status_code == 429 or exc.code in {"rate_limited", "queue_full", "deadline_exceeded"}:
+            if exc.status_code == 429 or exc.code in {
+                "rate_limited", "queue_full", "deadline_exceeded", "domain_blocked",
+                "upstream_proxy_error", "upstream_tls_error", "upstream_timeout",
+                "upstream_network_error", "upstream_request_error",
+            } or exc.upstream_status in {407, 500, 502, 503, 504}:
                 raise
             partial = True
             pages.append({
@@ -284,6 +277,7 @@ def _brave_results(data):
 
 def _brave(params, service):
     endpoint = _url(os.getenv("BRAVE_YIBU_BASE_URL", BRAVE_ENDPOINT))
+    service.check_url_allowed(endpoint)
     effective = {"q": params["query"], "count": params["count"]}
     for name in ("country", "search_lang", "ui_lang", "freshness"):
         if name in params:
@@ -303,17 +297,13 @@ def _brave(params, service):
         _brave_results(data)
         return data
 
-    def lifetime(data):
-        if not _brave_results(data):
-            return _ttl("SEARCH_CACHE_EMPTY_TTL", 300)
-        return _ttl("SEARCH_CACHE_BRAVE_FRESH_TTL", 900) if params.get("freshness") else _ttl("SEARCH_CACHE_BRAVE_TTL", 86400)
-
-    data = service.cached("brave_search", {"endpoint": endpoint, "params": effective, "version": 1}, fetch, lifetime)
+    data = service.cached("brave_search", {"endpoint": endpoint, "params": effective, "version": 1}, fetch, CACHE_TTL_SECONDS)
     return {"data": data}
 
 
 def _fetch(params, service):
     url = params["url"]
+    service.check_url_allowed(url)
     hostname = (urlsplit(url).hostname or "").lower()
     headers = dict(WEB_HEADERS)
     is_wiki = hostname == "wikipedia.org" or hostname.endswith(".wikipedia.org")
@@ -334,7 +324,7 @@ def _fetch(params, service):
 
     text = service.cached(
         "web_text", {"url": url, "headers": headers, "parser": "html.parser", "separator": "\n", "strip": True, "max_chars": 1000000, "version": 1},
-        fetch, lambda value: _ttl("SEARCH_CACHE_WEB_TTL", 86400) if value else _ttl("SEARCH_CACHE_EMPTY_TTL", 300),
+        fetch, CACHE_TTL_SECONDS,
     )
     return {"text": text[:params["max_length"]]}
 

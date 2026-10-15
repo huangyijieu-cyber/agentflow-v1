@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from agentflow.engine.factory import create_llm_engine
 from agentflow.models.formatters import ToolCommand
 from agentflow.models.utils import robust_json_loads
+from agentflow.tools.execution_context import ToolExecutionContext, bind_context, run_bounded
 ## t00620714 (modified here)
 # Tool name mapping: Static fallback mapping (long external names to internal)
 TOOL_NAME_MAPPING_LONG = {
@@ -192,7 +193,7 @@ execution = tool.execute(query=["Methanol", "function of hyperbola", "Fermat's L
     def execute_tool_command(self, tool_name: str, command: str) -> Any:
         """
         Execute a tool command with timeout protection. If execution exceeds max_time seconds,
-        the function will be interrupted and return a timeout message.
+        return a timeout message; cancellation of blocking work is cooperative.
 
         Args:
             tool_name (str): Name of the tool to execute
@@ -202,13 +203,15 @@ execution = tool.execute(query=["Methanol", "function of hyperbola", "Fermat's L
             Any: List of execution results or error message
         """
 
+        tool_context = ToolExecutionContext(self.max_time)
+
         def split_commands(command: str) -> List[str]:
             # Use regex to find all tool.execute() commands and their surrounding code
             pattern = r'.*?execution\s*=\s*tool\.execute\([^\n]*\)\s*(?:\n|$)'
             blocks = re.findall(pattern, command, re.DOTALL)
             return [block.strip() for block in blocks if block.strip()]
 
-        def execute_with_timeout(block: str, local_context: dict) -> Optional[str]:
+        def execute_with_timeout(block: str, local_context: dict) -> tuple:
             """
             Execute a code block with timeout protection using threading.
             This works in any thread, unlike signal.alarm() which only works in the main thread.
@@ -217,19 +220,23 @@ execution = tool.execute(query=["Methanol", "function of hyperbola", "Fermat's L
             """
             import threading
             
-            result_container = {'result': None, 'exception': None, 'completed': False}
-            cancel_event = threading.Event()
+            result_container = {'result': None, 'exception': None}
+            cancel_event = tool_context.cancel_event
+            completed_event = threading.Event()
             
             def target():
                 try:
                     # Inject cancel_event into the execution context for cooperative cancellation
                     local_context['_cancel_event'] = cancel_event
-                    exec(block, globals(), local_context)
+                    with bind_context(tool_context):
+                        tool_context.check()
+                        exec(block, globals(), local_context)
                     result_container['result'] = local_context.get('execution')
-                    result_container['completed'] = True
                 except Exception as e:
                     result_container['exception'] = e
-                    result_container['completed'] = True
+                finally:
+                    local_context.pop('_cancel_event', None)
+                    completed_event.set()
             
             # Start execution in a daemon thread
             exec_thread = threading.Thread(target=target, name=f"ToolExec-{id(block)}")
@@ -237,24 +244,24 @@ execution = tool.execute(query=["Methanol", "function of hyperbola", "Fermat's L
             exec_thread.start()
             
             # Wait for completion or timeout
-            exec_thread.join(timeout=self.max_time)
+            completed_event.wait(timeout=tool_context.remaining())
             
-            if not result_container['completed']:
+            if not completed_event.is_set():
                 # Timeout occurred - signal cancellation
-                cancel_event.set()
+                tool_context.cancel()
                 
                 # Give it a brief moment to notice the cancellation
-                exec_thread.join(timeout=0.5)
-                
-                # Clean up references to help GC
-                result_container.clear()
-                local_context.pop('_cancel_event', None)
-                
-                return f"Execution timed out after {self.max_time} seconds"
-            elif result_container['exception']:
+                completed_event.wait(timeout=0.5)
+
+            # An error/result arriving during the grace period must still be
+            # returned as itself, rather than cleared and replaced by timeout.
+            if not completed_event.is_set():
+                return (f"Execution timed out after {self.max_time} seconds "
+                        f"({tool_context.diagnostic()})"), True
+            if result_container['exception']:
                 raise result_container['exception']
             else:
-                return result_container['result']
+                return result_container['result'], False
 
 
         # Try to get tool from cache first
@@ -292,12 +299,11 @@ execution = tool.execute(query=["Methanol", "function of hyperbola", "Fermat's L
 
             try:
                 # Dynamically import the module
-                module = importlib.import_module(module_name)
-
-                # Get the tool class
-                tool_class = getattr(module, class_name)
-
-                tool = tool_class()
+                def initialize_tool():
+                    module = importlib.import_module(module_name)
+                    return getattr(module, class_name)()
+                with bind_context(tool_context):
+                    tool = run_bounded(initialize_tool, phase="tool.initialize")
 
             except Exception as e:
                 return f"Error importing tool '{tool_name}': {str(e)}"
@@ -318,12 +324,14 @@ execution = tool.execute(query=["Methanol", "function of hyperbola", "Fermat's L
                 local_context = {'tool': tool}
 
                 # Execute the block with timeout protection
-                result = execute_with_timeout(block, local_context)
+                result, timed_out = execute_with_timeout(block, local_context)
 
                 if result is not None:
                     executions.append(result)
                 else:
                     executions.append(f"No execution captured from block: {block}")
+                if timed_out or tool_context.cancel_event.is_set():
+                    break
 
             # Return all the execution results
             return executions
