@@ -430,7 +430,7 @@ def wiki_confirmation_sweep(plans, args, control, *, ceiling=None, progress=None
 
 def network_settings(confirmed):
     result = {}
-    for name, prefix in (("wiki", "WIKI"), ("brave", "BRAVE")):
+    for name, prefix in (("brave", "BRAVE"),):
         if name in confirmed:
             result["SEARCH_" + prefix + "_RPM"] = confirmed[name]["rpm"]
             result["SEARCH_" + prefix + "_CONCURRENCY"] = confirmed[name]["concurrency"]
@@ -444,6 +444,9 @@ def network_settings(confirmed):
 def store_confirmation(report, args, confirmed, *, full_windows=True):
     values = network_settings(confirmed)
     report["background_training"] = args.background_training
+    report["confirmed_measured_load" if full_windows else "smoke_measured_load"] = confirmed
+    report["ignored_service_settings"] = ["SEARCH_SERVICE_WORKERS", "SEARCH_SERVICE_QUEUE_SIZE",
+                                           "SEARCH_WIKI_RPM", "SEARCH_WIKI_CONCURRENCY"]
     if not full_windows:
         report["smoke_network_settings"] = values
         report["confirmed_network_settings"] = {}
@@ -628,12 +631,12 @@ def render_summary(report):
              f"Status: {report.get('status', 'running')}",
              f"Mode: {report['arguments']['mode']}", ""]
     if "local" in report:
-        lines.extend(["## Local synthetic load and configured boundaries", "",
+        lines.extend(["## Local synthetic load and removed legacy boundaries", "",
                       "Warm/cold/single-flight tests include real HTTP and SQLite, with a simulated upstream.",
-                      "A supported worker count here does not establish production mixed-network capacity.", "",
+                      "Worker/queue arguments are legacy labels and do not limit execution; no worker count is recommended.", "",
                       "```json", json.dumps(report["local"].get("boundaries", {}), ensure_ascii=False, indent=2), "```", "",
                       "```json", json.dumps(report["local"].get("recommendations", {}), ensure_ascii=False, indent=2), "```", ""])
-        lines += ["| Workers cap | Actual worker peak | Workload | Successful requests/s | p95 seconds | Status |",
+        lines += ["| Legacy worker value (ignored) | Actual provider execution peak | Workload | Successful requests/s | p95 seconds | Status |",
                   "|---:|---:|---|---:|---:|---|"]
         for row in report["local"].get("stages", []):
             lines.append(f"| {row.get('workers')} | {row.get('peak_executing_workers')} | {row.get('mode')} | {row.get('throughput_rps')} | "
@@ -655,8 +658,8 @@ def render_summary(report):
         for key, value in report.get("confirmed_network_settings", {}).items():
             lines.append(f"{key}={value:g}")
         lines += ["```", "",
-                  "An empty settings block means confirmation failed, was incomplete/skipped, or used smoke-test windows.",
-                  "Concurrency settings are passing caps; only burst tests require that actual overlap reaches the cap.",
+                  "An empty settings block means no applicable service settings were confirmed; Wiki measurements never export a service cap.",
+                  "Yibu/Web concurrency settings are passing caps. Wiki results describe offered test load only; the service has no Wiki RPM/concurrency/cooldown limit.",
                   "Web values apply only to the tested hostnames. HTTP limits exclude LLM/embedding stages.", "",
                   "```json", json.dumps(report.get("coverage", {}), ensure_ascii=False, indent=2), "```", ""]
     lines += ["## Unmeasured or incomplete", ""]
@@ -666,8 +669,8 @@ def render_summary(report):
               "- failure_boundary_observed: a higher tested load failed; inspect reasons, not every failure is quota exhaustion.",
               "- concurrency_not_exercised: requests completed too quickly to actually overlap at the requested concurrency.",
               "- no_stable_baseline: diagnose authentication, proxy/network or invalid workload first.",
-              "- queue length has no fixed performance maximum; adding slots does not increase throughput.",
-              "- Connection capacity remains workers + queue + 16; admission capacity remains workers + queue.",
+              "- Shared worker/queue limits are removed; legacy worker/queue arguments are ignored.",
+              "- The old workers + queue (+16) admission/HTTP formulas no longer apply; OS resource constraints still exist.",
               "- Minute-scale tests are necessary for RPM. A short successful run is only a smoke test.",
               "- Results share the current proxy exit and API account with other running traffic.", ""]
     if "joint_confirmation" in report:
@@ -702,12 +705,13 @@ def build_parser():
     parser.add_argument("--query-key", help="dot-separated query field, e.g. data.query")
     parser.add_argument("--urls-file", help="real training URLs, one per line or json/jsonl; grouped by hostname")
     parser.add_argument("--max-web-hosts", type=int, default=3)
-    parser.add_argument("--workers", type=lambda value: number_grid(value, integer=True), default=number_grid("8,16,32,64", integer=True))
+    parser.add_argument("--workers", type=lambda value: number_grid(value, integer=True), default=number_grid("8,16,32,64", integer=True),
+                        help="legacy compatibility only; values are reported as ignored and no worker cap is applied")
     parser.add_argument("--clients", type=int, default=256)
     parser.add_argument("--local-duration", type=float, default=3)
     parser.add_argument("--payload-bytes", type=int, default=16384)
     parser.add_argument("--producer-delay", type=float, default=.05)
-    parser.add_argument("--skip-connections", action="store_true")
+    parser.add_argument("--skip-connections", action="store_true", help="legacy compatibility; the old connection-cap probe is no longer applicable")
     parser.add_argument("--rpm-steps", type=number_grid, default=number_grid("30,60,120,150,180,200,240,360,480,600"))
     parser.add_argument("--concurrency-steps", type=lambda value: number_grid(value, integer=True), default=number_grid("1,2,4,8,16,32,64", integer=True))
     parser.add_argument("--duration", type=float, default=60, help="per upstream RPM stage, in seconds")
@@ -749,7 +753,9 @@ def main(argv=None):
     output = Path(args.output_dir or Path(tempfile.gettempdir()) / "agentflow-search-capacity" / f"{stamp}-{os.getpid()}").resolve()
     output.mkdir(parents=True, exist_ok=False)
     report = {"schema_version": 1, "started_at": stamp, "status": "running", "arguments": vars(args),
-              "unmeasured": [], "scope": "network cache service; no LLM/embedding or full agent training"}
+              "unmeasured": [], "scope": "network cache service; no LLM/embedding or full agent training",
+              "scheduler": {"shared_worker_queue": False, "derived_http_cap": False,
+                            "wiki_global_limits": False, "legacy_worker_argument_ignored": args.workers}}
     if args.duration < 60 or args.confirmation_duration < 120:
         report["unmeasured"].append("short windows selected: results are smoke tests, not sustained RPM ceilings")
     if args.skip_bursts:
@@ -767,7 +773,7 @@ def main(argv=None):
     exit_code = 0
     try:
         if args.mode in {"local", "all"}:
-            say("[RUN] Local HTTP/SQLite capacity and configured-boundary checks")
+            say("[RUN] Local HTTP/SQLite workloads; old worker/queue/connection caps are not applicable")
             report["local"] = run_local_suite(workers=args.workers, burst_size=args.clients,
                 duration=args.local_duration, latency_limit=args.latency_limit,
                 payload_bytes=args.payload_bytes, producer_delay=args.producer_delay,
@@ -805,6 +811,8 @@ def main(argv=None):
         say("[HEADROOM] Passing additional load while training runs; NOT a total service quota:")
         for name, setting in report["confirmed_additional_load"].items():
             say(f"{name}: extra {setting['rpm']:g} RPM, passing concurrency cap {setting['concurrency']}")
+    elif report.get("confirmed_measured_load"):
+        say("[MEASURED] Joint load recorded; no applicable service settings to export (Wiki limits are removed).")
     elif args.mode != "local":
         say("[UNCONFIRMED] No jointly confirmed network configuration; inspect independent stage results.")
     return exit_code

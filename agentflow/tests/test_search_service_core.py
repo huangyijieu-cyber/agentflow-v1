@@ -219,26 +219,190 @@ class SearchServiceCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "already owns"):
             SearchService(ServiceConfig(cache_dir=str(second_dir), token="test-token", db_path=self.service.cache.path), self.providers)
 
-    def test_queue_is_bounded_and_waiting_deadline_is_enforced(self):
+    def test_legacy_worker_and_queue_settings_do_not_serialize_unique_misses(self):
         self.service.close()
         self.service = SearchService(ServiceConfig(cache_dir=self.directory.name,
-            db_path=str(Path(self.directory.name) / "cache.sqlite3"), token="test-token", workers=1, queue_size=1), self.providers)
+            db_path=str(Path(self.directory.name) / "cache.sqlite3"), token="test-token", workers=1, queue_size=0), self.providers)
         self.addCleanup(self.service.close)
         self.providers.release.clear()
         with ThreadPoolExecutor(max_workers=2) as executor:
-            first = executor.submit(self.service.handle, "wikipedia", {"query": "blocked"})
-            self.assertTrue(self.providers.started.wait(1))
-            second = executor.submit(self.service.handle, "wikipedia", {"query": "queued"}, deadline=time.monotonic() + 0.15)
-            time.sleep(0.03)
-            with self.assertRaises(GatewayFailure) as error:
-                self.service.handle("wikipedia", {"query": "rejected"})
-            self.assertEqual(error.exception.code, "queue_full")
-            with self.assertRaises(GatewayFailure) as error:
-                second.result()
-            self.assertEqual(error.exception.code, "deadline_exceeded")
-            self.providers.release.set()
-            first.result()
-        self.assertNotIn("queued", self.providers.calls)
+            futures = [executor.submit(self.service.handle, "wikipedia", {"query": q}) for q in ("first", "second")]
+            try:
+                until = time.monotonic() + 1
+                while len(self.providers.calls) < 2 and time.monotonic() < until:
+                    time.sleep(0.005)
+                self.assertEqual(self.providers.calls, {"first": 1, "second": 1})
+            finally:
+                self.providers.release.set()
+            self.assertEqual(len([future.result() for future in futures]), 2)
+        self.assertEqual(self.service.metrics.snapshot().get("queue_rejections", 0), 0)
+
+    def test_cache_hit_does_not_wait_for_slow_unique_miss(self):
+        self.service.close()
+        self.service = SearchService(ServiceConfig(cache_dir=self.directory.name,
+            db_path=str(Path(self.directory.name) / "cache.sqlite3"), workers=1, queue_size=0), self.providers)
+        self.addCleanup(self.service.close)
+        self.service.handle("wikipedia", {"query": "warm"})
+        self.providers.started.clear()
+        self.providers.release.clear()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            slow = executor.submit(self.service.handle, "wikipedia", {"query": "slow"})
+            try:
+                self.assertTrue(self.providers.started.wait(1))
+                start = time.monotonic()
+                warm = self.service.handle("wikipedia", {"query": "warm"}, deadline=start + 0.3)
+                self.assertLess(time.monotonic() - start, 0.25)
+                self.assertEqual(warm["meta"]["cache_hits"], 1)
+                self.assertFalse(slow.done())
+            finally:
+                self.providers.release.set()
+            slow.result()
+
+    def test_duplicate_waiters_do_not_block_new_query_or_cached_result(self):
+        self.service.close()
+        self.service = SearchService(ServiceConfig(cache_dir=self.directory.name,
+            db_path=str(Path(self.directory.name) / "cache.sqlite3"), workers=1, queue_size=0), self.providers)
+        self.addCleanup(self.service.close)
+        self.service.handle("wikipedia", {"query": "warm"})
+        self.providers.started.clear()
+        self.providers.release.clear()
+        original = self.providers.execute
+
+        def execute(tool, params, service):
+            if params["query"] != "independent":
+                return original(tool, params, service)
+            def produce():
+                self.providers.calls["independent"] += 1
+                return {"results": [{"title": "independent"}]}
+            return service.cached("fake:" + tool, params, produce, 3600)
+
+        with patch.object(self.providers, "execute", side_effect=execute), ThreadPoolExecutor(max_workers=25) as executor:
+            requests = [executor.submit(self.service.handle, "wikipedia", {"query": "slow"}) for _ in range(25)]
+            try:
+                self.assertTrue(self.providers.started.wait(1))
+                self.wait_for_waiters(24)
+                start = time.monotonic()
+                for query in ("independent", "warm"):
+                    result = self.service.handle("wikipedia", {"query": query}, deadline=time.monotonic() + 0.3)
+                    self.assertEqual(result["results"][0]["title"], query)
+                self.assertLess(time.monotonic() - start, 0.5)
+                self.assertTrue(all(not future.done() for future in requests))
+            finally:
+                self.providers.release.set()
+            [future.result() for future in requests]
+        self.assertEqual(self.providers.calls, {"warm": 1, "slow": 1, "independent": 1})
+
+    def test_short_waiter_deadline_does_not_cancel_owner_or_cache_write(self):
+        self.providers.release.clear()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            owner = executor.submit(self.service.handle, "wikipedia", {"query": "shared"})
+            try:
+                self.assertTrue(self.providers.started.wait(1))
+                with self.assertRaises(GatewayFailure) as caught:
+                    self.service.handle("wikipedia", {"query": "shared"}, deadline=time.monotonic() + 0.025)
+                self.assertEqual(caught.exception.code, "deadline_exceeded")
+                self.assertFalse(owner.done())
+            finally:
+                self.providers.release.set()
+            owner.result()
+        result = self.service.handle("wikipedia", {"query": "shared"})
+        self.assertEqual(result["meta"]["cache_hits"], 1)
+        self.assertEqual(self.providers.calls["shared"], 1)
+
+    def test_batch_unique_misses_execute_concurrently_despite_legacy_worker_limit(self):
+        self.service.close()
+        self.service = SearchService(ServiceConfig(cache_dir=self.directory.name,
+            db_path=str(Path(self.directory.name) / "cache.sqlite3"), workers=1, queue_size=0), self.providers)
+        self.addCleanup(self.service.close)
+        self.providers.release.clear()
+        items = [{"tool": "wikipedia", "params": {"query": q}} for q in ("B", "A", "B")]
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            batch = executor.submit(self.service.batch, items)
+            try:
+                until = time.monotonic() + 1
+                while len(self.providers.calls) < 2 and time.monotonic() < until:
+                    time.sleep(0.005)
+                self.assertEqual(self.providers.calls, {"A": 1, "B": 1})
+            finally:
+                self.providers.release.set()
+            results = batch.result()["results"]
+        self.assertEqual([item["data"]["results"][0]["title"] for item in results], ["B", "A", "B"])
+
+    def test_more_than_32_unique_cold_keys_can_all_start_before_any_finishes(self):
+        gate = threading.Event()
+        all_started = threading.Event()
+        started_keys = set()
+        lock = threading.Lock()
+
+        def execute(tool, params, service):
+            def produce():
+                with lock:
+                    started_keys.add(params["query"])
+                    if len(started_keys) == 40:
+                        all_started.set()
+                if not gate.wait(4):
+                    raise AssertionError("Unique producers were not released")
+                return {"results": [{"title": params["query"]}]}
+            return service.cached("parallel", params, produce, 3600)
+
+        with patch.object(self.providers, "execute", side_effect=execute), ThreadPoolExecutor(max_workers=40) as executor:
+            futures = [executor.submit(self.service.handle, "wikipedia", {"query": str(i)}) for i in range(40)]
+            try:
+                self.assertTrue(all_started.wait(3), f"Only {len(started_keys)} producers started")
+                self.assertTrue(all(not future.done() for future in futures))
+            finally:
+                gate.set()
+            results = [future.result() for future in futures]
+        self.assertEqual(len(results), 40)
+        self.assertEqual(self.service.metrics.snapshot()["producer_executions"], 40)
+
+    def test_owner_deadline_does_not_remove_flight_before_producer_finishes(self):
+        self.providers.release.clear()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            owner = executor.submit(self.service.handle, "wikipedia", {"query": "slow"},
+                                    deadline=time.monotonic() + 0.05)
+            try:
+                self.assertTrue(self.providers.started.wait(1))
+                with self.assertRaises(GatewayFailure) as caught:
+                    owner.result()
+                self.assertEqual(caught.exception.code, "deadline_exceeded")
+                waiter = executor.submit(self.service.handle, "wikipedia", {"query": "slow"})
+                self.wait_for_waiters(1)
+                self.assertEqual(self.providers.calls["slow"], 1)
+            finally:
+                self.providers.release.set()
+            with self.assertRaises(GatewayFailure) as caught:
+                waiter.result()
+            self.assertEqual(caught.exception.code, "deadline_exceeded")
+        self.assertEqual(self.providers.calls["slow"], 1)
+        self.assertEqual(self.service.cache.stats()["entries"], 0)
+
+    def test_close_releases_waiters_without_allowing_late_producer_to_write(self):
+        self.providers.release.clear()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            calls = [executor.submit(self.service.handle, "wikipedia", {"query": "slow"}) for _ in range(2)]
+            try:
+                self.assertTrue(self.providers.started.wait(1))
+                self.wait_for_waiters(1)
+                started = time.monotonic()
+                self.service.close()
+                self.assertLess(time.monotonic() - started, 0.5)
+                for call in calls:
+                    with self.assertRaises(GatewayFailure) as caught:
+                        call.result(timeout=0.5)
+                    self.assertEqual(caught.exception.code, "service_closed")
+                replacement = SearchService(self.service.config, FakeProviders())
+                self.addCleanup(replacement.close)
+                with patch.object(self.service.cache, "put", side_effect=AssertionError("closed producer must not write")) as put:
+                    self.providers.release.set()
+                    until = time.monotonic() + 1
+                    while self.service.metrics_snapshot()["inflight_keys"] and time.monotonic() < until:
+                        time.sleep(0.005)
+                    self.assertEqual(self.service.metrics_snapshot()["inflight_keys"], 0)
+                    put.assert_not_called()
+                self.assertEqual(replacement.cache.stats()["entries"], 0)
+            finally:
+                self.providers.release.set()
 
 
 class NetworkFailureTests(unittest.TestCase):
@@ -312,6 +476,18 @@ class NetworkFailureTests(unittest.TestCase):
         self.assertFalse(caught.exception.retryable)
         self.assertEqual(self.session.request.call_count, 1)
         self.assertNotIn("secret", str(caught.exception))
+
+    def test_wikipedia_hosts_fetched_as_web_bypass_global_budgets_too(self):
+        response = MagicMock(status_code=200, headers={})
+        response.iter_content.return_value = [b"ok"]
+        self.session.request.return_value = response
+        self.service.config.wiki_rpm = 1
+        self.service.config.wiki_concurrency = 1
+        with patch("agentflow.search_service.core._RequestBudget.acquire",
+                   side_effect=AssertionError("Wikipedia must not acquire a global budget")):
+            for host in ("wikipedia.org", "en.wikipedia.org"):
+                result = self.service.request("web:" + host, "GET", "https://" + host + "/wiki/Moon")
+                self.assertIs(result, response)
 
 
 class _LocalUpstream(BaseHTTPRequestHandler):
@@ -401,12 +577,21 @@ class UpstreamBudgetTests(unittest.TestCase):
         self.assertEqual(self.service.metrics.snapshot()["upstream_attempts/wikipedia"], 2)
         self.assertGreaterEqual(self.upstream.paths[1][1] - self.upstream.paths[0][1], 0.49)
 
-    def test_last_429_cools_down_other_requests_not_only_its_retry(self):
+    def test_wikipedia_429_does_not_cool_down_independent_requests(self):
         self.service.config.max_retries = 0
         with self.assertRaises(GatewayFailure) as error:
             self.service.request("wikipedia", "GET", self.base_url + "/429")
         self.assertEqual(error.exception.upstream_status, 429)
+        started = time.monotonic()
         self.service.request("wikipedia", "GET", self.base_url + "/ok")
+        self.assertLess(time.monotonic() - started, 0.25)
+
+    def test_brave_429_still_cools_down_independent_requests(self):
+        self.service.config.max_retries = 0
+        with self.assertRaises(GatewayFailure) as error:
+            self.service.request("brave", "GET", self.base_url + "/429")
+        self.assertEqual(error.exception.upstream_status, 429)
+        self.service.request("brave", "GET", self.base_url + "/ok")
         self.assertGreaterEqual(self.upstream.paths[1][1] - self.upstream.paths[0][1], 0.49)
 
     def test_permanent_failure_does_not_retry(self):
@@ -478,35 +663,45 @@ class UpstreamBudgetTests(unittest.TestCase):
             self.service.request("wikipedia", "GET", self.base_url + "/large")
         self.assertEqual(error.exception.code, "upstream_too_large")
 
-    def test_each_attempt_start_obeys_rate_spacing(self):
-        self.service.config.wiki_rpm = 600
-        self.service.request("wikipedia", "GET", self.base_url + "/ok")
-        self.service.request("wikipedia", "GET", self.base_url + "/ok")
+    def test_web_attempt_start_still_obeys_per_host_rate_spacing(self):
+        self.service.config.web_rpm = 600
+        self.service.request("web:127.0.0.1", "GET", self.base_url + "/ok")
+        self.service.request("web:127.0.0.1", "GET", self.base_url + "/ok")
         self.assertGreaterEqual(self.upstream.paths[1][1] - self.upstream.paths[0][1], 0.09)
 
-    def test_concurrent_upstream_requests_are_bounded(self):
-        self.service.config.wiki_concurrency = 2
+    def test_web_concurrent_upstream_requests_still_obey_per_host_budget(self):
+        self.service.config.web_concurrency = 2
         with ThreadPoolExecutor(max_workers=8) as executor:
-            replies = list(executor.map(lambda _: self.service.request("wikipedia", "GET", self.base_url + "/hold"), range(8)))
+            replies = list(executor.map(lambda _: self.service.request("web:127.0.0.1", "GET", self.base_url + "/hold"), range(8)))
         self.assertEqual(len(replies), 8)
         self.assertLessEqual(self.upstream.maximum_active, 2)
         self.assertEqual(self.upstream.maximum_active, 2)
 
-    def test_web_fetch_of_wiki_uses_the_same_wikipedia_budget(self):
-        _, wiki_budget = self.service._budget("wikipedia", "https://en.wikipedia.org/w/api.php")
-        name, web_budget = self.service._budget("web:en.wikipedia.org", "https://en.wikipedia.org/wiki/Moon")
-        self.assertEqual(name, "wikipedia")
-        self.assertIs(web_budget, wiki_budget)
+    def test_wikipedia_ignores_legacy_global_rpm_and_concurrency(self):
+        self.service.config.wiki_rpm = 1
+        self.service.config.wiki_concurrency = 1
+        started = time.monotonic()
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            replies = list(executor.map(lambda _: self.service.request("wikipedia", "GET", self.base_url + "/hold"), range(4)))
+        self.assertEqual(len(replies), 4)
+        self.assertGreater(self.upstream.maximum_active, 1)
+        self.assertLess(time.monotonic() - started, 0.5)
 
-    def test_api_level_cooldown_applies_to_other_requests(self):
-        self.service.notify_cooldown("wikipedia", self.base_url, 0.08)
+    def test_wikipedia_api_level_cooldown_does_not_delay_other_requests(self):
+        self.service.notify_cooldown("wikipedia", self.base_url, 1)
         started = time.monotonic()
         self.service.request("wikipedia", "GET", self.base_url + "/ok")
-        self.assertGreaterEqual(time.monotonic() - started, 0.07)
-        self.assertEqual(self.service.metrics.snapshot()["api_cooldowns/wikipedia"], 1)
+        self.assertLess(time.monotonic() - started, 0.25)
         for invalid in (float("nan"), float("inf"), -1, True):
             with self.assertRaises(ValueError):
                 self.service.notify_cooldown("wikipedia", self.base_url, invalid)
+
+    def test_brave_api_level_cooldown_still_applies_to_other_requests(self):
+        self.service.notify_cooldown("brave", self.base_url, 0.08)
+        started = time.monotonic()
+        self.service.request("brave", "GET", self.base_url + "/ok")
+        self.assertGreaterEqual(time.monotonic() - started, 0.07)
+        self.assertEqual(self.service.metrics.snapshot()["api_cooldowns/brave"], 1)
 
 
 if __name__ == "__main__":

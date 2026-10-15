@@ -15,28 +15,17 @@ SPEC.loader.exec_module(probe)
 
 
 class CapacityLocalTests(unittest.TestCase):
-    def test_fixed_default_admission_boundary_rejects_145th_and_runs_only_16(self):
-        result = probe.probe_admission_boundary()
-        self.assertEqual(result["status"], "verified", result)
-        self.assertEqual(result["accepted"], 144)
-        self.assertEqual(result["next_request"], {"status": 503, "code": "queue_full"})
-        self.assertEqual(result["peak_executing_workers"], 16)
-        self.assertEqual(result["metrics"]["queue_rejections"], 1)
-        self.assertNotIn("connection_rejections", result["metrics"])
-
-    def test_incomplete_http_bodies_measure_connection_limit_separately(self):
-        result = probe.probe_connection_boundary()
-        if result["status"] == "inconclusive":
-            self.skipTest("OS did not support proving 160 held sockets: " + str(result["reason"]))
-        self.assertEqual(result["expected_connection_cap"], 160)
-        self.assertEqual(result["observed_occupied_slots"], 160)
-        self.assertEqual(result["next_request"]["status"], 503)
-        self.assertEqual(result["connection_rejections"], 1)
-        self.assertEqual(result["queue_rejections"], 0)
+    def test_old_admission_and_connection_boundaries_are_not_applicable(self):
+        for result in (probe.probe_admission_boundary(workers=1, queue_size=0),
+                       probe.probe_connection_boundary(workers=1, queue_size=0)):
+            self.assertEqual(result["status"], "not_applicable", result)
+            self.assertEqual(result["legacy_ignored"], {"workers": 1, "queue_size": 0})
+            self.assertIsNone(result.get("expected_capacity"))
+            self.assertIsNone(result.get("expected_connection_cap"))
 
     def test_actual_http_workload_distinguishes_warm_cold_and_shared_requests(self):
-        common = dict(workers=4, burst_size=12, duration=0, latency_limit=3,
-                      payload_bytes=1024, producer_delay=0.05)
+        common = dict(workers=1, burst_size=12, duration=0, latency_limit=3,
+                      payload_bytes=1024, producer_delay=0.1)
         warm = probe.probe_worker_stage(mode="warm_cache", **common)
         cold = probe.probe_worker_stage(mode="cold_unique", **common)
         shared = probe.probe_worker_stage(mode="same_key_singleflight", **common)
@@ -51,17 +40,18 @@ class CapacityLocalTests(unittest.TestCase):
         self.assertGreater(warm["peak_executing_workers"], 0)
         self.assertEqual(warm["metrics_delta"]["cache_hits"], 12)
         self.assertEqual(cold["producer_count"], 12)
-        self.assertEqual(cold["peak_producer_active"], 4)
-        self.assertGreater(cold["queue_wait_p95_seconds"], 0.01)
+        self.assertGreater(cold["peak_producer_active"], 1)
+        self.assertEqual(cold["queue_wait_p95_seconds"], 0.0)
+        self.assertEqual(cold["legacy_ignored"]["workers"], 1)
         self.assertEqual(shared["producer_count"], 1)
         self.assertGreater(shared["metrics_delta"].get("coalesced_waiters", 0), 0)
 
-    def test_deadline_includes_queue_and_does_not_pretend_to_cancel_running_work(self):
+    def test_deadline_bounds_independent_producers_without_pretending_to_kill_threads(self):
         result = probe.probe_deadline_behavior()
         self.assertEqual(result["status"], "verified", result)
-        self.assertTrue(result["queued_task_cancelled"])
+        self.assertIsNone(result["queued_task_cancelled"])
         self.assertTrue(result["running_task_continued_after_caller_deadline"])
-        self.assertEqual(result["provider_executions_before_release"], 1)
+        self.assertEqual(result["provider_executions_before_release"], 2)
         self.assertEqual(result["cache_entries_after_expired_producer"], 0)
         self.assertLess(result["elapsed_wait_seconds"], 1)
 
@@ -75,9 +65,11 @@ class CapacityLocalTests(unittest.TestCase):
         for item in result["scenarios"]:
             self.assertEqual(item["status"], "verified", item)
             self.assertEqual(item["offered_requests"], 8)
-            self.assertTrue(all(value <= 2 for value in item["peak_concurrency_by_group"].values()))
-        self.assertEqual(wiki["bucket_names"], ["wikipedia"])
-        self.assertTrue(all(value["same_bucket"] for value in wiki["routing"].values()))
+            if item["service_limit_applies"]:
+                self.assertTrue(all(value <= 2 for value in item["peak_concurrency_by_group"].values()))
+        self.assertEqual(wiki["bucket_names"], [])
+        self.assertTrue(wiki["legacy_wiki_limits_ignored"])
+        self.assertTrue(all(value["unlimited"] for value in wiki["routing"].values()))
         self.assertEqual(brave["bucket_names"], ["brave"])
         self.assertEqual(set(web["bucket_names"]), {"web:127.0.0.1", "web:localhost"})
         self.assertGreater(web["overall_peak_concurrency"], 2)
@@ -87,9 +79,21 @@ class CapacityLocalTests(unittest.TestCase):
                                        payload_bytes=256, producer_delay=0.01, include_connections=False)
         json.dumps(result, allow_nan=False)
         self.assertFalse(result["actual_production_service_touched"])
-        self.assertEqual(result["recommendations"]["largest_tested_stable_workers"], 2)
+        self.assertIsNone(result["recommendations"]["largest_tested_stable_workers"])
+        self.assertEqual(result["settings"]["legacy_ignored_worker_candidates"], [2])
         self.assertIsNone(result["recommendations"]["queue_size_upper_limit"])
         self.assertIsNone(result["recommendations"]["production_rpm_upper_limit"])
+
+    def test_ignored_worker_candidates_do_not_repeat_identical_workloads(self):
+        completed = {"mode": "synthetic", "workers": 1, "status": "stable", "requests": 4}
+        with patch.object(probe, "probe_worker_stage", return_value=completed) as stage, \
+             patch.object(probe, "probe_admission_boundary", return_value={}), \
+             patch.object(probe, "probe_deadline_behavior", return_value={}), \
+             patch.object(probe, "probe_budget_rules", return_value={}):
+            suite = probe.run_local_suite(workers=[1, 2, 8], include_connections=False)
+        self.assertEqual(stage.call_count, 3)
+        self.assertEqual(suite["settings"]["legacy_ignored_worker_candidates"], [1, 2, 8])
+        self.assertIsNone(suite["recommendations"]["largest_tested_stable_workers"])
 
     def test_invalid_probe_inputs_fail_before_starting_threads(self):
         for kwargs in (dict(workers=[]), dict(workers=[0]), dict(workers=[True]),
@@ -126,7 +130,7 @@ class CapacityLocalTests(unittest.TestCase):
             suite = probe.run_local_suite(workers=[4])
         self.assertEqual(len(suite["stages"]), 3)
         self.assertTrue(all(item["status"] == "inconclusive" for item in suite["boundaries"].values()))
-        self.assertEqual(suite["recommendations"]["largest_tested_stable_workers"], 4)
+        self.assertIsNone(suite["recommendations"]["largest_tested_stable_workers"])
         json.dumps(suite, allow_nan=False)
 
 

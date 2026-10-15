@@ -10,7 +10,7 @@ EC2 → 个人主机 → Internet 的出口。模型选页、embedding、RAG 摘
 训练任务 A / B / C
        ↓ HTTP（内网直连或 SSH 转发）
 开发服务器：搜索服务 → 本地临时盘 SQLite 缓存
-       ↓ 未命中：合并请求 / 限速 / 重试
+       ↓ 先查缓存 / 合并在途请求，唯一未命中请求独立执行
 EC2 → 个人主机 → Wikipedia / Yibu / 网页
 ```
 
@@ -117,7 +117,7 @@ bash train-roma/run_search_cache.sh
 nohup bash train-roma/run_search_cache.sh > /home/ma-user/work/code-rl/cache/service.log 2>&1 &
 ```
 
-同一数据库只允许一个服务进程运行，数据库旁的锁文件防止多进程分别执行限速。
+同一数据库只允许一个服务进程运行，数据库旁的锁文件保证缓存与请求合并状态的进程归属。
 服务只需 CPU 和磁盘，不需启动训练 SDK、vLLM 或 embedding 服务。
 若需要多进程/多副本，需先把请求合并和限速状态迁移到共享协调组件。
 
@@ -137,16 +137,15 @@ nohup bash train-roma/run_search_cache.sh > /home/ma-user/work/code-rl/cache/ser
 ```bash
 SEARCH_CACHE_DB_PATH=/var/tmp/agentflow-search-cache/search_cache.sqlite3
 SEARCH_CACHE_MAX_TTL=604800
-SEARCH_WIKI_RPM=120
-SEARCH_WIKI_CONCURRENCY=32
 SEARCH_BRAVE_RPM=240
 SEARCH_BRAVE_CONCURRENCY=16
 SEARCH_WEB_RPM=120
 SEARCH_WEB_CONCURRENCY=4
-SEARCH_SERVICE_WORKERS=32
-SEARCH_SERVICE_QUEUE_SIZE=128
 # SEARCH_BLOCKED_DOMAINS：复制 search-service.env.example 中完整的 325 项赋值。
 ```
+
+旧的 `SEARCH_SERVICE_WORKERS`、`SEARCH_SERVICE_QUEUE_SIZE`、`SEARCH_WIKI_RPM`、
+`SEARCH_WIKI_CONCURRENCY` 无需再设置；兼容读取已有配置，但不再形成执行、连接或 Wiki 限制。
 
 同步代码后必须重启开发服务器上的共享搜索服务。只重启训练会复用仍在运行的旧服务，
 不会应用新路径或新有效期。启动日志会打印实际数据库路径；切换新数据库后缓存从零积累。
@@ -242,17 +241,24 @@ subreward 和已命中 subgoal 状态不共享；按原工具 observation 及当
 ```
 
 不同批次或训练任务同时获取相同原始数据时，通过 single-flight 共用一个获取任务。
-每个等待者得到独立副本。失败由同一获取任务重试；等待者不会分别访问上游。
-训练 rollout 按原逻辑逐步产生 query，不需要等待所有轨迹凑齐。
+先检查缓存和登记在途请求，只有唯一未命中的 producer 创建独立执行线程并访问上游；
+命中直接返回，不经过公共 worker 队列；重复等待者只等待已有 Future，不占上游执行线程。
+内部页面等缓存层也继续按各自 key 合并。每个等待者得到独立副本，失败由同一获取任务重试，
+等待者不会分别访问上游。训练 rollout 按原逻辑逐步产生 query，不需要等待所有轨迹凑齐。
 
-Wiki 默认最多 120 次实际 HTTP attempt/分钟、32 个并发；Wiki HTML 与 API 共用该桶。
-Yibu 默认最多 240 次实际 HTTP attempt/分钟、16 个并发。
-这些是本次试用配置，不代表官方配额或物理上限；Wiki 32 的证据是突发测试，
-共同持续测试中的 Wiki 实际峰值为 6，Yibu 为 16。
-普通网页按目标域名分开限制。所有实际重试也计入额度。
-429 按 `Retry-After` 对对应桶统一 cooldown。
+共享服务不再设置公共 worker 池、排队槽位或由两者推导的 HTTP 接纳连接上限。
+旧的 32 worker、128 排队、160 未完成任务和 176 HTTP 连接数不再限制当前实现。
+每个唯一未命中请求独立执行；真实同时运行数仍受到机器资源和外部服务能力影响。
 
-队列、worker 和整体截止时间有上限，避免任务无限堆积。队列满返回结构化失败。
+Wiki API 和 Wiki HTML 不再使用服务内的全局 RPM、并发桶和共享 cooldown。
+某次 Wiki 请求遇到 429 时，仍按该请求的 Retry-After/退避规则在剩余总预算内有限重试，
+不会让其他 Wiki 请求统一等待。取消人工限制不改变 Wikipedia 自身的限流规则。
+Yibu 仍默认最多 240 次实际 HTTP attempt/分钟、16 个并发。
+普通网页仍按 hostname 分别限制为 120 次/分钟、4 个并发；重试也计入对应额度。
+这些是配置值，不代表官方配额或物理上限。Yibu/Web 的 429 仍按 Retry-After
+对对应桶统一 cooldown。
+
+每个逻辑请求仍受整体截止时间约束；等待重复请求、Yibu/Web 限速、网络和重试都计入预算。
 服务故障、代理故障和上游错误可以通过 error code、upstream 和 request ID 区分。
 过期成功结果刷新失败时不静默返回旧内容。
 
@@ -265,7 +271,7 @@ Yibu 默认最多 240 次实际 HTTP attempt/分钟、16 个并发。
 | 上游单次 HTTP 超时 | `upstream_timeout` | 在服务总预算内有限重试 |
 | 其他上游连接失败 | `upstream_network_error` | 在服务总预算内有限重试 |
 | 上游 HTTP 非成功状态 | `upstream_http_error` | 保留原始 HTTP 状态，沿用可重试状态集合 |
-| 队列满/服务总预算耗尽 | `queue_full` / `deadline_exceeded` | 返回明确错误 |
+| 服务总预算耗尽 | `deadline_exceeded` | 返回服务总预算耗尽错误 |
 
 客户端将 `upstream`、`upstream_status`、`attempts`、`retryable` 和 request ID 传到工具层。
 原始代理异常可能包含令牌和 URL，因此只提取状态码和安全的错误类型，不转发整段异常。
@@ -328,7 +334,7 @@ SEARCH_BLOCKED_DOMAINS='dead.example,another.example'
 填写域名即可，不填写协议、端口或路径；`*.dead.example` 与 `dead.example` 等价。
 域名匹配有边界，`notdead.example` 不会被 `dead.example` 拦截。
 
-网页请求在进入 worker 队列、读取已有网页缓存之前检查黑名单；Wiki/Yibu 在读取其
+网页请求在启动唯一 producer、读取已有网页缓存之前检查黑名单；Wiki/Yibu 在读取其
 API 缓存之前检查实际端点，所有上游 HTTP 请求及重定向目标也会检查。
 命中后返回 HTTP 410，`error.code=domain_blocked`、`retryable=false`，消息为
 `网站死亡：域名（域名黑名单）`；不访问被拦截的目标、不重试、不缓存错误。
@@ -363,12 +369,12 @@ API 缓存之前检查实际端点，所有上游 HTTP 请求及重定向目标�
 保留当前截断规则并采用 gzip，不擅自减少候选数或缩短 RAG 输入。
 实际收益应分别看 query、页面和 URL 命中率，以及真实上游请求数。
 
-默认配置可在 `search-service.env.example` 修改：缓存有效载荷上限 2 GiB，32 个执行
-worker，128 个排队任务，单次逻辑请求期限 120 秒，最大上游响应 20 MiB。
-未完成逻辑任务容量为 160，HTTP 接纳连接上限自动变为 176；后者包含 16 个额外连接槽。
-服务期限、客户端连接超时及最大重试次数保持原值；客户端读取超时已改为 150 秒。
+默认配置可在 `search-service.env.example` 修改：缓存有效载荷上限 2 GiB，
+单次逻辑请求期限 120 秒，最大上游响应 20 MiB。服务期限、客户端连接超时及最大重试次数
+保持原值；客户端读取超时仍为 150 秒。当前没有公共 worker、queue 或派生 HTTP 连接容量配置。
 SQLite 文件和 WAL 还会有索引/空闲页等开销，磁盘占用不等于有效载荷大小。
-冷批次中大量不同 query 可能因额度等待而超时；按观测调整服务期限、队列与训练并发。
+冷批次的大量不同 query 仍可能受真实上游限流、机器资源或 Yibu/Web 额度等待影响；
+缓存和合并只减少可复用请求，不能保证所有请求在预算内完成。
 
 当前出口有自签代理证书，provider 默认沿用 `main` 的 TLS 设置。
 有受信 CA 时可以设置 `SEARCH_SERVICE_VERIFY_TLS=1` 或 `SEARCH_SERVICE_CA_BUNDLE`。

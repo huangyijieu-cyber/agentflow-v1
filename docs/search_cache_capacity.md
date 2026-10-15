@@ -4,6 +4,13 @@
 
 本地路径 `train-roma/test_search_cache_capacity.sh` 会加载开发服务器的服务 env 和现有 proxy 配置。Python 入口默认 `--mode local`，不会访问外网；真实外网测试需要明确指定 `--mode all` 或 `--mode upstream`。
 
+当前服务已取消公共 worker/queue、派生 HTTP 接纳容量以及 Wiki 全局 RPM/并发/cooldown。
+旧报告中的 worker、queue、HTTP 边界仍是旧实现的历史测量，不能当成当前上限，
+也不要据此写回 `SEARCH_SERVICE_WORKERS`、`SEARCH_SERVICE_QUEUE_SIZE`、
+`SEARCH_WIKI_RPM` 或 `SEARCH_WIKI_CONCURRENCY`；这四项保留兼容读取但不再生效。
+当前有意义的容量观测是命中延迟、唯一 miss 吞吐、在途合并和真实外网负载；
+Yibu/Web 的限速配置仍可使用相应的共同负载测试结果评审。
+
 ## 一次完整运行
 
 测试时暂停使用同一代理/API账号的训练任务，否则结果包含它们占用的容量。真实测试会产生 Yibu API 调用，默认预算为最多 12000 次逻辑调用（HTTP跳转可能增加实际次数）。参数范围跑完可能需要几十分钟，默认新阶段调度预算两小时；已开始请求结束后收尾。
@@ -37,9 +44,9 @@ python3 train-roma/test_search_cache_capacity.py --mode local
 
 ## 测试范围
 
-1. 用冻结的模拟producer验证固定基线16个worker、128额外槽位：144个任务可接纳，第145个拒绝；单独验证160个HTTP连接边界。这是脚本显式指定的测试基线；当前生产默认已改为32个worker，对应160个任务和176个HTTP连接，旧基线结果不能当作新配置已通过的证据。
-2. worker候选8/16/32/64，256个客户端，真实HTTP与SQLite：warm命中、cold不同key、相同key在途合并；记录吞吐、p95、排队、实际producer次数和资源信息。
-3. loopback真实HTTP上游验证RPM间隔、并发桶以及当前deadline/cancel行为。这里验证实现遵守设定，不推断外网额度。
+1. 历史报告的固定基线为16个worker、128额外槽位，144个任务可接纳、第145个拒绝，HTTP连接边界160；后来32-worker配置曾对应160个任务和176个HTTP连接。以上仅适用旧调度实现，当前没有这些固定边界；对应probe返回not_applicable，不再开连接验证旧上限。
+2. 历史worker候选为8/16/32/64、256个客户端。当前只保留缓存工作负载的比较意义：warm命中、cold不同key、相同key在途合并，记录吞吐、p95、实际producer次数和资源信息；worker候选不再改变运行容量，兼容接收后只执行一组三类负载，不会按旧候选反复跑相同测试。重点验证命中不被慢miss拖住、相同key只启动一个producer。
+3. loopback真实HTTP上游验证Yibu/Web的RPM间隔、并发桶以及当前deadline/cancel行为；Wiki不应再受服务内共享RPM、并发或cooldown限制。这里验证实现遵守设定，不推断外网额度。
 4. 真实外网分别测试Wiki搜索API、页面身份API、完整正文API、Wiki HTML、Yibu和每个输入网页域名。通过生产 `SearchService.request` 出网，沿用proxy/UA/TLS/响应上限；绕过缓存、现有人工RPM/并发上限，禁用重试，防止旧设置或重试掩盖真实边界。
 5. RPM逐级加压；如果只有客户端并发不足导致送不出目标速率，增加并发后重测。出现429/内部限流停止升级，记录最后稳定档和失败档。
 6. 测并发突发：每档两轮，轮次之间静默65秒，测真实执行峰值。只设置并发64而实际仅重叠3个，不算测过64。
@@ -49,7 +56,7 @@ python3 train-roma/test_search_cache_capacity.py --mode local
 
 | 参数 | 默认 |
 |---|---|
-| worker候选 | 8,16,32,64 |
+| 历史worker候选（当前不再生效） | 8,16,32,64 |
 | 客户端并发 | 256 |
 | 本地每种缓存测试窗口 | 3秒 |
 | 本地模拟原文 | 16384字节 |
@@ -87,13 +94,17 @@ bash train-roma/test_search_cache_capacity.sh --mode upstream \
 默认写到本机临时目录下 `agentflow-search-capacity/<UTC时间>-<PID>/`。终端打印完整路径，可用 `--output-dir` 指定一个**尚不存在**的目录。阶段结束持续保存，Ctrl+C也保留已完成记录。
 
 - `report.json`：全部边界、每档数据、失败原因、独立值、共同出口确认值。
-- `summary.md`：可阅读的结果表及通过共同负载验证的 `SEARCH_*` 数值。
+- `summary.md`：可阅读的结果表及通过共同负载验证的配置候选；旧报告的worker/queue/Wiki配置项不适用于当前实现。
 
 没有额外乘0.8之类的折扣。最终配置候选取测试中通过的值；只有同时确认完成且窗口足够长，才输出 `confirmed_network_settings`。短于60秒的RPM或短于120秒的确认仅属于冒烟，不能导出持续负载的最终配置。需要把两份报告发回进行下一步配置评审。
 
-RPM表的并发数是该档通过的最小测试cap，另列真实峰值，不声称它就是物理必需并发。最终 `SEARCH_*_CONCURRENCY` 是通过负载验证的配置cap；并发burst表才要求真正同时执行到该数值。`coverage` 中 all_requested_buckets_confirmed 为false时，结果只覆盖已通过的部分工具/域名。
+RPM表的并发数是该档通过的最小测试cap，另列真实峰值，不声称它就是物理必需并发。Yibu/Web的 `SEARCH_*_CONCURRENCY` 可以作为通过负载验证的配置cap；Wiki数值只保留为负载测试结果，当前不会写回服务内限制。并发burst表才要求真正同时执行到该数值。`coverage` 中 all_requested_buckets_confirmed 为false时，结果只覆盖已通过的部分工具/域名。
 
-worker最大候选只证明本地模拟负载可支持它，不能直接当成真实混合搜索的生产上限。队列长度没有独立的固定性能上限，额外排队不增加上游吞吐；报告验证当前容量与等待情况，不凭空测出“最大queue”。连接容量由 `workers + queue + 16` 推导，系统文件描述符/线程资源不足时报告inconclusive，不当成API限流。
+旧报告的worker最大候选只证明当时本地模拟负载可支持它，不能当成当前混合搜索的生产上限。
+旧的 `workers + queue + 16` HTTP容量公式也已移除。当前只为唯一未命中producer启动独立线程，
+缓存命中直接返回、重复等待者不占上游执行线程；实际容量取决于系统线程/文件描述符、
+CPU/SQLite/网络和上游能力，不存在可从worker/queue环境变量推导的固定任务上限。
+系统资源不足不能当成API限流，也不能把历史边界值改名为新的实测上限。
 
 暂停其他训练任务只能隔离我们可控的流量；公司代理上的其他用户仍可能影响结果。测试到的上限属于当前出口、账号、URL样本和时间窗口。Wiki/Yibu API的HTTP200错误JSON不会算成功；网页HTML按生产规则解析文本，不能保证识别所有验证码或业务错误页。脚本不会打印令牌、API key、proxy地址凭据或查询原文。
 
@@ -113,4 +124,4 @@ bash train-roma/test_search_cache_capacity.sh \
 
 只读取旧报告中已经共同通过的Wiki/Yibu配置；重新确认基础档，再逐级提高混合Wiki负载，保持Yibu档不变。每档120秒＋档间65秒，全部5档约15–20分钟，提前失败则停止升级。不会重复独立API、burst、worker、队列或Web测试；旧数据不会冒充当前实测。
 
-确认模式默认复用旧报告的并发cap，不代表已重新找到并发上限。Wiki的搜索/身份/正文/HTML按1:10:10:3比例混合；HTML单项只能达到60RPM，不意味着整个Wiki桶也只能60RPM。背景训练流量会随时间变化，额外负载结果也会变化。
+确认模式默认复用旧报告的探测并发cap，不代表已重新找到并发上限；Wiki cap仅控制压测负载，不对应当前服务限制。Wiki的搜索/身份/正文/HTML按1:10:10:3比例混合；HTML单项只能达到60RPM，不意味着整个Wiki桶也只能60RPM。背景训练流量会随时间变化，额外负载结果也会变化。

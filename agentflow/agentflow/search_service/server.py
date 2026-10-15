@@ -10,7 +10,6 @@ import logging
 import math
 import os
 import sqlite3
-import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,33 +47,7 @@ class ServiceHTTPServer(ThreadingHTTPServer):
         if not token or token != token.strip() or any(c.isspace() for c in token):
             raise ValueError("SEARCH_SERVICE_TOKEN (or SEARCH_CACHE_TOKEN) is required and must contain no whitespace")
         self.service = service
-        self._connections = threading.BoundedSemaphore(service.config.workers + service.config.queue_size + 16)
         super().__init__(address, ServiceRequestHandler)
-
-    def process_request(self, request, client_address):
-        if not self._connections.acquire(blocking=False):
-            body = b'{"error":{"code":"queue_full","message":"Search service is busy","retryable":true}}'
-            try:
-                request.settimeout(1.0)
-                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nConnection: close\r\nRetry-After: 1\r\nContent-Length: "
-                                + str(len(body)).encode("ascii") + b"\r\n\r\n" + body)
-            except OSError:
-                pass
-            finally:
-                self.service.metrics.add("connection_rejections")
-                self.shutdown_request(request)
-            return
-        try:
-            super().process_request(request, client_address)
-        except BaseException:
-            self._connections.release()
-            raise
-
-    def process_request_thread(self, request, client_address):
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self._connections.release()
 
 
 class ServiceRequestHandler(BaseHTTPRequestHandler):

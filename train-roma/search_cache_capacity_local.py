@@ -12,7 +12,6 @@ import http.client
 import json
 import math
 import random
-import socket
 import sys
 import tempfile
 import threading
@@ -141,87 +140,19 @@ def _wait_until(predicate, seconds=3):
 
 
 def probe_admission_boundary(*, workers=16, queue_size=128):
-    """Freeze actual workers to prove W+Q admission and W execution limits."""
-    gate = threading.Event()
-    provider = SyntheticProviders(payload_bytes=32, delay=0, gate=gate)
-    capacity = workers + queue_size
-    with _service_harness(workers=workers, queue_size=queue_size, providers=provider) as (service, _):
-        futures = []
-        rejection = None
-        try:
-            deadline = time.monotonic() + 10
-            for index in range(capacity):
-                futures.append(service._submit("brave", {"query": str(index)}, deadline, "boundary"))
-            saturated = _wait_until(lambda: provider.active == workers)
-            try:
-                service._submit("brave", {"query": "overflow"}, deadline, "boundary-overflow")
-            except GatewayFailure as exc:
-                rejection = {"status": exc.status_code, "code": exc.code}
-            snapshot = service.metrics.snapshot()
-        finally:
-            gate.set()
-            for future in futures:
-                try:
-                    future.result(timeout=10)
-                except Exception:
-                    pass
-        verified = saturated and len(futures) == capacity and rejection == {"status": 503, "code": "queue_full"}
-        return {"status": "verified" if verified else "failed", "scope": "configured_admission_boundary",
-                "workers": workers, "queue_size": queue_size, "accepted": len(futures),
-                "expected_capacity": capacity, "next_request": rejection,
-                "peak_executing_workers": provider.peak_execution_active, "metrics": snapshot}
+    """Compatibility result: the old W+Q admission boundary was removed."""
+    return {"status": "not_applicable", "scope": "removed_shared_admission_boundary",
+            "legacy_ignored": {"workers": workers, "queue_size": queue_size},
+            "expected_capacity": None,
+            "note": "No shared worker pool, admission semaphore or waiting queue remains."}
 
 
 def probe_connection_boundary(*, workers=16, queue_size=128):
-    """Hold incomplete POST bodies without occupying the logical work queue."""
-    cap = workers + queue_size + 16
-    sockets = []
-    established = 0
-    observed_slots = 0
-    probe_response = None
-    reason = None
-    with _service_harness(workers=workers, queue_size=queue_size, request_timeout=12) as (service, server):
-        try:
-            acquisition_deadline = time.monotonic() + 8
-            for _ in range(cap):
-                if time.monotonic() >= acquisition_deadline:
-                    reason = "Could not hold every connection before the server body-read timeout"
-                    break
-                connection = socket.create_connection(("127.0.0.1", server.server_port), timeout=1)
-                sockets.append(connection)
-                connection.sendall(("POST /v1/search/brave HTTP/1.1\r\nHost: localhost\r\n"
-                                    "Authorization: Bearer " + service.config.token + "\r\n"
-                                    "Content-Type: application/json\r\nContent-Length: 1024\r\n\r\n{").encode())
-                established += 1
-            all_accepted = _wait_until(lambda: server._connections._value == 0, seconds=1)
-            observed_slots = cap - server._connections._value
-            if established == cap and all_accepted:
-                probe_response = _http_call(server.server_port, service.config.token, "/healthz", None, timeout=2)
-            elif reason is None:
-                reason = "OS/FD/thread/listen capacity prevented proving the service connection boundary"
-        except (OSError, RuntimeError) as exc:
-            reason = "Local resource failure: " + type(exc).__name__
-        finally:
-            for connection in sockets:
-                try:
-                    connection.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                connection.close()
-            _wait_until(lambda: server._connections._value == cap, seconds=2)
-        metrics = service.metrics.snapshot()
-        rejected = (probe_response is not None and probe_response["status"] == 503
-                    and probe_response["error_code"] == "queue_full"
-                    and metrics.get("connection_rejections", 0) == 1
-                    and metrics.get("queue_rejections", 0) == 0)
-        if not rejected and reason is None:
-            reason = "The expected connection-only 503 rejection was not observed"
-        return {"status": "verified" if rejected else "inconclusive", "scope": "configured_http_connection_boundary",
-                "expected_connection_cap": cap, "opened_sockets": established,
-                "observed_occupied_slots": observed_slots, "next_request": probe_response,
-                "connection_rejections": metrics.get("connection_rejections", 0),
-                "queue_rejections": metrics.get("queue_rejections", 0), "reason": reason,
-                "note": "An OS resource failure is not evidence of the service's configured upper limit."}
+    """Compatibility result: there is no W+Q+16 HTTP admission cap."""
+    return {"status": "not_applicable", "scope": "removed_http_connection_boundary",
+            "legacy_ignored": {"workers": workers, "queue_size": queue_size},
+            "expected_connection_cap": None,
+            "note": "The old derived cap is removed; OS/listen/FD/thread resources still apply."}
 
 
 def _http_call(port, token, path, payload, *, timeout):
@@ -268,8 +199,8 @@ def probe_worker_stage(*, workers, burst_size, duration, latency_limit, payload_
     if mode not in {"warm_cache", "cold_unique", "same_key_singleflight"}:
         raise ValueError("invalid worker probe mode")
     provider = SyntheticProviders(payload_bytes=payload_bytes, delay=producer_delay)
-    # A full burst can be admitted: overload/fixed queue boundary is tested separately.
-    queue_size = max(0, burst_size - workers)
+    # workers/queue_size remain accepted only for old callers and report labels.
+    queue_size = 0
     timeout = max(2.0, latency_limit + 2.0)
     with _service_harness(workers=workers, queue_size=queue_size, request_timeout=timeout, providers=provider) as (service, server):
         warm_key = "warm-" + uuid.uuid4().hex
@@ -278,7 +209,8 @@ def probe_worker_stage(*, workers, burst_size, duration, latency_limit, payload_
             if prewarm["status"] != 200:
                 failed = summarize_samples([prewarm], prewarm["latency_seconds"])
                 failed.update(mode=mode, workers=workers, status="failed", reason="Prewarm request failed",
-                              prewarm=prewarm, experimental_queue_size=queue_size,
+                              prewarm=prewarm, experimental_queue_size=None,
+                              legacy_ignored={"workers": workers, "queue_size": queue_size},
                               offered_client_concurrency=burst_size, producer_count=provider.producers,
                               peak_producer_active=provider.peak_active,
                               peak_executing_workers=provider.peak_execution_active,
@@ -326,7 +258,8 @@ def probe_worker_stage(*, workers, burst_size, duration, latency_limit, payload_
         delta = {key: value - metrics_before.get(key, 0) for key, value in metrics.items()
                  if value != metrics_before.get(key, 0)}
         producers = provider.producers - producers_before
-        summary.update(mode=mode, workers=workers, experimental_queue_size=queue_size,
+        summary.update(mode=mode, workers=workers, experimental_queue_size=None,
+                       legacy_ignored={"workers": workers, "queue_size": queue_size},
                        offered_client_concurrency=burst_size, producer_count=producers,
                        peak_producer_active=provider.peak_active,
                        peak_executing_workers=provider.peak_execution_active, metrics_delta=delta,
@@ -407,7 +340,7 @@ class _RecordingHandler(BaseHTTPRequestHandler):
 def probe_budget_rules(*, rpm=6000.0, concurrency=2, delay=0.05):
     """Measure limiter enforcement against actual loopback HTTP, never production."""
     scenarios = []
-    for kind, hints, hosts in (("wiki_shared", ["wiki", "wikipedia"], ["127.0.0.1"]),
+    for kind, hints, hosts in (("wiki_unlimited", ["wiki", "wikipedia"], ["127.0.0.1"]),
                                ("brave_shared", ["brave", "yibu"], ["127.0.0.1"]),
                                ("web_per_hostname", ["web"], ["127.0.0.1", "localhost"])):
         upstream = _RecordingUpstream(delay)
@@ -440,16 +373,23 @@ def probe_budget_rules(*, rpm=6000.0, concurrency=2, delay=0.05):
                 respects_rpm = all(gap >= interval - tolerance for gaps in intervals.values() for gap in gaps)
                 respects_concurrency = all(peak <= concurrency for peak in upstream.peak.values())
                 routing = {}
-                if kind == "wiki_shared":
-                    name, first = service._budget("wiki", "http://127.0.0.1")
+                if kind == "wiki_unlimited":
                     for label, hint, url in (("wiki_alias", "wikipedia", "http://127.0.0.1"),
                                              ("wiki_html_hostname", "web", "https://en.wikipedia.org/wiki/Test"),
                                              ("other_wiki_language", "web", "https://zh.wikipedia.org/wiki/Test")):
                         target_name, bucket = service._budget(hint, url)
-                        routing[label] = {"bucket": target_name, "same_bucket": bucket is first}
-                scenarios.append({"name": kind, "status": "verified" if respects_rpm and respects_concurrency else "failed",
-                                  "configured_rpm": rpm, "configured_concurrency_per_bucket": concurrency,
-                                  "expected_start_interval_seconds": interval, "arrival_tolerance_seconds": tolerance,
+                        routing[label] = {"bucket": target_name, "unlimited": bucket is None}
+                if kind == "wiki_unlimited":
+                    verified = all(value["unlimited"] for value in routing.values()) and not service._budgets
+                else:
+                    verified = respects_rpm and respects_concurrency
+                scenarios.append({"name": kind, "status": "verified" if verified else "failed",
+                                  "service_limit_applies": kind != "wiki_unlimited",
+                                  "legacy_wiki_limits_ignored": kind == "wiki_unlimited",
+                                  "configured_rpm": rpm if kind != "wiki_unlimited" else None,
+                                  "configured_concurrency_per_bucket": concurrency if kind != "wiki_unlimited" else None,
+                                  "expected_start_interval_seconds": interval if kind != "wiki_unlimited" else None,
+                                  "arrival_tolerance_seconds": tolerance,
                                   "min_start_intervals_seconds": {key: min(value) if value else None for key, value in intervals.items()},
                                   "peak_concurrency_by_group": dict(upstream.peak), "overall_peak_concurrency": upstream.total_peak,
                                   "offered_requests": offered, "elapsed_seconds": elapsed,
@@ -466,34 +406,37 @@ def probe_deadline_behavior():
     providers = SyntheticProviders(payload_bytes=32, delay=0, gate=gate)
     with _service_harness(workers=1, queue_size=1, request_timeout=0.15, providers=providers) as (service, _):
         deadline = time.monotonic() + 0.15
-        running = service._submit("brave", {"query": "running"}, deadline, "running")
-        active = _wait_until(lambda: providers.active == 1, seconds=0.05)
-        queued = service._submit("brave", {"query": "queued"}, deadline, "queued")
+        futures = [service._submit("brave", {"query": str(index)}, deadline, str(index))
+                   for index in range(2)]
+        active = _wait_until(lambda: providers.active == 2, seconds=0.08)
         failures = []
         started = time.monotonic()
         try:
-            for future in (running, queued):
+            for future in futures:
                 try:
                     service._wait(future, deadline)
                 except GatewayFailure as exc:
                     failures.append(exc.code)
-            still_running = not running.done()
-            queued_cancelled = queued.cancelled()
+            # Logical callers can already return their deadline error while
+            # daemon cache producers remain blocked behind the synthetic gate.
+            still_running = providers.active == 2
             executions_before_release = providers.executions
         finally:
             gate.set()
-            try:
-                running.result(timeout=2)
-            except GatewayFailure:
-                pass
-        verified = active and failures == ["deadline_exceeded", "deadline_exceeded"] and still_running and queued_cancelled and executions_before_release == 1
+            for future in futures:
+                try:
+                    future.result(timeout=2)
+                except GatewayFailure:
+                    pass
+        verified = (active and failures == ["deadline_exceeded", "deadline_exceeded"]
+                    and still_running and executions_before_release == 2)
         return {"status": "verified" if verified else "failed", "scope": "current_deadline_cancellation_behavior",
                 "budget_seconds": 0.15, "elapsed_wait_seconds": time.monotonic() - started,
-                "error_codes": failures, "queued_task_cancelled": queued_cancelled,
+                "error_codes": failures, "queued_task_cancelled": None,
                 "running_task_continued_after_caller_deadline": still_running,
                 "provider_executions_before_release": executions_before_release,
                 "cache_entries_after_expired_producer": service.cache.stats()["entries"],
-                "note": "Waiting/queue time consumes the budget; cancelling a running Future does not stop its worker."}
+                "note": "Unique misses execute independently; a running producer cannot be force-killed, but expired work is not cached."}
 
 
 def run_local_suite(*, workers, burst_size=256, duration=3.0, latency_limit=10.0,
@@ -510,7 +453,8 @@ def run_local_suite(*, workers, burst_size=256, duration=3.0, latency_limit=10.0
         raise ValueError("latency_limit must be finite and positive")
     workers = sorted(set(workers))
     stages = []
-    for count in workers:
+    # Repeating ignored worker values would benchmark identical settings.
+    for count in workers[:1]:
         for mode in ("warm_cache", "cold_unique", "same_key_singleflight"):
             try:
                 stages.append(probe_worker_stage(workers=count, burst_size=burst_size, duration=duration,
@@ -518,7 +462,6 @@ def run_local_suite(*, workers, burst_size=256, duration=3.0, latency_limit=10.0
                                                  producer_delay=producer_delay, mode=mode))
             except (OSError, RuntimeError) as exc:
                 stages.append({"mode": mode, "workers": count, "status": "inconclusive", "reason": type(exc).__name__})
-    stable = [count for count in workers if all(stage["status"] == "stable" for stage in stages if stage["workers"] == count)]
     boundaries = {}
     boundary_probes = [("admission", probe_admission_boundary), ("deadline", probe_deadline_behavior)]
     if include_connections:
@@ -534,14 +477,14 @@ def run_local_suite(*, workers, burst_size=256, duration=3.0, latency_limit=10.0
     except (OSError, RuntimeError, GatewayFailure) as exc:
         limiter = {"status": "inconclusive", "scope": "limiter_mechanism_only_not_production_quota", "reason": type(exc).__name__}
     return {"scope": "offline_synthetic_loopback_only", "actual_production_service_touched": False,
-            "settings": {"worker_candidates": workers, "client_burst": burst_size, "duration_per_sustained_stage_seconds": duration,
+            "settings": {"legacy_ignored_worker_candidates": workers, "client_burst": burst_size, "duration_per_sustained_stage_seconds": duration,
                          "latency_limit_seconds": latency_limit, "payload_bytes": payload_bytes,
                          "producer_delay_seconds": producer_delay},
             "boundaries": boundaries, "stages": stages, "limiter_mechanism": limiter,
-            "recommendations": {"largest_tested_stable_workers": max(stable) if stable else None,
+            "recommendations": {"largest_tested_stable_workers": None,
                                 "tested_client_burst": burst_size,
-                                "scope": "Only this synthetic workload; not a production mixed-network worker upper limit",
+                                "scope": "Only this synthetic workload; shared worker/queue limits no longer apply",
                                 "queue_size_upper_limit": None,
-                                "queue_note": "Queue capacity is a configured admission boundary, not extra throughput or a discoverable physical maximum.",
+                                "queue_note": "No shared queue or derived HTTP admission cap remains.",
                                 "production_rpm_upper_limit": None,
-                                "rpm_note": "Local tests verify the limiter, not Wikipedia/Yibu/provider quotas."}}
+                                "rpm_note": "Wiki has no service limiter; local Yibu/Web tests do not establish provider quotas."}}

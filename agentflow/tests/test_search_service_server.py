@@ -57,9 +57,10 @@ class ServiceHTTPTests(unittest.TestCase):
         self.start()
         self.addCleanup(self.stop)
 
-    def start(self):
+    def start(self, **config_overrides):
         self.service = SearchService(ServiceConfig(cache_dir=self.directory.name,
-            db_path=str(Path(self.directory.name) / "cache.sqlite3"), token="secret-test-token"), self.providers)
+            db_path=str(Path(self.directory.name) / "cache.sqlite3"), token="secret-test-token",
+            **config_overrides), self.providers)
         self.server = ServiceHTTPServer(("127.0.0.1", 0), self.service)
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         self.thread.start()
@@ -131,12 +132,12 @@ class ServiceHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["text"].startswith("https://test.invalid/page"))
 
-    def test_blacklisted_fetch_rejects_before_cache_and_worker_admission(self):
+    def test_blacklisted_fetch_rejects_before_cache_and_provider_execution(self):
         url = "https://dead.test/page"
         self.assertEqual(self.request("/v1/fetch", {"url": url})[0], 200)
         self.service.config.blocked_domains = ("dead.test",)
         with patch.object(self.service.cache, "get", side_effect=AssertionError("cache must not be read")), \
-             patch.object(self.service, "_submit", side_effect=AssertionError("must not enter work queue")):
+             patch.object(self.providers, "execute", side_effect=AssertionError("provider must not execute")):
             for _ in range(2):
                 status, headers, body = self.request("/v1/fetch", {"url": url})
                 self.assertEqual(status, 410)
@@ -147,10 +148,11 @@ class ServiceHTTPTests(unittest.TestCase):
         self.assertEqual(self.providers.calls, 1)
 
     def test_client_remaining_budget_limits_service_deadline(self):
-        original = self.providers.execute
-        def slow(*args):
-            time.sleep(0.1)
-            return original(*args)
+        def slow(tool, params, service):
+            def produce():
+                time.sleep(0.1)
+                return {"text": "late result"}
+            return service.cached("slow-test", params, produce, 3600)
         started = time.monotonic()
         with patch.object(self.providers, "execute", side_effect=slow):
             status, _, body = self.request("/v1/fetch", {"url": "https://allowed.test"},
@@ -214,6 +216,33 @@ class ServiceHTTPTests(unittest.TestCase):
         self.assertTrue(all(reply[0] == 200 for reply in replies))
         self.assertEqual(self.providers.calls, 1)
 
+    def test_http_connections_are_not_capped_by_legacy_workers_and_queue(self):
+        self.stop()
+        self.start(workers=1, queue_size=0)
+        release = threading.Event()
+        all_entered = threading.Event()
+        count = 0
+        lock = threading.Lock()
+
+        def execute(tool, params, service):
+            nonlocal count
+            with lock:
+                count += 1
+                if count == 24:
+                    all_entered.set()
+            if not release.wait(3):
+                raise AssertionError("HTTP requests were not released")
+            return {"results": []}
+
+        with patch.object(self.providers, "execute", side_effect=execute), ThreadPoolExecutor(max_workers=24) as executor:
+            futures = [executor.submit(self.request, "/v1/search/wikipedia", {"query": str(i)}) for i in range(24)]
+            try:
+                self.assertTrue(all_entered.wait(1.5), f"Only {count} HTTP requests were admitted")
+                self.assertEqual(self.service.metrics.snapshot().get("connection_rejections", 0), 0)
+            finally:
+                release.set()
+            self.assertTrue(all(future.result()[0] == 200 for future in futures))
+
     def test_gzip_input_and_output_roundtrip(self):
         query = "long-query-" * 100
         status, headers, body = self.request("/v1/search/wikipedia", raw=gzip.compress(json.dumps({"query": query}).encode()),
@@ -262,10 +291,8 @@ class ServiceHTTPTests(unittest.TestCase):
 
 
 class ServerConfigurationTests(unittest.TestCase):
-    def test_updated_capacity_defaults_and_blacklist_environment(self):
+    def test_active_capacity_defaults_and_blacklist_environment(self):
         defaults = ServiceConfig.from_env({})
-        self.assertEqual((defaults.workers, defaults.queue_size), (32, 128))
-        self.assertEqual((defaults.wiki_rpm, defaults.wiki_concurrency), (120, 32))
         self.assertEqual((defaults.brave_rpm, defaults.brave_concurrency), (240, 16))
         self.assertEqual(defaults.blocked_domains, ())
         config = ServiceConfig.from_env({"SEARCH_BLOCKED_DOMAINS": "Example.ORG., *.dead.test 例子.测试,example.org"})
@@ -291,9 +318,17 @@ class ServerConfigurationTests(unittest.TestCase):
         self.assertEqual(config.token, "shared-test-token")
 
     def test_invalid_nonfinite_configuration_is_rejected(self):
-        for name in ("SEARCH_WIKI_RPM", "SEARCH_SERVICE_REQUEST_TIMEOUT", "SEARCH_CACHE_MAX_TTL"):
+        for name in ("SEARCH_BRAVE_RPM", "SEARCH_SERVICE_REQUEST_TIMEOUT", "SEARCH_CACHE_MAX_TTL"):
             with self.assertRaises(ValueError):
                 ServiceConfig.from_env({name: "nan"})
+
+    def test_obsolete_global_worker_and_wiki_settings_are_ignored(self):
+        names = ("SEARCH_SERVICE_WORKERS", "SEARCH_SERVICE_QUEUE_SIZE", "SEARCH_WIKI_RPM", "SEARCH_WIKI_CONCURRENCY")
+        defaults = ServiceConfig.from_env({})
+        for old_value in ("0", "1", "nan", "not-a-number"):
+            config = ServiceConfig.from_env(dict.fromkeys(names, old_value))
+            self.assertEqual((config.workers, config.queue_size, config.wiki_rpm, config.wiki_concurrency),
+                             (defaults.workers, defaults.queue_size, defaults.wiki_rpm, defaults.wiki_concurrency))
 
 
 if __name__ == "__main__":

@@ -23,6 +23,20 @@ def stage(rpm=120, concurrency=2, passed=True, duration=60):
 
 
 class CapacityCliTests(unittest.TestCase):
+    def test_network_settings_omit_removed_limits_and_preserve_wiki_measurement(self):
+        known = {"wiki": {"rpm": 150, "concurrency": 32},
+                 "brave": {"rpm": 240, "concurrency": 16}}
+        args = capacity.build_parser().parse_args([])
+        report = {}
+        capacity.store_confirmation(report, args, known)
+        self.assertEqual(report["confirmed_measured_load"], known)
+        self.assertEqual(report["confirmed_network_settings"],
+                         {"SEARCH_BRAVE_RPM": 240, "SEARCH_BRAVE_CONCURRENCY": 16})
+        self.assertEqual(set(report["ignored_service_settings"]),
+                         {"SEARCH_SERVICE_WORKERS", "SEARCH_SERVICE_QUEUE_SIZE",
+                          "SEARCH_WIKI_RPM", "SEARCH_WIKI_CONCURRENCY"})
+        self.assertEqual(capacity.network_settings({"wiki": known["wiki"]}), {})
+
     def test_grid_validation_and_sorting(self):
         self.assertEqual(capacity.number_grid("4,1,2,2", integer=True), [1, 2, 4])
         for invalid in ("nan", "inf", "0", "-1", ""):
