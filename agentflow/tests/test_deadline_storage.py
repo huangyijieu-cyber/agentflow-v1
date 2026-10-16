@@ -204,12 +204,13 @@ class DeadlineStorageTests(unittest.TestCase):
         with closing(sqlite3.connect(self.path)) as conn:
             self.assertEqual(conn.execute("SELECT DISTINCT accessed FROM entries").fetchall(), [(1000.0,)])
 
-    def test_expiry_cleanup_updates_incremental_totals(self):
+    def test_elapsed_old_ttl_does_not_remove_records_or_change_incremental_totals(self):
         with patch("agentflow.search_service.core.time.time", return_value=1000):
             self.cache.put("a", "old", '"old"', 1)
         with patch("agentflow.search_service.core.time.time", return_value=1002):
             self.cache.put("a", "new", "{}", 100)
-        self.assertEqual(self.totals(), (1, 2))
+        self.assertEqual(self.totals(), (2, 7))
+        self.assertEqual(self.cache.get("a", "old"), '"old"')
 
 
 if __name__ == "__main__":

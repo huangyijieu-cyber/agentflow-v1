@@ -321,9 +321,16 @@ class ServerConfigurationTests(unittest.TestCase):
         self.assertEqual(config.token, "shared-test-token")
 
     def test_invalid_nonfinite_configuration_is_rejected(self):
-        for name in ("SEARCH_SERVICE_REQUEST_TIMEOUT", "SEARCH_CACHE_MAX_TTL"):
+        for name in ("SEARCH_SERVICE_REQUEST_TIMEOUT", "SEARCH_SERVICE_CONNECT_TIMEOUT", "SEARCH_SERVICE_READ_TIMEOUT"):
             with self.assertRaises(ValueError):
                 ServiceConfig.from_env({name: "nan"})
+
+    def test_obsolete_cache_ttl_environment_is_ignored_even_when_invalid(self):
+        defaults = ServiceConfig.from_env({})
+        for value in ("604800", "0", "nan", "inf", "not-a-number"):
+            with self.subTest(value=value):
+                config = ServiceConfig.from_env({"SEARCH_CACHE_MAX_TTL": value})
+                self.assertEqual(config.cache_max_ttl, defaults.cache_max_ttl)
 
     def test_obsolete_global_worker_and_provider_settings_are_ignored(self):
         names = ("SEARCH_SERVICE_WORKERS", "SEARCH_SERVICE_QUEUE_SIZE", "SEARCH_WIKI_RPM", "SEARCH_WIKI_CONCURRENCY",

@@ -101,7 +101,10 @@ class ServiceRequestHandler(BaseHTTPRequestHandler):
 
     def _error(self, failure, request_id):
         self.server.service.metrics.add("http_errors")
-        self._send_json(failure.status_code, {"error": failure.as_dict(), "request_id": request_id},
+        payload = {"error": failure.as_dict(), "request_id": request_id}
+        if failure.yibu_usage_events:
+            payload["yibu_usage_events"] = failure.yibu_usage_events
+        self._send_json(failure.status_code, payload,
                         request_id=request_id, retry_after=failure.retry_after)
 
     def do_GET(self):
