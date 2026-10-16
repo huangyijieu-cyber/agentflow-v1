@@ -214,9 +214,26 @@ class AgentFlowTrainer(RayPPOTrainer):
 
     ## score=0, score=1, classify(统一划分)
     def _trans_to_dpo_batch(self, history_batch_list: list):
+        self._slic_turn_metrics = {}
         if not history_batch_list:
             print("## No DPO data with history")
             return None
+
+        task = str(self.config.data.get("task", "")).lower()
+        slic_turn_scope = self.config.data.get("slic_turn_scope", "all")
+        is_slic = "slic" in self.algorithm.split("+")
+        if is_slic:
+            if slic_turn_scope not in {"all", "analysis_first_tool_final"}:
+                raise ValueError(f"Invalid data.slic_turn_scope: {slic_turn_scope!r}")
+            if slic_turn_scope != "all" and task != "qa":
+                raise ValueError("data.slic_turn_scope=analysis_first_tool_final requires data.task=qa")
+            if task == "qa":
+                self._slic_turn_metrics = {
+                    "replay/slic_candidate_turns": 0,
+                    "replay/slic_filtered_turns": 0,
+                    **{f"replay/slic_pairs_{stage}": 0
+                       for stage in ("analysis", "first_tool", "middle", "final")},
+                }
 
         k_partitions = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
         split_select_keys = [
@@ -244,15 +261,29 @@ class AgentFlowTrainer(RayPPOTrainer):
             lengths = response_mask.sum(dim=-1)
             bsz = scores.shape[0]
 
-            task = str(self.config.data.get("task", "")).lower()
             rollout_last_turn = {}
+            qa_turn_stages = []
             if task == "qa":
+                # Determine final turns from the full batch, before any filtering.
                 for i in range(bsz):
                     rollout_id = str(rollout_ids[i])
                     turn = int(turn_indices[i])
                     rollout_last_turn[rollout_id] = max(
                         rollout_last_turn.get(rollout_id, -1), turn
                     )
+                # QA OUTPUT_TYPE=final logs analysis, tool choices, then final output.
+                # Executor and verifier calls are fixed models, not planner turns.
+                for i in range(bsz):
+                    turn = int(turn_indices[i])
+                    if turn == rollout_last_turn[str(rollout_ids[i])]:
+                        stage = "final"
+                    elif turn == 0:
+                        stage = "analysis"
+                    elif turn == 1:
+                        stage = "first_tool"
+                    else:
+                        stage = "middle"
+                    qa_turn_stages.append(stage)
 
             id2score = defaultdict(list)
             id2index = defaultdict(list)
@@ -264,6 +295,11 @@ class AgentFlowTrainer(RayPPOTrainer):
                     # 排除超长 prompt：响应来自完整上下文，不能用于截断上下文下的 SLiC。
                     if is_drop_mask is not None and bool(is_drop_mask[i].item()):
                         continue
+                    if is_slic and task == "qa":
+                        self._slic_turn_metrics["replay/slic_candidate_turns"] += 1
+                        if slic_turn_scope == "analysis_first_tool_final" and qa_turn_stages[i] == "middle":
+                            self._slic_turn_metrics["replay/slic_filtered_turns"] += 1
+                            continue
                     uid = str(uids[i])
                     turn = str(turn_indices[i])
                     ## replay collection
@@ -410,6 +446,9 @@ class AgentFlowTrainer(RayPPOTrainer):
                         proto.non_tensor_batch["born_step"] = np.array([self.global_steps], dtype=np.int64)
                         # =====================================================================
                         proto_list.append(proto)
+                        if is_slic and task == "qa":
+                            stage = qa_turn_stages[p_idx]
+                            self._slic_turn_metrics[f"replay/slic_pairs_{stage}"] += 1
 
         if not proto_list:
             print("## DPO pair is not found!")
@@ -601,6 +640,7 @@ class AgentFlowTrainer(RayPPOTrainer):
                     self._dpo_ring_buffer = deque(maxlen=replay_buffer_size)
 
                 new_dpo_pairs = self._trans_to_dpo_batch([batch])
+                metrics.update(self._slic_turn_metrics)
                 if new_dpo_pairs is not None:
                     # uid 全局配额：同一 uid 在 buffer 中最多 M 对（防多轮相邻 turn 冗余）
                     if not hasattr(self, '_uid_pair_count'):
