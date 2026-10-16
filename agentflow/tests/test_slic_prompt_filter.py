@@ -42,7 +42,8 @@ def load_pair_function():
 PAIR = load_pair_function()
 
 
-def run(rows, with_drop_mask=True):
+def run(rows, with_drop_mask=True, *, previous_tools=None, data_overrides=None,
+        algorithm='grpo+slic', return_details=False, n_gpus=1):
     # Each row is rollout_id, turn, reward, mean log-prob, is_dropped.
     size = len(rows)
     ids = torch.arange(size).reshape(size, 1).repeat(1, 2)
@@ -56,16 +57,23 @@ def run(rows, with_drop_mask=True):
     non = {key: np.array(['q'] * size) for key in ['uid', 'data_id_list']}
     non.update({key: np.array([row[0] for row in rows]) for key in ['rollout_id_list', 'traj_id_list', 'traj_uid']})
     non['turn_index_list'] = np.array([row[1] for row in rows])
+    if previous_tools is not None:
+        non['previous_tool_name_list'] = np.array(previous_tools, dtype=object)
+    data_config = {'task': 'qa', 'replay_collection': 'uid-turn'}
+    data_config.update(data_overrides or {})
+    proto = Proto(batch, non, {'temperature': 0.7})
     trainer = SimpleNamespace(
         config=SimpleNamespace(
-            trainer=SimpleNamespace(n_gpus_per_node=1, nnodes=1),
-            data={'task': 'qa', 'replay_collection': 'uid-turn'},
+            trainer=SimpleNamespace(n_gpus_per_node=n_gpus, nnodes=1),
+            data=data_config,
         ),
+        algorithm=algorithm,
         use_reference_policy=False,
         global_steps=1,
     )
     with contextlib.redirect_stdout(io.StringIO()):
-        return PAIR(trainer, [Proto(batch, non, {'temperature': 0.7})])
+        pairs = PAIR(trainer, [proto])
+    return (pairs, trainer, proto) if return_details else pairs
 
 
 class SlicPromptFilterTests(unittest.TestCase):

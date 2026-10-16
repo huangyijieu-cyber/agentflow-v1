@@ -758,7 +758,11 @@ class AgentModeDaemon:
             # Example triplet.prompt: {"token_ids": [...]}
             # Example triplet.response: {"token_ids": [...]}
             trace_list = [
-                {"prompt_ids": t.prompt.get("token_ids", []), "response_ids": t.response.get("token_ids", [])}
+                {
+                    "prompt_ids": t.prompt.get("token_ids", []),
+                    "response_ids": t.response.get("token_ids", []),
+                    "previous_tool_name": t.metadata.get("previous_tool_name"),
+                }
                 for t in rollout.triplets
             ]
 
@@ -806,6 +810,7 @@ class AgentModeDaemon:
         response_ids_list, response_attention_mask_list = [], []
         reward_list, data_id_list, rollout_id_list, turn_index_list, is_drop_list = [], [], [], [], []
         anchor_list, traj_id_list, active_mask_list = [], [], []
+        previous_tool_name_list = []
         n_trunc_sample_because_of_response = 0
         valid_samples = 0
         all_samples_num = 0
@@ -867,6 +872,7 @@ class AgentModeDaemon:
                 anchor_list.append(sample_info["anchor_list"][turn_index])
                 rollout_id_list.append(rollout_id)
                 turn_index_list.append(turn_index)
+                previous_tool_name_list.append(trace["previous_tool_name"])
 
         logger.info(f"[STEP-WISE DEBUG]: valid response trace length in this training step is [{valid_samples}/{all_samples_num}]")
         if valid_samples == 0:
@@ -932,6 +938,7 @@ class AgentModeDaemon:
         data_proto.non_tensor_batch["data_id_list"] = np.array(data_id_list)
         data_proto.non_tensor_batch["rollout_id_list"] = np.array(rollout_id_list)
         data_proto.non_tensor_batch["turn_index_list"] = np.array(turn_index_list)
+        data_proto.non_tensor_batch["previous_tool_name_list"] = np.array(previous_tool_name_list, dtype=object)
         data_proto.non_tensor_batch["anchor_list"] = np.array(anchor_list)
         data_proto.non_tensor_batch["traj_id_list"] = np.array(traj_id_list)
         data_proto.non_tensor_batch["reward_list"] = np.array(reward_list)

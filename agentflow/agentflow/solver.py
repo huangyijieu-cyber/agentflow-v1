@@ -80,6 +80,8 @@ class Solver:
             timing = RolloutTiming() if profiling_enabled() else None
             measure = timing.track if timing else lambda *args, **kwargs: nullcontext()
             self.memory.clear()
+            # Explicit boundary marker; None is reserved for an unknown/invalid tool.
+            self.planner._previous_tool_name = "__no_previous_tool__"
             # Update cache directory for the executor
             self.executor.set_query_cache_dir(self.root_cache_dir)
 
@@ -147,6 +149,11 @@ class Solver:
                             self.max_tokens,
                         )
                         context, sub_goal, tool_name = self.planner.extract_context_subgoal_and_tool(next_step)
+                    # generate_next_step already logged the preceding tool. Update
+                    # only after that log, using the canonical name used by execution.
+                    self.planner._previous_tool_name = (
+                        tool_name if tool_name in self.planner.available_tools else None
+                    )
                     if self.verbose:
                         log_info(f"[NextStep raw][step={step_count}]: {next_step}")
                         log_info(f"\n==> 🎯 Step {step_count}: Action Prediction ({tool_name})\n")

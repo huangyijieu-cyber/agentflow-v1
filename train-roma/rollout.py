@@ -357,7 +357,10 @@ class RolloutAgent(LitAgent):
                         prompt={"token_ids": list(prompt_ids)},
                         response={"token_ids": list(response_ids)},
                         reward=None,
-                        metadata={"finish_reason": finish_reason},
+                        metadata={
+                            "finish_reason": finish_reason,
+                            "previous_tool_name": log.get("previous_tool_name"),
+                        },
                     )
                 )
             return triplets

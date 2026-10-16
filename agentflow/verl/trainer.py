@@ -214,9 +214,24 @@ class AgentFlowTrainer(RayPPOTrainer):
 
     ## score=0, score=1, classify(统一划分)
     def _trans_to_dpo_batch(self, history_batch_list: list):
+        self._slic_previous_tool_metrics = {}
         if not history_batch_list:
             print("## No DPO data with history")
             return None
+
+        task = str(self.config.data.get("task", "")).lower()
+        match_previous_tool = (
+            self.config.data.get("slic_match_previous_tool", False)
+            and "slic" in self.algorithm.split("+")
+        )
+        if match_previous_tool:
+            if task != "qa":
+                raise ValueError("data.slic_match_previous_tool=True requires data.task=qa")
+            self._slic_previous_tool_metrics = {
+                f"replay/slic_prev_tool_{name}": 0
+                for name in ("candidate_pairs", "turn_mismatch_pairs", "unknown_pairs",
+                             "mismatch_pairs", "matched_pairs", "selected_pairs")
+            }
 
         k_partitions = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
         split_select_keys = [
@@ -239,12 +254,20 @@ class AgentFlowTrainer(RayPPOTrainer):
             rollout_ids = history_batch.non_tensor_batch["rollout_id_list"]
             old_log_probs = history_batch.batch["old_log_probs"]
             is_drop_mask = history_batch.batch.get("is_drop_mask")
+            previous_tools = history_batch.non_tensor_batch.get("previous_tool_name_list")
+            pair_split_keys = list(non_tensor_split_select_keys)
+            if match_previous_tool:
+                if previous_tools is None:
+                    raise ValueError(
+                        "SLIC previous-tool filtering requires previous_tool_name_list; "
+                        "restart rollout workers with the updated metadata pipeline."
+                    )
+                pair_split_keys.append("previous_tool_name_list")
 
             scores = token_level_scores.sum(dim=-1)
             lengths = response_mask.sum(dim=-1)
             bsz = scores.shape[0]
 
-            task = str(self.config.data.get("task", "")).lower()
             rollout_last_turn = {}
             if task == "qa":
                 for i in range(bsz):
@@ -364,6 +387,24 @@ class AgentFlowTrainer(RayPPOTrainer):
                                 n_is_last = int(turn_indices[n_idx]) == rollout_last_turn[n_rollout_id]
                                 if p_is_last != n_is_last:
                                     continue
+                            # Keep the original groups/baselines and filter candidate
+                            # pairs before top-K. Compare the previous choice, not
+                            # the tool being selected by the current response.
+                            if match_previous_tool:
+                                stats = self._slic_previous_tool_metrics
+                                stats["replay/slic_prev_tool_candidate_pairs"] += 1
+                                if int(turn_indices[p_idx]) != int(turn_indices[n_idx]):
+                                    stats["replay/slic_prev_tool_turn_mismatch_pairs"] += 1
+                                    continue
+                                p_tool, n_tool = previous_tools[p_idx], previous_tools[n_idx]
+                                if not (isinstance(p_tool, str) and p_tool.strip()
+                                        and isinstance(n_tool, str) and n_tool.strip()):
+                                    stats["replay/slic_prev_tool_unknown_pairs"] += 1
+                                    continue
+                                if p_tool != n_tool:
+                                    stats["replay/slic_prev_tool_mismatch_pairs"] += 1
+                                    continue
+                                stats["replay/slic_prev_tool_matched_pairs"] += 1
                             if p_score - n_score > sat_thresh:      # 白送对，梯度≈0
                                 continue
                             if max(p_len, n_len) / min(p_len, n_len) > LENGTH_RATIO_MAX:
@@ -400,8 +441,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                             {key + "_a": history_batch.batch[key][p_idx: p_idx+1, :] for key in split_select_keys}
                             | {key + "_b": history_batch.batch[key][n_idx: n_idx+1, :] for key in split_select_keys}
                             | {key: history_batch.non_tensor_batch[key][p_idx: p_idx+1] for key in non_tensor_select_keys}
-                            | {key + "_a": history_batch.non_tensor_batch[key][p_idx: p_idx+1] for key in non_tensor_split_select_keys}
-                            | {key + "_b": history_batch.non_tensor_batch[key][n_idx: n_idx+1] for key in non_tensor_split_select_keys}
+                            | {key + "_a": history_batch.non_tensor_batch[key][p_idx: p_idx+1] for key in pair_split_keys}
+                            | {key + "_b": history_batch.non_tensor_batch[key][n_idx: n_idx+1] for key in pair_split_keys}
                         )
                         # ========== 关键：baseline 和 group_size 放入 non_tensor_batch ==========
                         # DataProto.concat 会正确拼接 non_tensor_batch，不会丢失 per-sample 标量
@@ -410,6 +451,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                         proto.non_tensor_batch["born_step"] = np.array([self.global_steps], dtype=np.int64)
                         # =====================================================================
                         proto_list.append(proto)
+                        if match_previous_tool:
+                            self._slic_previous_tool_metrics["replay/slic_prev_tool_selected_pairs"] += 1
 
         if not proto_list:
             print("## DPO pair is not found!")
@@ -601,6 +644,7 @@ class AgentFlowTrainer(RayPPOTrainer):
                     self._dpo_ring_buffer = deque(maxlen=replay_buffer_size)
 
                 new_dpo_pairs = self._trans_to_dpo_batch([batch])
+                metrics.update(self._slic_previous_tool_metrics)
                 if new_dpo_pairs is not None:
                     # uid 全局配额：同一 uid 在 buffer 中最多 M 对（防多轮相邻 turn 冗余）
                     if not hasattr(self, '_uid_pair_count'):

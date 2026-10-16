@@ -43,6 +43,7 @@ class Planner:
             "prompt_token_ids": metadata.get("prompt_token_ids"),
             "response_token_ids": metadata.get("response_token_ids"),
             "finish_reason": metadata.get("finish_reason"),
+            "previous_tool_name": getattr(self, "_previous_tool_name", None),
         })
 
     def get_image_info(self, image_path: str) -> Dict[str, Any]:
