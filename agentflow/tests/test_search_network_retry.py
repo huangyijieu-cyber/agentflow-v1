@@ -7,7 +7,9 @@ import io
 import json
 import os
 import sys
+import time
 import unittest
+import uuid
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from functools import partial
@@ -57,7 +59,8 @@ def http_response(status, *, headers=None, content=b"", data=None):
 
 def retry_scope():
     return dict(
-        requests=requests, time=NS(sleep=Mock()),
+        requests=requests, time=NS(sleep=Mock(), perf_counter=time.perf_counter),
+        uuid=uuid, yibu_timestamp=lambda: datetime.now(timezone.utc).isoformat(),
         MAX_NETWORK_RETRIES=retry.MAX_NETWORK_RETRIES,
         MAX_RETRY_WAIT_SECONDS=retry.MAX_RETRY_WAIT_SECONDS,
         RETRYABLE_HTTP_STATUSES=retry.RETRYABLE_HTTP_STATUSES,
@@ -222,7 +225,7 @@ class BraveRetryTests(unittest.TestCase):
         self.scope.update(Any=object, Dict=dict, List=list, Optional=Optional)
         self.search = production_function("brave_search/tool.py", "_execute_search", self.scope)
         self.tool = NS(api_key="test", endpoint="https://search.test/v1", timeout=20,
-                       max_retries=retry.MAX_NETWORK_RETRIES)
+                       max_retries=retry.MAX_NETWORK_RETRIES, token_usage=Mock())
         self.tool._as_text = production_function("brave_search/tool.py", "_as_text", self.scope)
         self.tool._extract_results = production_function("brave_search/tool.py", "_extract_results", self.scope)
         self.tool._format_results = partial(production_function("brave_search/tool.py", "_format_results", self.scope), self.tool)

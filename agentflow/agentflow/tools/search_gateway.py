@@ -45,6 +45,30 @@ def _response_diagnostics(error: Mapping[str, Any]) -> Dict[str, Any]:
     return diagnostics
 
 
+def _yibu_usage_events(value: Any) -> list[Dict[str, Any]]:
+    """Keep per-attempt telemetry separate from error text and cached results."""
+    if not isinstance(value, list):
+        return []
+    fields = {
+        "call_id", "attempt", "input_text", "started_at", "elapsed_s", "http_status",
+        "status", "response_body_text", "error_type", "event_id", "query",
+        "raw_response_text", "duration_ms", "finished_at",
+    }
+    events = []
+    for event in value:
+        if not isinstance(event, dict):
+            continue
+        event = dict(event)
+        event.setdefault("input_text", event.get("query"))
+        if (not isinstance(event.get("call_id"), str)
+                or type(event.get("attempt")) is not int or event["attempt"] < 1
+                or not isinstance(event.get("input_text"), str)
+                or not isinstance(event.get("status"), str)):
+            continue
+        events.append({key: deepcopy(item) for key, item in event.items() if key in fields})
+    return events
+
+
 class SearchGatewayError(RuntimeError):
     """Search Gateway 访问或返回异常。"""
 
@@ -61,6 +85,7 @@ class SearchGatewayError(RuntimeError):
         attempts: Optional[int] = None,
         retryable: Optional[bool] = None,
         diagnostics: Optional[Mapping[str, Any]] = None,
+        usage_events: Optional[list[Dict[str, Any]]] = None,
     ):
         self.message = " ".join(str(message).split())[:500]
         self.code = code
@@ -72,6 +97,8 @@ class SearchGatewayError(RuntimeError):
         self.attempts = attempts
         self.retryable = retryable
         self.diagnostics = sanitize_search_diagnostics(diagnostics)
+        # Query/body texts are intentional token-log inputs, never diagnostics or str(error).
+        self.usage_events = _yibu_usage_events(usage_events)
         self.phase = self.diagnostics.get("phase")
         self.deadline_reason = self.diagnostics.get("deadline_reason")
         self.deadline_scope = self.diagnostics.get("deadline_scope")
@@ -182,6 +209,7 @@ class SearchGatewayClient:
         # 最关键：
         # 禁止继承训练服务器 HTTP_PROXY / HTTPS_PROXY。
         self.session.trust_env = False
+        self.last_usage_events = []
 
     @classmethod
     def from_env(
@@ -272,6 +300,7 @@ class SearchGatewayClient:
         *,
         payload: Optional[Dict[str, Any]] = None,
     ):
+        self.last_usage_events = []
         url = self._url(path)
 
         headers = {
@@ -340,6 +369,7 @@ class SearchGatewayClient:
                 data = response.json()
 
                 if isinstance(data, dict):
+                    self.last_usage_events = _yibu_usage_events(data.get("yibu_usage_events"))
                     request_id = request_id or data.get("request_id")
                     error = data.get("error")
                     detail = data.get("detail")
@@ -395,6 +425,7 @@ class SearchGatewayClient:
                 attempts=attempts,
                 retryable=retryable,
                 diagnostics=diagnostics,
+                usage_events=self.last_usage_events,
             )
             response.close()
             raise error
@@ -402,6 +433,10 @@ class SearchGatewayClient:
         try:
             # Protect cached objects from mutation by each rollout's local RAG.
             result = deepcopy(response.json())
+            if isinstance(result, dict):
+                meta = result.get("meta")
+                if isinstance(meta, dict):
+                    self.last_usage_events = _yibu_usage_events(meta.get("yibu_usage_events"))
             if context is not None:
                 context.check()
             return result

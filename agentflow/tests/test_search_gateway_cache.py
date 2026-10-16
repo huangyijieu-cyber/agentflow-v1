@@ -3,7 +3,9 @@ import ast
 import importlib.util
 import os
 import sys
+import time
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock, Mock, patch
@@ -221,7 +223,10 @@ class ToolIntegrationTests(unittest.TestCase):
             "MAX_NETWORK_RETRIES": 3, "MAX_RETRY_WAIT_SECONDS": 30,
             "RETRYABLE_HTTP_STATUSES": {429, 500, 502, 503, 504},
             "YIBU_RETRYABLE_HTTP_STATUSES": {422, 429, 500, 502, 503, 504},
-            "retry_wait_seconds": Mock(return_value=0), "time": NS(sleep=Mock()),
+            "retry_wait_seconds": Mock(return_value=0),
+            "time": NS(sleep=Mock(), perf_counter=time.perf_counter), "uuid": uuid,
+            "yibu_timestamp": lambda: "2026-10-16T08:00:00.000+08:00",
+            "YibuTokenUsageRecorder": Mock(), "SimpleNamespace": NS, "_warn_once": Mock(),
             "create_llm_engine": lambda **kwargs: NS(), "TOOL_NAME": "test_tool",
             "LIMITATION": "", "LIMITATIONS": "", "BEST_PRACTICE": "", "BEST_PRACTICES": "",
             "SUMMARIZE_PROMPT_TEMPLATE": "{query}\n{reference_information}",

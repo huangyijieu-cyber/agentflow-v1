@@ -24,6 +24,7 @@ from collections import Counter
 from contextlib import contextmanager
 from concurrent.futures import Future, TimeoutError
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urljoin, urlsplit
@@ -31,9 +32,11 @@ from urllib.parse import urljoin, urlsplit
 import requests
 
 
-CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+# Compatibility export: None means records have no age-based expiry.
+CACHE_TTL_SECONDS = None
 DEFAULT_CACHE_DB_PATH = "/var/tmp/agentflow-search-cache/search_cache.sqlite3"
 LOG = logging.getLogger("agentflow.search_service")
+_YIBU_TZ = timezone(timedelta(hours=8))
 
 
 def _blocked_domain(value):
@@ -61,7 +64,7 @@ class GatewayFailure(RuntimeError):
                  status_code: int = 502, retryable: bool = False,
                  upstream: str | None = None, upstream_status: int | None = None,
                  retry_after: float | None = None, attempts: int | None = None,
-                 diagnostics: dict | None = None):
+                 diagnostics: dict | None = None, yibu_usage_events=None):
         self.message = " ".join(str(message).split())[:500]
         self.code = code
         self.status_code = status_code
@@ -71,6 +74,9 @@ class GatewayFailure(RuntimeError):
         self.retry_after = retry_after
         self.attempts = attempts
         self.diagnostics = dict(diagnostics or {})
+        # Response telemetry is deliberately separate from safe error diagnostics.
+        # Queries/bodies must never leak into deadline or exception messages.
+        self.yibu_usage_events = list(yibu_usage_events or [])
         super().__init__(self.message)
 
     def as_dict(self) -> dict:
@@ -86,7 +92,14 @@ class GatewayFailure(RuntimeError):
         return GatewayFailure(self.message, code=self.code, status_code=self.status_code,
                               retryable=self.retryable, upstream=self.upstream,
                               upstream_status=self.upstream_status, retry_after=self.retry_after,
-                              attempts=self.attempts, diagnostics={**self.diagnostics, **details})
+                              attempts=self.attempts, diagnostics={**self.diagnostics, **details},
+                              yibu_usage_events=self.yibu_usage_events)
+
+    def with_yibu_usage(self, events):
+        copy = self.with_diagnostics()
+        copy.yibu_usage_events = list({event["event_id"]: event for event in
+                                     [*self.yibu_usage_events, *events]}.values())
+        return copy
 
 
 def json_dumps(value: Any, *, canonical: bool = False) -> str:
@@ -110,7 +123,8 @@ class ServiceConfig:
     max_body_bytes: int = 8 * 1024 * 1024
     max_upstream_bytes: int = 20 * 1024 * 1024
     cache_max_bytes: int = 2 * 1024 * 1024 * 1024
-    cache_max_ttl: float = float(CACHE_TTL_SECONDS)
+    # Legacy argument, ignored: cache lifetime is controlled only by LRU capacity.
+    cache_max_ttl: float = 0.0
     # Retained only for callers constructing old configs; all are ignored.
     wiki_rpm: float = 120.0
     wiki_concurrency: int = 32
@@ -137,7 +151,7 @@ class ServiceConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
-        for name in ("request_timeout", "cache_max_ttl", "connect_timeout", "read_timeout"):
+        for name in ("request_timeout", "connect_timeout", "read_timeout"):
             value = getattr(self, name)
             if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be a finite positive number")
@@ -149,7 +163,7 @@ class ServiceConfig:
         mapping = {
             "request_timeout": "SEARCH_SERVICE_REQUEST_TIMEOUT", "max_batch": "SEARCH_SERVICE_MAX_BATCH",
             "max_body_bytes": "SEARCH_SERVICE_MAX_BODY_BYTES", "max_upstream_bytes": "SEARCH_SERVICE_MAX_UPSTREAM_BYTES",
-            "cache_max_bytes": "SEARCH_CACHE_MAX_BYTES", "cache_max_ttl": "SEARCH_CACHE_MAX_TTL",
+            "cache_max_bytes": "SEARCH_CACHE_MAX_BYTES",
             "max_retries": "SEARCH_SERVICE_MAX_RETRIES", "connect_timeout": "SEARCH_SERVICE_CONNECT_TIMEOUT",
             "read_timeout": "SEARCH_SERVICE_READ_TIMEOUT",
         }
@@ -197,6 +211,15 @@ class _Trace:
         self.shared = None
         self._lock = threading.Lock()
         self._reported = False
+        self._yibu_usage = {}
+
+    def add_yibu_usage(self, events):
+        with self._lock:
+            self._yibu_usage.update((event["event_id"], event) for event in events)
+
+    def yibu_usage(self):
+        with self._lock:
+            return list(self._yibu_usage.values())
 
     def set_phase(self, phase):
         with self._lock:
@@ -271,10 +294,12 @@ class SQLiteCache:
     _MAX_READERS = 16
     _TOUCH_BATCH_SIZE = 128
 
-    def __init__(self, path, *, max_bytes, max_ttl):
+    def __init__(self, path, *, max_bytes, max_ttl=None):
         self.path = str(path)
         self.max_bytes = max_bytes
-        self.max_ttl = max_ttl
+        # Retain the old constructor/attribute without allowing an old env or
+        # caller to re-enable age-based expiration.
+        self.max_ttl = None
         self._writer_lock = threading.RLock()
         self._read_condition = threading.Condition()
         self._idle_readers = []
@@ -308,12 +333,12 @@ class SQLiteCache:
             conn.execute("""CREATE TABLE IF NOT EXISTS entries (
                 namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
                 expires REAL NOT NULL, accessed REAL NOT NULL, size INTEGER NOT NULL,
-                ttl REAL NOT NULL DEFAULT 604800,
+                ttl REAL NOT NULL DEFAULT 0,
                 PRIMARY KEY(namespace, key))""")
             columns = {row[1] for row in conn.execute("PRAGMA table_info(entries)")}
             if "ttl" not in columns:
-                # Keep healthy legacy schemas usable without changing expiry.
-                conn.execute("ALTER TABLE entries ADD COLUMN ttl REAL NOT NULL DEFAULT 604800")
+                # Keep legacy records intact; lookup ignores their old expiry.
+                conn.execute("ALTER TABLE entries ADD COLUMN ttl REAL NOT NULL DEFAULT 0")
             conn.execute("CREATE INDEX IF NOT EXISTS entries_expiry ON entries(expires)")
             conn.execute("CREATE INDEX IF NOT EXISTS entries_access ON entries(accessed)")
             # Bootstrap legacy databases once. Triggers keep totals transactional
@@ -437,8 +462,8 @@ class SQLiteCache:
             # Access time is monotonic per entry; a concurrent old read must
             # not move the access time of a replacement value backwards.
             conn.executemany("UPDATE entries SET accessed=MAX(accessed,?) "
-                             "WHERE namespace=? AND key=? AND expires>?",
-                             ((accessed, namespace, key, accessed)
+                             "WHERE namespace=? AND key=?",
+                             ((accessed, namespace, key)
                               for (namespace, key), accessed in touches.items()))
 
     @contextmanager
@@ -470,22 +495,22 @@ class SQLiteCache:
     def get(self, namespace, key):
         with self._read_connection() as conn:
             now = time.time()
-            row = conn.execute("SELECT value, expires FROM entries WHERE namespace=? AND key=?",
+            row = conn.execute("SELECT value FROM entries WHERE namespace=? AND key=?",
                                (namespace, key)).fetchone()
             if row is None:
-                return None
-            if row[1] <= now:
                 return None
             with self._touch_lock:
                 pair = (namespace, key)
                 self._pending_touches[pair] = max(now, self._pending_touches.get(pair, now))
         return row[0]
 
-    def put(self, namespace, key, value_json, ttl, *, before_commit=None):
+    def put(self, namespace, key, value_json, ttl=None, *, before_commit=None):
         self._check_open()
-        if isinstance(ttl, bool) or not isinstance(ttl, (float, int)) or not math.isfinite(ttl):
+        if ttl is not None and (isinstance(ttl, bool) or not isinstance(ttl, (float, int)) or not math.isfinite(ttl)):
             raise ValueError("cache ttl must be finite")
-        if ttl <= 0:
+        # Nonpositive TTL still means "do not store" for old callable policies.
+        # Positive legacy TTLs are accepted but no longer expire the record.
+        if ttl is not None and ttl <= 0:
             return False
         size = len(value_json.encode("utf-8"))
         if size > self.max_bytes:
@@ -494,14 +519,12 @@ class SQLiteCache:
         try:
             with self.connect(before_commit=before_commit) as conn:
                 now = time.time()
-                lifetime = min(float(ttl), self.max_ttl)
-                conn.execute("DELETE FROM entries WHERE expires<=?", (now,))
                 conn.execute("""INSERT INTO entries (namespace, key, value, expires, accessed, size, ttl)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(namespace, key) DO UPDATE SET value=excluded.value,
                     expires=excluded.expires, accessed=excluded.accessed, size=excluded.size,
                     ttl=excluded.ttl""",
-                    (namespace, key, value_json, now + lifetime, now, size, lifetime))
+                    (namespace, key, value_json, 0, now, size, 0))
                 total = conn.execute("SELECT bytes FROM cache_totals WHERE id=1").fetchone()[0]
                 if total > self.max_bytes:
                     # Ordinary writes flush a bounded batch. Before eviction,
@@ -529,8 +552,7 @@ class SQLiteCache:
 
     def stats(self):
         with self._read_connection() as conn:
-            row = conn.execute("SELECT COUNT(*),COALESCE(SUM(size),0) FROM entries WHERE expires>?",
-                               (time.time(),)).fetchone()
+            row = conn.execute("SELECT COUNT(*),COALESCE(SUM(size),0) FROM entries").fetchone()
         return {"entries": row[0], "bytes": row[1]}
 
     def close(self):
@@ -879,7 +901,7 @@ class SearchService:
         if context is not None:
             context[field] = context.get(field, 0) + count
 
-    def cached(self, namespace, params, producer: Callable, ttl, persist=True):
+    def cached(self, namespace, params, producer: Callable, ttl=None, persist=True):
         if not isinstance(namespace, str) or not namespace or len(namespace) > 128:
             raise ValueError("invalid cache namespace")
         self.check_deadline()
@@ -946,6 +968,8 @@ class SearchService:
         if trace is not None:
             trace.set_shared(flight.trace)
         if isinstance(inherited_error, GatewayFailure) and inherited_error.code == "deadline_exceeded":
+            if trace is not None:
+                trace.add_yibu_usage(flight.trace.yibu_usage())
             raise self._deadline_failure("Previous shared search execution has expired",
                                          shared=flight.trace, scope="inherited",
                                          reason="previous_producer_deadline", code="shared_execution_expired")
@@ -969,6 +993,11 @@ class SearchService:
                                                reason=exc.diagnostics.get("deadline_reason"))
                 raise error from exc
             raise
+        finally:
+            # Every coalesced caller receives the same stable attempt IDs.
+            # They live on the flight trace, never in the cached JSON value.
+            if trace is not None:
+                trace.add_yibu_usage(flight.trace.yibu_usage())
         self.set_phase("response_decode")
         value = json.loads(encoded)
         self.check_deadline()
@@ -1112,6 +1141,7 @@ class SearchService:
         options_base = dict(kwargs)
         options_base.pop("allow_redirects", None)
         total_attempts = 0
+        usage_call_id = uuid.uuid4().hex
         with self._session_factory() as session, self._abort_on_cancel(getattr(session, "close", None)):
             # The server's existing proxy route is the only external network exit.
             session.trust_env = True
@@ -1135,6 +1165,9 @@ class SearchService:
                     flight = getattr(self._local, "flight", None)
                     failure = None
                     retry_after = None
+                    attempt_started = None
+                    attempt_started_at = None
+                    attempt_error_type = None
                     try:
                         remaining = self.remaining()
                         options = dict(options_base)
@@ -1146,6 +1179,8 @@ class SearchService:
                         self._note("upstream_attempts")
                         self.metrics.add("upstream_attempts/" + name)
                         total_attempts += 1
+                        attempt_started = time.monotonic()
+                        attempt_started_at = datetime.now(_YIBU_TZ).isoformat(timespec="milliseconds")
                         self.set_phase("upstream_headers")
                         response = session.request(current_method, current_url, **options)
                         # Observe status before checking expiry: a late 429 must
@@ -1228,6 +1263,7 @@ class SearchService:
                             self.set_phase("response_decode")
                             return response
                     except requests.exceptions.ProxyError as exc:
+                        attempt_error_type = type(exc).__name__
                         status = _proxy_http_status(exc)
                         retryable = status not in {400, 401, 403, 407}
                         failure = GatewayFailure(
@@ -1241,6 +1277,7 @@ class SearchService:
                             raise failure from exc
                         delay = float(2 ** attempt)
                     except requests.exceptions.SSLError as exc:
+                        attempt_error_type = type(exc).__name__
                         self.metrics.add("upstream_errors/upstream_tls_error")
                         failure = GatewayFailure("Upstream TLS connection failed", code="upstream_tls_error",
                                                  status_code=502, retryable=False, upstream=name,
@@ -1248,6 +1285,7 @@ class SearchService:
                         self._local.trace.failure(failure)
                         raise failure from exc
                     except (requests.Timeout, requests.ConnectionError) as exc:
+                        attempt_error_type = type(exc).__name__
                         timed_out = _is_request_timeout(exc)
                         failure = GatewayFailure(
                             "Upstream HTTP request timed out" if timed_out else "Upstream network connection failed",
@@ -1261,6 +1299,7 @@ class SearchService:
                             raise failure from exc
                         delay = float(2 ** attempt)
                     except requests.RequestException as exc:
+                        attempt_error_type = type(exc).__name__
                         self.metrics.add("upstream_errors/upstream_request_error")
                         failure = GatewayFailure("Upstream request failed", code="upstream_request_error",
                                                  status_code=502, upstream=name, attempts=total_attempts)
@@ -1271,6 +1310,12 @@ class SearchService:
                     finally:
                         if watchdog is not None:
                             watchdog.cancel()
+                        if name == "brave" and attempt_started is not None:
+                            self._record_yibu_attempt(
+                                usage_call_id, total_attempts, options_base,
+                                response, failure, attempt_error_type,
+                                attempt_started, attempt_started_at,
+                            )
                         try:
                             if response is not None:
                                 response.close()
@@ -1296,6 +1341,45 @@ class SearchService:
                 current_url = next_url
         raise GatewayFailure("Upstream request failed")
 
+    def _record_yibu_attempt(self, call_id, attempt, options, response, failure,
+                             error_type, started, started_at):
+        """Capture already-read data only; telemetry cannot trigger network IO."""
+        try:
+            trace = getattr(self._local, "trace", None)
+            if trace is None:
+                return
+            params = options.get("params", {})
+            query = params.get("q", "") if isinstance(params, dict) else ""
+            status = response.status_code if response is not None else None
+            body = None
+            # On errors/redirects stream=True may leave the body unread. Access
+            # private buffered bytes, never response.text/content or iter_content.
+            if response is not None and response.__dict__.get("_content_consumed") is True:
+                raw = response.__dict__.get("_content")
+                if isinstance(raw, bytes):
+                    encoding = response.__dict__.get("encoding") or "utf-8"
+                    try:
+                        body = raw.decode(encoding, errors="replace")
+                    except LookupError:
+                        body = raw.decode("utf-8", errors="replace")
+            outcome = "success" if status is not None and 200 <= status < 300 and body is not None else (
+                "http_error" if status is not None and status >= 400 else "network_error")
+            event = {
+                "call_id": call_id, "event_id": f"{call_id}:{attempt}",
+                "attempt": attempt, "input_text": query, "query": query,
+                "source": "shared_service", "event_type": "upstream_attempt", "http_attempt": True,
+                "status": outcome, "http_status": status,
+                "error_type": error_type or (failure.code if failure is not None else None),
+                "started_at": started_at,
+                "finished_at": datetime.now(_YIBU_TZ).isoformat(timespec="milliseconds"),
+                "elapsed_s": round(max(0.0, time.monotonic() - started), 6),
+                "response_body_text": body,
+            }
+            trace.add_yibu_usage([event])
+        except Exception:
+            # Like the main tool logger, accounting must not retry/fail a search.
+            self.metrics.add("yibu_usage_record_errors")
+
     def _execute(self, tool, params, deadline, queued_at, request_id, trace=None):
         previous = dict(self._local.__dict__)
         self._local.deadline = deadline
@@ -1319,23 +1403,28 @@ class SearchService:
             meta.update(self._local.context)
             meta.update(request_id=request_id, queue_wait_seconds=0.0,
                         duration_seconds=round(time.monotonic() - started, 6))
+            usage_events = trace.yibu_usage()
+            if usage_events:
+                meta["yibu_usage_events"] = usage_events
             result["meta"] = meta
             if trace.claim_outcome():
                 self.metrics.add("requests_succeeded")
             return result
         except GatewayFailure as exc:
-            failure = self._decorate_failure(exc, trace)
+            failure = self._decorate_failure(exc, trace).with_yibu_usage(trace.yibu_usage())
             self._record_failure(failure, trace)
             if failure is exc:
                 raise
             raise failure from exc
         except TimeoutError as exc:
             failure = GatewayFailure("Search suboperation timed out", code="producer_timeout",
-                                     status_code=504, retryable=True, diagnostics=trace.snapshot())
+                                     status_code=504, retryable=True, diagnostics=trace.snapshot(),
+                                     yibu_usage_events=trace.yibu_usage())
             self._record_failure(failure, trace)
             raise failure from exc
         except Exception as exc:
-            failure = GatewayFailure("Search provider failed", code="provider_error", status_code=502)
+            failure = GatewayFailure("Search provider failed", code="provider_error", status_code=502,
+                                     yibu_usage_events=trace.yibu_usage())
             self._record_failure(failure, trace)
             raise failure from exc
         finally:
@@ -1377,6 +1466,9 @@ class SearchService:
             failure = self._deadline_failure("Search batch request deadline exceeded", trace=trace,
                                              shared=trace.shared_trace() if trace is not None else None)
             if trace is not None:
+                shared = trace.shared_trace()
+                usage = trace.yibu_usage() + (shared.yibu_usage() if shared is not None else [])
+                failure = failure.with_yibu_usage(usage)
                 self._record_failure(failure, trace)
             raise failure from None
 
@@ -1424,6 +1516,8 @@ class SearchService:
                 resolved[key] = {"ok": True, "data": self._wait(future, deadline)}
             except GatewayFailure as exc:
                 resolved[key] = {"ok": False, "error": exc.as_dict()}
+                if exc.yibu_usage_events:
+                    resolved[key]["yibu_usage_events"] = exc.yibu_usage_events
         return {"results": [json_clone({"ok": False, "error": key.as_dict()} if isinstance(key, GatewayFailure)
                                       else resolved[key]) for key in order]}
 

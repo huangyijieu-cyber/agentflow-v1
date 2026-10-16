@@ -37,19 +37,21 @@ class SQLiteReadTests(unittest.TestCase):
                     self.assertEqual(self.cache.get("a", "one"), '"value"')
                     self.assertEqual(self.cache.stats()["entries"], 1)
             self.assertEqual(opened.call_count, 1)
-        self.assertEqual(self.raw_row("one"), ('"value"', 605800, 1000))
+        self.assertEqual(self.raw_row("one"), ('"value"', 0, 1000))
         self.assertEqual(self.cache._pending_touches, {("a", "one"): 1100})
         self.cache.close()
-        self.assertEqual(self.raw_row("one"), ('"value"', 605800, 1100))
+        self.assertEqual(self.raw_row("one"), ('"value"', 0, 1100))
 
-    def test_expired_read_is_a_miss_without_deleting_or_touching(self):
-        with patch("agentflow.search_service.core.time.time", return_value=1000):
-            self.cache.put("a", "old", '"old"', 10)
+    def test_legacy_expired_read_is_a_hit_without_rewriting_expiry(self):
+        with self.cache.connect() as conn:
+            conn.execute("INSERT INTO entries VALUES ('a','old','\"old\"',1010,1000,5,10)")
         with patch("agentflow.search_service.core.time.time", return_value=1011):
-            self.assertIsNone(self.cache.get("a", "old"))
-            self.assertEqual(self.cache.stats()["entries"], 0)
+            self.assertEqual(self.cache.get("a", "old"), '"old"')
+            self.assertEqual(self.cache.stats()["entries"], 1)
         self.assertEqual(self.raw_row("old"), ('"old"', 1010, 1000))
-        self.assertEqual(self.cache._pending_touches, {})
+        self.assertEqual(self.cache._pending_touches, {("a", "old"): 1011})
+        self.cache.close()
+        self.assertEqual(self.raw_row("old"), ('"old"', 1010, 1011))
 
     def test_wal_hit_returns_while_writer_has_uncommitted_transaction(self):
         self.cache.put("a", "one", '"committed"', 100)
@@ -124,7 +126,7 @@ class SQLiteReadTests(unittest.TestCase):
             self.cache.put("a", "new", '"uvwxyz"', 100)
             self.assertIsNone(self.cache.get("a", "idle"))
             self.assertEqual(self.cache.get("a", "old"), '"123456"')
-        self.assertEqual(self.raw_row("old")[1], 1100)
+        self.assertEqual(self.raw_row("old")[1], 0)
 
     def test_precommit_deadline_failure_rolls_back_value_and_preserves_pending_touch(self):
         with patch("agentflow.search_service.core.time.time", return_value=1000):

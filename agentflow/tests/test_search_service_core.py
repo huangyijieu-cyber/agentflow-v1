@@ -64,19 +64,18 @@ class SQLiteCacheTests(unittest.TestCase):
         self.assertEqual(restored, value)
         self.assertEqual(list(restored[0]), ["z", "a"])
 
-    def test_hits_keep_original_capped_expiry_and_do_not_revive_expired_entries(self):
+    def test_successful_values_are_permanent_even_with_old_positive_ttl(self):
         with patch("agentflow.search_service.core.time.time", return_value=1000):
             self.cache.put("wiki", "one", '"old"', 10000)
         with patch("agentflow.search_service.core.time.time", return_value=1029):
             self.assertEqual(self.cache.get("wiki", "one"), '"old"')
         with self.cache.connect() as conn:
-            self.assertEqual(conn.execute("SELECT expires, accessed FROM entries").fetchone(), (1030, 1029))
-        # Even a hit one second before expiry does not extend the original TTL.
-        with patch("agentflow.search_service.core.time.time", return_value=1030):
-            self.assertIsNone(self.cache.get("wiki", "one"))
-        self.assertEqual(self.cache.stats()["entries"], 0)
+            self.assertEqual(conn.execute("SELECT expires, accessed FROM entries").fetchone(), (0, 1029))
+        with patch("agentflow.search_service.core.time.time", return_value=1000 + 180 * 86400):
+            self.assertEqual(self.cache.get("wiki", "one"), '"old"')
+        self.assertEqual(self.cache.stats()["entries"], 1)
 
-    def test_stats_do_not_renew_ttl_or_refresh_other_entries(self):
+    def test_stats_and_restart_keep_all_retained_records_available(self):
         with patch("agentflow.search_service.core.time.time", return_value=1000):
             self.cache.put("wiki", "hit", '"hit"', 20)
             self.cache.put("wiki", "idle", '"idle"', 20)
@@ -86,8 +85,9 @@ class SQLiteCacheTests(unittest.TestCase):
         restart = SQLiteCache(self.path, max_bytes=100000, max_ttl=30)
         self.addCleanup(restart.close)
         with patch("agentflow.search_service.core.time.time", return_value=1021):
-            self.assertIsNone(restart.get("wiki", "idle"))
-            self.assertIsNone(restart.get("wiki", "hit"))
+            self.assertEqual(restart.get("wiki", "idle"), '"idle"')
+            self.assertEqual(restart.get("wiki", "hit"), '"hit"')
+        self.assertEqual(restart.stats()["entries"], 2)
 
     def test_healthy_legacy_schema_preserves_existing_expiry(self):
         path = Path(self.directory.name) / "legacy.sqlite3"
@@ -102,10 +102,10 @@ class SQLiteCacheTests(unittest.TestCase):
             self.assertEqual(cache.get("wiki", "old"), '"value"')
         with cache.connect() as conn:
             expires, ttl = conn.execute("SELECT expires, ttl FROM entries").fetchone()
-        self.assertEqual((expires, ttl), (2000, CACHE_TTL_SECONDS))
+        self.assertEqual((expires, ttl), (2000, 0))
         cache.put("wiki", "new", '"new"', CACHE_TTL_SECONDS)
 
-    def test_hits_update_lru_without_extending_expiry(self):
+    def test_permanent_hits_update_lru_and_preserve_capacity_eviction(self):
         cache = SQLiteCache(self.path, max_bytes=16, max_ttl=100)
         self.addCleanup(cache.close)
         with patch("agentflow.search_service.core.time.time", return_value=100):
@@ -119,7 +119,7 @@ class SQLiteCacheTests(unittest.TestCase):
             self.assertIsNone(cache.get("a", "idle"))
             self.assertEqual(cache.get("a", "old"), '"123456"')
         with cache.connect() as conn:
-            self.assertEqual(conn.execute("SELECT expires FROM entries WHERE key='old'").fetchone()[0], 200)
+            self.assertEqual(conn.execute("SELECT expires FROM entries WHERE key='old'").fetchone()[0], 0)
 
     def test_capacity_evicts_oldest_without_partial_writes(self):
         cache = SQLiteCache(self.path, max_bytes=12, max_ttl=100)

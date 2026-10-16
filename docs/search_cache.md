@@ -137,7 +137,6 @@ nohup bash train-roma/run_search_cache.sh > /home/ma-user/work/code-rl/cache/ser
 
 ```bash
 SEARCH_CACHE_DB_PATH=/var/tmp/agentflow-search-cache/search_cache.sqlite3
-SEARCH_CACHE_MAX_TTL=604800
 # SEARCH_BLOCKED_DOMAINS：复制 search-service.env.example 中完整的 325 项赋值。
 ```
 
@@ -145,7 +144,7 @@ SEARCH_CACHE_MAX_TTL=604800
 `SEARCH_{WIKI,BRAVE,WEB}_{RPM,CONCURRENCY}` 均无需再设置；这些旧配置不再生效。
 
 同步代码后必须重启开发服务器上的共享搜索服务。只重启训练会复用仍在运行的旧服务，
-不会应用新路径或新有效期。启动日志会打印实际数据库路径；切换新数据库后缓存从零积累。
+不会应用新路径或缓存策略。启动日志会打印实际数据库路径；切换新数据库后缓存从零积累。
 
 ## 训练机接入
 
@@ -204,20 +203,22 @@ VERL 的 Ray 入口会显式向 actor 传递客户端配置。直接调用其它
 
 | 工具 | 缓存内容 | key 与有效期 |
 | --- | --- | --- |
-| Wiki 候选 | 完整、有序标题列表 | API 站点/语言、query、实际参数、版本；写入后 7 天，命中不续期 |
-| Wiki 页面 | 页面身份、正文、URL | 站点/语言、标题身份或 pageid、参数、版本；写入后 7 天，命中不续期 |
-| Web RAG | 当前 BeautifulSoup 规则解析出的网页文本 | 完整实际 URL、影响内容的 headers、解析版本与长度；写入后 7 天，命中不续期 |
-| Yibu/Brave | 完整、有序上游 JSON，包括所有搜索结果和 snippets | endpoint、query、count、地区/语言/freshness、版本；包括 freshness 搜索均为写入后 7 天，命中不续期 |
+| Wiki 候选 | 完整、有序标题列表 | API 站点/语言、query、实际参数、版本；不按时间过期 |
+| Wiki 页面 | 页面身份、正文、URL | 站点/语言、标题身份或 pageid、参数、版本；不按时间过期 |
+| Web RAG | 当前 BeautifulSoup 规则解析出的网页文本 | 完整实际 URL、影响内容的 headers、解析版本与长度；不按时间过期 |
+| Yibu/Brave | 完整、有序上游 JSON，包括所有搜索结果和 snippets | endpoint、query、count、地区/语言/freshness、版本；包括 freshness 搜索均不按时间过期 |
 | Base Generator / Python Coder | 不做全局结果缓存 | 非上述网络检索路径 |
 
-成功响应中的真实零结果也缓存 7 天；429、超时、未知响应、5xx 不作为成功内容缓存。
+成功响应中的真实零结果也不按时间过期；429、超时、未知响应、5xx 不作为成功内容缓存。
 Wiki 单页失败保留当前占位结果，但失败页面不入正常缓存；成功页面可以复用。
 Wiki API 正文和 HTML 解析文本属于不同缓存类型，不能互相替代。
 
-每条记录写入时设置 `expires = 写入时间 + 604800 秒`，之后命中不会修改 `expires`。
+所有工具取消七天有效期，不执行过期删除、按需刷新或后台刷新。已有记录一直可命中，
+直到容量不足被 LRU 淘汰、手工清理，或本地临时盘丢失。网页变化不会自动触发重新检索。
 缓存读取允许并发，命中不再同步取得数据库写锁更新 `accessed`；LRU访问时间延后合并写回，
-用于容量不足时近似淘汰最近没有使用的记录。即使频繁命中，到达原定有效期也必须重新访问上游。查询 `/metrics` 不延长有效期，容量上限仍可提前淘汰记录。
-升级时已有健康记录保留当前的 `expires`，不会清库，也不会继续续期；不能追溯恢复旧记录此前的原始写入时间。
+用于容量不足时淘汰最近没有使用的记录。访问旧记录同样参与 LRU，读取指标不改变 LRU。
+数据库保留旧的 `expires` / `ttl` 列以兼容已有表结构，但读取、容量统计和淘汰不再依据它们。
+旧库中仍存在但原先已经过期的成功记录也直接复用，无需清库或全表重写；此前已删除的数据无法恢复。
 
 取得并验证成功内容后，先完成在途任务的 Future，让调用方取得结果，再尽力写入 SQLite。
 写入期间保留该 key 的在途记录，因此此时来的相同请求仍可复用已经完成的结果，
@@ -227,11 +228,11 @@ Wiki API 正文和 HTML 解析文本属于不同缓存类型，不能互相替�
 
 数据库读连接池、写锁和 SQLite 锁等待受当前操作剩余预算限制，SQL 执行也检查截止时间，
 不再无限等待。容量通过 SQLite 触发器增量维护，正常每次写入不再全表 `SUM(size)`；
-`/metrics` 仍统计当前未过期的条目和有效载荷，并不使用命中续期。
+`/metrics` 的 `cache.entries` / `cache.bytes` 统计所有保留条目及其有效载荷，不再按旧过期时间过滤。
 
-各工具统一使用 7 天，不再读取旧的 `SEARCH_CACHE_WIKI_TTL`、`SEARCH_CACHE_WEB_TTL`、
-`SEARCH_CACHE_BRAVE_TTL`、`SEARCH_CACHE_BRAVE_FRESH_TTL`、`SEARCH_CACHE_EMPTY_TTL`。
-保留总上限 `SEARCH_CACHE_MAX_TTL`，默认和示例均为 `604800`；设置得更低会缩短有效期。
+旧的 `SEARCH_CACHE_MAX_TTL`、`SEARCH_CACHE_WIKI_TTL`、`SEARCH_CACHE_WEB_TTL`、
+`SEARCH_CACHE_BRAVE_TTL`、`SEARCH_CACHE_BRAVE_FRESH_TTL`、`SEARCH_CACHE_EMPTY_TTL` 均不再生效。
+已有 env 即使保留 `SEARCH_CACHE_MAX_TTL=604800`，也不会恢复七天过期；无需修改训练端配置。
 
 缓存不改变候选排序、重复项、字段顺序和模型使用的文本长度。
 从缓存读取时重新构造独立对象，避免 Wiki 原地加入摘要污染其他 query。
@@ -273,7 +274,7 @@ producer到达自身截止时间时会唤醒等待者返回超时；如果底层
 
 网络、重试及等待重复请求仍消耗各自对应预算。
 服务故障、代理故障和上游错误可以通过 error code、upstream 和 request ID 区分。
-过期成功结果刷新失败时不静默返回旧内容。
+缓存未命中时获取新内容；上游失败仍返回具体错误，不将错误文本作为成功结果存入缓存。
 
 共享链路的失败保持结构化原因，不统一替换成工具 300 秒超时：
 
@@ -457,6 +458,62 @@ SQLite 文件和 WAL 还会有索引/空闲页等开销，磁盘占用不等于�
 有受信 CA 时可以设置 `SEARCH_SERVICE_VERIFY_TLS=1` 或 `SEARCH_SERVICE_CA_BUNDLE`。
 训练客户端连接 HTTPS 共享服务时会校验证书。
 
+## 保留 main 的 Yibu 文本流量统计
+
+本地 main 中的 `YibuTokenUsageRecorder`、日志汇总入口，以及普通/profiling rollout
+对已加载 tokenizer 的绑定均保留在 cache。统计不调用额外模型或搜索 API。
+统计代码在 `agentflow/agentflow/tools/brave_search/tool.py`，不需要单独的统计服务。
+
+每条记录包含完整 query、工具返回文本、已收到的 HTTP 正文、时间、状态、事件 ID 和
+token 数。按 `encode(text, add_special_tokens=False)` 计数，不把字符数冒充 token。
+无可用 tokenizer 或分词失败时记 `null`；同一 tokenizer 最多缓存 1024 个文本指纹/计数。
+记录器异常不改变搜索结果，不触发重试；不记录认证头或 API key。
+
+共享缓存开启后，必须区分两类事件：
+
+| `source` / `event_type` | 统计对象 | 是否计入实际 HTTP 尝试数 |
+| --- | --- | --- |
+| `direct` / `upstream_attempt` | 未开缓存时，每次实际 Yibu 请求，包含重试 | 是 |
+| `shared_service` / `upstream_attempt` | 共享服务实际发出的 Yibu 请求，包含重试 | 是，按服务端事件 ID 去重 |
+| `shared_cache` / `tool_call` | 每次工具调用交付给训练 worker 的结果，包括缓存命中/合并 | 否 |
+
+冷请求返回真实上游 attempt 记录，缓存命中不返回历史 attempt；合并等待者收到相同的
+稳定 `event_id`，汇总多个日志目录时只计一次实际 HTTP。不同 tokenizer 的 token 数
+分别分组，不能把两种 tokenizer 的计数相加。`tool_call` 与 `upstream_attempt` 也分组，
+不能把逻辑调用 token 和网络流量 token 相加。
+
+`input_tokens` 是 query token 数；`output_tokens` 是完整工具输出（最终错误提示也计入），
+中间重试没有工具输出，记 0；`response_body_tokens` 是原始 HTTP 正文；
+`total_tokens=input_tokens+output_tokens`。工具格式化输出和 HTTP 正文是两个口径，不相加。
+共享服务只传递已经读取的正文；未读取的错误流、未收到响应的网络错误记 `null`，
+不会为了统计额外读取流而延长请求时间。HTTP 成功后 provider 校验仍可能失败；
+`shared_service` 的 `success` 表示成功收到 HTTP 正文，最终工具结果看 `tool_call` 状态。
+
+attempt 元数据通过成功响应 `meta.yibu_usage_events` 或失败响应顶层 `yibu_usage_events`
+传给 worker，由训练模型 tokenizer 计数；不写进缓存值、错误文本或 deadline 诊断。
+日志只覆盖 worker 已收到的事件。连接中断/提前超时后仍在服务端完成的请求可能无法交付，
+全集群实际尝试次数应以 `/metrics` 的 `upstream_attempts/brave` 为准；它不是 token 总量。
+跨任务共享时，单任务日志可能包含该任务参与等待的同一个上游请求；聚合所有任务日志后
+按稳定 ID 去重，不将其理解为各任务独占配额或 Yibu 的计费 token。
+
+完整日志统一追加到 `yibu_token.log`，线程锁和文件锁保护并发写入。目录优先级：
+
+1. `AGENTFLOW_YIBU_TOKEN_USAGE_DIR`。
+2. `$LOG_DIR_PREFIX/task_logs/127.0.0.1_rank0/`。
+3. 当前目录的 `rollout_data/`。
+
+原 serving 日志只打印 `[Yibu Token Usage]` 计数摘要。`AGENTFLOW_YIBU_TOKEN_USAGE=0`
+关闭 worker 记录；独立运行可设置 `AGENTFLOW_YIBU_TOKENIZER_PATH` 为本地模型目录，
+fallback 仅加载本地文件。普通训练直接复用 worker 已加载的 tokenizer。
+
+```bash
+python agentflow/agentflow/tools/brave_search/tool.py --summarize "$LOG_DIR_PREFIX/task_logs/127.0.0.1_rank0/yibu_token.log"
+```
+
+汇总可接收多个文件或目录，无需 Yibu 密钥或网络请求，兼容旧版日志。
+`http_attempts` 是去重实际尝试数，`tool_calls` 是共享逻辑调用数，
+`groups` 按 source、event_type 和 tokenizer 分开给出 token 合计及缺失计数。
+
 ## 离线验证
 
 在仓库根目录运行：
@@ -464,10 +521,11 @@ SQLite 文件和 WAL 还会有索引/空闲页等开销，磁盘占用不等于�
 ```bash
 python3 -m unittest discover -s agentflow/tests -p 'test_search_*' -v
 python3 -m unittest discover -s agentflow/tests -p 'test_deadline_client_diagnostics.py' -v
+python3 -m unittest discover -s tests -p 'test_wikipedia_retry.py' -v
 bash -n train-roma/run_search_cache.sh train-roma/enable_search_cache.sh train-roma/open_search_cache_tunnel.sh
 ```
 
-测试覆盖持久化、命中不续期、过期后重新获取、旧表结构兼容、并发合并、重复 batch 映射、
+测试覆盖无时间过期、旧过期条目直接复用、容量 LRU、旧表结构兼容、并发合并、重复 batch 映射、
 错误不缓存、指标接口数据库异常、共享限速已取消、黑名单及重定向拦截和三个工具的接入，
 以及先返回后写库、读写等待期限、Future等待超时与子任务异常区分、旧producer错误、
 deadline原因统计、晚到HTTP状态和客户端诊断贯通。

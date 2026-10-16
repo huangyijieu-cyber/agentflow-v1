@@ -234,6 +234,9 @@ class RolloutAgent(LitAgent):
             else:
                 prompt = task["question"]
 
+            yibu_tool = rollout.solver.executor.tool_instances_cache.get("Yibu_Brave_Search_Tool")
+            if yibu_tool is not None:
+                yibu_tool.token_usage.set_tokenizer(self.tokenizer)
             result, reward = await asyncio.to_thread(rollout.solve, question=prompt, ground_truth=task["result"])
 
             if "anchor" in result.keys():
