@@ -10,6 +10,7 @@ import email.utils
 import fcntl
 import hashlib
 import json
+import logging
 import math
 import os
 import random
@@ -32,6 +33,7 @@ import requests
 
 CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_CACHE_DB_PATH = "/var/tmp/agentflow-search-cache/search_cache.sqlite3"
+LOG = logging.getLogger("agentflow.search_service")
 
 
 def _blocked_domain(value):
@@ -58,7 +60,8 @@ class GatewayFailure(RuntimeError):
     def __init__(self, message: str, *, code: str = "upstream_error",
                  status_code: int = 502, retryable: bool = False,
                  upstream: str | None = None, upstream_status: int | None = None,
-                 retry_after: float | None = None, attempts: int | None = None):
+                 retry_after: float | None = None, attempts: int | None = None,
+                 diagnostics: dict | None = None):
         self.message = " ".join(str(message).split())[:500]
         self.code = code
         self.status_code = status_code
@@ -67,6 +70,7 @@ class GatewayFailure(RuntimeError):
         self.upstream_status = upstream_status
         self.retry_after = retry_after
         self.attempts = attempts
+        self.diagnostics = dict(diagnostics or {})
         super().__init__(self.message)
 
     def as_dict(self) -> dict:
@@ -75,7 +79,14 @@ class GatewayFailure(RuntimeError):
             value = getattr(self, name)
             if value is not None:
                 result[name] = value
+        result.update(self.diagnostics)
         return result
+
+    def with_diagnostics(self, **details):
+        return GatewayFailure(self.message, code=self.code, status_code=self.status_code,
+                              retryable=self.retryable, upstream=self.upstream,
+                              upstream_status=self.upstream_status, retry_after=self.retry_after,
+                              attempts=self.attempts, diagnostics={**self.diagnostics, **details})
 
 
 def json_dumps(value: Any, *, canonical: bool = False) -> str:
@@ -94,7 +105,7 @@ class ServiceConfig:
     # Legacy constructor fields: no shared pool/queue or upstream limiter uses them.
     workers: int = 32
     queue_size: int = 128
-    request_timeout: float = 120.0
+    request_timeout: float = 180.0
     max_batch: int = 128
     max_body_bytes: int = 8 * 1024 * 1024
     max_upstream_bytes: int = 20 * 1024 * 1024
@@ -170,10 +181,95 @@ class Metrics:
             return dict(self._values)
 
 
+class _Trace:
+    """Bounded, credential-free timings for one caller or one shared producer."""
+
+    def __init__(self, deadline, *, tool=None, request_id=None, source="service", started=None):
+        self.started = time.monotonic() if started is None else started
+        self.deadline = deadline
+        self.tool, self.request_id, self.source = tool, request_id, source
+        self.phase, self.phase_started = "request_setup", self.started
+        self.durations = Counter()
+        self.namespace = None
+        self.upstream = self.upstream_status = self.attempts = None
+        self.last_error = None
+        self.recovered = False
+        self.shared = None
+        self._lock = threading.Lock()
+        self._reported = False
+
+    def set_phase(self, phase):
+        with self._lock:
+            if phase != "shared_wait":
+                self.shared = None
+            if phase != self.phase:
+                now = time.monotonic()
+                self.durations[self.phase] += max(0.0, now - self.phase_started)
+                self.phase, self.phase_started = phase, now
+
+    def set_shared(self, shared):
+        with self._lock:
+            self.shared = shared
+
+    def shared_trace(self):
+        with self._lock:
+            return self.shared
+
+    def observe(self, upstream, status, attempts, failure=None):
+        with self._lock:
+            self.upstream, self.upstream_status, self.attempts = upstream, status, attempts
+            if failure is not None:
+                self.last_error = self._safe_error(failure)
+                self.recovered = False
+            elif status is not None and 200 <= status < 300:
+                self.recovered = self.last_error is not None
+
+    def failure(self, error):
+        with self._lock:
+            self.last_error = self._safe_error(error)
+            self.recovered = False
+            if error.upstream is not None:
+                self.upstream = error.upstream
+            if error.attempts is not None:
+                self.attempts = error.attempts
+
+    @staticmethod
+    def _safe_error(error):
+        return {name: value for name in ("code", "upstream", "upstream_status", "attempts", "retry_after")
+                if (value := getattr(error, name, None)) is not None}
+
+    def claim_outcome(self):
+        with self._lock:
+            if self._reported:
+                return False
+            self._reported = True
+            return True
+
+    def snapshot(self):
+        with self._lock:
+            now = time.monotonic()
+            durations = dict(self.durations)
+            durations[self.phase] = durations.get(self.phase, 0.0) + max(0.0, now - self.phase_started)
+            result = {
+                "phase": self.phase, "deadline_source": self.source,
+                "elapsed_seconds": round(max(0.0, now - self.started), 6),
+                "budget_seconds": round(max(0.0, self.deadline - self.started), 6),
+                "phase_elapsed_seconds": round(max(0.0, now - self.phase_started), 6),
+                "phase_durations": {key: round(value, 6) for key, value in durations.items()},
+            }
+            if self.namespace is not None:
+                result["cache_namespace"] = self.namespace
+            if self.last_error is not None:
+                result["last_upstream_error"] = dict(self.last_error)
+                result["upstream_recovered"] = self.recovered
+            return result
+
+
 class SQLiteCache:
-    """Reuse WAL readers; batch LRU touches into the next write or close."""
+    """Reuse WAL readers and bound request-side waits by their caller budget."""
 
     _MAX_READERS = 16
+    _TOUCH_BATCH_SIZE = 128
 
     def __init__(self, path, *, max_bytes, max_ttl):
         self.path = str(path)
@@ -187,6 +283,7 @@ class SQLiteCache:
         self._closed = False
         self._touch_lock = threading.Lock()
         self._pending_touches = {}
+        self._operation_local = threading.local()
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._writer = self._open_connection()
         try:
@@ -198,6 +295,9 @@ class SQLiteCache:
     def _open_connection(self):
         conn = sqlite3.connect(self.path, timeout=5.0, check_same_thread=False)
         conn.execute("PRAGMA busy_timeout=5000")
+        # REPLACE must fire the delete trigger too, including writes made via
+        # connect(), otherwise accounting would double-count replacements.
+        conn.execute("PRAGMA recursive_triggers=ON")
         return conn
 
     def _initialize(self):
@@ -216,6 +316,67 @@ class SQLiteCache:
                 conn.execute("ALTER TABLE entries ADD COLUMN ttl REAL NOT NULL DEFAULT 604800")
             conn.execute("CREATE INDEX IF NOT EXISTS entries_expiry ON entries(expires)")
             conn.execute("CREATE INDEX IF NOT EXISTS entries_access ON entries(accessed)")
+            # Bootstrap legacy databases once. Triggers keep totals transactional
+            # even for callers using the compatibility connect() interface.
+            conn.execute("""CREATE TABLE IF NOT EXISTS cache_totals (
+                id INTEGER PRIMARY KEY CHECK(id=1), entries INTEGER NOT NULL,
+                bytes INTEGER NOT NULL)""")
+            if conn.execute("SELECT 1 FROM cache_totals WHERE id=1").fetchone() is None:
+                conn.execute("INSERT INTO cache_totals SELECT 1,COUNT(*),COALESCE(SUM(size),0) FROM entries")
+            conn.execute("""CREATE TRIGGER IF NOT EXISTS cache_totals_insert AFTER INSERT ON entries
+                BEGIN UPDATE cache_totals SET entries=entries+1,bytes=bytes+NEW.size WHERE id=1; END""")
+            conn.execute("""CREATE TRIGGER IF NOT EXISTS cache_totals_update AFTER UPDATE OF size ON entries
+                BEGIN UPDATE cache_totals SET bytes=bytes+NEW.size-OLD.size WHERE id=1; END""")
+            conn.execute("""CREATE TRIGGER IF NOT EXISTS cache_totals_delete AFTER DELETE ON entries
+                BEGIN UPDATE cache_totals SET entries=entries-1,bytes=bytes-OLD.size WHERE id=1; END""")
+
+    @contextmanager
+    def operation(self, deadline=None, phase_callback=None):
+        """Attach a monotonic deadline and phase observer to this thread only."""
+        previous = getattr(self._operation_local, "state", None)
+        self._operation_local.state = {"deadline": deadline, "callback": phase_callback, "phase": None}
+        try:
+            yield
+        finally:
+            self._operation_local.state = previous
+
+    def _remaining(self, phase):
+        state = getattr(self._operation_local, "state", None)
+        if state is None:
+            return None
+        if state["phase"] != phase:
+            state["phase"] = phase
+            if state["callback"] is not None:
+                state["callback"](phase)
+        deadline = state["deadline"]
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GatewayFailure("Search deadline expired during cache access", code="deadline_exceeded",
+                                 status_code=504, retryable=True,
+                                 diagnostics={"phase": phase, "deadline_reason": phase})
+        return remaining
+
+    @contextmanager
+    def _sqlite_operation(self, conn, phase):
+        remaining = self._remaining(phase)
+        if remaining is not None:
+            conn.execute("PRAGMA busy_timeout=%d" % max(1, min(5000, math.ceil(remaining * 1000))))
+            deadline = self._operation_local.state["deadline"]
+            conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        try:
+            yield
+            self._remaining(phase)
+        except sqlite3.OperationalError:
+            # SQLite lock waits/progress interruption must retain deadline
+            # classification instead of surfacing as a generic database error.
+            self._remaining(phase)
+            raise
+        finally:
+            if remaining is not None:
+                conn.set_progress_handler(None, 0)
+                conn.execute("PRAGMA busy_timeout=5000")
 
     def _check_open(self):
         with self._read_condition:
@@ -228,9 +389,10 @@ class SQLiteCache:
         # lived and must not retain one connection for every past request.
         with self._read_condition:
             while not self._closed and not self._idle_readers and self._reader_count >= self._MAX_READERS:
-                self._read_condition.wait()
+                self._read_condition.wait(timeout=self._remaining("cache_read_wait"))
             if self._closed:
                 raise RuntimeError("Search cache is closed")
+            self._remaining("cache_read_wait")
             conn = self._idle_readers.pop() if self._idle_readers else None
             if conn is None:
                 self._reader_count += 1
@@ -238,7 +400,8 @@ class SQLiteCache:
         try:
             if conn is None:
                 conn = self._open_connection()
-            yield conn
+            with self._sqlite_operation(conn, "cache_read"):
+                yield conn
         finally:
             with self._read_condition:
                 self._active_readers -= 1
@@ -250,9 +413,17 @@ class SQLiteCache:
                     self._idle_readers.append(conn)
                 self._read_condition.notify_all()
 
-    def _take_touches(self):
+    def _take_touches(self, limit=0):
+        if limit == 0:
+            limit = self._TOUCH_BATCH_SIZE
         with self._touch_lock:
-            touches, self._pending_touches = self._pending_touches, {}
+            if limit is None or len(self._pending_touches) <= limit:
+                touches, self._pending_touches = self._pending_touches, {}
+            else:
+                touches = {}
+                for _ in range(limit):
+                    key = next(iter(self._pending_touches))
+                    touches[key] = self._pending_touches.pop(key)
         return touches
 
     def _restore_touches(self, touches):
@@ -273,19 +444,28 @@ class SQLiteCache:
     @contextmanager
     def connect(self, *, before_commit=None):
         """Compatibility write interface; flush pending LRU touches atomically."""
-        with self._writer_lock:
+        remaining = self._remaining("cache_write_wait")
+        acquired = self._writer_lock.acquire() if remaining is None else self._writer_lock.acquire(timeout=remaining)
+        if not acquired:
+            self._remaining("cache_write_wait")
+            raise RuntimeError("Search cache writer lock was not acquired")
+        try:
             self._check_open()
             touches = self._take_touches()
             try:
-                with self._writer as conn:
-                    conn.execute("BEGIN IMMEDIATE")
-                    self._apply_touches(conn, touches)
-                    yield conn
-                    if before_commit is not None:
-                        before_commit()
+                with self._sqlite_operation(self._writer, "cache_write"):
+                    with self._writer as conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        self._apply_touches(conn, touches)
+                        yield conn
+                        if before_commit is not None:
+                            before_commit()
+                        self._remaining("cache_write")
             except BaseException:
                 self._restore_touches(touches)
                 raise
+        finally:
+            self._writer_lock.release()
 
     def get(self, namespace, key):
         with self._read_connection() as conn:
@@ -310,25 +490,41 @@ class SQLiteCache:
         size = len(value_json.encode("utf-8"))
         if size > self.max_bytes:
             return False
-        with self.connect(before_commit=before_commit) as conn:
-            now = time.time()
-            lifetime = min(float(ttl), self.max_ttl)
-            conn.execute("DELETE FROM entries WHERE expires<=?", (now,))
-            conn.execute("""INSERT INTO entries (namespace, key, value, expires, accessed, size, ttl)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(namespace, key) DO UPDATE SET value=excluded.value,
-                expires=excluded.expires, accessed=excluded.accessed, size=excluded.size,
-                ttl=excluded.ttl""",
-                (namespace, key, value_json, now + lifetime, now, size, lifetime))
-            total = conn.execute("SELECT COALESCE(SUM(size),0) FROM entries").fetchone()[0]
-            if total > self.max_bytes:
-                for old_namespace, old_key, old_size in conn.execute(
-                    "SELECT namespace,key,size FROM entries ORDER BY accessed,namespace,key"
-                ).fetchall():
-                    if total <= self.max_bytes:
-                        break
-                    conn.execute("DELETE FROM entries WHERE namespace=? AND key=?", (old_namespace, old_key))
-                    total -= old_size
+        eviction_touches = {}
+        try:
+            with self.connect(before_commit=before_commit) as conn:
+                now = time.time()
+                lifetime = min(float(ttl), self.max_ttl)
+                conn.execute("DELETE FROM entries WHERE expires<=?", (now,))
+                conn.execute("""INSERT INTO entries (namespace, key, value, expires, accessed, size, ttl)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(namespace, key) DO UPDATE SET value=excluded.value,
+                    expires=excluded.expires, accessed=excluded.accessed, size=excluded.size,
+                    ttl=excluded.ttl""",
+                    (namespace, key, value_json, now + lifetime, now, size, lifetime))
+                total = conn.execute("SELECT bytes FROM cache_totals WHERE id=1").fetchone()[0]
+                if total > self.max_bytes:
+                    # Ordinary writes flush a bounded batch. Before eviction,
+                    # apply remaining observed hits so exact LRU is preserved.
+                    eviction_touches = self._take_touches(limit=None)
+                    items = list(eviction_touches.items())
+                    for offset in range(0, len(items), self._TOUCH_BATCH_SIZE):
+                        self._remaining("cache_write")
+                        self._apply_touches(conn, dict(items[offset:offset + self._TOUCH_BATCH_SIZE]))
+                    while total > self.max_bytes:
+                        self._remaining("cache_write")
+                        rows = conn.execute("SELECT namespace,key,size FROM entries "
+                                            "ORDER BY accessed,namespace,key LIMIT 128").fetchall()
+                        if not rows:
+                            break
+                        for old_namespace, old_key, old_size in rows:
+                            if total <= self.max_bytes:
+                                break
+                            conn.execute("DELETE FROM entries WHERE namespace=? AND key=?", (old_namespace, old_key))
+                            total -= old_size
+        except BaseException:
+            self._restore_touches(eviction_touches)
+            raise
         return True
 
     def stats(self):
@@ -350,7 +546,7 @@ class SQLiteCache:
         for conn in idle:
             conn.close()
         with self._writer_lock:
-            touches = self._take_touches()
+            touches = self._take_touches(limit=None)
             try:
                 with self._writer as conn:
                     if touches:
@@ -363,9 +559,11 @@ class SQLiteCache:
 class _Flight:
     """One actual producer, whose completion and budget outlive individual callers."""
 
-    def __init__(self, deadline):
+    def __init__(self, deadline, trace=None):
         self.deadline = deadline
+        self.trace = trace or _Trace(deadline)
         self.future = Future()
+        self.finished = threading.Event()
         self.cancelled = threading.Event()
         self._lock = threading.Lock()
         self._aborters = {}
@@ -443,6 +641,25 @@ def _proxy_http_status(error):
     return int(match.group(1)) if match else None
 
 
+def _is_request_timeout(error):
+    """requests wraps streaming ReadTimeoutError inside ConnectionError."""
+    pending, seen = [error], set()
+    while pending and len(seen) < 16:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, requests.Timeout) or type(current).__name__ in {
+            "ReadTimeoutError", "ConnectTimeoutError", "TimeoutError",
+        }:
+            return True
+        pending.extend(value for value in (
+            getattr(current, "__cause__", None), getattr(current, "__context__", None),
+            *getattr(current, "args", ()),
+        ) if isinstance(value, BaseException))
+    return False
+
+
 def _abort_response(response):
     """Interrupt a slow response at its overall deadline, including slow trickles.
 
@@ -503,8 +720,9 @@ class SearchService:
             raise
 
     def close(self):
-        # Never join blocked network threads. Writes share this lifecycle lock;
-        # readers are short, independently leased operations drained by close().
+        # Drain already-published material, without waiting for blocked network
+        # producers. Cache IO never runs under the service-wide state lock.
+        self.flush_cache(timeout=min(5.0, self.config.request_timeout))
         with self._state_lock:
             if self._closed:
                 return
@@ -513,11 +731,20 @@ class SearchService:
                 pending = list(self._flights.values())
             for flight in pending:
                 flight.cancel(self._closed_failure())
-            try:
-                self.cache.close()
-            finally:
-                fcntl.flock(self._process_lock, fcntl.LOCK_UN)
-                self._process_lock.close()
+        try:
+            self.cache.close()
+        finally:
+            fcntl.flock(self._process_lock, fcntl.LOCK_UN)
+            self._process_lock.close()
+
+    def flush_cache(self, timeout=5.0):
+        """Wait for already-returned results to finish their best-effort writes."""
+        until = time.monotonic() + timeout
+        with self._flight_lock:
+            pending = [flight for flight in self._flights.values()
+                       if flight.future.done() and not flight.future.cancelled()
+                       and flight.future.exception() is None]
+        return all(flight.finished.wait(max(0.0, until - time.monotonic())) for flight in pending)
 
     @staticmethod
     def _closed_failure():
@@ -530,6 +757,94 @@ class SearchService:
     def remaining(self):
         return max(0.0, self.deadline() - time.monotonic())
 
+    def set_phase(self, phase):
+        trace = getattr(self._local, "trace", None)
+        if trace is not None:
+            trace.set_phase(phase)
+
+    def _deadline_failure(self, message="Search request deadline exceeded", *, trace=None,
+                          shared=None, scope="caller", reason=None, code="deadline_exceeded"):
+        trace = trace or getattr(self._local, "trace", None)
+        details = trace.snapshot() if trace is not None else {
+            "phase": "request_setup", "elapsed_seconds": 0.0,
+            "budget_seconds": self.config.request_timeout,
+        }
+        cause_phase = details["phase"]
+        if shared is not None:
+            seen = set()
+            while id(shared) not in seen:
+                seen.add(id(shared))
+                nested = shared.shared_trace()
+                if nested is None:
+                    break
+                shared = nested
+            shared_details = shared.snapshot()
+            details["caller_phase"] = details["phase"]
+            for field in ("phase", "elapsed_seconds", "budget_seconds", "phase_durations"):
+                details["shared_" + field] = shared_details[field]
+            for field in ("last_upstream_error", "upstream_recovered", "cache_namespace"):
+                if field in shared_details:
+                    details[field] = shared_details[field]
+            cause_phase = shared_details["phase"]
+        details.update(deadline_reason=reason or cause_phase or "request_budget_exhausted",
+                       deadline_scope=scope)
+        return GatewayFailure(message, code=code, status_code=504, retryable=True,
+                              diagnostics=details)
+
+    def _decorate_failure(self, error, trace):
+        if error.code not in {"deadline_exceeded", "shared_execution_expired"}:
+            return error
+        details = trace.snapshot()
+        # Preserve the producing operation's timings and cause as shared details,
+        # but report the duration/budget of this particular logical caller.
+        diagnostics = {**details, **error.diagnostics}
+        diagnostics.update(elapsed_seconds=details["elapsed_seconds"],
+                           budget_seconds=details["budget_seconds"],
+                           phase=details["phase"],
+                           phase_elapsed_seconds=details["phase_elapsed_seconds"],
+                           phase_durations=details["phase_durations"],
+                           deadline_source=details["deadline_source"])
+        diagnostics.setdefault("phase", details["phase"])
+        diagnostics.setdefault("deadline_reason", diagnostics["phase"])
+        diagnostics.setdefault("deadline_scope", "caller")
+        return error.with_diagnostics(**diagnostics)
+
+    def _record_failure(self, error, trace):
+        if not trace.claim_outcome():
+            return
+        self.metrics.add("requests_failed")
+        self.metrics.add("requests_failed/" + error.code)
+        if error.code in {"deadline_exceeded", "shared_execution_expired"}:
+            details = error.diagnostics
+            reason = details.get("deadline_reason", "request_budget_exhausted")
+            phase = details.get("shared_phase", details.get("phase", "request_setup"))
+            scope = details.get("deadline_scope", "caller")
+            self.metrics.add("deadline_events")
+            self.metrics.add("deadline_reasons/" + reason)
+            self.metrics.add("deadline_phases/" + phase)
+            self.metrics.add("deadline_scopes/" + scope)
+            self.metrics.add("deadline_tools/" + (trace.tool or "unknown"))
+            last_error = details.get("last_upstream_error", {})
+            status = last_error.get("upstream_status")
+            if status is not None and not details.get("upstream_recovered", False):
+                self.metrics.add("deadline_upstream_status/" + str(status))
+            if last_error.get("code") and not details.get("upstream_recovered", False):
+                self.metrics.add("deadline_upstream_errors/" + last_error["code"])
+            LOG.warning("search_deadline %s", json_dumps({
+                "event": "search_deadline", "request_id": trace.request_id,
+                "tool": trace.tool, "code": error.code, **details,
+            }))
+
+    @contextmanager
+    def _state_guard(self):
+        if not self._state_lock.acquire(timeout=self.remaining()):
+            raise self._deadline_failure(reason="flight_register")
+        try:
+            self.check_deadline()
+            yield
+        finally:
+            self._state_lock.release()
+
     def check_deadline(self):
         if self._closed:
             raise self._closed_failure()
@@ -538,8 +853,7 @@ class SearchService:
             # Preserve the terminal reason chosen by the watchdog/close().
             flight.future.result()
         if self.remaining() <= 0:
-            raise GatewayFailure("Search request deadline exceeded", code="deadline_exceeded",
-                                 status_code=504, retryable=True)
+            raise self._deadline_failure(scope="producer" if flight is not None else "caller")
 
     def check_url_allowed(self, url):
         """Reject listed hosts and subdomains before cache reads or HTTP attempts."""
@@ -570,15 +884,21 @@ class SearchService:
             raise ValueError("invalid cache namespace")
         self.check_deadline()
         deadline = self.deadline()
+        trace = getattr(self._local, "trace", None)
+        if trace is not None:
+            trace.namespace = namespace
         key = hashlib.sha256(json_dumps(params, canonical=True).encode("utf-8")).hexdigest()
         flight_key = (namespace, key)
         cached = self._cache_get(namespace, key) if persist else None
         if cached is not None:
             self._note("cache_hits")
-            return json.loads(cached)
-        self._note("cache_misses")
-        with self._state_lock:
+            self.set_phase("response_decode")
+            value = json.loads(cached)
             self.check_deadline()
+            return value
+        self._note("cache_misses")
+        self.set_phase("flight_register")
+        with self._state_guard():
             with self._flight_lock:
                 flight = self._flights.get(flight_key)
                 owner = flight is None
@@ -590,7 +910,13 @@ class SearchService:
                     parent = getattr(self._local, "flight", None)
                     if parent is not None:
                         producer_deadline = min(producer_deadline, parent.deadline)
-                    flight = self._flights[flight_key] = _Flight(producer_deadline)
+                    producer_trace = _Trace(producer_deadline,
+                                            tool=trace.tool if trace is not None else None,
+                                            request_id=trace.request_id if trace is not None else None)
+                    producer_trace.namespace = namespace
+                    flight = self._flights[flight_key] = _Flight(producer_deadline, producer_trace)
+                inherited = flight.future.done() and not flight.future.cancelled()
+                inherited_error = flight.future.exception() if inherited else None
             if owner:
                 # Lookup/coalescing is already complete. Only this unique miss
                 # gets an upstream execution thread; waiters do not get one.
@@ -616,18 +942,43 @@ class SearchService:
                     raise
         if not owner:
             self._note("coalesced_waiters")
+        self.set_phase("shared_wait")
+        if trace is not None:
+            trace.set_shared(flight.trace)
+        if isinstance(inherited_error, GatewayFailure) and inherited_error.code == "deadline_exceeded":
+            raise self._deadline_failure("Previous shared search execution has expired",
+                                         shared=flight.trace, scope="inherited",
+                                         reason="previous_producer_deadline", code="shared_execution_expired")
         try:
-            return json.loads(flight.future.result(timeout=max(0.0, deadline - time.monotonic())))
-        except TimeoutError:
+            encoded = flight.future.result(timeout=max(0.0, deadline - time.monotonic()))
+        except TimeoutError as exc:
+            # Future.result also rethrows an exception produced *by* the task.
+            # Identity distinguishes it from the wait operation timing out.
+            if flight.future.done() and not flight.future.cancelled() and flight.future.exception() is exc:
+                raise GatewayFailure("Search suboperation timed out", code="producer_timeout",
+                                     status_code=504, retryable=True,
+                                     diagnostics=flight.trace.snapshot()) from exc
             # A caller expiring must not cancel/pop a producer still serving
             # other callers, nor permit a second identical upstream operation.
-            raise GatewayFailure("Deadline expired waiting for shared search result",
-                                 code="deadline_exceeded", status_code=504, retryable=True) from None
+            raise self._deadline_failure("Deadline expired waiting for shared search result",
+                                         shared=flight.trace) from None
+        except GatewayFailure as exc:
+            if exc.code == "deadline_exceeded":
+                error = self._deadline_failure(exc.message, shared=flight.trace,
+                                               scope=exc.diagnostics.get("deadline_scope", "producer"),
+                                               reason=exc.diagnostics.get("deadline_reason"))
+                raise error from exc
+            raise
+        self.set_phase("response_decode")
+        value = json.loads(encoded)
+        self.check_deadline()
+        return value
 
     def _cache_get(self, namespace, key):
         self.check_deadline()
         try:
-            cached = self.cache.get(namespace, key)
+            with self.cache.operation(deadline=self.deadline(), phase_callback=self.set_phase):
+                cached = self.cache.get(namespace, key)
         except RuntimeError:
             self.check_deadline()  # A concurrent close must stay service_closed.
             raise
@@ -635,10 +986,17 @@ class SearchService:
         return cached
 
     def _expire_flight(self, flight):
-        failure = GatewayFailure("Shared search producer deadline exceeded",
-                                 code="deadline_exceeded", status_code=504, retryable=True)
+        failure = self._deadline_failure("Shared search producer deadline exceeded",
+                                         trace=flight.trace, shared=flight.trace.shared_trace(), scope="producer")
         if flight.cancel(failure):
             self.metrics.add("producer_deadlines_exceeded")
+            details = failure.diagnostics
+            self.metrics.add("producer_deadline_reasons/" + details["deadline_reason"])
+            self.metrics.add("producer_deadline_phases/" + details.get("shared_phase", details["phase"]))
+            LOG.warning("search_producer_deadline %s", json_dumps({
+                "event": "search_producer_deadline", "request_id": flight.trace.request_id,
+                "tool": flight.trace.tool, "code": failure.code, **details,
+            }))
         # Keep the flight registered until its real execution thread exits.
         # New identical callers see the completed failure without duplicating IO.
 
@@ -647,31 +1005,52 @@ class SearchService:
         self._local.deadline = flight.deadline
         self._local.flight = flight
         self._local.context = context
+        self._local.trace = flight.trace
         try:
             # A previous owner may have completed between the first lookup and the lock.
             self.check_deadline()
             cached = self._cache_get(namespace, key) if persist else None
+            produced = cached is None
             if cached is None:
                 self.metrics.add("producer_executions")
+                self.set_phase("producer_start")
                 value = producer()
                 self.check_deadline()
+                self.set_phase("result_encode")
                 cached = json_dumps(value)
                 effective_ttl = ttl(value) if callable(ttl) else ttl
-                with self._state_lock:
-                    self.check_deadline()
-                    if persist and self.cache.put(namespace, key, cached, effective_ttl,
-                                                  before_commit=self.check_deadline):
-                        self._note("cache_stores")
-            with self._state_lock:
-                self.check_deadline()
+            # Publish validated material first. Keep the flight until the write
+            # finishes, so a miss during write-back reuses this completed value.
+            with self._state_guard():
                 flight.complete(value=cached)
+            if produced and persist:
+                try:
+                    with self.cache.operation(deadline=flight.deadline, phase_callback=self.set_phase):
+                        if self.cache.put(namespace, key, cached, effective_ttl,
+                                          before_commit=self.check_deadline):
+                            self._note("cache_stores")
+                except Exception as exc:
+                    self.metrics.add("cache_write_errors")
+                    code = exc.code if isinstance(exc, GatewayFailure) else "cache_database_error"
+                    self.metrics.add("cache_write_errors/" + code)
+                    LOG.warning("cache_write_failed %s", json_dumps({
+                        "event": "cache_write_failed", "code": code,
+                        "request_id": flight.trace.request_id, **flight.trace.snapshot(),
+                    }))
+        except TimeoutError as exc:
+            flight.complete(error=GatewayFailure("Search suboperation timed out", code="producer_timeout",
+                                                 status_code=504, retryable=True,
+                                                 diagnostics=flight.trace.snapshot()))
         except BaseException as exc:
+            if isinstance(exc, GatewayFailure) and exc.upstream is not None:
+                flight.trace.failure(exc)
             flight.complete(error=exc)
         finally:
             flight.timer.cancel()
             with self._flight_lock:
                 if self._flights.get(flight_key) is flight:
                     self._flights.pop(flight_key)
+            flight.finished.set()
             self._local.__dict__.clear()
 
     def _budget(self, upstream, url):
@@ -711,13 +1090,18 @@ class SearchService:
 
     def request(self, upstream, method, url, **kwargs):
         owns_deadline = not hasattr(self._local, "deadline")
+        owns_trace = not hasattr(self._local, "trace")
         if owns_deadline:
             self._local.deadline = time.monotonic() + self.config.request_timeout
+        if owns_trace:
+            self._local.trace = _Trace(self.deadline())
         try:
             return self._request(upstream, method, url, **kwargs)
         finally:
             if owns_deadline:
                 del self._local.deadline
+            if owns_trace:
+                del self._local.trace
 
     def _request(self, upstream, method, url, **kwargs):
         parsed = urlsplit(url)
@@ -762,14 +1146,44 @@ class SearchService:
                         self._note("upstream_attempts")
                         self.metrics.add("upstream_attempts/" + name)
                         total_attempts += 1
+                        self.set_phase("upstream_headers")
                         response = session.request(current_method, current_url, **options)
+                        # Observe status before checking expiry: a late 429 must
+                        # remain visible even if the caller/watchdog already left.
+                        status = response.status_code
+                        if status == 429:
+                            was_429 = True
+                            self.metrics.add("upstream_429/" + name)
+                            retry_after = _retry_after(response.headers.get("Retry-After"))
+                            delay = (2 ** attempt) + random.uniform(0.0, 0.5) if retry_after is None else retry_after + 0.5
+                        elif status in retry_statuses:
+                            delay = float(2 ** attempt)
+                        if not 200 <= status < 300 and status not in {301, 302, 303, 307, 308}:
+                            failure = GatewayFailure(
+                                f"Upstream returned HTTP {status}",
+                                code="upstream_proxy_error" if status == 407 else "upstream_http_error",
+                                status_code=429 if status == 429 else 502, retryable=status in retry_statuses,
+                                upstream=name, upstream_status=status, retry_after=delay if was_429 else None,
+                                attempts=total_attempts,
+                            )
+                            self.metrics.add("upstream_errors/" + failure.code)
+                        trace = getattr(self._local, "trace", None)
+                        if trace is not None:
+                            trace.observe(name, status, total_attempts, failure)
+                        if failure is not None and (self.remaining() <= 0 or (
+                                flight is not None and flight.cancelled.is_set())):
+                            self.metrics.add("late_upstream_status/" + str(status))
+                            LOG.warning("search_late_upstream %s", json_dumps({
+                                "event": "search_late_upstream", "request_id": trace.request_id,
+                                "upstream": name, "upstream_status": status,
+                                **trace.snapshot(),
+                            }))
                         if flight is not None:
                             abort_token = flight.register_abort(lambda response=response: _abort_response(response))
                         watchdog = threading.Timer(self.remaining(), _abort_response, args=(response,))
                         watchdog.daemon = True
                         watchdog.start()
                         self.check_deadline()
-                        status = response.status_code
                         if status in {301, 302, 303, 307, 308} and response.headers.get("Location"):
                             next_url = urljoin(current_url, response.headers["Location"])
                             redirect_parts = urlsplit(next_url)
@@ -788,28 +1202,18 @@ class SearchService:
                             options_base.pop("params", None)
                             self.metrics.add("upstream_redirects")
                             break
-                        if status == 429:
-                            was_429 = True
-                            self.metrics.add("upstream_429/" + name)
-                            retry_after = _retry_after(response.headers.get("Retry-After"))
-                            delay = (2 ** attempt) + random.uniform(0.0, 0.5) if retry_after is None else retry_after + 0.5
-                        elif status in retry_statuses:
-                            delay = float(2 ** attempt)
                         if not 200 <= status < 300:
-                            failure = GatewayFailure(
-                                f"Upstream returned HTTP {status}",
-                                code="upstream_proxy_error" if status == 407 else "upstream_http_error",
-                                status_code=429 if status == 429 else 502, retryable=status in retry_statuses,
-                                upstream=name, upstream_status=status, retry_after=delay if was_429 else None,
-                                attempts=total_attempts,
-                            )
-                            self.metrics.add("upstream_errors/" + failure.code)
+                            if failure is None:
+                                failure = GatewayFailure(f"Upstream returned HTTP {status}",
+                                                         code="upstream_http_error", upstream=name,
+                                                         upstream_status=status, attempts=total_attempts)
                             # Match the old Web/Yibu fast-fail policy. A long
                             # Retry-After affects this request only, never peers.
                             long_wait = was_429 and name != "wikipedia" and retry_after is not None and retry_after > 30
                             if status not in retry_statuses or attempt == self.config.max_retries or long_wait:
                                 raise failure
                         else:
+                            self.set_phase("upstream_body")
                             chunks, size = [], 0
                             for chunk in response.iter_content(chunk_size=4096):
                                 self.check_deadline()
@@ -821,6 +1225,7 @@ class SearchService:
                             response._content = b"".join(chunks)
                             response._content_consumed = True
                             self.check_deadline()
+                            self.set_phase("response_decode")
                             return response
                     except requests.exceptions.ProxyError as exc:
                         status = _proxy_http_status(exc)
@@ -831,16 +1236,19 @@ class SearchService:
                             upstream=name, upstream_status=status, attempts=total_attempts,
                         )
                         self.metrics.add("upstream_errors/upstream_proxy_error")
+                        self._local.trace.failure(failure)
                         if not retryable or attempt == self.config.max_retries or self.remaining() <= 0:
                             raise failure from exc
                         delay = float(2 ** attempt)
                     except requests.exceptions.SSLError as exc:
                         self.metrics.add("upstream_errors/upstream_tls_error")
-                        raise GatewayFailure("Upstream TLS connection failed", code="upstream_tls_error",
-                                             status_code=502, retryable=False, upstream=name,
-                                             attempts=total_attempts) from exc
+                        failure = GatewayFailure("Upstream TLS connection failed", code="upstream_tls_error",
+                                                 status_code=502, retryable=False, upstream=name,
+                                                 attempts=total_attempts)
+                        self._local.trace.failure(failure)
+                        raise failure from exc
                     except (requests.Timeout, requests.ConnectionError) as exc:
-                        timed_out = isinstance(exc, requests.Timeout)
+                        timed_out = _is_request_timeout(exc)
                         failure = GatewayFailure(
                             "Upstream HTTP request timed out" if timed_out else "Upstream network connection failed",
                             code="upstream_timeout" if timed_out else "upstream_network_error",
@@ -848,14 +1256,18 @@ class SearchService:
                             upstream=name, attempts=total_attempts,
                         )
                         self.metrics.add("upstream_errors/" + failure.code)
+                        self._local.trace.failure(failure)
                         if attempt == self.config.max_retries or self.remaining() <= 0:
                             raise failure from exc
                         delay = float(2 ** attempt)
                     except requests.RequestException as exc:
-                        self.check_deadline()
                         self.metrics.add("upstream_errors/upstream_request_error")
-                        raise GatewayFailure("Upstream request failed", code="upstream_request_error",
-                                             status_code=502, upstream=name, attempts=total_attempts) from exc
+                        failure = GatewayFailure("Upstream request failed", code="upstream_request_error",
+                                                 status_code=502, upstream=name, attempts=total_attempts)
+                        self._local.trace.failure(failure)
+                        if self.remaining() <= 0:
+                            raise self._deadline_failure(scope="producer" if flight is not None else "caller") from exc
+                        raise failure from exc
                     finally:
                         if watchdog is not None:
                             watchdog.cancel()
@@ -871,6 +1283,7 @@ class SearchService:
                         if failure is not None and delay >= self.remaining():
                             raise failure
                         try:
+                            self.set_phase("retry_wait")
                             self._sleep(delay)
                         except GatewayFailure as exc:
                             if exc.code == "deadline_exceeded" and failure is not None:
@@ -883,17 +1296,22 @@ class SearchService:
                 current_url = next_url
         raise GatewayFailure("Upstream request failed")
 
-    def _execute(self, tool, params, deadline, queued_at, request_id):
+    def _execute(self, tool, params, deadline, queued_at, request_id, trace=None):
         previous = dict(self._local.__dict__)
         self._local.deadline = deadline
         self._local.context = {}
+        trace = trace or _Trace(deadline, tool=tool, request_id=request_id,
+                                source="client" if deadline - queued_at < self.config.request_timeout - 0.01 else "service")
+        self._local.trace = trace
         self.metrics.add("unique_executions")
         started = time.monotonic()
         try:
             self.check_deadline()
             result = self.providers.execute(tool, params, self)
             self.check_deadline()
+            self.set_phase("result_encode")
             result = json_clone(result)
+            self.check_deadline()
             provider_meta = result.pop("_meta", {})
             if not isinstance(provider_meta, dict):
                 provider_meta = {}
@@ -902,58 +1320,80 @@ class SearchService:
             meta.update(request_id=request_id, queue_wait_seconds=0.0,
                         duration_seconds=round(time.monotonic() - started, 6))
             result["meta"] = meta
-            self.metrics.add("requests_succeeded")
+            if trace.claim_outcome():
+                self.metrics.add("requests_succeeded")
             return result
         except GatewayFailure as exc:
-            self.metrics.add("requests_failed")
-            self.metrics.add("requests_failed/" + exc.code)
-            raise
+            failure = self._decorate_failure(exc, trace)
+            self._record_failure(failure, trace)
+            if failure is exc:
+                raise
+            raise failure from exc
+        except TimeoutError as exc:
+            failure = GatewayFailure("Search suboperation timed out", code="producer_timeout",
+                                     status_code=504, retryable=True, diagnostics=trace.snapshot())
+            self._record_failure(failure, trace)
+            raise failure from exc
         except Exception as exc:
-            self.metrics.add("requests_failed")
-            raise GatewayFailure("Search provider failed", code="provider_error", status_code=502) from exc
+            failure = GatewayFailure("Search provider failed", code="provider_error", status_code=502)
+            self._record_failure(failure, trace)
+            raise failure from exc
         finally:
             self._local.__dict__.clear()
             self._local.__dict__.update(previous)
 
-    def _submit(self, tool, prepared, deadline, request_id):
+    def _submit(self, tool, prepared, deadline, request_id, *, deadline_source="client", started_at=None):
         # Batch multiplexing only; regular HTTP requests run in their handler.
         # There is no shared worker pool, admission semaphore or waiting queue.
         if self._closed:
             raise self._closed_failure()
         future = Future()
+        queued_at = time.monotonic() if started_at is None else started_at
+        trace = _Trace(deadline, tool=tool, request_id=request_id,
+                       source=deadline_source, started=queued_at)
+        future.search_trace = trace
 
         def run():
             if not future.set_running_or_notify_cancel():
                 return
             try:
                 future.set_result(self._execute(tool, prepared, deadline,
-                                               time.monotonic(), request_id))
+                                               queued_at, request_id, trace))
             except BaseException as exc:
                 future.set_exception(exc)
 
         threading.Thread(target=run, name="search-batch", daemon=True).start()
         return future
 
-    @staticmethod
-    def _wait(future, deadline):
+    def _wait(self, future, deadline):
         try:
             return future.result(timeout=max(0.0, deadline - time.monotonic()))
-        except TimeoutError:
+        except TimeoutError as exc:
+            if future.done() and not future.cancelled() and future.exception() is exc:
+                raise GatewayFailure("Search suboperation timed out", code="producer_timeout",
+                                     status_code=504, retryable=True) from exc
             future.cancel()
-            raise GatewayFailure("Search request deadline exceeded", code="deadline_exceeded",
-                                 status_code=504, retryable=True) from None
+            trace = getattr(future, "search_trace", None)
+            failure = self._deadline_failure("Search batch request deadline exceeded", trace=trace,
+                                             shared=trace.shared_trace() if trace is not None else None)
+            if trace is not None:
+                self._record_failure(failure, trace)
+            raise failure from None
 
-    def handle(self, tool, params, *, deadline=None, request_id=None):
+    def handle(self, tool, params, *, deadline=None, request_id=None, deadline_source=None, started_at=None):
+        source = deadline_source or ("service" if deadline is None else "client")
         deadline = deadline or time.monotonic() + self.config.request_timeout
         request_id = request_id or uuid.uuid4().hex
         self.metrics.add("logical_requests")
         prepared = self._prepare(tool, params)
-        return self._execute(tool, prepared, deadline, time.monotonic(), request_id)
+        trace = _Trace(deadline, tool=tool, request_id=request_id, source=source, started=started_at)
+        return self._execute(tool, prepared, deadline, trace.started, request_id, trace)
 
-    def batch(self, requests_list, *, deadline=None, request_id=None):
+    def batch(self, requests_list, *, deadline=None, request_id=None, deadline_source=None, started_at=None):
         if not isinstance(requests_list, list) or not requests_list or len(requests_list) > self.config.max_batch:
             raise GatewayFailure(f"requests must contain 1..{self.config.max_batch} entries",
                                  code="invalid_request", status_code=400)
+        source = deadline_source or ("service" if deadline is None else "client")
         deadline = deadline or time.monotonic() + self.config.request_timeout
         request_id = request_id or uuid.uuid4().hex
         self.metrics.add("logical_requests", len(requests_list))
@@ -967,7 +1407,8 @@ class SearchService:
                 key = json_dumps([tool, prepared], canonical=True)
                 if key not in unique:
                     try:
-                        unique[key] = self._submit(tool, prepared, deadline, request_id)
+                        unique[key] = self._submit(tool, prepared, deadline, request_id,
+                                                   deadline_source=source, started_at=started_at)
                     except GatewayFailure as exc:
                         unique[key] = exc
                 else:

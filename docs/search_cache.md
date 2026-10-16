@@ -119,7 +119,8 @@ nohup bash train-roma/run_search_cache.sh > /home/ma-user/work/code-rl/cache/ser
 
 同一数据库只允许一个服务进程运行，数据库旁的锁文件保证缓存与请求合并状态的进程归属。
 服务只需 CPU 和磁盘，不需启动训练 SDK、vLLM 或 embedding 服务。
-若需要多进程/多副本，需先把请求合并状态迁移到共享协调组件。
+前面的自动启动与本节手动启动是两种管理方式，不需要同时运行；已有服务通过健康检查后会直接复用。
+若需要多进程/多副本，需先设计跨进程的请求合并和持久化协调；当前没有需要共享的服务内限速状态。
 
 ### 数据库存放与升级
 
@@ -218,6 +219,16 @@ Wiki API 正文和 HTML 解析文本属于不同缓存类型，不能互相替�
 用于容量不足时近似淘汰最近没有使用的记录。即使频繁命中，到达原定有效期也必须重新访问上游。查询 `/metrics` 不延长有效期，容量上限仍可提前淘汰记录。
 升级时已有健康记录保留当前的 `expires`，不会清库，也不会继续续期；不能追溯恢复旧记录此前的原始写入时间。
 
+取得并验证成功内容后，先完成在途任务的 Future，让调用方取得结果，再尽力写入 SQLite。
+写入期间保留该 key 的在途记录，因此此时来的相同请求仍可复用已经完成的结果，
+不会因为数据库中暂时查不到就再次访问上游。写库不持有服务级状态锁；写库失败只增加
+`cache_write_errors` 及其错误分类，不能把已成功的网络结果改成 deadline。
+因此服务响应可能先于 `cache_stores` 或数据库条目增长；响应后、落盘前进程退出可能使该条缓存缺失。
+
+数据库读连接池、写锁和 SQLite 锁等待受当前操作剩余预算限制，SQL 执行也检查截止时间，
+不再无限等待。容量通过 SQLite 触发器增量维护，正常每次写入不再全表 `SUM(size)`；
+`/metrics` 仍统计当前未过期的条目和有效载荷，并不使用命中续期。
+
 各工具统一使用 7 天，不再读取旧的 `SEARCH_CACHE_WIKI_TTL`、`SEARCH_CACHE_WEB_TTL`、
 `SEARCH_CACHE_BRAVE_TTL`、`SEARCH_CACHE_BRAVE_FRESH_TTL`、`SEARCH_CACHE_EMPTY_TTL`。
 保留总上限 `SEARCH_CACHE_MAX_TTL`，默认和示例均为 `604800`；设置得更低会缩短有效期。
@@ -253,11 +264,12 @@ Retry-After超过30秒时直接返回上游429，不在服务内长时间睡眠�
 取消人工限制不会取消Wikipedia、Yibu或网站自己的限流规则。
 
 调用方等待期限和共享producer期限分开：每个新producer从创建时获得独立的
-`SEARCH_SERVICE_REQUEST_TIMEOUT`（默认120秒）预算，不继承最早等待者仅剩的几秒。
+`SEARCH_SERVICE_REQUEST_TIMEOUT`（默认180秒）预算，不继承最早等待者仅剩的几秒。
 每个调用方只等到自己的截止时间；其超时不会取消其他调用方共用的producer。
 producer到达自身截止时间时会唤醒等待者返回超时；如果底层线程尚未真正退出，
 仍保留该key的在途占位，后续相同请求不会启动重复上游调用。逾期结果不写入正常缓存。
-这一占位不代表还能成功返回，可能表示正在退出的底层调用。
+这一占位不代表还能成功返回，可能表示正在退出的底层调用；新来的请求会明确收到
+`shared_execution_expired`，而不是假装新请求已经用尽自己的预算。
 
 网络、重试及等待重复请求仍消耗各自对应预算。
 服务故障、代理故障和上游错误可以通过 error code、upstream 和 request ID 区分。
@@ -272,18 +284,25 @@ producer到达自身截止时间时会唤醒等待者返回超时；如果底层
 | 上游单次 HTTP 超时 | `upstream_timeout` | 在服务总预算内有限重试 |
 | 其他上游连接失败 | `upstream_network_error` | 在服务总预算内有限重试 |
 | 上游 HTTP 非成功状态 | `upstream_http_error` | 保留原始 HTTP 状态，沿用可重试状态集合 |
-| 服务总预算耗尽 | `deadline_exceeded` | 返回服务总预算耗尽错误 |
+| 当前调用方或 producer 的预算耗尽 | `deadline_exceeded` | 标明实际阶段、预算、scope 与已知上游错误 |
+| 子任务自身抛出 `TimeoutError` | `producer_timeout` | 与等待 Future 到期区分，不冒充整次预算耗尽 |
+| 相同旧 producer 已超时、底层线程仍未退出 | `shared_execution_expired` | `scope=inherited`、`reason=previous_producer_deadline`，不启动重复上游调用 |
 
 客户端将 `upstream`、`upstream_status`、`attempts`、`retryable` 和 request ID 传到工具层。
+新 `diagnostics` 中的阶段、原因、预算、耗时和最后已知上游错误同样保留到最终工具错误及其副本；
+例如 `cause=retry_wait, scope=producer, last_upstream=upstream_http_error/wikipedia/HTTP 429`。
+只允许安全的短标识和有限数值，不能把任意 query、URL、令牌或上游响应正文塞进诊断日志。
 原始代理异常可能包含令牌和 URL，因此只提取状态码和安全的错误类型，不转发整段异常。
 Wiki 候选页解析遇到共享网络失败时立即退出，不逐页重复失败链路；模型选页后执行的
 Web RAG 也将共享链路故障向上抛出。单个网页 404/黑名单错误则保留在该页结果中，
 允许继续处理其他页面，不把原因写成 `None`。失败内容不进入 embedding 或摘要。
 
-Python客户端读取超时默认150秒，示例也显式设置 `SEARCH_CACHE_READ_TIMEOUT_SECONDS=150`。
-启动shell对未设置值仍有600秒回退；平台预置env或实际local.env的显式值会覆盖Python默认值，
-本次未改客户端超时配置，实际生效值应以训练进程env为准。
-服务仍以 120 秒为单次逻辑请求预算，150 秒留给传输和响应开销，并小于外层工具的 300 秒。
+Python客户端读取超时、启动shell回退值和示例均为210秒，
+示例显式设置 `SEARCH_CACHE_READ_TIMEOUT_SECONDS=210`。
+平台预置env或实际local.env的显式值会覆盖默认值；已有配置需同步更新，实际以进程env为准。
+服务以 180 秒为单次逻辑请求预算，客户端 210 秒为传输和响应留出开销，
+并小于外层工具的 300 秒。Wiki API 单次HTTP连接/读取超时仍各为20秒，
+选页、embedding和摘要的单阶段120秒上限不变。
 客户端不重试共享服务请求，也不自动退回直连。
 
 Executor 保留在 0.5 秒取消宽限内已经完成的结果/异常，不再清空后统一报超时；
@@ -298,7 +317,7 @@ Executor 保留在 0.5 秒取消宽限内已经完成的结果/异常，不再�
 | Executor 总预算 | 默认 300 秒，同一 command 全部 block 共用 |
 | 选页/embedding/摘要单阶段 | 最多 120 秒，同时不超过工具剩余时间；包含 SDK 调用和内部等待的墙钟时间 |
 | 搜索客户端 | socket 超时不超过工具剩余时间，整个请求另有墙钟预算 |
-| 共享服务 | `min(服务原有 120 秒预算, X-Search-Timeout-Seconds)`，不能由客户端延长 |
+| 共享服务 | `min(服务的 180 秒预算, X-Search-Timeout-Seconds)`，不能由客户端延长 |
 | 取消宽限 | 0.5 秒，已完成的具体错误仍保留 |
 
 工具内部的 vLLM API 和 embedding SDK 使用本次调用独有的客户端，传入
@@ -318,8 +337,12 @@ Python 不能强杀任意阻塞线程，因此不承诺内核卡死或不响应�
 调用方仍按墙钟预算返回错误。超过真正工具总预算时，仍会返回带阶段诊断的工具超时。
 
 升级本次补丁必须同时同步新的 `execution_context.py`、Executor、Wiki/Web 工具、
-搜索客户端、vLLM 引擎，以及共享服务的 `server.py`。无需新增训练配置项，
-同步后重启共享搜索服务和训练进程；原先的 150 秒客户端配置仍适用。
+搜索客户端、vLLM 引擎，以及共享服务的 `core.py`、`server.py`。无需新增训练配置项，
+同步后将服务端 `SEARCH_SERVICE_REQUEST_TIMEOUT` 设为180、训练端
+`SEARCH_CACHE_READ_TIMEOUT_SECONDS` 设为210。重启共享服务才能加载服务端代码与配置；
+客户端的新代码或超时配置需要重启相关 rollout/训练进程才能加载，没有热更新。
+若只改服务端预算、现有客户端等待仍足够长（例如600秒），不必仅为服务端改动重启训练。
+仅再次运行ensure脚本会复用健康的旧服务，不会重新加载其环境配置。
 
 服务端 `SEARCH_BLOCKED_DOMAINS` 是手工域名黑名单，代码默认留空；
 `train-roma/search-service.env.example` 已填入用户提供的 325 个域名，按原始主机名保留，
@@ -364,6 +387,57 @@ API 缓存之前检查实际端点，所有上游 HTTP 请求及重定向目标�
 `upstream_errors/<code>` 按失败类型统计实际 HTTP attempt 的错误次数；
 `requests_failed/<code>` 统计执行失败的逻辑请求原因，可区分代理、HTTP 超时和总预算耗尽。
 
+### 每次 deadline 的原因与计数
+
+每个最终以 `deadline_exceeded` 或 `shared_execution_expired` 退出的逻辑请求，服务写一条
+`search_deadline {JSON}` 单行日志。调用方和 producer 共享等待时，会同时记录两者已知状态：
+
+| 字段 | 含义 |
+| --- | --- |
+| `request_id`、`tool`、`code` | 关联 HTTP 请求、工具与错误分类 |
+| `phase` / `shared_phase` | 调用方超时所在阶段 / 所等待 producer 当时的阶段；未等待共享任务时没有 `shared_phase` |
+| `deadline_reason` | 已知超时位置或继承原因，例如 `retry_wait`、`upstream_headers`、`cache_read_wait`、`previous_producer_deadline` |
+| `deadline_scope` | `caller` 为该调用方截止，`producer` 为共用任务截止，`inherited` 为复用已超时的旧任务 |
+| `deadline_source` | `service` 为服务配置决定的预算，`client` 为客户端传入的剩余预算更短 |
+| `elapsed_seconds` / `budget_seconds` | 该逻辑请求实际耗时 / 实际预算；客户端剩余时间较短时可能不足180秒 |
+| `phase_elapsed_seconds`、`phase_durations` | 当前阶段已耗时，以及各阶段累计墙钟耗时；不是独立网络请求耗时的总和 |
+| `shared_elapsed_seconds`、`shared_budget_seconds`、`shared_phase_durations` | 等待的 producer 的耗时、预算和阶段耗时；与调用方单独计算 |
+| `last_upstream_error` | 已观察到的最后一个安全错误摘要，仅含 code、上游、HTTP状态、尝试数和退避时间等字段 |
+| `upstream_recovered` | 最后一个已知上游错误之后，是否又观察到成功响应；为 true 时不能把该错误当成当前未恢复故障 |
+
+主要阶段包括 `cache_read_wait`（借读连接）、`cache_read`（读库）、`flight_register`（登记合并）、
+`shared_wait`（等待共享结果）、`upstream_headers`（等待响应头）、`upstream_body`（读取响应体）、
+`retry_wait`（本请求退避）、`response_decode` 和 `result_encode`。
+`cache_write_wait` / `cache_write` 发生在结果发布之后，其失败通过 `cache_write_errors` 和
+`cache_write_failed` 日志观察，不再把已发布成功的请求统计成 deadline。
+
+这些原因说明“超时时代码停在哪、此前观察到了什么”，不等于已证明远端根因。
+例如 `upstream_headers` 不能进一步证明一定是 Wikipedia服务器、代理或DNS慢；
+`last_upstream_error` 是历史观测，必须结合 `upstream_recovered` 和阶段耗时判断。
+新诊断只覆盖更新代码之后的请求，不能回溯给旧累计 deadline 补原因。
+
+`/metrics` 新增以下累计计数，计数对象是失败的逻辑请求，而不是每一次HTTP重试或每个producer：
+
+| 指标 | 用途 |
+| --- | --- |
+| `deadline_events` | deadline及旧producer已超时导致的失败总数 |
+| `deadline_reasons/<reason>` | 按已知原因统计 |
+| `deadline_phases/<phase>` | 按实际等待阶段统计；有共享producer时使用其阶段 |
+| `deadline_scopes/<scope>` | 按 caller / producer / inherited 统计 |
+| `deadline_tools/<tool>` | 区分 wikipedia / brave / fetch 等工具 |
+| `deadline_upstream_status/<status>` | deadline时仍未恢复的最后已知HTTP状态，例如429 |
+| `deadline_upstream_errors/<code>` | deadline时仍未恢复的最后已知上游错误类型 |
+| `cache_write_errors`、`cache_write_errors/<code>` | 成功结果发布后写缓存失败，不计作搜索失败 |
+
+producer watchdog 确认共用任务自身预算到期时，另写一条 `search_producer_deadline {JSON}` 日志，
+并增加 `producer_deadlines_exceeded`、`producer_deadline_reasons/<reason>` 和
+`producer_deadline_phases/<phase>`。这些按实际到期的 producer 计数，与按逻辑请求计的
+`deadline_events` 分开：一个 producer 让多个等待者失败，不能因此把 producer 次数也重复增加。
+
+响应返回后，底层阻塞线程仍可能稍后拿到429等HTTP错误状态。此时状态依然计入正常上游观测，
+另增加 `late_upstream_status/<status>`，写一条带 request_id 的 `search_late_upstream` 日志，
+以便关联之前的deadline。晚到观测不能修改已经发给客户端的错误，也不能据此回改已发布的原因快照。
+
 `/metrics` 读取数据库失败时返回 HTTP 503 和 `cache_database_error`，详细异常写入服务日志，
 避免未捕获异常造成空响应。`/healthz` 仅检查进程能否响应，不执行数据库完整性检查。
 
@@ -372,9 +446,9 @@ API 缓存之前检查实际端点，所有上游 HTTP 请求及重定向目标�
 实际收益应分别看 query、页面和 URL 命中率，以及真实上游请求数。
 
 默认配置可在 `search-service.env.example` 修改：缓存有效载荷上限 2 GiB，
-单次逻辑请求期限 120 秒，最大上游响应 20 MiB。服务期限、客户端连接超时及最大重试次数
-保持原值；Python客户端默认读取超时为150秒；实际以进程env为准，启动shell未显式设置时仍会注入600秒，
-本次未改该回退值。当前没有公共worker、queue、派生HTTP容量或上游共享限速配置。
+单次逻辑请求期限 180 秒，最大上游响应 20 MiB。客户端读取超时默认210秒，
+启动shell回退值也为210秒；连接超时及最大重试次数保持原值，实际以进程env为准。
+当前没有公共worker、queue、派生HTTP容量或上游共享限速配置。
 SQLite 文件和 WAL 还会有索引/空闲页等开销，磁盘占用不等于有效载荷大小。
 冷批次的大量不同query仍可能受真实上游限流、机器资源和逐请求重试影响；
 缓存和合并只减少可复用请求，不能保证所有请求在预算内完成。
@@ -389,10 +463,13 @@ SQLite 文件和 WAL 还会有索引/空闲页等开销，磁盘占用不等于�
 
 ```bash
 python3 -m unittest discover -s agentflow/tests -p 'test_search_*' -v
+python3 -m unittest discover -s agentflow/tests -p 'test_deadline_client_diagnostics.py' -v
 bash -n train-roma/run_search_cache.sh train-roma/enable_search_cache.sh train-roma/open_search_cache_tunnel.sh
 ```
 
 测试覆盖持久化、命中不续期、过期后重新获取、旧表结构兼容、并发合并、重复 batch 映射、
-错误不缓存、指标接口数据库异常、共享限速已取消、黑名单及重定向拦截和三个工具的接入。
+错误不缓存、指标接口数据库异常、共享限速已取消、黑名单及重定向拦截和三个工具的接入，
+以及先返回后写库、读写等待期限、Future等待超时与子任务异常区分、旧producer错误、
+deadline原因统计、晚到HTTP状态和客户端诊断贯通。
 真实部署还需检查开发服务器端口可达性、代理出口、Yibu 账户额度，再用少量 rollout
 检查 observation 和奖励，最后增加多任务并发。本地离线测试不代表已经完成远程部署。

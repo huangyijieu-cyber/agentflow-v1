@@ -179,6 +179,7 @@ class SearchServiceCoreTests(unittest.TestCase):
         self.assertEqual(self.providers.calls["same"], 1)
         results[0]["results"][0]["nested"].append(99)
         self.assertEqual(results[1]["results"][0]["nested"], [3, 2, 1])
+        self.assertTrue(self.service.flush_cache())
         next_result = self.service.handle("wikipedia", {"query": "same"})
         self.assertEqual(next_result["meta"]["cache_hits"], 1)
         self.assertNotIn("_meta", next_result)
@@ -249,6 +250,7 @@ class SearchServiceCoreTests(unittest.TestCase):
             db_path=str(Path(self.directory.name) / "cache.sqlite3"), workers=1, queue_size=0), self.providers)
         self.addCleanup(self.service.close)
         self.service.handle("wikipedia", {"query": "warm"})
+        self.assertTrue(self.service.flush_cache())
         self.providers.started.clear()
         self.providers.release.clear()
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -270,6 +272,7 @@ class SearchServiceCoreTests(unittest.TestCase):
             db_path=str(Path(self.directory.name) / "cache.sqlite3"), workers=1, queue_size=0), self.providers)
         self.addCleanup(self.service.close)
         self.service.handle("wikipedia", {"query": "warm"})
+        self.assertTrue(self.service.flush_cache())
         self.providers.started.clear()
         self.providers.release.clear()
         original = self.providers.execute
@@ -311,6 +314,7 @@ class SearchServiceCoreTests(unittest.TestCase):
             finally:
                 self.providers.release.set()
             owner.result()
+        self.assertTrue(self.service.flush_cache())
         result = self.service.handle("wikipedia", {"query": "shared"})
         self.assertEqual(result["meta"]["cache_hits"], 1)
         self.assertEqual(self.providers.calls["shared"], 1)
@@ -379,6 +383,7 @@ class SearchServiceCoreTests(unittest.TestCase):
                 self.providers.release.set()
             self.assertEqual(waiter.result()["results"][0]["title"], "slow")
         self.assertEqual(self.providers.calls["slow"], 1)
+        self.assertTrue(self.service.flush_cache())
         self.assertEqual(self.service.cache.stats()["entries"], 1)
 
     def test_producer_deadline_wakes_waiters_and_keeps_tombstone_until_actual_exit(self):
@@ -401,7 +406,8 @@ class SearchServiceCoreTests(unittest.TestCase):
                 started = time.monotonic()
                 with self.assertRaises(GatewayFailure) as caught:
                     self.service.handle("wikipedia", {"query": "stuck"}, deadline=started + 3)
-                self.assertEqual(caught.exception.code, "deadline_exceeded")
+                self.assertEqual(caught.exception.code, "shared_execution_expired")
+                self.assertEqual(caught.exception.diagnostics["deadline_scope"], "inherited")
                 self.assertLess(time.monotonic() - started, 0.1)
                 self.assertEqual(self.providers.calls["stuck"], 1)
                 self.assertEqual(self.service.metrics.snapshot()["producer_deadlines_exceeded"], 1)
@@ -482,6 +488,7 @@ class SearchServiceCoreTests(unittest.TestCase):
         import hashlib
         for query in ("slow-hit", "fast-hit"):
             self.service.handle("wikipedia", {"query": query})
+        self.assertTrue(self.service.flush_cache())
         slow_key = hashlib.sha256(json_dumps({"query": "slow-hit"}, canonical=True).encode()).hexdigest()
         entered, release = threading.Event(), threading.Event()
         original = self.service.cache.get
@@ -621,6 +628,19 @@ class NetworkFailureTests(unittest.TestCase):
                 with self.assertRaises(GatewayFailure) as caught:
                     self.service.request("wikipedia", "GET", "https://en.wikipedia.org/page")
                 self.assertEqual((caught.exception.code, caught.exception.status_code), (code, status))
+
+    def test_streaming_read_timeout_wrapped_by_requests_is_still_a_timeout(self):
+        from urllib3.exceptions import ReadTimeoutError
+        self.service.config.max_retries = 0
+        response = MagicMock(status_code=200, headers={})
+        response.iter_content.side_effect = requests.ConnectionError(
+            ReadTimeoutError(None, "/private?token=do-not-log", "read timed out"))
+        self.session.request.return_value = response
+        with self.assertRaises(GatewayFailure) as caught:
+            self.service.request("wikipedia", "GET", "https://en.wikipedia.org/page")
+        self.assertEqual(caught.exception.code, "upstream_timeout")
+        self.assertNotIn("do-not-log", str(caught.exception))
+        self.assertEqual(self.service.metrics.snapshot()["upstream_errors/upstream_timeout"], 1)
 
     def test_tls_failure_is_explicit_and_not_retried(self):
         self.session.request.side_effect = requests.exceptions.SSLError("certificate secret")

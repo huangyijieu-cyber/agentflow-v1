@@ -100,7 +100,7 @@ class GatewayClientTests(unittest.TestCase):
         }, session=Session())
         self.assertEqual(client.base_url, "http://ec2.test")
         self.assertEqual(client.token, "legacy-token")
-        self.assertEqual(client.read_timeout, 150.0)
+        self.assertEqual(client.read_timeout, 210.0)
 
     def test_proxy_failure_preserves_upstream_status_attempts_and_stops_shared_route(self):
         client, session = self.client({"error": {
