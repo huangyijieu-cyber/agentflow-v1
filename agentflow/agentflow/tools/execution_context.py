@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextvars
+import math
 import re
 import threading
 import time
@@ -13,25 +14,146 @@ DEFAULT_API_TIMEOUT = 120.0
 _current = contextvars.ContextVar("agentflow_tool_execution", default=None)
 
 
+def _diagnostic_label(value):
+    """Accept bounded phase/code labels, never free-form upstream text."""
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,79}", value):
+        return value
+    return None
+
+
+def _diagnostic_seconds(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            if math.isfinite(value) and value >= 0:
+                return value
+        except OverflowError:
+            pass
+    return None
+
+
+def sanitize_search_diagnostics(value):
+    """Keep only structured timing/error fields safe for rollout logs.
+
+    A service response must not inject URLs, prompts, exception bodies or tokens
+    through otherwise useful diagnostics. Nested dictionaries have their own
+    allowlist; they are never copied verbatim.
+    """
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for name in ("phase", "deadline_reason", "deadline_scope", "deadline_source", "caller_phase",
+                 "shared_phase", "cache_namespace", "tool"):
+        label = _diagnostic_label(value.get(name))
+        if label is not None:
+            result[name] = label
+    for name in ("elapsed_seconds", "budget_seconds", "phase_elapsed_seconds",
+                 "shared_elapsed_seconds", "shared_budget_seconds"):
+        number = _diagnostic_seconds(value.get(name))
+        if number is not None:
+            result[name] = number
+    for name in ("phase_durations", "shared_phase_durations"):
+        durations = value.get(name)
+        if isinstance(durations, dict):
+            clean = {}
+            for phase, seconds in list(durations.items())[:64]:
+                label, number = _diagnostic_label(phase), _diagnostic_seconds(seconds)
+                if label is not None and number is not None:
+                    clean[label] = number
+            if clean:
+                result[name] = clean
+    recovered = value.get("upstream_recovered")
+    if isinstance(recovered, bool):
+        result["upstream_recovered"] = recovered
+    upstream_error = value.get("last_upstream_error")
+    if isinstance(upstream_error, dict):
+        clean = {}
+        code = _diagnostic_label(upstream_error.get("code"))
+        if code is not None:
+            clean["code"] = code
+        upstream = upstream_error.get("upstream")
+        if isinstance(upstream, str) and re.fullmatch(
+            r"(?:wikipedia|brave|web(?::[A-Za-z0-9.-]{1,253})?)", upstream
+        ):
+            clean["upstream"] = upstream
+        status = upstream_error.get("upstream_status")
+        if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+            clean["upstream_status"] = status
+        attempts = upstream_error.get("attempts")
+        if isinstance(attempts, int) and not isinstance(attempts, bool) and 0 <= attempts <= 1000000:
+            clean["attempts"] = attempts
+        retry_after = _diagnostic_seconds(upstream_error.get("retry_after"))
+        if retry_after is not None:
+            clean["retry_after"] = retry_after
+        if clean:
+            result["last_upstream_error"] = clean
+    return result
+
+
+def search_diagnostic_details(diagnostics):
+    """Render a compact safe cause without serializing arbitrary dictionaries."""
+    diagnostics = sanitize_search_diagnostics(diagnostics)
+    details = []
+    cause = diagnostics.get("deadline_reason") or diagnostics.get("phase")
+    if cause:
+        details.append(f"cause={cause}")
+    phase = diagnostics.get("phase")
+    if phase and phase != cause:
+        details.append(f"search_phase={phase}")
+    for name, label in (("deadline_scope", "scope"), ("deadline_source", "source"),
+                        ("shared_phase", "shared_phase")):
+        if name in diagnostics:
+            details.append(f"{label}={diagnostics[name]}")
+    for name, label in (("elapsed_seconds", "elapsed"), ("budget_seconds", "budget"),
+                        ("shared_elapsed_seconds", "shared_elapsed"), ("shared_budget_seconds", "shared_budget")):
+        if name in diagnostics:
+            details.append(f"{label}={diagnostics[name]:.3g}s")
+    upstream_error = diagnostics.get("last_upstream_error", {})
+    if upstream_error:
+        parts = []
+        for name in ("code", "upstream"):
+            if name in upstream_error:
+                parts.append(str(upstream_error[name]))
+        if "upstream_status" in upstream_error:
+            parts.append(f"HTTP {upstream_error['upstream_status']}")
+        if "attempts" in upstream_error:
+            parts.append(f"attempts={upstream_error['attempts']}")
+        if "retry_after" in upstream_error:
+            parts.append(f"retry_after={upstream_error['retry_after']:.3g}s")
+        details.append("last_upstream=" + "/".join(parts))
+        if "upstream_recovered" in diagnostics:
+            details.append(f"upstream_recovered={str(diagnostics['upstream_recovered']).lower()}")
+    return details
+
+
 class ToolExecutionError(RuntimeError):
-    def __init__(self, message, *, code, phase, error_type=None, status_code=None, budget_seconds=None):
+    def __init__(self, message, *, code, phase, error_type=None, status_code=None, budget_seconds=None,
+                 diagnostics=None):
         self.message = message
         self.code, self.phase = code, phase
         self.error_type, self.status_code = error_type, status_code
-        self.budget_seconds = budget_seconds
+        self.diagnostics = sanitize_search_diagnostics(diagnostics)
+        self.budget_seconds = budget_seconds if budget_seconds is not None else self.diagnostics.get("budget_seconds")
+        self.deadline_reason = self.diagnostics.get("deadline_reason")
+        self.deadline_scope = self.diagnostics.get("deadline_scope")
+        self.search_phase = self.diagnostics.get("phase")
+        self.elapsed_seconds = self.diagnostics.get("elapsed_seconds")
+        self.last_upstream_error = self.diagnostics.get("last_upstream_error")
         detail = f"{code}, phase={phase}"
         if error_type:
             detail += f", type={error_type}"
         if status_code is not None:
             detail += f", HTTP={status_code}"
-        if budget_seconds is not None:
+        if budget_seconds is not None and "budget_seconds" not in self.diagnostics:
             detail += f", budget={budget_seconds:.3g}s"
+        diagnostic_details = search_diagnostic_details(self.diagnostics)
+        if diagnostic_details:
+            detail += ", " + ", ".join(diagnostic_details)
         super().__init__(f"{message} ({detail})")
 
     def copy(self):
         return type(self)(self.message, code=self.code, phase=self.phase,
                           error_type=self.error_type, status_code=self.status_code,
-                          budget_seconds=self.budget_seconds)
+                          budget_seconds=self.budget_seconds, diagnostics=self.diagnostics)
 
 
 def safe_failure(error, phase):
@@ -53,7 +175,8 @@ def safe_failure(error, phase):
         code = getattr(error, "code", "search_request_error")
         code = code if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_]{1,80}", code) else "search_request_error"
         return ToolExecutionError("Shared search request failed", code=code, phase=phase,
-                                  error_type=kind, status_code=status)
+                                  error_type=kind, status_code=status,
+                                  diagnostics=getattr(error, "diagnostics", None))
     if "ProxyError" in names:
         code = "api_proxy_error"
         if status is None:

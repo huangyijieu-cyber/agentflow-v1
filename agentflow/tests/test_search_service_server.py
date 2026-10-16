@@ -160,6 +160,8 @@ class ServiceHTTPTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 0.5)
         self.assertEqual(status, 504)
         self.assertEqual(body["error"]["code"], "deadline_exceeded")
+        self.assertEqual(body["error"]["deadline_source"], "client")
+        self.assertAlmostEqual(body["error"]["budget_seconds"], 0.025, delta=0.005)
 
     def test_invalid_budget_rejected_and_large_budget_cannot_extend_service_cap(self):
         for value in ("nan", "inf", "-1", "0", "bad"):
@@ -171,7 +173,9 @@ class ServiceHTTPTests(unittest.TestCase):
             started = time.monotonic()
             self.request("/v1/fetch", {"url": "https://allowed.test"},
                          headers={"X-Search-Timeout-Seconds": "9999"})
-        self.assertLessEqual(handle.call_args.kwargs["deadline"] - started, 120.01)
+        self.assertLessEqual(handle.call_args.kwargs["deadline"] - started, 180.01)
+        self.assertEqual(handle.call_args.kwargs["deadline_source"], "service")
+        self.assertGreaterEqual(handle.call_args.kwargs["started_at"], started)
 
     def test_batch_keeps_blocked_errors_in_place_and_executes_other_requests(self):
         self.service.config.blocked_domains = ("dead.test",)

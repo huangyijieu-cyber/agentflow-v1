@@ -169,7 +169,9 @@ class ServiceRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         request_id = uuid.uuid4().hex
-        deadline = time.monotonic() + self.server.service.config.request_timeout
+        started_at = time.monotonic()
+        deadline = started_at + self.server.service.config.request_timeout
+        deadline_source = "service"
         try:
             if not self._authenticated():
                 raise GatewayFailure("Bearer authentication required", code="unauthorized", status_code=401)
@@ -181,7 +183,9 @@ class ServiceRequestHandler(BaseHTTPRequestHandler):
                     raise GatewayFailure("Invalid search timeout budget", code="invalid_request", status_code=400)
                 if not math.isfinite(requested_budget) or requested_budget <= 0:
                     raise GatewayFailure("Invalid search timeout budget", code="invalid_request", status_code=400)
-                deadline = min(deadline, time.monotonic() + requested_budget)
+                requested_deadline = time.monotonic() + requested_budget
+                if requested_deadline < deadline:
+                    deadline, deadline_source = requested_deadline, "client"
             path = urlsplit(self.path).path
             endpoints = {"/v1/search/wikipedia": "wikipedia", "/v1/search/brave": "brave", "/v1/fetch": "fetch"}
             if path not in endpoints and path != "/v1/batch":
@@ -190,9 +194,11 @@ class ServiceRequestHandler(BaseHTTPRequestHandler):
             if path == "/v1/batch":
                 if set(body) != {"requests"}:
                     raise GatewayFailure("Batch body requires only requests", code="invalid_request", status_code=400)
-                result = self.server.service.batch(body["requests"], deadline=deadline, request_id=request_id)
+                result = self.server.service.batch(body["requests"], deadline=deadline, request_id=request_id,
+                                                   deadline_source=deadline_source, started_at=started_at)
             else:
-                result = self.server.service.handle(endpoints[path], body, deadline=deadline, request_id=request_id)
+                result = self.server.service.handle(endpoints[path], body, deadline=deadline, request_id=request_id,
+                                                    deadline_source=deadline_source, started_at=started_at)
             self._send_json(200, result, request_id=request_id)
         except GatewayFailure as exc:
             self._error(exc, request_id)

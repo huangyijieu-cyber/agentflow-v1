@@ -7,11 +7,13 @@ from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urlsplit
 
 import requests
-from agentflow.tools.execution_context import current_context, run_bounded
+from agentflow.tools.execution_context import (
+    current_context, run_bounded, sanitize_search_diagnostics, search_diagnostic_details,
+)
 
 
 DEFAULT_CONNECT_TIMEOUT = 5.0
-DEFAULT_READ_TIMEOUT = 150.0
+DEFAULT_READ_TIMEOUT = 210.0
 
 
 def search_cache_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
@@ -36,6 +38,13 @@ def _gateway_environment(env: Mapping[str, str]) -> Dict[str, Any]:
     }
 
 
+def _response_diagnostics(error: Mapping[str, Any]) -> Dict[str, Any]:
+    """Accept the service's flat error fields and older nested envelopes safely."""
+    diagnostics = sanitize_search_diagnostics(error)
+    diagnostics.update(sanitize_search_diagnostics(error.get("diagnostics")))
+    return diagnostics
+
+
 class SearchGatewayError(RuntimeError):
     """Search Gateway 访问或返回异常。"""
 
@@ -51,6 +60,7 @@ class SearchGatewayError(RuntimeError):
         upstream: Optional[str] = None,
         attempts: Optional[int] = None,
         retryable: Optional[bool] = None,
+        diagnostics: Optional[Mapping[str, Any]] = None,
     ):
         self.message = " ".join(str(message).split())[:500]
         self.code = code
@@ -61,6 +71,13 @@ class SearchGatewayError(RuntimeError):
         self.upstream = upstream
         self.attempts = attempts
         self.retryable = retryable
+        self.diagnostics = sanitize_search_diagnostics(diagnostics)
+        self.phase = self.diagnostics.get("phase")
+        self.deadline_reason = self.diagnostics.get("deadline_reason")
+        self.deadline_scope = self.diagnostics.get("deadline_scope")
+        self.elapsed_seconds = self.diagnostics.get("elapsed_seconds")
+        self.budget_seconds = self.diagnostics.get("budget_seconds")
+        self.last_upstream_error = self.diagnostics.get("last_upstream_error")
 
         details = [code]
 
@@ -73,6 +90,7 @@ class SearchGatewayError(RuntimeError):
             details.append(f"upstream={upstream}")
         if attempts is not None:
             details.append(f"attempts={attempts}")
+        details.extend(search_diagnostic_details(self.diagnostics))
 
         super().__init__(
             f"{self.message} ({', '.join(details)})"
@@ -83,6 +101,7 @@ class SearchGatewayError(RuntimeError):
         """Do not continue fetching more pages through a failed shared route."""
         return self.code in {
             "gateway_unreachable", "gateway_request_error", "queue_full", "deadline_exceeded",
+            "shared_execution_expired", "producer_timeout",
             "upstream_proxy_error", "upstream_tls_error", "upstream_timeout",
             "upstream_network_error", "upstream_request_error", "rate_limited",
             "configuration_error", "missing_gateway_configuration", "invalid_gateway_configuration",
@@ -313,6 +332,7 @@ class SearchGatewayClient:
             code = f"gateway_http_{response.status_code}"
             upstream_status_code = None
             upstream, attempts, retryable = None, None, None
+            diagnostics = None
 
             # 只解析结构化错误。
             # 不直接把整个任意 response body 打进训练日志。
@@ -333,6 +353,7 @@ class SearchGatewayClient:
                         upstream = error.get("upstream")
                         attempts = error.get("attempts")
                         retryable = error.get("retryable")
+                        diagnostics = _response_diagnostics(error)
 
                     elif isinstance(detail, str):
                         message = detail
@@ -343,6 +364,7 @@ class SearchGatewayClient:
                         upstream_status_code = upstream_status
                         detail_message = detail.get("message")
                         detail_code = detail.get("code")
+                        diagnostics = _response_diagnostics(detail)
 
                         if detail_message:
                             message = str(detail_message)
@@ -372,6 +394,7 @@ class SearchGatewayClient:
                 upstream=upstream,
                 attempts=attempts,
                 retryable=retryable,
+                diagnostics=diagnostics,
             )
             response.close()
             raise error

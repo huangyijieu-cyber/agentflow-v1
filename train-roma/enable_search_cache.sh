@@ -37,7 +37,7 @@ _agentflow_enable_search_cache() {
     export SEARCH_CACHE_ENABLED=1
     export SEARCH_CACHE_BASE_URL SEARCH_CACHE_TOKEN
     export SEARCH_CACHE_CONNECT_TIMEOUT_SECONDS="${SEARCH_CACHE_CONNECT_TIMEOUT_SECONDS:-5}"
-    export SEARCH_CACHE_READ_TIMEOUT_SECONDS="${SEARCH_CACHE_READ_TIMEOUT_SECONDS:-600}"
+    export SEARCH_CACHE_READ_TIMEOUT_SECONDS="${SEARCH_CACHE_READ_TIMEOUT_SECONDS:-210}"
     # The platform copies this checkout to each training node. Prepare local
     # SSH runtime files automatically; no chmod/login is needed on the node.
     export SEARCH_CACHE_SSH_AUTO_PREPARE="${SEARCH_CACHE_SSH_AUTO_PREPARE:-1}"
