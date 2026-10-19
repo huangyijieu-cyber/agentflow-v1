@@ -75,6 +75,8 @@ class Solver:
         reward = None ## placeholder
 
         if self.task == "qa":
+            # A worker reuses this Solver; keep actions and files local to this question.
+            self.memory.clear()
             # Update cache directory for the executor
             self.executor.set_query_cache_dir(self.root_cache_dir)
 
