@@ -225,7 +225,7 @@ class AgentFlowTrainer(RayPPOTrainer):
     ## score=0, score=1, classify(统一划分)
     def _trans_to_dpo_batch(self, history_batch_list: list):
         """
-        分叉点 DPO pair 构建；关闭 cross_anchor_replay 时保留 cache 原路径。
+        分叉点 DPO pair 构建（替换原实现）。
 
         核心改动：
           1. 同任务内跨回合按 anchor 聚类；QA 保留末 turn / 中间 turn 边界。
@@ -234,8 +234,6 @@ class AgentFlowTrainer(RayPPOTrainer):
           4. chosen 端质量过滤：基础有效性检查、排除重复响应。
           5. 难分对优先：按两端 per-token logP 接近度升序取 top-K。
         """
-        if not self.config.data.get("cross_anchor_replay", False):
-            return self._trans_to_dpo_batch_legacy(history_batch_list)
         if not history_batch_list:
             return None
 
@@ -769,8 +767,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                                 self._enq_ema = float(enq) if getattr(self, '_enq_ema', None) is None \
                                                 else 0.9 * self._enq_ema + 0.1 * enq
 
-                            # Keep the existing default; rep16 can be enabled independently.
-                            replay_multiplier = self.config.data.get("replay_sample_multiplier", 4)
+                            # Replay sampling defaults to rep16.
+                            replay_multiplier = self.config.data.get("replay_sample_multiplier", 16)
                             if not isinstance(replay_multiplier, int) or isinstance(replay_multiplier, bool) or replay_multiplier <= 0:
                                 raise ValueError("replay_sample_multiplier must be a positive integer")
                             n_batch = max(int(round(self._enq_ema)) * replay_multiplier, k_partitions)
@@ -982,224 +980,4 @@ class AgentFlowTrainer(RayPPOTrainer):
 
                 progress_bar.update(1)
                 self.global_steps += 1
-
-    def _trans_to_dpo_batch_legacy(self, history_batch_list: list):
-        if not history_batch_list:
-            print("## No DPO data with history")
-            return None
-
-        k_partitions = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
-        split_select_keys = [
-            "input_ids", "attention_mask", "old_log_probs", "position_ids",
-            "prompts", "response_mask", "responses", "token_level_scores",
-        ]
-        if self.use_reference_policy:
-            split_select_keys += ["ref_log_prob"]
-
-        non_tensor_select_keys = ["data_id_list", "uid", "traj_id_list", "traj_uid"]
-        non_tensor_split_select_keys = ["turn_index_list", "rollout_id_list"]
-
-        proto_list = []
-
-        for history_batch in history_batch_list:
-            token_level_scores = history_batch.batch["token_level_scores"]
-            response_mask = history_batch.batch["response_mask"]
-            uids = history_batch.non_tensor_batch["uid"]
-            turn_indices = history_batch.non_tensor_batch["turn_index_list"]
-            rollout_ids = history_batch.non_tensor_batch["rollout_id_list"]
-            old_log_probs = history_batch.batch["old_log_probs"]
-            is_drop_mask = history_batch.batch.get("is_drop_mask")
-
-            scores = token_level_scores.sum(dim=-1)
-            lengths = response_mask.sum(dim=-1)
-            bsz = scores.shape[0]
-
-            task = str(self.config.data.get("task", "")).lower()
-            rollout_last_turn = {}
-            if task == "qa":
-                for i in range(bsz):
-                    rollout_id = str(rollout_ids[i])
-                    turn = int(turn_indices[i])
-                    rollout_last_turn[rollout_id] = max(
-                        rollout_last_turn.get(rollout_id, -1), turn
-                    )
-
-            id2score = defaultdict(list)
-            id2index = defaultdict(list)
-            id2length = defaultdict(list)
-            id2logP = defaultdict(list)
-
-            with torch.no_grad():
-                for i in range(bsz):
-                    # 排除超长 prompt：响应来自完整上下文，不能用于截断上下文下的 SLiC。
-                    if is_drop_mask is not None and bool(is_drop_mask[i].item()):
-                        continue
-                    uid = str(uids[i])
-                    turn = str(turn_indices[i])
-                    ## replay collection
-                    replay_collection = self.config.data.get("replay_collection", "uid-turn")
-                    if replay_collection == "uid-turn":
-                        key_index = f"{uid}::turn_{turn}"
-                    elif replay_collection == "cross":
-                        key_index = "0"
-                    elif replay_collection == "turn":
-                        key_index = f"0::turn_{turn}"
-                    else:
-                        raise ValueError(f"replay collection: {key_index} is invalid!")
-
-                    # 累积 logP（用于 baseline）
-                    logP = (old_log_probs[i] * response_mask[i]).sum().item()
-
-                    id2score[key_index].append(scores[i])
-                    id2length[key_index].append(lengths[i])
-                    id2index[key_index].append(i)
-                    id2logP[key_index].append(logP)
-
-                # QA 按轨迹末 turn / 中间 turn 分别计算组内 per-token baseline。
-                id2baseline = {}
-                for idx in id2score.keys():
-                    group_logPs = id2logP[idx]
-                    group_lengths = [max(l.item(), 1) for l in id2length[idx]]
-                    per_tokens = [lp / l for lp, l in zip(group_logPs, group_lengths)]
-                    if task == "qa":
-                        stage_per_tokens = defaultdict(list)
-                        for sample_index, per_token in zip(id2index[idx], per_tokens):
-                            rollout_id = str(rollout_ids[sample_index])
-                            turn = int(turn_indices[sample_index])
-                            is_last = turn == rollout_last_turn[rollout_id]
-                            stage_per_tokens[is_last].append(per_token)
-
-                        id2baseline[idx] = {
-                            is_last: float(sum(values) / max(len(values), 1))
-                            for is_last, values in stage_per_tokens.items()
-                        }
-                    else:
-                        id2baseline[idx] = float(sum(per_tokens) / max(len(per_tokens), 1))
-
-                # usage = defaultdict(int)
-                # MAX_USE = 4
-
-                # ========== 新增 0：配置 ==========
-                cfg = self.config.data.get("replay_filter", {})
-                K_PAIRS_PER_GROUP   = cfg.get("k_pairs_per_group", 2)      # 每 turn 最多入队对数
-                LENGTH_RATIO_MAX    = cfg.get("length_ratio_max", 1.8)     # 你原来的 1.8 提到配置
-                MARGIN_SAT_QUANTILE = cfg.get("margin_sat_quantile", 0.9)  # 组内 margin 饱和分位
-
-
-                for idx in id2score.keys():
-                    group_size = len(id2score[idx])
-                    if group_size <= 1:
-                        continue
-
-                    # ========== 新增 1：turn 级分歧度过滤 ==========
-                    group_scores = torch.stack(id2score[idx]).float()
-                    g_std  = group_scores.std().item()
-                    g_mean = group_scores.mean().item()
-
-                    # 全同分（全成/全败）的 turn，pair 梯度≈0，直接跳过
-                    if g_std < 1e-6:
-                        continue
-
-                    pos_samples = []
-                    neg_samples = []
-
-                    for i in range(group_size):
-                        score = id2score[idx][i].item()
-                        length = id2length[idx][i].item()
-                        index = id2index[idx][i]
-
-                        if length == 0:
-                            continue
-
-                        if score > 0:
-                            pos_samples.append((index, score, length))
-                        else:
-                            neg_samples.append((index, score, length))
-
-                    if not pos_samples or not neg_samples:
-                        continue
-
-                    # ========== 新增 2：构建全部候选对 + margin 饱和过滤 ==========
-                    # 先算组内所有对的 margin，取饱和分位做阈值
-                    pair_margins = [p_s - n_s for _, p_s, _ in pos_samples for _, n_s, _ in neg_samples]
-                    sat_thresh = np.quantile(pair_margins, MARGIN_SAT_QUANTILE)
-
-                    valid_pairs = []
-                    for p_idx, p_score, p_len in pos_samples:
-                        for n_idx, n_score, n_len in neg_samples:
-                            if task == "qa":
-                                p_rollout_id = str(rollout_ids[p_idx])
-                                n_rollout_id = str(rollout_ids[n_idx])
-                                p_is_last = int(turn_indices[p_idx]) == rollout_last_turn[p_rollout_id]
-                                n_is_last = int(turn_indices[n_idx]) == rollout_last_turn[n_rollout_id]
-                                if p_is_last != n_is_last:
-                                    continue
-                            if p_score - n_score > sat_thresh:      # 白送对，梯度≈0
-                                continue
-                            if max(p_len, n_len) / min(p_len, n_len) > LENGTH_RATIO_MAX:
-                                continue
-                            valid_pairs.append((p_idx, n_idx, p_len, n_len))
-
-                    if not valid_pairs:
-                        continue
-
-                    # ========== 新增 3：近似难对度 top-K（替代随机 shuffle + 长度权重采样）==========
-                    # 用生成时 per-token logP 的接近程度近似"模型当前难分"
-                    pos_in_group = {batch_idx: i for i, batch_idx in enumerate(id2index[idx])}
-                    def _hardness(pair):
-                        p_idx, n_idx, _, _ = pair
-                        p_pos = pos_in_group[p_idx]          # batch 行号 → 组内位置
-                        n_pos = pos_in_group[n_idx]
-                        pt_a = id2logP[idx][p_pos] / max(id2length[idx][p_pos].item(), 1)
-                        pt_b = id2logP[idx][n_pos] / max(id2length[idx][n_pos].item(), 1)
-                        return abs(pt_a - pt_b)
-
-                    valid_pairs.sort(key=_hardness)                        # 难分在前
-                    selected = valid_pairs[:K_PAIRS_PER_GROUP]             # 只留 top-K
-
-                    baseline = id2baseline[idx]
-
-                    for p_idx, n_idx, _, _ in selected:
-                        pair_baseline = baseline
-                        if task == "qa":
-                            p_rollout_id = str(rollout_ids[p_idx])
-                            p_is_last = int(turn_indices[p_idx]) == rollout_last_turn[p_rollout_id]
-                            pair_baseline = baseline[p_is_last]
-
-                        proto = DataProto.from_single_dict(
-                            {key + "_a": history_batch.batch[key][p_idx: p_idx+1, :] for key in split_select_keys}
-                            | {key + "_b": history_batch.batch[key][n_idx: n_idx+1, :] for key in split_select_keys}
-                            | {key: history_batch.non_tensor_batch[key][p_idx: p_idx+1] for key in non_tensor_select_keys}
-                            | {key + "_a": history_batch.non_tensor_batch[key][p_idx: p_idx+1] for key in non_tensor_split_select_keys}
-                            | {key + "_b": history_batch.non_tensor_batch[key][n_idx: n_idx+1] for key in non_tensor_split_select_keys}
-                        )
-                        # ========== 关键：baseline 和 group_size 放入 non_tensor_batch ==========
-                        # DataProto.concat 会正确拼接 non_tensor_batch，不会丢失 per-sample 标量
-                        proto.non_tensor_batch["group_baseline"] = np.array([pair_baseline], dtype=np.float32)
-                        proto.non_tensor_batch["group_size"] = np.array([group_size], dtype=np.int32)
-                        proto.non_tensor_batch["born_step"] = np.array([self.global_steps], dtype=np.int64)
-                        # =====================================================================
-                        proto_list.append(proto)
-
-        if not proto_list:
-            print("## DPO pair is not found!")
-            return None
-
-        ## 增加最大上限
-        MAX_PAIRS_PER_STEP = 256
-        if len(proto_list) > MAX_PAIRS_PER_STEP:
-            proto_list = random.sample(proto_list, MAX_PAIRS_PER_STEP)
-
-        remainder = len(proto_list) % k_partitions
-        if remainder != 0:
-            extra = random.choices(proto_list, k=k_partitions - remainder)
-            proto_list.extend(extra)
-
-        print(f">>> Obtain paired #batch: {len(proto_list)}")
-
-        temperature = history_batch_list[0].meta_info.get("temperature", 0.7)
-        for proto in proto_list:
-            proto.meta_info["temperature"] = temperature
-
-        return proto_list
 
