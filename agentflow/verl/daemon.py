@@ -780,7 +780,7 @@ class AgentModeDaemon:
                 "trace_list": trace_list,
                 "data_id": original_sample["data_id"],
                 "anchor_list": anchor_list,
-                "turn_flags": rollout.metadata.get("turn_flags"),
+                "turn_flags": rollout.metadata.get("turn_flags") if rollout.metadata else None,
             }
             finished_id_to_sample_info[rollout_id] = info
 
@@ -807,7 +807,7 @@ class AgentModeDaemon:
         response_ids_list, response_attention_mask_list = [], []
         reward_list, data_id_list, rollout_id_list, turn_index_list, is_drop_list = [], [], [], [], []
         anchor_list, traj_id_list, active_mask_list = [], [], []
-        turn_valid_list, turn_dup_list = [], []
+        turn_valid_list, turn_dup_list = [], []   # DPO pair chosen 端质量标记
         n_trunc_sample_because_of_response = 0
         valid_samples = 0
         all_samples_num = 0
@@ -869,10 +869,11 @@ class AgentModeDaemon:
                 anchor_list.append(sample_info["anchor_list"][turn_index])
                 rollout_id_list.append(rollout_id)
                 turn_index_list.append(turn_index)
-                flags = sample_info.get("turn_flags") or []
-                flag = flags[turn_index] if turn_index < len(flags) else {}
-                turn_valid_list.append(bool(flag.get("valid", True)))
-                turn_dup_list.append(bool(flag.get("dup", False)))
+                # DPO pair 质量标记（老 rollout 无该字段时默认合法/不重复）
+                _flags = (sample_info.get("turn_flags") or [])
+                _f = _flags[turn_index] if turn_index < len(_flags) else {}
+                turn_valid_list.append(bool(_f.get("valid", True)))
+                turn_dup_list.append(bool(_f.get("dup", False)))
 
         logger.info(f"[STEP-WISE DEBUG]: valid response trace length in this training step is [{valid_samples}/{all_samples_num}]")
         if valid_samples == 0:
@@ -942,8 +943,8 @@ class AgentModeDaemon:
         data_proto.non_tensor_batch["traj_id_list"] = np.array(traj_id_list)
         data_proto.non_tensor_batch["reward_list"] = np.array(reward_list)
         data_proto.non_tensor_batch["active_mask_list"] = np.array(active_mask_list)
-        data_proto.non_tensor_batch["turn_valid_list"] = np.array(turn_valid_list, dtype=bool)
-        data_proto.non_tensor_batch["turn_dup_list"] = np.array(turn_dup_list, dtype=bool)
+        data_proto.non_tensor_batch["turn_valid_list"] = np.array(turn_valid_list)
+        data_proto.non_tensor_batch["turn_dup_list"] = np.array(turn_dup_list)
 
         logger.info(f"[STEP-WISE-DEBUG]: transform {len(input_ids_list)} data to torch tensor.")
         return data_proto, data_metrics

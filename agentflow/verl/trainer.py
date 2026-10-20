@@ -214,6 +214,7 @@ class AgentFlowTrainer(RayPPOTrainer):
 
     @staticmethod
     def _anchors_match(a, b, thresh: float = 0.95) -> bool:
+        """anchor 观测相似度判断（与 GiGPO are_similar 同语义，避免跨模块导入）"""
         if a == b:
             return True
         if not isinstance(a, str) or not isinstance(b, str):
@@ -221,178 +222,21 @@ class AgentFlowTrainer(RayPPOTrainer):
         from difflib import SequenceMatcher
         return SequenceMatcher(None, a, b).ratio() >= thresh
 
-    def _trans_to_cross_anchor_dpo_batch(self, history_batch_list: list):
-        """Optional state-matched replay; retain QA and prompt validity guards."""
-        if not history_batch_list:
-            return None
-
-        cfg = self.config.data.get("replay_filter", {})
-        similarity = cfg.get("anchor_sim_thresh", 0.95)
-        pair_limit = cfg.get("k_pairs_per_group", None)
-        step_limit = cfg.get("max_pairs_per_step", 256)
-        length_ratio_max = cfg.get("length_ratio_max", 1.8)
-        chosen_must_valid = cfg.get("chosen_must_valid", True)
-        skip_dup_chosen = cfg.get("skip_dup_chosen", True)
-        if not 0 <= similarity <= 1:
-            raise ValueError("anchor_sim_thresh must be between 0 and 1")
-        if pair_limit is not None and (not isinstance(pair_limit, int) or pair_limit <= 0):
-            raise ValueError("k_pairs_per_group must be a positive integer or None")
-        if not isinstance(step_limit, int) or step_limit <= 0:
-            raise ValueError("max_pairs_per_step must be a positive integer")
-        if length_ratio_max is not None and length_ratio_max < 1:
-            raise ValueError("length_ratio_max must be at least 1 or None")
-
-        task = str(self.config.data.get("task", "")).lower()
-        k_partitions = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
-        tensor_keys = [
-            "input_ids", "attention_mask", "old_log_probs", "position_ids",
-            "prompts", "response_mask", "responses", "token_level_scores",
-        ]
-        if self.use_reference_policy:
-            tensor_keys.append("ref_log_prob")
-        common_keys = ["data_id_list", "uid", "traj_id_list", "traj_uid"]
-        split_keys = ["turn_index_list", "rollout_id_list"]
-        proto_list = []
-
-        for history_batch in history_batch_list:
-            non_tensor = history_batch.non_tensor_batch
-            batch = history_batch.batch
-            scores = batch["token_level_scores"].sum(dim=-1)
-            lengths = batch["response_mask"].sum(dim=-1)
-            log_probs = (batch["old_log_probs"] * batch["response_mask"]).sum(dim=-1)
-            dropped = batch.get("is_drop_mask")
-            anchors = non_tensor.get("anchor_list")
-            valid_flags = non_tensor.get("turn_valid_list")
-            dup_flags = non_tensor.get("turn_dup_list")
-
-            # Determine QA stage before dropping rows, as in the original path.
-            last_turn = {}
-            if task == "qa":
-                for rollout, turn in zip(non_tensor["rollout_id_list"], non_tensor["turn_index_list"]):
-                    rollout = str(rollout)
-                    last_turn[rollout] = max(last_turn.get(rollout, -1), int(turn))
-
-            rows = []
-            with torch.no_grad():
-                for i in range(len(scores)):
-                    if dropped is not None and bool(dropped[i].item()):
-                        continue
-                    length = int(lengths[i].item())
-                    if length <= 0:
-                        continue
-                    turn = int(non_tensor["turn_index_list"][i])
-                    rollout = str(non_tensor["rollout_id_list"][i])
-                    anchor = anchors[i] if anchors is not None else None
-                    if not isinstance(anchor, str) or not anchor.strip():
-                        anchor = None
-                    rows.append({
-                        "row": i,
-                        "uid": str(non_tensor["uid"][i]),
-                        "traj": str(non_tensor["traj_uid"][i]),
-                        "turn": turn,
-                        "stage": turn == last_turn[rollout] if task == "qa" else None,
-                        "anchor": anchor,
-                        "score": float(scores[i].item()),
-                        "length": length,
-                        "logP": float(log_probs[i].item()),
-                        "resp": tuple(batch["responses"][i][batch["response_mask"][i].bool()].detach().cpu().tolist()),
-                        "valid": bool(valid_flags[i]) if valid_flags is not None else True,
-                        "dup": bool(dup_flags[i]) if dup_flags is not None else False,
-                    })
-
-            trajectory_scores = defaultdict(float)
-            for row in rows:
-                trajectory_scores[(row["uid"], row["traj"])] += row["score"]
-
-            # Missing QA anchors retain uid/turn/stage groups instead of matching None.
-            groups = defaultdict(list)
-            fallback_groups = {}
-            for row in rows:
-                clusters = groups[(row["uid"], row["stage"])]
-                if row["anchor"] is None:
-                    key = (row["uid"], row["stage"], row["turn"])
-                    if key not in fallback_groups:
-                        fallback_groups[key] = []
-                        clusters.append(fallback_groups[key])
-                    fallback_groups[key].append(row)
-                    continue
-                for cluster in clusters:
-                    if cluster[0]["anchor"] is not None and self._anchors_match(
-                        cluster[0]["anchor"], row["anchor"], similarity
-                    ):
-                        cluster.append(row)
-                        break
-                else:
-                    clusters.append([row])
-
-            candidates_by_uid = defaultdict(list)
-            for (uid, stage), clusters in groups.items():
-                for cluster in clusters:
-                    if len(cluster) < 2:
-                        continue
-                    # Prefer an eligible positive over an earlier failed duplicate.
-                    unique = {}
-                    def response_rank(row):
-                        eligible = (not chosen_must_valid or row["valid"]) and (not skip_dup_chosen or not row["dup"])
-                        return (row["score"] > 0 and eligible, row["score"], row["valid"], not row["dup"])
-                    for row in cluster:
-                        previous = unique.get(row["resp"])
-                        if previous is None or response_rank(row) > response_rank(previous):
-                            unique[row["resp"]] = row
-                    unique_rows = list(unique.values())
-                    positive = sorted((r for r in unique_rows if r["score"] > 0), key=lambda r: -r["score"])
-                    negative = sorted((r for r in unique_rows if r["score"] <= 0 and
-                                       trajectory_scores[(r["uid"], r["traj"])] <= 0), key=lambda r: r["score"])
-                    if not positive or not negative:
-                        continue
-                    baseline = float(np.mean([r["logP"] / r["length"] for r in unique_rows]))
-                    for index, chosen in enumerate(positive):
-                        rejected = negative[index % len(negative)]
-                        if chosen_must_valid and not chosen["valid"]:
-                            continue
-                        if skip_dup_chosen and chosen["dup"]:
-                            continue
-                        if length_ratio_max is not None and max(chosen["length"], rejected["length"]) / min(chosen["length"], rejected["length"]) > length_ratio_max:
-                            continue
-                        hardness = abs(chosen["logP"] / chosen["length"] - rejected["logP"] / rejected["length"])
-                        candidates_by_uid[uid].append((hardness, chosen, rejected, len(unique_rows), baseline))
-
-            for candidates in candidates_by_uid.values():
-                candidates.sort(key=lambda candidate: candidate[0])
-                for hardness, chosen, rejected, group_size, baseline in candidates[:pair_limit]:
-                    p_idx, n_idx = chosen["row"], rejected["row"]
-                    proto = DataProto.from_single_dict(
-                        {key + "_a": batch[key][p_idx:p_idx + 1, :] for key in tensor_keys}
-                        | {key + "_b": batch[key][n_idx:n_idx + 1, :] for key in tensor_keys}
-                        | {key: non_tensor[key][p_idx:p_idx + 1] for key in common_keys}
-                        | {key + "_a": non_tensor[key][p_idx:p_idx + 1] for key in split_keys}
-                        | {key + "_b": non_tensor[key][n_idx:n_idx + 1] for key in split_keys}
-                    )
-                    proto.non_tensor_batch["group_baseline"] = np.array([baseline], dtype=np.float32)
-                    proto.non_tensor_batch["group_size"] = np.array([group_size], dtype=np.int32)
-                    proto.non_tensor_batch["born_step"] = np.array([self.global_steps], dtype=np.int64)
-                    proto.non_tensor_batch["pair_turn"] = np.array([chosen["turn"]], dtype=np.int32)
-                    proto_list.append(proto)
-
-        if not proto_list:
-            return None
-        if len(proto_list) > step_limit:
-            proto_list = random.sample(proto_list, step_limit)
-        remainder = len(proto_list) % k_partitions
-        if remainder:
-            proto_list.extend(random.choices(proto_list, k=k_partitions - remainder))
-        temperature = history_batch_list[0].meta_info.get("temperature", 0.7)
-        for proto in proto_list:
-            proto.meta_info["temperature"] = temperature
-        print(f">>> Obtain cross-anchor paired #batch: {len(proto_list)}")
-        return proto_list
-
     ## score=0, score=1, classify(统一划分)
     def _trans_to_dpo_batch(self, history_batch_list: list):
-        if self.config.data.get("cross_anchor_replay", False):
-            return self._trans_to_cross_anchor_dpo_batch(history_batch_list)
+        """
+        分叉点 DPO pair 构建；关闭 cross_anchor_replay 时保留 cache 原路径。
+
+        核心改动：
+          1. 同任务内跨回合按 anchor 聚类；QA 保留末 turn / 中间 turn 边界。
+          2. 簇内 response 去重，优先保留符合质量要求的正例。
+          3. 正负奖励排序配对，负例仅来自非正总分轨迹。
+          4. chosen 端质量过滤：基础有效性检查、排除重复响应。
+          5. 难分对优先：按两端 per-token logP 接近度升序取 top-K。
+        """
+        if not self.config.data.get("cross_anchor_replay", False):
+            return self._trans_to_dpo_batch_legacy(history_batch_list)
         if not history_batch_list:
-            print("## No DPO data with history")
             return None
 
         k_partitions = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
@@ -406,194 +250,192 @@ class AgentFlowTrainer(RayPPOTrainer):
         non_tensor_select_keys = ["data_id_list", "uid", "traj_id_list", "traj_uid"]
         non_tensor_split_select_keys = ["turn_index_list", "rollout_id_list"]
 
+        cfg = self.config.data.get("replay_filter", {})
+        K_PAIRS_PER_GROUP   = cfg.get("k_pairs_per_group", None)
+        LENGTH_RATIO_MAX    = cfg.get("length_ratio_max", 1.8)
+        ANCHOR_SIM_THRESH   = cfg.get("anchor_sim_thresh", 0.95)
+        CHOSEN_MUST_VALID   = cfg.get("chosen_must_valid", True)
+        SKIP_DUP_CHOSEN     = cfg.get("skip_dup_chosen", True)
+        MAX_PAIRS_PER_STEP  = cfg.get("max_pairs_per_step", 256)
+
+        if not 0 <= ANCHOR_SIM_THRESH <= 1:
+            raise ValueError("anchor_sim_thresh must be between 0 and 1")
+        if K_PAIRS_PER_GROUP is not None and (not isinstance(K_PAIRS_PER_GROUP, int) or K_PAIRS_PER_GROUP <= 0):
+            raise ValueError("k_pairs_per_group must be a positive integer or None")
+        if not isinstance(MAX_PAIRS_PER_STEP, int) or MAX_PAIRS_PER_STEP <= 0:
+            raise ValueError("max_pairs_per_step must be a positive integer")
+        if LENGTH_RATIO_MAX is not None and LENGTH_RATIO_MAX < 1:
+            raise ValueError("length_ratio_max must be at least 1 or None")
+
+        task = str(self.config.data.get("task", "")).lower()
         proto_list = []
 
         for history_batch in history_batch_list:
+            uids           = history_batch.non_tensor_batch["uid"]
+            traj_uids      = history_batch.non_tensor_batch["traj_uid"]
+            turn_indices   = history_batch.non_tensor_batch["turn_index_list"]
+            anchors        = history_batch.non_tensor_batch.get("anchor_list")
+            responses      = history_batch.batch["responses"]
+            response_mask  = history_batch.batch["response_mask"]
+            old_log_probs  = history_batch.batch["old_log_probs"]
             token_level_scores = history_batch.batch["token_level_scores"]
-            response_mask = history_batch.batch["response_mask"]
-            uids = history_batch.non_tensor_batch["uid"]
-            turn_indices = history_batch.non_tensor_batch["turn_index_list"]
-            rollout_ids = history_batch.non_tensor_batch["rollout_id_list"]
-            old_log_probs = history_batch.batch["old_log_probs"]
+            valid_flags = history_batch.non_tensor_batch.get("turn_valid_list")
+            dup_flags   = history_batch.non_tensor_batch.get("turn_dup_list")
             is_drop_mask = history_batch.batch.get("is_drop_mask")
 
-            scores = token_level_scores.sum(dim=-1)
+            scores  = token_level_scores.sum(dim=-1)
             lengths = response_mask.sum(dim=-1)
+            seq_logP = (old_log_probs * response_mask).sum(dim=-1)
             bsz = scores.shape[0]
 
-            task = str(self.config.data.get("task", "")).lower()
+            # QA stage is determined before dropping rows, as in cache.
+            rollout_ids = history_batch.non_tensor_batch["rollout_id_list"]
             rollout_last_turn = {}
             if task == "qa":
-                for i in range(bsz):
-                    rollout_id = str(rollout_ids[i])
-                    turn = int(turn_indices[i])
-                    rollout_last_turn[rollout_id] = max(
-                        rollout_last_turn.get(rollout_id, -1), turn
-                    )
+                for rollout, turn in zip(rollout_ids, turn_indices):
+                    rollout = str(rollout)
+                    rollout_last_turn[rollout] = max(rollout_last_turn.get(rollout, -1), int(turn))
 
-            id2score = defaultdict(list)
-            id2index = defaultdict(list)
-            id2length = defaultdict(list)
-            id2logP = defaultdict(list)
-
+            # 行结构: uid -> 轨迹 -> 逐 turn 行
+            rows = []
             with torch.no_grad():
                 for i in range(bsz):
-                    # 排除超长 prompt：响应来自完整上下文，不能用于截断上下文下的 SLiC。
                     if is_drop_mask is not None and bool(is_drop_mask[i].item()):
                         continue
-                    uid = str(uids[i])
-                    turn = str(turn_indices[i])
-                    ## replay collection
-                    replay_collection = self.config.data.get("replay_collection", "uid-turn")
-                    if replay_collection == "uid-turn":
-                        key_index = f"{uid}::turn_{turn}"
-                    elif replay_collection == "cross":
-                        key_index = "0"
-                    elif replay_collection == "turn":
-                        key_index = f"0::turn_{turn}"
-                    else:
-                        raise ValueError(f"replay collection: {key_index} is invalid!")
+                    rlen = int(lengths[i].item())
+                    if rlen <= 0:
+                        continue
+                    resp_ids = responses[i][response_mask[i].bool()].detach().cpu().tolist()
+                    turn = int(turn_indices[i])
+                    anchor = anchors[i] if anchors is not None else None
+                    if not isinstance(anchor, str) or not anchor.strip():
+                        anchor = None
+                    rows.append({
+                        "row":    i,
+                        "uid":    str(uids[i]),
+                        "traj":   str(traj_uids[i]),
+                        "turn":   turn,
+                        "anchor": anchor,
+                        "score":  float(scores[i].item()),
+                        "length": rlen,
+                        "logP":   float(seq_logP[i].item()),
+                        "resp":   tuple(resp_ids),
+                        "valid":  bool(valid_flags[i]) if valid_flags is not None else True,
+                        "dup":    bool(dup_flags[i])   if dup_flags   is not None else False,
+                        "stage":  turn == rollout_last_turn[str(rollout_ids[i])] if task == "qa" else None,
+                    })
 
-                    # 累积 logP（用于 baseline）
-                    logP = (old_log_probs[i] * response_mask[i]).sum().item()
+            uid2trajs = defaultdict(lambda: defaultdict(list))
+            for r in rows:
+                uid2trajs[r["uid"]][r["traj"]].append(r)
+            for uid in uid2trajs:
+                for traj in uid2trajs[uid]:
+                    uid2trajs[uid][traj].sort(key=lambda r: r["turn"])
 
-                    id2score[key_index].append(scores[i])
-                    id2length[key_index].append(lengths[i])
-                    id2index[key_index].append(i)
-                    id2logP[key_index].append(logP)
+            # 轨迹结局标注：neg 池只收非正总分轨迹的行。
+            traj_total = defaultdict(float)
+            for r in rows:
+                traj_total[(r["uid"], r["traj"])] += r["score"]
+            for r in rows:
+                # Only a known nonpositive total is eligible for the negative pool.
+                r["traj_succ"] = not (traj_total[(r["uid"], r["traj"])] <= 0.0)
 
-                # QA 按轨迹末 turn / 中间 turn 分别计算组内 per-token baseline。
-                id2baseline = {}
-                for idx in id2score.keys():
-                    group_logPs = id2logP[idx]
-                    group_lengths = [max(l.item(), 1) for l in id2length[idx]]
-                    per_tokens = [lp / l for lp, l in zip(group_logPs, group_lengths)]
-                    if task == "qa":
-                        stage_per_tokens = defaultdict(list)
-                        for sample_index, per_token in zip(id2index[idx], per_tokens):
-                            rollout_id = str(rollout_ids[sample_index])
-                            turn = int(turn_indices[sample_index])
-                            is_last = turn == rollout_last_turn[rollout_id]
-                            stage_per_tokens[is_last].append(per_token)
+            # Preserve stage and candidate order from the existing implementation.
+            uid_stage_order = dict.fromkeys((r["uid"], r["stage"]) for r in rows)
+            candidates_by_uid = defaultdict(list)
+            for uid, stage in uid_stage_order:
+                trajs = uid2trajs[uid]
+                turn2rows = defaultdict(list)
+                for traj_rows in trajs.values():
+                    for r in traj_rows:
+                        if r["stage"] == stage:
+                            turn2rows["cross_turn"].append(r)
 
-                        id2baseline[idx] = {
-                            is_last: float(sum(values) / max(len(values), 1))
-                            for is_last, values in stage_per_tokens.items()
-                        }
-                    else:
-                        id2baseline[idx] = float(sum(per_tokens) / max(len(per_tokens), 1))
+                candidates = []  # (hardness, chosen, rejected, cluster_size, baseline)
 
-                # usage = defaultdict(int)
-                # MAX_USE = 4
-
-                # ========== 新增 0：配置 ==========
-                cfg = self.config.data.get("replay_filter", {})
-                K_PAIRS_PER_GROUP   = cfg.get("k_pairs_per_group", 2)      # 每 turn 最多入队对数
-                LENGTH_RATIO_MAX    = cfg.get("length_ratio_max", 1.8)     # 你原来的 1.8 提到配置
-                MARGIN_SAT_QUANTILE = cfg.get("margin_sat_quantile", 0.9)  # 组内 margin 饱和分位
-
-
-                for idx in id2score.keys():
-                    group_size = len(id2score[idx])
-                    if group_size <= 1:
+                for turn in sorted(turn2rows.keys()):
+                    rows_t = sorted(turn2rows[turn], key=lambda r: r["row"])
+                    if len(rows_t) < 2:
                         continue
 
-                    # ========== 新增 1：turn 级分歧度过滤 ==========
-                    group_scores = torch.stack(id2score[idx]).float()
-                    g_std  = group_scores.std().item()
-                    g_mean = group_scores.mean().item()
+                    # 1) anchor 聚类；缺少 anchor 时保留同 turn 分组。
+                    clusters = []
+                    for r in rows_t:
+                        placed = False
+                        for c in clusters:
+                            same_fallback_turn = c[0]["anchor"] is None and r["anchor"] is None and c[0]["turn"] == r["turn"]
+                            same_anchor = c[0]["anchor"] is not None and r["anchor"] is not None and self._anchors_match(c[0]["anchor"], r["anchor"], ANCHOR_SIM_THRESH)
+                            if same_fallback_turn or same_anchor:
+                                c.append(r)
+                                placed = True
+                                break
+                        if not placed:
+                            clusters.append([r])
 
-                    # 全同分（全成/全败）的 turn，pair 梯度≈0，直接跳过
-                    if g_std < 1e-6:
-                        continue
-
-                    pos_samples = []
-                    neg_samples = []
-
-                    for i in range(group_size):
-                        score = id2score[idx][i].item()
-                        length = id2length[idx][i].item()
-                        index = id2index[idx][i]
-
-                        if length == 0:
+                    for cluster in clusters:
+                        if len(cluster) < 2:
                             continue
 
-                        if score > 0:
-                            pos_samples.append((index, score, length))
-                        else:
-                            neg_samples.append((index, score, length))
+                        # 2) response 去重；不让较早的失败响应覆盖有效正例。
+                        unique = {}
+                        def response_rank(r):
+                            eligible = (not CHOSEN_MUST_VALID or r["valid"]) and (not SKIP_DUP_CHOSEN or not r["dup"])
+                            return (r["score"] > 0 and eligible, r["score"], r["valid"], not r["dup"])
+                        for r in cluster:
+                            previous = unique.get(r["resp"])
+                            if previous is None or response_rank(r) > response_rank(previous):
+                                unique[r["resp"]] = r
+                        uniq = list(unique.values())
 
-                    if not pos_samples or not neg_samples:
-                        continue
+                        # 3) 正例降序、负例升序匹配；负例不足时循环复用。
+                        pos = sorted((r for r in uniq if r["score"] > 0.0),
+                                     key=lambda r: -r["score"])
+                        neg = sorted((r for r in uniq if r["score"] <= 0.0 and not r["traj_succ"]),
+                                     key=lambda r: r["score"])
+                        if not pos or not neg:
+                            continue
+                        baseline = float(np.mean([r["logP"] / r["length"] for r in uniq]))
+                        for k in range(len(pos)):
+                            chosen   = pos[k]
+                            rejected = neg[k % len(neg)]
 
-                    # ========== 新增 2：构建全部候选对 + margin 饱和过滤 ==========
-                    # 先算组内所有对的 margin，取饱和分位做阈值
-                    pair_margins = [p_s - n_s for _, p_s, _ in pos_samples for _, n_s, _ in neg_samples]
-                    sat_thresh = np.quantile(pair_margins, MARGIN_SAT_QUANTILE)
-
-                    valid_pairs = []
-                    for p_idx, p_score, p_len in pos_samples:
-                        for n_idx, n_score, n_len in neg_samples:
-                            if task == "qa":
-                                p_rollout_id = str(rollout_ids[p_idx])
-                                n_rollout_id = str(rollout_ids[n_idx])
-                                p_is_last = int(turn_indices[p_idx]) == rollout_last_turn[p_rollout_id]
-                                n_is_last = int(turn_indices[n_idx]) == rollout_last_turn[n_rollout_id]
-                                if p_is_last != n_is_last:
-                                    continue
-                            if p_score - n_score > sat_thresh:      # 白送对，梯度≈0
+                            # 4) chosen 端质量过滤。
+                            if CHOSEN_MUST_VALID and not chosen["valid"]:
                                 continue
-                            if max(p_len, n_len) / min(p_len, n_len) > LENGTH_RATIO_MAX:
+                            if SKIP_DUP_CHOSEN and chosen["dup"]:
                                 continue
-                            valid_pairs.append((p_idx, n_idx, p_len, n_len))
 
-                    if not valid_pairs:
-                        continue
+                            # 5) 保留 cache 的长度比保护，可显式配置 None 关闭。
+                            if LENGTH_RATIO_MAX is not None and max(chosen["length"], rejected["length"]) / min(chosen["length"], rejected["length"]) > LENGTH_RATIO_MAX:
+                                continue
 
-                    # ========== 新增 3：近似难对度 top-K（替代随机 shuffle + 长度权重采样）==========
-                    # 用生成时 per-token logP 的接近程度近似"模型当前难分"
-                    pos_in_group = {batch_idx: i for i, batch_idx in enumerate(id2index[idx])}
-                    def _hardness(pair):
-                        p_idx, n_idx, _, _ = pair
-                        p_pos = pos_in_group[p_idx]          # batch 行号 → 组内位置
-                        n_pos = pos_in_group[n_idx]
-                        pt_a = id2logP[idx][p_pos] / max(id2length[idx][p_pos].item(), 1)
-                        pt_b = id2logP[idx][n_pos] / max(id2length[idx][n_pos].item(), 1)
-                        return abs(pt_a - pt_b)
+                            # 6) 按 per-token old logP 接近度排序。
+                            hardness = abs(chosen["logP"] / chosen["length"] - rejected["logP"] / rejected["length"])
+                            candidates.append((hardness, chosen, rejected, len(uniq), baseline))
 
-                    valid_pairs.sort(key=_hardness)                        # 难分在前
-                    selected = valid_pairs[:K_PAIRS_PER_GROUP]             # 只留 top-K
+                if candidates:
+                    candidates_by_uid[uid].extend(candidates)
 
-                    baseline = id2baseline[idx]
-
-                    for p_idx, n_idx, _, _ in selected:
-                        pair_baseline = baseline
-                        if task == "qa":
-                            p_rollout_id = str(rollout_ids[p_idx])
-                            p_is_last = int(turn_indices[p_idx]) == rollout_last_turn[p_rollout_id]
-                            pair_baseline = baseline[p_is_last]
-
-                        proto = DataProto.from_single_dict(
-                            {key + "_a": history_batch.batch[key][p_idx: p_idx+1, :] for key in split_select_keys}
-                            | {key + "_b": history_batch.batch[key][n_idx: n_idx+1, :] for key in split_select_keys}
-                            | {key: history_batch.non_tensor_batch[key][p_idx: p_idx+1] for key in non_tensor_select_keys}
-                            | {key + "_a": history_batch.non_tensor_batch[key][p_idx: p_idx+1] for key in non_tensor_split_select_keys}
-                            | {key + "_b": history_batch.non_tensor_batch[key][n_idx: n_idx+1] for key in non_tensor_split_select_keys}
-                        )
-                        # ========== 关键：baseline 和 group_size 放入 non_tensor_batch ==========
-                        # DataProto.concat 会正确拼接 non_tensor_batch，不会丢失 per-sample 标量
-                        proto.non_tensor_batch["group_baseline"] = np.array([pair_baseline], dtype=np.float32)
-                        proto.non_tensor_batch["group_size"] = np.array([group_size], dtype=np.int32)
-                        proto.non_tensor_batch["born_step"] = np.array([self.global_steps], dtype=np.int64)
-                        # =====================================================================
-                        proto_list.append(proto)
+            for candidates in candidates_by_uid.values():
+                candidates.sort(key=lambda x: x[0])
+                for hardness, chosen, rejected, cluster_size, baseline in candidates[:K_PAIRS_PER_GROUP]:
+                    p_idx, n_idx = chosen["row"], rejected["row"]
+                    proto = DataProto.from_single_dict(
+                        {key + "_a": history_batch.batch[key][p_idx: p_idx + 1, :] for key in split_select_keys}
+                        | {key + "_b": history_batch.batch[key][n_idx: n_idx + 1, :] for key in split_select_keys}
+                        | {key: history_batch.non_tensor_batch[key][p_idx: p_idx + 1] for key in non_tensor_select_keys}
+                        | {key + "_a": history_batch.non_tensor_batch[key][p_idx: p_idx + 1] for key in non_tensor_split_select_keys}
+                        | {key + "_b": history_batch.non_tensor_batch[key][n_idx: n_idx + 1] for key in non_tensor_split_select_keys}
+                    )
+                    proto.non_tensor_batch["group_baseline"] = np.array([baseline], dtype=np.float32)
+                    proto.non_tensor_batch["group_size"]     = np.array([cluster_size], dtype=np.int32)
+                    proto.non_tensor_batch["born_step"]      = np.array([self.global_steps], dtype=np.int64)
+                    proto.non_tensor_batch["pair_turn"]      = np.array([chosen["turn"]], dtype=np.int32)
+                    proto_list.append(proto)
 
         if not proto_list:
-            print("## DPO pair is not found!")
             return None
 
-        ## 增加最大上限
-        MAX_PAIRS_PER_STEP = 256
         if len(proto_list) > MAX_PAIRS_PER_STEP:
             proto_list = random.sample(proto_list, MAX_PAIRS_PER_STEP)
 
@@ -602,13 +444,14 @@ class AgentFlowTrainer(RayPPOTrainer):
             extra = random.choices(proto_list, k=k_partitions - remainder)
             proto_list.extend(extra)
 
-        print(f">>> Obtain paired #batch: {len(proto_list)}")
-
         temperature = history_batch_list[0].meta_info.get("temperature", 0.7)
         for proto in proto_list:
             proto.meta_info["temperature"] = temperature
 
+        print(f">>> Obtain cross-anchor paired #batch: {len(proto_list)}")
         return proto_list
+
+
 
 
     def _sample_dpo_data(self, dpo_queue: deque, bs: int):
@@ -1139,4 +982,224 @@ class AgentFlowTrainer(RayPPOTrainer):
 
                 progress_bar.update(1)
                 self.global_steps += 1
+
+    def _trans_to_dpo_batch_legacy(self, history_batch_list: list):
+        if not history_batch_list:
+            print("## No DPO data with history")
+            return None
+
+        k_partitions = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+        split_select_keys = [
+            "input_ids", "attention_mask", "old_log_probs", "position_ids",
+            "prompts", "response_mask", "responses", "token_level_scores",
+        ]
+        if self.use_reference_policy:
+            split_select_keys += ["ref_log_prob"]
+
+        non_tensor_select_keys = ["data_id_list", "uid", "traj_id_list", "traj_uid"]
+        non_tensor_split_select_keys = ["turn_index_list", "rollout_id_list"]
+
+        proto_list = []
+
+        for history_batch in history_batch_list:
+            token_level_scores = history_batch.batch["token_level_scores"]
+            response_mask = history_batch.batch["response_mask"]
+            uids = history_batch.non_tensor_batch["uid"]
+            turn_indices = history_batch.non_tensor_batch["turn_index_list"]
+            rollout_ids = history_batch.non_tensor_batch["rollout_id_list"]
+            old_log_probs = history_batch.batch["old_log_probs"]
+            is_drop_mask = history_batch.batch.get("is_drop_mask")
+
+            scores = token_level_scores.sum(dim=-1)
+            lengths = response_mask.sum(dim=-1)
+            bsz = scores.shape[0]
+
+            task = str(self.config.data.get("task", "")).lower()
+            rollout_last_turn = {}
+            if task == "qa":
+                for i in range(bsz):
+                    rollout_id = str(rollout_ids[i])
+                    turn = int(turn_indices[i])
+                    rollout_last_turn[rollout_id] = max(
+                        rollout_last_turn.get(rollout_id, -1), turn
+                    )
+
+            id2score = defaultdict(list)
+            id2index = defaultdict(list)
+            id2length = defaultdict(list)
+            id2logP = defaultdict(list)
+
+            with torch.no_grad():
+                for i in range(bsz):
+                    # 排除超长 prompt：响应来自完整上下文，不能用于截断上下文下的 SLiC。
+                    if is_drop_mask is not None and bool(is_drop_mask[i].item()):
+                        continue
+                    uid = str(uids[i])
+                    turn = str(turn_indices[i])
+                    ## replay collection
+                    replay_collection = self.config.data.get("replay_collection", "uid-turn")
+                    if replay_collection == "uid-turn":
+                        key_index = f"{uid}::turn_{turn}"
+                    elif replay_collection == "cross":
+                        key_index = "0"
+                    elif replay_collection == "turn":
+                        key_index = f"0::turn_{turn}"
+                    else:
+                        raise ValueError(f"replay collection: {key_index} is invalid!")
+
+                    # 累积 logP（用于 baseline）
+                    logP = (old_log_probs[i] * response_mask[i]).sum().item()
+
+                    id2score[key_index].append(scores[i])
+                    id2length[key_index].append(lengths[i])
+                    id2index[key_index].append(i)
+                    id2logP[key_index].append(logP)
+
+                # QA 按轨迹末 turn / 中间 turn 分别计算组内 per-token baseline。
+                id2baseline = {}
+                for idx in id2score.keys():
+                    group_logPs = id2logP[idx]
+                    group_lengths = [max(l.item(), 1) for l in id2length[idx]]
+                    per_tokens = [lp / l for lp, l in zip(group_logPs, group_lengths)]
+                    if task == "qa":
+                        stage_per_tokens = defaultdict(list)
+                        for sample_index, per_token in zip(id2index[idx], per_tokens):
+                            rollout_id = str(rollout_ids[sample_index])
+                            turn = int(turn_indices[sample_index])
+                            is_last = turn == rollout_last_turn[rollout_id]
+                            stage_per_tokens[is_last].append(per_token)
+
+                        id2baseline[idx] = {
+                            is_last: float(sum(values) / max(len(values), 1))
+                            for is_last, values in stage_per_tokens.items()
+                        }
+                    else:
+                        id2baseline[idx] = float(sum(per_tokens) / max(len(per_tokens), 1))
+
+                # usage = defaultdict(int)
+                # MAX_USE = 4
+
+                # ========== 新增 0：配置 ==========
+                cfg = self.config.data.get("replay_filter", {})
+                K_PAIRS_PER_GROUP   = cfg.get("k_pairs_per_group", 2)      # 每 turn 最多入队对数
+                LENGTH_RATIO_MAX    = cfg.get("length_ratio_max", 1.8)     # 你原来的 1.8 提到配置
+                MARGIN_SAT_QUANTILE = cfg.get("margin_sat_quantile", 0.9)  # 组内 margin 饱和分位
+
+
+                for idx in id2score.keys():
+                    group_size = len(id2score[idx])
+                    if group_size <= 1:
+                        continue
+
+                    # ========== 新增 1：turn 级分歧度过滤 ==========
+                    group_scores = torch.stack(id2score[idx]).float()
+                    g_std  = group_scores.std().item()
+                    g_mean = group_scores.mean().item()
+
+                    # 全同分（全成/全败）的 turn，pair 梯度≈0，直接跳过
+                    if g_std < 1e-6:
+                        continue
+
+                    pos_samples = []
+                    neg_samples = []
+
+                    for i in range(group_size):
+                        score = id2score[idx][i].item()
+                        length = id2length[idx][i].item()
+                        index = id2index[idx][i]
+
+                        if length == 0:
+                            continue
+
+                        if score > 0:
+                            pos_samples.append((index, score, length))
+                        else:
+                            neg_samples.append((index, score, length))
+
+                    if not pos_samples or not neg_samples:
+                        continue
+
+                    # ========== 新增 2：构建全部候选对 + margin 饱和过滤 ==========
+                    # 先算组内所有对的 margin，取饱和分位做阈值
+                    pair_margins = [p_s - n_s for _, p_s, _ in pos_samples for _, n_s, _ in neg_samples]
+                    sat_thresh = np.quantile(pair_margins, MARGIN_SAT_QUANTILE)
+
+                    valid_pairs = []
+                    for p_idx, p_score, p_len in pos_samples:
+                        for n_idx, n_score, n_len in neg_samples:
+                            if task == "qa":
+                                p_rollout_id = str(rollout_ids[p_idx])
+                                n_rollout_id = str(rollout_ids[n_idx])
+                                p_is_last = int(turn_indices[p_idx]) == rollout_last_turn[p_rollout_id]
+                                n_is_last = int(turn_indices[n_idx]) == rollout_last_turn[n_rollout_id]
+                                if p_is_last != n_is_last:
+                                    continue
+                            if p_score - n_score > sat_thresh:      # 白送对，梯度≈0
+                                continue
+                            if max(p_len, n_len) / min(p_len, n_len) > LENGTH_RATIO_MAX:
+                                continue
+                            valid_pairs.append((p_idx, n_idx, p_len, n_len))
+
+                    if not valid_pairs:
+                        continue
+
+                    # ========== 新增 3：近似难对度 top-K（替代随机 shuffle + 长度权重采样）==========
+                    # 用生成时 per-token logP 的接近程度近似"模型当前难分"
+                    pos_in_group = {batch_idx: i for i, batch_idx in enumerate(id2index[idx])}
+                    def _hardness(pair):
+                        p_idx, n_idx, _, _ = pair
+                        p_pos = pos_in_group[p_idx]          # batch 行号 → 组内位置
+                        n_pos = pos_in_group[n_idx]
+                        pt_a = id2logP[idx][p_pos] / max(id2length[idx][p_pos].item(), 1)
+                        pt_b = id2logP[idx][n_pos] / max(id2length[idx][n_pos].item(), 1)
+                        return abs(pt_a - pt_b)
+
+                    valid_pairs.sort(key=_hardness)                        # 难分在前
+                    selected = valid_pairs[:K_PAIRS_PER_GROUP]             # 只留 top-K
+
+                    baseline = id2baseline[idx]
+
+                    for p_idx, n_idx, _, _ in selected:
+                        pair_baseline = baseline
+                        if task == "qa":
+                            p_rollout_id = str(rollout_ids[p_idx])
+                            p_is_last = int(turn_indices[p_idx]) == rollout_last_turn[p_rollout_id]
+                            pair_baseline = baseline[p_is_last]
+
+                        proto = DataProto.from_single_dict(
+                            {key + "_a": history_batch.batch[key][p_idx: p_idx+1, :] for key in split_select_keys}
+                            | {key + "_b": history_batch.batch[key][n_idx: n_idx+1, :] for key in split_select_keys}
+                            | {key: history_batch.non_tensor_batch[key][p_idx: p_idx+1] for key in non_tensor_select_keys}
+                            | {key + "_a": history_batch.non_tensor_batch[key][p_idx: p_idx+1] for key in non_tensor_split_select_keys}
+                            | {key + "_b": history_batch.non_tensor_batch[key][n_idx: n_idx+1] for key in non_tensor_split_select_keys}
+                        )
+                        # ========== 关键：baseline 和 group_size 放入 non_tensor_batch ==========
+                        # DataProto.concat 会正确拼接 non_tensor_batch，不会丢失 per-sample 标量
+                        proto.non_tensor_batch["group_baseline"] = np.array([pair_baseline], dtype=np.float32)
+                        proto.non_tensor_batch["group_size"] = np.array([group_size], dtype=np.int32)
+                        proto.non_tensor_batch["born_step"] = np.array([self.global_steps], dtype=np.int64)
+                        # =====================================================================
+                        proto_list.append(proto)
+
+        if not proto_list:
+            print("## DPO pair is not found!")
+            return None
+
+        ## 增加最大上限
+        MAX_PAIRS_PER_STEP = 256
+        if len(proto_list) > MAX_PAIRS_PER_STEP:
+            proto_list = random.sample(proto_list, MAX_PAIRS_PER_STEP)
+
+        remainder = len(proto_list) % k_partitions
+        if remainder != 0:
+            extra = random.choices(proto_list, k=k_partitions - remainder)
+            proto_list.extend(extra)
+
+        print(f">>> Obtain paired #batch: {len(proto_list)}")
+
+        temperature = history_batch_list[0].meta_info.get("temperature", 0.7)
+        for proto in proto_list:
+            proto.meta_info["temperature"] = temperature
+
+        return proto_list
 

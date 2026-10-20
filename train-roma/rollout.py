@@ -36,21 +36,26 @@ configure_logger(logging.INFO)
 
 
 def _compute_turn_flags(planner_logs: list, task: str) -> list:
-    """Basic output checks and exact repeated-response flags; no QA correctness label."""
+    """
+    逐 turn 质量标记：
+      valid : 基础有效性检查（QA 仅判断非空）
+      dup   : 该 turn 的输出与同轨迹历史某 turn 完全相同（循环动作）
+    """
     flags = []
     seen = set()
     for log in planner_logs:
         response = log.get("response")
         resp = "" if response is None else str(response).strip()
         if task == "alfworld":
-            match = re.search(r"<action>(.*?)</action>", resp, re.DOTALL)
-            valid = bool(match and match.group(1).strip())
+            m = re.search(r"<action>(.*?)</action>", resp, re.DOTALL)
+            valid = bool(m and m.group(1).strip())
         elif task == "webshop":
-            valid = bool(resp) and not resp.startswith("[ERROR]")
+            valid = len(resp) > 0 and not resp.startswith("[ERROR]")
         else:
-            valid = bool(resp)
-        flags.append({"valid": valid, "dup": bool(resp) and resp in seen})
+            valid = len(resp) > 0
+        dup = (resp in seen) if resp else False
         seen.add(resp)
+        flags.append({"valid": bool(valid), "dup": bool(dup)})
     return flags
 
 
