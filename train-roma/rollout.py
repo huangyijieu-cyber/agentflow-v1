@@ -35,6 +35,25 @@ import logging
 configure_logger(logging.INFO)
 
 
+def _compute_turn_flags(planner_logs: list, task: str) -> list:
+    """Basic output checks and exact repeated-response flags; no QA correctness label."""
+    flags = []
+    seen = set()
+    for log in planner_logs:
+        response = log.get("response")
+        resp = "" if response is None else str(response).strip()
+        if task == "alfworld":
+            match = re.search(r"<action>(.*?)</action>", resp, re.DOTALL)
+            valid = bool(match and match.group(1).strip())
+        elif task == "webshop":
+            valid = bool(resp) and not resp.startswith("[ERROR]")
+        else:
+            valid = bool(resp)
+        flags.append({"valid": valid, "dup": bool(resp) and resp in seen})
+        seen.add(resp)
+    return flags
+
+
 @reward
 async def evaluate(question: str, groundtruth: any, answer_extracted: any, val: bool = False) -> float:
     """
@@ -369,7 +388,7 @@ class RolloutAgent(LitAgent):
             # Rollout.metadata is declared as Dict[str, Any].  Passing None
             # explicitly bypasses the model's default_factory and causes a
             # Pydantic ValidationError for QA rollouts, whose anchor is None.
-            metadata = {}
+            metadata = {"turn_flags": _compute_turn_flags(planner_logs, self.task)}
             if anchor is not None:
                 metadata["anchor"] = anchor
             rollout_package = Rollout(

@@ -17,6 +17,8 @@ env:
   STALE_ITERATION: ${env:STALE_ITERATION,0}
   REPLAY_BUFFER_SIZE: ${env:REPLAY_BUFFER_SIZE,512}
   REPLAY_COLLECTION: ${env:REPLAY_COLLECTION,uid-turn}    # uid-turn(fast) | cross(slow) | turn(medium)
+  CROSS_ANCHOR_REPLAY: ${env:CROSS_ANCHOR_REPLAY,false}
+  REPLAY_SAMPLE_MULTIPLIER: ${env:REPLAY_SAMPLE_MULTIPLIER,4}
 
   # ----- 评分模型 (Reward Model) -----
   SCORE_MODEL_NAME: "Qwen3-30B-A3B-Instruct-2507"
@@ -122,6 +124,8 @@ python_args:
   +data.algorithm: '${ALGORITHM}'
   +data.replay_buffer_size: '${REPLAY_BUFFER_SIZE}'
   +data.replay_collection: '${REPLAY_COLLECTION}'
+  +data.cross_anchor_replay: '${CROSS_ANCHOR_REPLAY}'
+  +data.replay_sample_multiplier: '${REPLAY_SAMPLE_MULTIPLIER}'
 
   # --------------------------------------------------------------------------
   # Trainer 配置

@@ -212,8 +212,185 @@ class AgentFlowTrainer(RayPPOTrainer):
             torch.npu.empty_cache()
         gc.collect()
 
+    @staticmethod
+    def _anchors_match(a, b, thresh: float = 0.95) -> bool:
+        if a == b:
+            return True
+        if not isinstance(a, str) or not isinstance(b, str):
+            return False
+        from difflib import SequenceMatcher
+        return SequenceMatcher(None, a, b).ratio() >= thresh
+
+    def _trans_to_cross_anchor_dpo_batch(self, history_batch_list: list):
+        """Optional state-matched replay; retain QA and prompt validity guards."""
+        if not history_batch_list:
+            return None
+
+        cfg = self.config.data.get("replay_filter", {})
+        similarity = cfg.get("anchor_sim_thresh", 0.95)
+        pair_limit = cfg.get("k_pairs_per_group", None)
+        step_limit = cfg.get("max_pairs_per_step", 256)
+        length_ratio_max = cfg.get("length_ratio_max", 1.8)
+        chosen_must_valid = cfg.get("chosen_must_valid", True)
+        skip_dup_chosen = cfg.get("skip_dup_chosen", True)
+        if not 0 <= similarity <= 1:
+            raise ValueError("anchor_sim_thresh must be between 0 and 1")
+        if pair_limit is not None and (not isinstance(pair_limit, int) or pair_limit <= 0):
+            raise ValueError("k_pairs_per_group must be a positive integer or None")
+        if not isinstance(step_limit, int) or step_limit <= 0:
+            raise ValueError("max_pairs_per_step must be a positive integer")
+        if length_ratio_max is not None and length_ratio_max < 1:
+            raise ValueError("length_ratio_max must be at least 1 or None")
+
+        task = str(self.config.data.get("task", "")).lower()
+        k_partitions = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+        tensor_keys = [
+            "input_ids", "attention_mask", "old_log_probs", "position_ids",
+            "prompts", "response_mask", "responses", "token_level_scores",
+        ]
+        if self.use_reference_policy:
+            tensor_keys.append("ref_log_prob")
+        common_keys = ["data_id_list", "uid", "traj_id_list", "traj_uid"]
+        split_keys = ["turn_index_list", "rollout_id_list"]
+        proto_list = []
+
+        for history_batch in history_batch_list:
+            non_tensor = history_batch.non_tensor_batch
+            batch = history_batch.batch
+            scores = batch["token_level_scores"].sum(dim=-1)
+            lengths = batch["response_mask"].sum(dim=-1)
+            log_probs = (batch["old_log_probs"] * batch["response_mask"]).sum(dim=-1)
+            dropped = batch.get("is_drop_mask")
+            anchors = non_tensor.get("anchor_list")
+            valid_flags = non_tensor.get("turn_valid_list")
+            dup_flags = non_tensor.get("turn_dup_list")
+
+            # Determine QA stage before dropping rows, as in the original path.
+            last_turn = {}
+            if task == "qa":
+                for rollout, turn in zip(non_tensor["rollout_id_list"], non_tensor["turn_index_list"]):
+                    rollout = str(rollout)
+                    last_turn[rollout] = max(last_turn.get(rollout, -1), int(turn))
+
+            rows = []
+            with torch.no_grad():
+                for i in range(len(scores)):
+                    if dropped is not None and bool(dropped[i].item()):
+                        continue
+                    length = int(lengths[i].item())
+                    if length <= 0:
+                        continue
+                    turn = int(non_tensor["turn_index_list"][i])
+                    rollout = str(non_tensor["rollout_id_list"][i])
+                    anchor = anchors[i] if anchors is not None else None
+                    if not isinstance(anchor, str) or not anchor.strip():
+                        anchor = None
+                    rows.append({
+                        "row": i,
+                        "uid": str(non_tensor["uid"][i]),
+                        "traj": str(non_tensor["traj_uid"][i]),
+                        "turn": turn,
+                        "stage": turn == last_turn[rollout] if task == "qa" else None,
+                        "anchor": anchor,
+                        "score": float(scores[i].item()),
+                        "length": length,
+                        "logP": float(log_probs[i].item()),
+                        "resp": tuple(batch["responses"][i][batch["response_mask"][i].bool()].detach().cpu().tolist()),
+                        "valid": bool(valid_flags[i]) if valid_flags is not None else True,
+                        "dup": bool(dup_flags[i]) if dup_flags is not None else False,
+                    })
+
+            trajectory_scores = defaultdict(float)
+            for row in rows:
+                trajectory_scores[(row["uid"], row["traj"])] += row["score"]
+
+            # Missing QA anchors retain uid/turn/stage groups instead of matching None.
+            groups = defaultdict(list)
+            fallback_groups = {}
+            for row in rows:
+                clusters = groups[(row["uid"], row["stage"])]
+                if row["anchor"] is None:
+                    key = (row["uid"], row["stage"], row["turn"])
+                    if key not in fallback_groups:
+                        fallback_groups[key] = []
+                        clusters.append(fallback_groups[key])
+                    fallback_groups[key].append(row)
+                    continue
+                for cluster in clusters:
+                    if cluster[0]["anchor"] is not None and self._anchors_match(
+                        cluster[0]["anchor"], row["anchor"], similarity
+                    ):
+                        cluster.append(row)
+                        break
+                else:
+                    clusters.append([row])
+
+            candidates_by_uid = defaultdict(list)
+            for (uid, stage), clusters in groups.items():
+                for cluster in clusters:
+                    if len(cluster) < 2:
+                        continue
+                    # Prefer an eligible positive over an earlier failed duplicate.
+                    unique = {}
+                    def response_rank(row):
+                        eligible = (not chosen_must_valid or row["valid"]) and (not skip_dup_chosen or not row["dup"])
+                        return (row["score"] > 0 and eligible, row["score"], row["valid"], not row["dup"])
+                    for row in cluster:
+                        previous = unique.get(row["resp"])
+                        if previous is None or response_rank(row) > response_rank(previous):
+                            unique[row["resp"]] = row
+                    unique_rows = list(unique.values())
+                    positive = sorted((r for r in unique_rows if r["score"] > 0), key=lambda r: -r["score"])
+                    negative = sorted((r for r in unique_rows if r["score"] <= 0 and
+                                       trajectory_scores[(r["uid"], r["traj"])] <= 0), key=lambda r: r["score"])
+                    if not positive or not negative:
+                        continue
+                    baseline = float(np.mean([r["logP"] / r["length"] for r in unique_rows]))
+                    for index, chosen in enumerate(positive):
+                        rejected = negative[index % len(negative)]
+                        if chosen_must_valid and not chosen["valid"]:
+                            continue
+                        if skip_dup_chosen and chosen["dup"]:
+                            continue
+                        if length_ratio_max is not None and max(chosen["length"], rejected["length"]) / min(chosen["length"], rejected["length"]) > length_ratio_max:
+                            continue
+                        hardness = abs(chosen["logP"] / chosen["length"] - rejected["logP"] / rejected["length"])
+                        candidates_by_uid[uid].append((hardness, chosen, rejected, len(unique_rows), baseline))
+
+            for candidates in candidates_by_uid.values():
+                candidates.sort(key=lambda candidate: candidate[0])
+                for hardness, chosen, rejected, group_size, baseline in candidates[:pair_limit]:
+                    p_idx, n_idx = chosen["row"], rejected["row"]
+                    proto = DataProto.from_single_dict(
+                        {key + "_a": batch[key][p_idx:p_idx + 1, :] for key in tensor_keys}
+                        | {key + "_b": batch[key][n_idx:n_idx + 1, :] for key in tensor_keys}
+                        | {key: non_tensor[key][p_idx:p_idx + 1] for key in common_keys}
+                        | {key + "_a": non_tensor[key][p_idx:p_idx + 1] for key in split_keys}
+                        | {key + "_b": non_tensor[key][n_idx:n_idx + 1] for key in split_keys}
+                    )
+                    proto.non_tensor_batch["group_baseline"] = np.array([baseline], dtype=np.float32)
+                    proto.non_tensor_batch["group_size"] = np.array([group_size], dtype=np.int32)
+                    proto.non_tensor_batch["born_step"] = np.array([self.global_steps], dtype=np.int64)
+                    proto.non_tensor_batch["pair_turn"] = np.array([chosen["turn"]], dtype=np.int32)
+                    proto_list.append(proto)
+
+        if not proto_list:
+            return None
+        if len(proto_list) > step_limit:
+            proto_list = random.sample(proto_list, step_limit)
+        remainder = len(proto_list) % k_partitions
+        if remainder:
+            proto_list.extend(random.choices(proto_list, k=k_partitions - remainder))
+        temperature = history_batch_list[0].meta_info.get("temperature", 0.7)
+        for proto in proto_list:
+            proto.meta_info["temperature"] = temperature
+        print(f">>> Obtain cross-anchor paired #batch: {len(proto_list)}")
+        return proto_list
+
     ## score=0, score=1, classify(统一划分)
     def _trans_to_dpo_batch(self, history_batch_list: list):
+        if self.config.data.get("cross_anchor_replay", False):
+            return self._trans_to_cross_anchor_dpo_batch(history_batch_list)
         if not history_batch_list:
             print("## No DPO data with history")
             return None
@@ -749,8 +926,11 @@ class AgentFlowTrainer(RayPPOTrainer):
                                 self._enq_ema = float(enq) if getattr(self, '_enq_ema', None) is None \
                                                 else 0.9 * self._enq_ema + 0.1 * enq
 
-                            # 目标采样量为入队速率 EMA 的 4 倍，随后受回放池存量及分区整除约束。
-                            n_batch = max(int(round(self._enq_ema)) * 4, k_partitions)
+                            # Keep the existing default; rep16 can be enabled independently.
+                            replay_multiplier = self.config.data.get("replay_sample_multiplier", 4)
+                            if not isinstance(replay_multiplier, int) or isinstance(replay_multiplier, bool) or replay_multiplier <= 0:
+                                raise ValueError("replay_sample_multiplier must be a positive integer")
+                            n_batch = max(int(round(self._enq_ema)) * replay_multiplier, k_partitions)
                             n_batch = min(n_batch, history_length)
                             n_batch = n_batch // k_partitions * k_partitions
                             n_batch = max(n_batch, k_partitions)
