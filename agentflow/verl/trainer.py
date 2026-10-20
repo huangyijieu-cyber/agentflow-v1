@@ -284,6 +284,17 @@ class AgentFlowTrainer(RayPPOTrainer):
             seq_logP = (old_log_probs * response_mask).sum(dim=-1)
             bsz = scores.shape[0]
 
+            task = str(self.config.data.get("task", "")).lower()
+            rollout_last_turn = {}
+            if task == "qa":
+                rollout_ids = history_batch.non_tensor_batch["rollout_id_list"]
+                for i in range(bsz):
+                    rollout_id = str(rollout_ids[i])
+                    turn = int(turn_indices[i])
+                    rollout_last_turn[rollout_id] = max(
+                        rollout_last_turn.get(rollout_id, -1), turn
+                    )
+
             # 行结构: uid -> 轨迹 -> 逐 turn 行
             rows = []
             with torch.no_grad():
@@ -302,6 +313,7 @@ class AgentFlowTrainer(RayPPOTrainer):
                         "resp":   tuple(resp_ids),
                         "valid":  bool(valid_flags[i]) if valid_flags is not None else True,
                         "dup":    bool(dup_flags[i])   if dup_flags   is not None else False,
+                        "is_last": int(turn_indices[i]) == rollout_last_turn[str(rollout_ids[i])] if task == "qa" else None,
                     })
 
             uid2trajs = defaultdict(lambda: defaultdict(list))
@@ -323,7 +335,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                 for traj_rows in trajs.values():
                     for r in traj_rows:
                         # turn2rows[r["turn"]].append(r)
-                        turn2rows["cross_turn"].append(r)
+                        # QA 末轮与中间轮分开配对，组内保持新版 anchor 聚类。
+                        turn2rows[r["is_last"] if task == "qa" else "cross_turn"].append(r)
 
                 candidates = []  # (hardness, chosen, rejected, cluster_size, baseline, turn)
 
