@@ -87,7 +87,7 @@ class Solver:
             json_data = {
                 "query": question,
                 "image": image_path,
-                "anchor": None,
+                "anchor": [] if set(self.output_types) == {"final"} else None,
             }
             if self.verbose:
                 log_info(f"\n==> 🔍 Received Query: {question}")
@@ -118,6 +118,11 @@ class Solver:
 
                 # [1] Analyze query
                 query_start_time = time.time()
+                if json_data["anchor"] is not None:
+                    json_data["anchor"].append("analysis\n" + json.dumps(
+                        {"question": question}, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"),
+                    ))
                 with measure("planner", detail="query_analysis"):
                     query_analysis = self.planner.analyze_query(question, image_path, self.max_tokens)
                 json_data["query_analysis"] = query_analysis
@@ -135,6 +140,16 @@ class Solver:
 
                     # [2] Generate next step
                     local_start_time = time.time()
+                    if json_data["anchor"] is not None:
+                        json_data["anchor"].append("tool\n" + json.dumps(
+                            {
+                                "question": question,
+                                "available_tools": self.planner.available_tools,
+                                "toolbox_metadata": self.planner.toolbox_metadata,
+                                "actions": self.memory.get_actions(),
+                            }, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"),
+                        ))
                     with measure("planner", detail="next_step"):
                         next_step = self.planner.generate_next_step(
                             question,
@@ -230,6 +245,11 @@ class Solver:
 
                 # Generate final output if requested
                 if 'final' in self.output_types:
+                    if json_data["anchor"] is not None:
+                        json_data["anchor"].append("final\n" + json.dumps(
+                            {"question": question, "actions": self.memory.get_actions()},
+                            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                        ))
                     with measure("planner", detail="final_output"):
                         final_output = self.planner.generate_final_output(question, image_path, self.memory, self.max_tokens)
                     json_data["final_output"] = final_output

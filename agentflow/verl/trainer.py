@@ -335,8 +335,14 @@ class AgentFlowTrainer(RayPPOTrainer):
                 for traj_rows in trajs.values():
                     for r in traj_rows:
                         # turn2rows[r["turn"]].append(r)
-                        # QA 末轮与中间轮分开配对，组内保持新版 anchor 聚类。
-                        turn2rows[r["is_last"] if task == "qa" else "cross_turn"].append(r)
+                        # QA 保留末轮/中间轮隔离，并分别处理三类 anchor。
+                        if task == "qa":
+                            turn_type = r["anchor"].partition("\n")[0]
+                            if turn_type not in ("analysis", "tool", "final"):
+                                turn_type = ""
+                            turn2rows[(r["is_last"], turn_type)].append(r)
+                        else:
+                            turn2rows["cross_turn"].append(r)
 
                 candidates = []  # (hardness, chosen, rejected, cluster_size, baseline, turn)
 
