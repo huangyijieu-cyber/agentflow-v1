@@ -18,6 +18,7 @@ import torch
 from collections import defaultdict, Counter
 from verl import DataProto
 import uuid
+import json
 
 from difflib import SequenceMatcher
 from typing import Sequence, List, Dict, Any
@@ -82,6 +83,25 @@ def are_similar(a: str, b: str, threshold: float = 0.95) -> bool:
     """
     if not isinstance(a, str) or not isinstance(b, str):
         raise ValueError("Only text-based observations are supported for similarity-based GiGPO in this version.")
+    # QA 固定字段完全一致，只对当前可见的工具历史计算相似度。
+    qa_stages = ("analysis", "tool", "final")
+    a_stage, a_sep, a_state = a.partition("\n")
+    b_stage, b_sep, b_state = b.partition("\n")
+    if (a_sep and a_stage in qa_stages) or (b_sep and b_stage in qa_stages):
+        if a_stage != b_stage or not a_sep or not b_sep:
+            return False
+        a_state, b_state = json.loads(a_state), json.loads(b_state)
+        if a_state["question"] != b_state["question"]:
+            return False
+        if a_stage == "analysis":
+            return True
+        if a_stage == "tool" and (
+            a_state["available_tools"] != b_state["available_tools"]
+            or a_state["toolbox_metadata"] != b_state["toolbox_metadata"]
+        ):
+            return False
+        a = json.dumps(a_state["actions"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        b = json.dumps(b_state["actions"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return SequenceMatcher(None, a, b).ratio() >= threshold
 
 def compute_step_discounted_returns(batch: DataProto, gamma: float):

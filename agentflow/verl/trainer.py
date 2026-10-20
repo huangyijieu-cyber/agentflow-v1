@@ -669,6 +669,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                     "norm_adv_by_std_in_grpo", True
                 )  # GRPO adv normalization factor
 
+                if self.config.algorithm.adv_estimator == "gigpo" and str(self.config.data.get("task", "")).lower() == "qa":
+                    batch.meta_info["task"] = "qa"
                 batch = compute_advantage(
                     batch,
                     adv_estimator=self.config.algorithm.adv_estimator,

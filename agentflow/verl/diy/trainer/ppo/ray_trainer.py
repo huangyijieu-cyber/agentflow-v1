@@ -298,7 +298,7 @@ def compute_advantage(
         # default parameters for gigpo
         step_advantage_w = 1.0
         gigpo_mode = "mean_norm"   ## "mean_std_norm" (bad) | "mean_norm"
-        gigpo_enable_similarity = False
+        gigpo_enable_similarity = data.meta_info.get("task") == "qa"
         gigpo_similarity_thresh = 0.95
         compute_cross_step_data = False
         advantages, returns = core_gigpo.compute_gigpo_outcome_advantage(
