@@ -212,6 +212,7 @@ class AgentFlowTrainer(RayPPOTrainer):
             torch.npu.empty_cache()
         gc.collect()
 
+    
     @staticmethod
     def _anchors_match(a, b, thresh: float = 0.95) -> bool:
         """anchor 观测相似度判断（与 GiGPO are_similar 同语义，避免跨模块导入）"""
@@ -222,19 +223,25 @@ class AgentFlowTrainer(RayPPOTrainer):
         from difflib import SequenceMatcher
         return SequenceMatcher(None, a, b).ratio() >= thresh
 
+
     ## score=0, score=1, classify(统一划分)
     def _trans_to_dpo_batch(self, history_batch_list: list):
         """
         分叉点 DPO pair 构建（替换原实现）。
 
         核心改动：
-          1. 同任务内跨回合按 anchor 聚类；QA 保留末 turn / 中间 turn 边界。
-          2. 簇内 response 去重，优先保留符合质量要求的正例。
-          3. 正负奖励排序配对，负例仅来自非正总分轨迹。
-          4. chosen 端质量过滤：基础有效性检查、排除重复响应。
+          1. 分组键从 (uid, turn) 细化为 (uid, turn, anchor簇)：
+             只有"相同任务、相同回合序号、相同/相似观测状态"的样本才参与配对，
+             消除跨状态对比噪音。
+          2. 簇内 response 完全相同的样本去重：动作一致则无对比意义。
+          3. pair 两端轨迹终局奖励必须不同（require_reward_gap），
+             同结局对不提供 contrastive 信号（二值奖励下修复原 margin 过滤空转）。
+          4. chosen 端质量过滤：该 turn 动作格式必须合法（turn_valid_list）、
+             不得为循环重复动作（turn_dup_list），消除"碰巧成功"的假正例。
           5. 难分对优先：按两端 per-token logP 接近度升序取 top-K。
         """
         if not history_batch_list:
+            print("## No DPO data with history")
             return None
 
         k_partitions = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
@@ -252,75 +259,49 @@ class AgentFlowTrainer(RayPPOTrainer):
         K_PAIRS_PER_GROUP   = cfg.get("k_pairs_per_group", None)
         LENGTH_RATIO_MAX    = cfg.get("length_ratio_max", 1.8)
         ANCHOR_SIM_THRESH   = cfg.get("anchor_sim_thresh", 0.95)
+        REQUIRE_REWARD_GAP  = cfg.get("require_reward_gap", True)
         CHOSEN_MUST_VALID   = cfg.get("chosen_must_valid", True)
         SKIP_DUP_CHOSEN     = cfg.get("skip_dup_chosen", True)
-        MAX_PAIRS_PER_STEP  = cfg.get("max_pairs_per_step", 256)
+        MAX_PAIRS_PER_STEP  = cfg.get("max_pairs_per_step", 256)  # 回退到 mathwork 剂量
 
-        if not 0 <= ANCHOR_SIM_THRESH <= 1:
-            raise ValueError("anchor_sim_thresh must be between 0 and 1")
-        if K_PAIRS_PER_GROUP is not None and (not isinstance(K_PAIRS_PER_GROUP, int) or K_PAIRS_PER_GROUP <= 0):
-            raise ValueError("k_pairs_per_group must be a positive integer or None")
-        if not isinstance(MAX_PAIRS_PER_STEP, int) or MAX_PAIRS_PER_STEP <= 0:
-            raise ValueError("max_pairs_per_step must be a positive integer")
-        if LENGTH_RATIO_MAX is not None and LENGTH_RATIO_MAX < 1:
-            raise ValueError("length_ratio_max must be at least 1 or None")
-
-        task = str(self.config.data.get("task", "")).lower()
         proto_list = []
 
         for history_batch in history_batch_list:
             uids           = history_batch.non_tensor_batch["uid"]
             traj_uids      = history_batch.non_tensor_batch["traj_uid"]
             turn_indices   = history_batch.non_tensor_batch["turn_index_list"]
-            anchors        = history_batch.non_tensor_batch.get("anchor_list")
+            anchors        = history_batch.non_tensor_batch["anchor_list"]
             responses      = history_batch.batch["responses"]
             response_mask  = history_batch.batch["response_mask"]
             old_log_probs  = history_batch.batch["old_log_probs"]
             token_level_scores = history_batch.batch["token_level_scores"]
+            # 质量标记（daemon 透传；老数据缺省时默认合法/不重复）
             valid_flags = history_batch.non_tensor_batch.get("turn_valid_list")
             dup_flags   = history_batch.non_tensor_batch.get("turn_dup_list")
-            is_drop_mask = history_batch.batch.get("is_drop_mask")
 
             scores  = token_level_scores.sum(dim=-1)
             lengths = response_mask.sum(dim=-1)
             seq_logP = (old_log_probs * response_mask).sum(dim=-1)
             bsz = scores.shape[0]
 
-            # QA stage is determined before dropping rows, as in cache.
-            rollout_ids = history_batch.non_tensor_batch["rollout_id_list"]
-            rollout_last_turn = {}
-            if task == "qa":
-                for rollout, turn in zip(rollout_ids, turn_indices):
-                    rollout = str(rollout)
-                    rollout_last_turn[rollout] = max(rollout_last_turn.get(rollout, -1), int(turn))
-
             # 行结构: uid -> 轨迹 -> 逐 turn 行
             rows = []
             with torch.no_grad():
                 for i in range(bsz):
-                    if is_drop_mask is not None and bool(is_drop_mask[i].item()):
-                        continue
                     rlen = int(lengths[i].item())
-                    if rlen <= 0:
-                        continue
-                    resp_ids = responses[i][response_mask[i].bool()].detach().cpu().tolist()
-                    turn = int(turn_indices[i])
-                    anchor = anchors[i] if anchors is not None else None
-                    if not isinstance(anchor, str) or not anchor.strip():
-                        anchor = None
+                    resp_ids = responses[i, :rlen].detach().cpu().tolist() if rlen > 0 else []
                     rows.append({
                         "row":    i,
                         "uid":    str(uids[i]),
                         "traj":   str(traj_uids[i]),
-                        "turn":   turn,
-                        "anchor": anchor,
+                        "turn":   int(turn_indices[i]),
+                        "anchor": anchors[i] if isinstance(anchors[i], str) else str(anchors[i]),
                         "score":  float(scores[i].item()),
-                        "length": rlen,
+                        "length": max(rlen, 1),
                         "logP":   float(seq_logP[i].item()),
                         "resp":   tuple(resp_ids),
                         "valid":  bool(valid_flags[i]) if valid_flags is not None else True,
                         "dup":    bool(dup_flags[i])   if dup_flags   is not None else False,
-                        "stage":  turn == rollout_last_turn[str(rollout_ids[i])] if task == "qa" else None,
                     })
 
             uid2trajs = defaultdict(lambda: defaultdict(list))
@@ -330,40 +311,33 @@ class AgentFlowTrainer(RayPPOTrainer):
                 for traj in uid2trajs[uid]:
                     uid2trajs[uid][traj].sort(key=lambda r: r["turn"])
 
-            # 轨迹结局标注：neg 池只收非正总分轨迹的行。
+            # 轨迹结局标注：neg 池只收"整条轨迹失败"的行（截断负例过滤）
             traj_total = defaultdict(float)
             for r in rows:
                 traj_total[(r["uid"], r["traj"])] += r["score"]
             for r in rows:
-                # Only a known nonpositive total is eligible for the negative pool.
-                r["traj_succ"] = not (traj_total[(r["uid"], r["traj"])] <= 0.0)
+                r["traj_succ"] = traj_total[(r["uid"], r["traj"])] > 0.0
 
-            # Preserve stage and candidate order from the existing implementation.
-            uid_stage_order = dict.fromkeys((r["uid"], r["stage"]) for r in rows)
-            candidates_by_uid = defaultdict(list)
-            for uid, stage in uid_stage_order:
-                trajs = uid2trajs[uid]
+            for uid, trajs in uid2trajs.items():
                 turn2rows = defaultdict(list)
                 for traj_rows in trajs.values():
                     for r in traj_rows:
-                        if r["stage"] == stage:
-                            turn2rows["cross_turn"].append(r)
+                        # turn2rows[r["turn"]].append(r)
+                        turn2rows["cross_turn"].append(r)
 
-                candidates = []  # (hardness, chosen, rejected, cluster_size, baseline)
+                candidates = []  # (hardness, chosen, rejected, cluster_size, baseline, turn)
 
                 for turn in sorted(turn2rows.keys()):
-                    rows_t = sorted(turn2rows[turn], key=lambda r: r["row"])
+                    rows_t = turn2rows[turn]
                     if len(rows_t) < 2:
                         continue
 
-                    # 1) anchor 聚类；缺少 anchor 时保留同 turn 分组。
+                    # 1) anchor 聚类：只有相同/相似观测状态才配对
                     clusters = []
                     for r in rows_t:
                         placed = False
                         for c in clusters:
-                            same_fallback_turn = c[0]["anchor"] is None and r["anchor"] is None and c[0]["turn"] == r["turn"]
-                            same_anchor = c[0]["anchor"] is not None and r["anchor"] is not None and self._anchors_match(c[0]["anchor"], r["anchor"], ANCHOR_SIM_THRESH)
-                            if same_fallback_turn or same_anchor:
+                            if self._anchors_match(c[0]["anchor"], r["anchor"], ANCHOR_SIM_THRESH): ## 必须项
                                 c.append(r)
                                 placed = True
                                 break
@@ -374,49 +348,48 @@ class AgentFlowTrainer(RayPPOTrainer):
                         if len(cluster) < 2:
                             continue
 
-                        # 2) response 去重；不让较早的失败响应覆盖有效正例。
-                        unique = {}
-                        def response_rank(r):
-                            eligible = (not CHOSEN_MUST_VALID or r["valid"]) and (not SKIP_DUP_CHOSEN or not r["dup"])
-                            return (r["score"] > 0 and eligible, r["score"], r["valid"], not r["dup"])
+                        # 2) response 完全相同的样本去重
+                        uniq, seen_resp = [], set()
                         for r in cluster:
-                            previous = unique.get(r["resp"])
-                            if previous is None or response_rank(r) > response_rank(previous):
-                                unique[r["resp"]] = r
-                        uniq = list(unique.values())
-
-                        # 3) 正例降序、负例升序匹配；负例不足时循环复用。
-                        pos = sorted((r for r in uniq if r["score"] > 0.0),
-                                     key=lambda r: -r["score"])
-                        neg = sorted((r for r in uniq if r["score"] <= 0.0 and not r["traj_succ"]),
-                                     key=lambda r: r["score"])
-                        if not pos or not neg:
+                            if r["resp"] in seen_resp:
+                                continue
+                            seen_resp.add(r["resp"])
+                            uniq.append(r)
+                        if len(uniq) < 2:
                             continue
-                        baseline = float(np.mean([r["logP"] / r["length"] for r in uniq]))
-                        for k in range(len(pos)):
-                            chosen   = pos[k]
-                            rejected = neg[k % len(neg)]
 
-                            # 4) chosen 端质量过滤。
+                        # 3) 正负配对：正例(>0)为 chosen，非正例(<=0)为 rejected；
+                        #    最大↔最小、次大↔次小、第三大↔第三小……
+                        #    正例数量为配对上限；正多于负时，负例从最小开始循环复用
+                        pos = sorted((r for r in uniq if r["score"] > 0.0),
+                                     key=lambda r: -r["score"])      # 正例池：降序
+                        neg = sorted((r for r in uniq if r["score"] <= 0.0 and not r["traj_succ"]),
+                                     key=lambda r: r["score"])       # 非正池：升序（最小在前）
+                        if not pos or not neg:
+                            continue                                 # 缺任一侧则无对比
+                                                                   # （等价原 require_reward_gap 的语义）
+                        for k in range(len(pos)):                    # 正例为上限制
+                            chosen   = pos[k]
+                            rejected = neg[k % len(neg)]             # 负例从最小起循环遍历
+
+                            # 4) chosen 端质量过滤（该正例不合法则跳过它，不影响其余正例）
                             if CHOSEN_MUST_VALID and not chosen["valid"]:
                                 continue
                             if SKIP_DUP_CHOSEN and chosen["dup"]:
                                 continue
 
-                            # 5) 保留 cache 的长度比保护，可显式配置 None 关闭。
-                            if LENGTH_RATIO_MAX is not None and max(chosen["length"], rejected["length"]) / min(chosen["length"], rejected["length"]) > LENGTH_RATIO_MAX:
-                                continue
+                            # # 5) 长度比过滤
+                            # lr = max(chosen["length"], rejected["length"]) / max(min(chosen["length"], rejected["length"]), 1)
+                            # if lr > LENGTH_RATIO_MAX:
+                            #     continue
 
-                            # 6) 按 per-token old logP 接近度排序。
+                            # 6) 难分度排序键（candidates 仍按 hardness 升序，top-K 取难分对）
                             hardness = abs(chosen["logP"] / chosen["length"] - rejected["logP"] / rejected["length"])
-                            candidates.append((hardness, chosen, rejected, len(uniq), baseline))
+                            baseline = float(np.mean([r["logP"] / r["length"] for r in uniq]))
+                            candidates.append((hardness, chosen, rejected, len(uniq), baseline, turn))
 
-                if candidates:
-                    candidates_by_uid[uid].extend(candidates)
-
-            for candidates in candidates_by_uid.values():
                 candidates.sort(key=lambda x: x[0])
-                for hardness, chosen, rejected, cluster_size, baseline in candidates[:K_PAIRS_PER_GROUP]:
+                for hardness, chosen, rejected, cluster_size, baseline, turn in candidates[:K_PAIRS_PER_GROUP]:
                     p_idx, n_idx = chosen["row"], rejected["row"]
                     proto = DataProto.from_single_dict(
                         {key + "_a": history_batch.batch[key][p_idx: p_idx + 1, :] for key in split_select_keys}
@@ -428,10 +401,11 @@ class AgentFlowTrainer(RayPPOTrainer):
                     proto.non_tensor_batch["group_baseline"] = np.array([baseline], dtype=np.float32)
                     proto.non_tensor_batch["group_size"]     = np.array([cluster_size], dtype=np.int32)
                     proto.non_tensor_batch["born_step"]      = np.array([self.global_steps], dtype=np.int64)
-                    proto.non_tensor_batch["pair_turn"]      = np.array([chosen["turn"]], dtype=np.int32)
+                    proto.non_tensor_batch["pair_turn"]      = np.array([chosen["turn"]], dtype=np.int32)   # 日志用
                     proto_list.append(proto)
 
         if not proto_list:
+            print("## DPO pair is not found!")
             return None
 
         if len(proto_list) > MAX_PAIRS_PER_STEP:
@@ -442,16 +416,15 @@ class AgentFlowTrainer(RayPPOTrainer):
             extra = random.choices(proto_list, k=k_partitions - remainder)
             proto_list.extend(extra)
 
+        print(f">>> Obtain paired #batch: {len(proto_list)}")
+
         temperature = history_batch_list[0].meta_info.get("temperature", 0.7)
         for proto in proto_list:
             proto.meta_info["temperature"] = temperature
 
-        print(f">>> Obtain cross-anchor paired #batch: {len(proto_list)}")
         return proto_list
 
-
-
-
+    
     def _sample_dpo_data(self, dpo_queue: deque, bs: int):
         """
            从环形缓冲中随机有放回采样 bs 个单样本，拼接成 DataProto。
@@ -461,7 +434,7 @@ class AgentFlowTrainer(RayPPOTrainer):
         if n_size == 0:
             return None
 
-
+        
         ages = np.array([self.global_steps - int(p.non_tensor_batch["born_step"][0])
                  for p in dpo_queue], dtype=np.float64)
         tau = max(float(np.median(ages)), 1.0)   # max(·,1) 只防除零，不是调参
@@ -648,7 +621,7 @@ class AgentFlowTrainer(RayPPOTrainer):
                     metrics["replay/n_new_pairs"] = 0
                 metrics["replay/buffer_size"] = len(self._dpo_ring_buffer)
 
-
+                
                 self._stale_step_counter += 1
                 stale_iteration = self.config.data.get("stale_iteration", 0)
                 if self._stale_step_counter > stale_iteration:
@@ -752,14 +725,14 @@ class AgentFlowTrainer(RayPPOTrainer):
                 dpo_type = next((k for k in dpo_types if k in algorithm), None)
                 if dpo_type is not None:
                     print(f"{time.strftime('%Y-%m-%d %H-%M-%S')}: >>> Begin DPO")
-
+                    
                     with _timer("update_actor_by_dpo", timing_raw):
                         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
 
                         if hasattr(self, '_dpo_ring_buffer') and len(self._dpo_ring_buffer) > 0:
                             batch_size = len(batch)
                             history_length = len(self._dpo_ring_buffer)
-
+                            
                             # 闭环：消化速率 = 实际入队速率 EMA（0 入队步不更新）
                             enq = metrics.get("replay/n_new_pairs", 0) - metrics.get("replay/n_quota_skipped", 0)
                             enq = max(enq, 0)
@@ -767,11 +740,9 @@ class AgentFlowTrainer(RayPPOTrainer):
                                 self._enq_ema = float(enq) if getattr(self, '_enq_ema', None) is None \
                                                 else 0.9 * self._enq_ema + 0.1 * enq
 
-                            # Replay sampling defaults to rep16.
-                            replay_multiplier = self.config.data.get("replay_sample_multiplier", 16)
-                            if not isinstance(replay_multiplier, int) or isinstance(replay_multiplier, bool) or replay_multiplier <= 0:
-                                raise ValueError("replay_sample_multiplier must be a positive integer")
-                            n_batch = max(int(round(self._enq_ema)) * replay_multiplier, k_partitions)
+                            # 消化 = 入队；三重上限：能切分、不超存量、不超 GRPO 两倍
+                            # repeat x 16
+                            n_batch = max(int(round(self._enq_ema)) * 16, k_partitions)
                             n_batch = min(n_batch, history_length)
                             n_batch = n_batch // k_partitions * k_partitions
                             n_batch = max(n_batch, k_partitions)
@@ -780,15 +751,15 @@ class AgentFlowTrainer(RayPPOTrainer):
 
                             # ## batch size (full)
                             # n_batch = history_length // k_partitions * k_partitions
-
+                            
                             print(f"## update dpo ({n_batch}) bs from ({history_length})")
                             sample_batch = self._sample_dpo_data(self._dpo_ring_buffer, bs=n_batch)
-
+                            
                             if sample_batch is not None and len(sample_batch) > 0:
                                 print(f"{time.strftime('%Y-%m-%d %H-%M-%S')}: >>> Middle-2 DPO")
                                 sample_batch.meta_info["dpo_type"] = dpo_type
                                 sample_batch.meta_info["max_response_length"] = self.config.data.max_response_length
-
+                                
                                 # 建议：在DPO前也做长度检查，过滤极端长短样本
                                 # 可在 update_actor_by_dpo 内部或这里加
                                 dpo_output = self.actor_rollout_wg.update_actor_by_dpo(sample_batch)
@@ -798,10 +769,10 @@ class AgentFlowTrainer(RayPPOTrainer):
                                 print("## DPO skipped this step (insufficient fresh pairs).")
                         else:
                             print("## DPO skipped: ring buffer empty.")
-
+                            
                     print(f"{time.strftime('%Y-%m-%d %H-%M-%S')}: >>> END DPO")
 
-
+            
 
         # compute training metrics
         metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
@@ -809,7 +780,7 @@ class AgentFlowTrainer(RayPPOTrainer):
 
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-
+        
 
         # 释放目标(pytorch, 释放训练过程)
         print(f"Free pytorch memory!")
@@ -928,12 +899,12 @@ class AgentFlowTrainer(RayPPOTrainer):
                 self._clean_npu_cache()
                 metrics = self._train_step(batch_dict)
                 self._clean_npu_cache()
-                ## skip stale
+                ## skip stale 
                 if metrics is None:
                     print("stale data is not collnected enough, skip this batch.")
                     continue
-
-
+                
+                
 
                 # validate
                 # ### is_last_step close
@@ -980,4 +951,3 @@ class AgentFlowTrainer(RayPPOTrainer):
 
                 progress_bar.update(1)
                 self.global_steps += 1
-

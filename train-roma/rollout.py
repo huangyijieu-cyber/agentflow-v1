@@ -38,14 +38,13 @@ configure_logger(logging.INFO)
 def _compute_turn_flags(planner_logs: list, task: str) -> list:
     """
     逐 turn 质量标记：
-      valid : 基础有效性检查（QA 仅判断非空）
+      valid : 该 turn 的 planner 输出动作格式合法
       dup   : 该 turn 的输出与同轨迹历史某 turn 完全相同（循环动作）
     """
     flags = []
     seen = set()
     for log in planner_logs:
-        response = log.get("response")
-        resp = "" if response is None else str(response).strip()
+        resp = (log.get("response") or "").strip()
         if task == "alfworld":
             m = re.search(r"<action>(.*?)</action>", resp, re.DOTALL)
             valid = bool(m and m.group(1).strip())
