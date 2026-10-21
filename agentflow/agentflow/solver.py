@@ -20,6 +20,12 @@ def log_info(message):
     print(f"[{ts}] {message}")
     
 
+def _serialize_qa_anchor(state):
+    # Normalize JSON object keys before sorting, without changing stored tool results.
+    state = json.loads(json.dumps(state, ensure_ascii=False))
+    return json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 class Solver:
     def __init__(
         self,
@@ -84,7 +90,7 @@ class Solver:
             json_data = {
                 "query": question,
                 "image": image_path,
-                "anchor": None,
+                "anchor": [] if set(self.output_types) == {"final"} else None,
             }
             if self.verbose:
                 log_info(f"\n==> 🔍 Received Query: {question}")
@@ -112,6 +118,10 @@ class Solver:
 
                 # [1] Analyze query
                 query_start_time = time.time()
+                if json_data["anchor"] is not None:
+                    json_data["anchor"].append("analysis\n" + _serialize_qa_anchor(
+                        {"question": question},
+                    ))
                 query_analysis = self.planner.analyze_query(question, image_path, self.max_tokens)
                 json_data["query_analysis"] = query_analysis
                 if self.verbose:
@@ -128,6 +138,15 @@ class Solver:
 
                     # [2] Generate next step
                     local_start_time = time.time()
+                    if json_data["anchor"] is not None:
+                        json_data["anchor"].append("tool\n" + _serialize_qa_anchor(
+                            {
+                                "question": question,
+                                "available_tools": self.planner.available_tools,
+                                "toolbox_metadata": self.planner.toolbox_metadata,
+                                "actions": self.memory.get_actions(),
+                            },
+                        ))
                     next_step = self.planner.generate_next_step(
                         question, 
                         image_path, 
@@ -217,6 +236,10 @@ class Solver:
 
                 # Generate final output if requested
                 if 'final' in self.output_types:
+                    if json_data["anchor"] is not None:
+                        json_data["anchor"].append("final\n" + _serialize_qa_anchor(
+                            {"question": question, "actions": self.memory.get_actions()},
+                        ))
                     final_output = self.planner.generate_final_output(question, image_path, self.memory, self.max_tokens)
                     json_data["final_output"] = final_output
                     log_info(f"\n==> 🐙 Detailed Solution:\n\n{final_output}")

@@ -813,6 +813,17 @@ class AgentModeDaemon:
                 )
                 gigpo_pair_mask = [True] * len(trace_list)
 
+            # SLiC uses the planner-state snapshot; keep GiGPO's hit-state anchors.
+            slic_anchor_list = rollout.metadata.get("slic_anchor")
+            if slic_anchor_list is not None:
+                slic_anchor_list = list(slic_anchor_list)
+                if len(slic_anchor_list) < len(trace_list):
+                    slic_anchor_list.extend([None] * (len(trace_list) - len(slic_anchor_list)))
+                elif len(slic_anchor_list) > len(trace_list):
+                    slic_anchor_list = slic_anchor_list[:len(trace_list)]
+            else:
+                slic_anchor_list = [None] * len(trace_list)
+
             trajectory_reward = self._fillna_reward(rollout)
             reward_breakdown = rollout.metadata.get("reward_breakdown", {})
             if not isinstance(reward_breakdown, dict):
@@ -832,7 +843,9 @@ class AgentModeDaemon:
                 "trace_list": trace_list,
                 "data_id": original_sample["data_id"],
                 "anchor_list": anchor_list,
-                "gigpo_pair_mask": gigpo_pair_mask
+                "gigpo_pair_mask": gigpo_pair_mask,
+                "slic_anchor_list": slic_anchor_list,
+                "turn_flags": rollout.metadata.get("turn_flags"),
             }
             finished_id_to_sample_info[rollout_id] = info
 
@@ -860,6 +873,7 @@ class AgentModeDaemon:
         reward_list, episode_reward_list, step_reward_list = [], [], []
         data_id_list, rollout_id_list, turn_index_list, is_drop_list = [], [], [], []
         anchor_list, traj_id_list, active_mask_list, gigpo_pair_mask_list = [], [], [], []
+        slic_anchor_list, turn_valid_list, turn_dup_list = [], [], []
         n_trunc_sample_because_of_response = 0
         valid_samples = 0
         all_samples_num = 0
@@ -932,6 +946,11 @@ class AgentModeDaemon:
                 gigpo_pair_mask_list.append(bool(sample_info["gigpo_pair_mask"][turn_index]))
                 rollout_id_list.append(rollout_id)
                 turn_index_list.append(turn_index)
+                slic_anchor_list.append(sample_info["slic_anchor_list"][turn_index])
+                _flags = (sample_info.get("turn_flags") or [])
+                _f = _flags[turn_index] if turn_index < len(_flags) else {}
+                turn_valid_list.append(bool(_f.get("valid", True)))
+                turn_dup_list.append(bool(_f.get("dup", False)))
 
         logger.info(f"[STEP-WISE DEBUG]: valid response trace length in this training step is [{valid_samples}/{all_samples_num}]")
         if valid_samples == 0:
@@ -1013,6 +1032,9 @@ class AgentModeDaemon:
         data_proto.non_tensor_batch["episode_reward_list"] = np.array(episode_reward_list, dtype=np.float32)
         data_proto.non_tensor_batch["step_reward_list"] = np.array(step_reward_list, dtype=np.float32)
         data_proto.non_tensor_batch["active_mask_list"] = np.array(active_mask_list)
+        data_proto.non_tensor_batch["slic_anchor_list"] = np.array(slic_anchor_list)
+        data_proto.non_tensor_batch["turn_valid_list"] = np.array(turn_valid_list)
+        data_proto.non_tensor_batch["turn_dup_list"] = np.array(turn_dup_list)
 
         logger.info(f"[STEP-WISE-DEBUG]: transform {len(input_ids_list)} data to torch tensor.")
         return data_proto, data_metrics

@@ -36,6 +36,29 @@ import logging
 configure_logger(logging.INFO)
 
 
+def _compute_turn_flags(planner_logs: list, task: str) -> list:
+    """
+    逐 turn 质量标记：
+      valid : 该 turn 的 planner 输出动作格式合法
+      dup   : 该 turn 的输出与同轨迹历史某 turn 完全相同（循环动作）
+    """
+    flags = []
+    seen = set()
+    for log in planner_logs:
+        resp = (log.get("response") or "").strip()
+        if task == "alfworld":
+            m = re.search(r"<action>(.*?)</action>", resp, re.DOTALL)
+            valid = bool(m and m.group(1).strip())
+        elif task == "webshop":
+            valid = len(resp) > 0 and not resp.startswith("[ERROR]")
+        else:
+            valid = len(resp) > 0
+        dup = (resp in seen) if resp else False
+        seen.add(resp)
+        flags.append({"valid": bool(valid), "dup": bool(dup)})
+    return flags
+
+
 @reward
 async def evaluate(question: str, groundtruth: any, answer_extracted: any, val: bool = False) -> float:
     """
@@ -591,7 +614,10 @@ class RolloutAgent(LitAgent):
             # Rollout.metadata is declared as Dict[str, Any].  Passing None
             # explicitly bypasses the model's default_factory and causes a
             # Pydantic ValidationError for QA rollouts, whose anchor is None.
-            metadata = {}
+            metadata = {
+                "turn_flags": _compute_turn_flags(planner_logs, self.task),
+                "slic_anchor": anchor,
+            }
             if anchor is not None:
                 metadata["anchor"] = anchor
             if self.task == "qa":

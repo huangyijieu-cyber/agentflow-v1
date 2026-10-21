@@ -179,8 +179,33 @@ class AgentFlowTrainer(RayPPOTrainer):
             torch.npu.empty_cache()
         gc.collect()
 
+    @staticmethod
+    def _anchors_match(a, b, thresh: float = 0.95) -> bool:
+        """anchor 观测相似度判断（与 GiGPO are_similar 同语义，避免跨模块导入）"""
+        if a == b:
+            return True
+        if not isinstance(a, str) or not isinstance(b, str):
+            return False
+        from difflib import SequenceMatcher
+        return SequenceMatcher(None, a, b).ratio() >= thresh
+
+
     ## score=0, score=1, classify(统一划分)
     def _trans_to_dpo_batch(self, history_batch_list: list):
+        """
+        分叉点 DPO pair 构建（替换原实现）。
+
+        核心改动：
+          1. 分组键从 (uid, turn) 细化为 (uid, turn, anchor簇)：
+             只有"相同任务、相同回合序号、相同/相似观测状态"的样本才参与配对，
+             消除跨状态对比噪音。
+          2. 簇内 response 完全相同的样本去重：动作一致则无对比意义。
+          3. pair 两端轨迹终局奖励必须不同（require_reward_gap），
+             同结局对不提供 contrastive 信号（二值奖励下修复原 margin 过滤空转）。
+          4. chosen 端质量过滤：该 turn 动作格式必须合法（turn_valid_list）、
+             不得为循环重复动作（turn_dup_list），消除"碰巧成功"的假正例。
+          5. 难分对优先：按两端 per-token logP 接近度升序取 top-K。
+        """
         if not history_batch_list:
             print("## No DPO data with history")
             return None
@@ -196,153 +221,178 @@ class AgentFlowTrainer(RayPPOTrainer):
         non_tensor_select_keys = ["data_id_list", "uid", "traj_id_list", "traj_uid"]
         non_tensor_split_select_keys = ["turn_index_list", "rollout_id_list"]
 
+        cfg = self.config.data.get("replay_filter", {})
+        K_PAIRS_PER_GROUP   = cfg.get("k_pairs_per_group", None)
+        LENGTH_RATIO_MAX    = cfg.get("length_ratio_max", 1.8)
+        ANCHOR_SIM_THRESH   = cfg.get("anchor_sim_thresh", 0.95)
+        REQUIRE_REWARD_GAP  = cfg.get("require_reward_gap", True)
+        CHOSEN_MUST_VALID   = cfg.get("chosen_must_valid", True)
+        SKIP_DUP_CHOSEN     = cfg.get("skip_dup_chosen", True)
+        MAX_PAIRS_PER_STEP  = cfg.get("max_pairs_per_step", 256)  # 回退到 mathwork 剂量
+
         proto_list = []
 
         for history_batch in history_batch_list:
+            uids           = history_batch.non_tensor_batch["uid"]
+            traj_uids      = history_batch.non_tensor_batch["traj_uid"]
+            turn_indices   = history_batch.non_tensor_batch["turn_index_list"]
+            anchors        = history_batch.non_tensor_batch["slic_anchor_list"]
+            responses      = history_batch.batch["responses"]
+            response_mask  = history_batch.batch["response_mask"]
+            old_log_probs  = history_batch.batch["old_log_probs"]
             token_level_scores = history_batch.batch["token_level_scores"]
-            response_mask = history_batch.batch["response_mask"]
-            uids = history_batch.non_tensor_batch["uid"]
-            turn_indices = history_batch.non_tensor_batch["turn_index_list"]
-            old_log_probs = history_batch.batch["old_log_probs"]
+            # 质量标记（daemon 透传；老数据缺省时默认合法/不重复）
+            valid_flags = history_batch.non_tensor_batch.get("turn_valid_list")
+            dup_flags   = history_batch.non_tensor_batch.get("turn_dup_list")
 
-            scores = token_level_scores.sum(dim=-1)
+            scores  = token_level_scores.sum(dim=-1)
             lengths = response_mask.sum(dim=-1)
+            seq_logP = (old_log_probs * response_mask).sum(dim=-1)
             bsz = scores.shape[0]
 
-            id2score = defaultdict(list)
-            id2index = defaultdict(list)
-            id2length = defaultdict(list)
-            id2logP = defaultdict(list)
+            task = str(self.config.data.get("task", "")).lower()
+            rollout_last_turn = {}
+            if task == "qa":
+                rollout_ids = history_batch.non_tensor_batch["rollout_id_list"]
+                for i in range(bsz):
+                    rollout_id = str(rollout_ids[i])
+                    turn = int(turn_indices[i])
+                    rollout_last_turn[rollout_id] = max(
+                        rollout_last_turn.get(rollout_id, -1), turn
+                    )
 
+            # 行结构: uid -> 轨迹 -> 逐 turn 行
+            rows = []
             with torch.no_grad():
                 for i in range(bsz):
-                    uid = str(uids[i])
-                    turn = str(turn_indices[i])
-                    ## replay collection
-                    replay_collection = self.config.data.get("replay_collection", "uid-turn")
-                    if replay_collection == "uid-turn":
-                        key_index = f"{uid}::turn_{turn}"
-                    elif replay_collection == "cross":
-                        key_index = "0"
-                    elif replay_collection == "turn":
-                        key_index = f"0::turn_{turn}"
-                    else:
-                        raise ValueError(f"replay collection: {key_index} is invalid!")
+                    rlen = int(lengths[i].item())
+                    resp_ids = responses[i, :rlen].detach().cpu().tolist() if rlen > 0 else []
+                    rows.append({
+                        "row":    i,
+                        "uid":    str(uids[i]),
+                        "traj":   str(traj_uids[i]),
+                        "turn":   int(turn_indices[i]),
+                        "anchor": anchors[i] if isinstance(anchors[i], str) else str(anchors[i]),
+                        "score":  float(scores[i].item()),
+                        "length": max(rlen, 1),
+                        "logP":   float(seq_logP[i].item()),
+                        "resp":   tuple(resp_ids),
+                        "valid":  bool(valid_flags[i]) if valid_flags is not None else True,
+                        "dup":    bool(dup_flags[i])   if dup_flags   is not None else False,
+                        "is_last": int(turn_indices[i]) == rollout_last_turn[str(rollout_ids[i])] if task == "qa" else None,
+                    })
 
-                    # 累积 logP（用于 baseline）
-                    logP = (old_log_probs[i] * response_mask[i]).sum().item()
+            uid2trajs = defaultdict(lambda: defaultdict(list))
+            for r in rows:
+                uid2trajs[r["uid"]][r["traj"]].append(r)
+            for uid in uid2trajs:
+                for traj in uid2trajs[uid]:
+                    uid2trajs[uid][traj].sort(key=lambda r: r["turn"])
 
-                    id2score[key_index].append(scores[i])
-                    id2length[key_index].append(lengths[i])
-                    id2index[key_index].append(i)
-                    id2logP[key_index].append(logP)
+            # 轨迹结局标注：neg 池只收"整条轨迹失败"的行（截断负例过滤）
+            traj_total = defaultdict(float)
+            for r in rows:
+                traj_total[(r["uid"], r["traj"])] += r["score"]
+            for r in rows:
+                r["traj_succ"] = traj_total[(r["uid"], r["traj"])] > 0.0
 
-                # 计算每个组的 baseline：组内平均 per-token logP
-                id2baseline = {}
-                for idx in id2score.keys():
-                    group_logPs = id2logP[idx]
-                    group_lengths = [max(l.item(), 1) for l in id2length[idx]]
-                    per_tokens = [lp / l for lp, l in zip(group_logPs, group_lengths)]
-                    id2baseline[idx] = float(sum(per_tokens) / max(len(per_tokens), 1))
+            for uid, trajs in uid2trajs.items():
+                turn2rows = defaultdict(list)
+                for traj_rows in trajs.values():
+                    for r in traj_rows:
+                        # turn2rows[r["turn"]].append(r)
+                        # QA 保留末轮/中间轮隔离，并分别处理三类 anchor。
+                        if task == "qa":
+                            turn_type = r["anchor"].partition("\n")[0]
+                            if turn_type not in ("analysis", "tool", "final"):
+                                turn_type = ""
+                            turn2rows[(r["is_last"], turn_type)].append(r)
+                        else:
+                            turn2rows["cross_turn"].append(r)
 
-                # usage = defaultdict(int)
-                # MAX_USE = 4
+                candidates = []  # (hardness, chosen, rejected, cluster_size, baseline, turn)
 
-                # ========== 新增 0：配置 ==========
-                cfg = self.config.data.get("replay_filter", {})
-                K_PAIRS_PER_GROUP   = cfg.get("k_pairs_per_group", 2)      # 每 turn 最多入队对数
-                LENGTH_RATIO_MAX    = cfg.get("length_ratio_max", 1.8)     # 你原来的 1.8 提到配置
-                MARGIN_SAT_QUANTILE = cfg.get("margin_sat_quantile", 0.9)  # 组内 margin 饱和分位
-
-
-                for idx in id2score.keys():
-                    group_size = len(id2score[idx])
-                    if group_size <= 1:
+                for turn in sorted(turn2rows.keys()):
+                    rows_t = turn2rows[turn]
+                    if len(rows_t) < 2:
                         continue
 
-                    # ========== 新增 1：turn 级分歧度过滤 ==========
-                    group_scores = torch.stack(id2score[idx]).float()
-                    g_std  = group_scores.std().item()
-                    g_mean = group_scores.mean().item()
+                    # 1) anchor 聚类：只有相同/相似观测状态才配对
+                    clusters = []
+                    for r in rows_t:
+                        placed = False
+                        for c in clusters:
+                            if self._anchors_match(c[0]["anchor"], r["anchor"], ANCHOR_SIM_THRESH): ## 必须项
+                                c.append(r)
+                                placed = True
+                                break
+                        if not placed:
+                            clusters.append([r])
 
-                    # 全同分（全成/全败）的 turn，pair 梯度≈0，直接跳过
-                    if g_std < 1e-6:
-                        continue
-
-                    pos_samples = []
-                    neg_samples = []
-
-                    for i in range(group_size):
-                        score = id2score[idx][i].item()
-                        length = id2length[idx][i].item()
-                        index = id2index[idx][i]
-
-                        if length == 0:
+                    for cluster in clusters:
+                        if len(cluster) < 2:
                             continue
 
-                        if score > 0:
-                            pos_samples.append((index, score, length))
-                        else:
-                            neg_samples.append((index, score, length))
-
-                    if not pos_samples or not neg_samples:
-                        continue
-
-                    # ========== 新增 2：构建全部候选对 + margin 饱和过滤 ==========
-                    # 先算组内所有对的 margin，取饱和分位做阈值
-                    pair_margins = [p_s - n_s for _, p_s, _ in pos_samples for _, n_s, _ in neg_samples]
-                    sat_thresh = np.quantile(pair_margins, MARGIN_SAT_QUANTILE)
-
-                    valid_pairs = []
-                    for p_idx, p_score, p_len in pos_samples:
-                        for n_idx, n_score, n_len in neg_samples:
-                            if p_score - n_score > sat_thresh:      # 白送对，梯度≈0
+                        # 2) response 完全相同的样本去重
+                        uniq, seen_resp = [], set()
+                        for r in cluster:
+                            if r["resp"] in seen_resp:
                                 continue
-                            if max(p_len, n_len) / min(p_len, n_len) > LENGTH_RATIO_MAX:
+                            seen_resp.add(r["resp"])
+                            uniq.append(r)
+                        if len(uniq) < 2:
+                            continue
+
+                        # 3) 正负配对：正例(>0)为 chosen，非正例(<=0)为 rejected；
+                        #    最大↔最小、次大↔次小、第三大↔第三小……
+                        #    正例数量为配对上限；正多于负时，负例从最小开始循环复用
+                        pos = sorted((r for r in uniq if r["score"] > 0.0),
+                                     key=lambda r: -r["score"])      # 正例池：降序
+                        neg = sorted((r for r in uniq if r["score"] <= 0.0 and not r["traj_succ"]),
+                                     key=lambda r: r["score"])       # 非正池：升序（最小在前）
+                        if not pos or not neg:
+                            continue                                 # 缺任一侧则无对比
+                                                                   # （等价原 require_reward_gap 的语义）
+                        for k in range(len(pos)):                    # 正例为上限制
+                            chosen   = pos[k]
+                            rejected = neg[k % len(neg)]             # 负例从最小起循环遍历
+
+                            # 4) chosen 端质量过滤（该正例不合法则跳过它，不影响其余正例）
+                            if CHOSEN_MUST_VALID and not chosen["valid"]:
                                 continue
-                            valid_pairs.append((p_idx, n_idx, p_len, n_len))
+                            if SKIP_DUP_CHOSEN and chosen["dup"]:
+                                continue
 
-                    if not valid_pairs:
-                        continue
+                            # # 5) 长度比过滤
+                            # lr = max(chosen["length"], rejected["length"]) / max(min(chosen["length"], rejected["length"]), 1)
+                            # if lr > LENGTH_RATIO_MAX:
+                            #     continue
 
-                    # ========== 新增 3：近似难对度 top-K（替代随机 shuffle + 长度权重采样）==========
-                    # 用生成时 per-token logP 的接近程度近似"模型当前难分"
-                    pos_in_group = {batch_idx: i for i, batch_idx in enumerate(id2index[idx])}
-                    def _hardness(pair):
-                        p_idx, n_idx, _, _ = pair
-                        p_pos = pos_in_group[p_idx]          # batch 行号 → 组内位置
-                        n_pos = pos_in_group[n_idx]
-                        pt_a = id2logP[idx][p_pos] / max(id2length[idx][p_pos].item(), 1)
-                        pt_b = id2logP[idx][n_pos] / max(id2length[idx][n_pos].item(), 1)
-                        return abs(pt_a - pt_b)
+                            # 6) 难分度排序键（candidates 仍按 hardness 升序，top-K 取难分对）
+                            hardness = abs(chosen["logP"] / chosen["length"] - rejected["logP"] / rejected["length"])
+                            baseline = float(np.mean([r["logP"] / r["length"] for r in uniq]))
+                            candidates.append((hardness, chosen, rejected, len(uniq), baseline, turn))
 
-                    valid_pairs.sort(key=_hardness)                        # 难分在前
-                    selected = valid_pairs[:K_PAIRS_PER_GROUP]             # 只留 top-K
-
-                    baseline = id2baseline[idx]
-
-                    for p_idx, n_idx, _, _ in selected:
-                        proto = DataProto.from_single_dict(
-                            {key + "_a": history_batch.batch[key][p_idx: p_idx+1, :] for key in split_select_keys}
-                            | {key + "_b": history_batch.batch[key][n_idx: n_idx+1, :] for key in split_select_keys}
-                            | {key: history_batch.non_tensor_batch[key][p_idx: p_idx+1] for key in non_tensor_select_keys}
-                            | {key + "_a": history_batch.non_tensor_batch[key][p_idx: p_idx+1] for key in non_tensor_split_select_keys}
-                            | {key + "_b": history_batch.non_tensor_batch[key][n_idx: n_idx+1] for key in non_tensor_split_select_keys}
-                        )
-                        # ========== 关键：baseline 和 group_size 放入 non_tensor_batch ==========
-                        # DataProto.concat 会正确拼接 non_tensor_batch，不会丢失 per-sample 标量
-                        proto.non_tensor_batch["group_baseline"] = np.array([baseline], dtype=np.float32)
-                        proto.non_tensor_batch["group_size"] = np.array([group_size], dtype=np.int32)
-                        proto.non_tensor_batch["born_step"] = np.array([self.global_steps], dtype=np.int64)
-                        # =====================================================================
-                        proto_list.append(proto)
+                candidates.sort(key=lambda x: x[0])
+                for hardness, chosen, rejected, cluster_size, baseline, turn in candidates[:K_PAIRS_PER_GROUP]:
+                    p_idx, n_idx = chosen["row"], rejected["row"]
+                    proto = DataProto.from_single_dict(
+                        {key + "_a": history_batch.batch[key][p_idx: p_idx + 1, :] for key in split_select_keys}
+                        | {key + "_b": history_batch.batch[key][n_idx: n_idx + 1, :] for key in split_select_keys}
+                        | {key: history_batch.non_tensor_batch[key][p_idx: p_idx + 1] for key in non_tensor_select_keys}
+                        | {key + "_a": history_batch.non_tensor_batch[key][p_idx: p_idx + 1] for key in non_tensor_split_select_keys}
+                        | {key + "_b": history_batch.non_tensor_batch[key][n_idx: n_idx + 1] for key in non_tensor_split_select_keys}
+                    )
+                    proto.non_tensor_batch["group_baseline"] = np.array([baseline], dtype=np.float32)
+                    proto.non_tensor_batch["group_size"]     = np.array([cluster_size], dtype=np.int32)
+                    proto.non_tensor_batch["born_step"]      = np.array([self.global_steps], dtype=np.int64)
+                    proto.non_tensor_batch["pair_turn"]      = np.array([chosen["turn"]], dtype=np.int32)   # 日志用
+                    proto_list.append(proto)
 
         if not proto_list:
             print("## DPO pair is not found!")
             return None
 
-        ## 增加最大上限
-        MAX_PAIRS_PER_STEP = 256
         if len(proto_list) > MAX_PAIRS_PER_STEP:
             proto_list = random.sample(proto_list, MAX_PAIRS_PER_STEP)
 
@@ -689,7 +739,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                                                 else 0.9 * self._enq_ema + 0.1 * enq
 
                             # 消化 = 入队；三重上限：能切分、不超存量、不超 GRPO 两倍
-                            n_batch = max(int(round(self._enq_ema)), k_partitions)
+                            # repeat x 16
+                            n_batch = max(int(round(self._enq_ema)) * 16, k_partitions)
                             n_batch = min(n_batch, history_length)
                             n_batch = n_batch // k_partitions * k_partitions
                             n_batch = max(n_batch, k_partitions)
