@@ -58,6 +58,21 @@ def _compute_turn_flags(planner_logs: list, task: str) -> list:
     return flags
 
 
+def _compute_format_counts(planner_logs: list) -> dict:
+    """Count the three observed QA stages before replay or batch filtering."""
+    counts = {
+        stage: {"correct": 0, "total": 0}
+        for stage in ("analysis", "tool_plan", "final_answer")
+    }
+    for log in planner_logs:
+        stage = log.get("format_stage")
+        valid = log.get("format_valid")
+        if stage in counts and isinstance(valid, bool):
+            counts[stage]["total"] += 1
+            counts[stage]["correct"] += int(valid)
+    return counts
+
+
 @reward
 async def evaluate(question: str, groundtruth: any, answer_extracted: any, val: bool = False) -> float:
     """
@@ -393,6 +408,8 @@ class RolloutAgent(LitAgent):
             # explicitly bypasses the model's default_factory and causes a
             # Pydantic ValidationError for QA rollouts, whose anchor is None.
             metadata = {"turn_flags": _compute_turn_flags(planner_logs, self.task)}
+            if self.task == "qa":
+                metadata["format_counts"] = _compute_format_counts(planner_logs)
             if anchor is not None:
                 metadata["anchor"] = anchor
             rollout_package = Rollout(

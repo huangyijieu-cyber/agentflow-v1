@@ -685,6 +685,36 @@ class AgentModeDaemon:
             logger.info(f"Completed {completed}/{self._total_tasks_queued} tasks before error.")
             raise
 
+    def _get_format_metrics(self, split: str) -> dict:
+        metric_names = {
+            "analysis": "analysis_schema_rate",
+            "tool_plan": "tool_plan_schema_rate",
+            "final_answer": "final_answer_rate",
+        }
+        correct = {stage: 0 for stage in metric_names}
+        total = {stage: 0 for stage in metric_names}
+        for rollout in self._completed_rollouts.values():
+            metadata = rollout.metadata or {}
+            counts = metadata.get("format_counts") if isinstance(metadata, dict) else None
+            if not isinstance(counts, dict):
+                continue
+            for stage in metric_names:
+                values = counts.get(stage)
+                if not isinstance(values, dict):
+                    continue
+                n_correct, n_total = values.get("correct"), values.get("total")
+                if (
+                    type(n_correct) is int and type(n_total) is int
+                    and n_total > 0 and 0 <= n_correct <= n_total
+                ):
+                    correct[stage] += n_correct
+                    total[stage] += n_total
+        return {
+            f"{split}/format/{name}": correct[stage] / total[stage]
+            for stage, name in metric_names.items() if total[stage] > 0
+        }
+
+
     def get_test_metrics(self):
         """Calculates and returns metrics for a validation run."""
         assert not self.is_train, "This method should only be called during validation."
@@ -700,6 +730,7 @@ class AgentModeDaemon:
                 "val/mean_response_length": 0.0,
                 "val/sum_response_length": 0.0,
                 "val/turn_count": 0.0,
+                **self._get_format_metrics("val"),
             }
 
         sample_stat_list = []
@@ -722,6 +753,7 @@ class AgentModeDaemon:
             "val/mean_response_length": np.mean([stat["mean_response_length"] for stat in sample_stat_list]),
             "val/sum_response_length": np.mean([stat["sum_response_length"] for stat in sample_stat_list]),
             "val/turn_count": np.mean([stat["turn_count"] for stat in sample_stat_list]),
+            **self._get_format_metrics("val"),
         }
 
     def get_train_data_batch(self, max_prompt_length, max_response_length, device):
@@ -880,6 +912,7 @@ class AgentModeDaemon:
             return None, {
                 "agent_mode/n_trunc_sample_because_of_response": n_trunc_sample_because_of_response,
                 "agent_mode/n_sample_to_train": 0,
+                **self._get_format_metrics("train"),
             }
 
         # CHECK
@@ -934,6 +967,7 @@ class AgentModeDaemon:
             "agent_mode/n_trunc_sample_because_of_response": n_trunc_sample_because_of_response,
             "agent_mode/n_sample_to_train": n_transition,
         }
+        data_metrics.update(self._get_format_metrics("train"))
 
         # Add non-tensor data for advantage calculation and logging
         data_proto.non_tensor_batch["data_id_list"] = np.array(data_id_list)
