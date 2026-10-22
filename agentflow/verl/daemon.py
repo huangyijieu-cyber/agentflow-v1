@@ -696,6 +696,36 @@ class AgentModeDaemon:
             logger.info(f"Completed {completed}/{self._total_tasks_queued} tasks before error.")
             raise
 
+    def _get_format_metrics(self, split: str) -> dict:
+        metric_names = {
+            "analysis": "analysis_schema_rate",
+            "tool_plan": "tool_plan_schema_rate",
+            "final_answer": "final_answer_rate",
+        }
+        correct = {stage: 0 for stage in metric_names}
+        total = {stage: 0 for stage in metric_names}
+        for rollout in self._completed_rollouts.values():
+            metadata = rollout.metadata or {}
+            counts = metadata.get("format_counts") if isinstance(metadata, dict) else None
+            if not isinstance(counts, dict):
+                continue
+            for stage in metric_names:
+                values = counts.get(stage)
+                if not isinstance(values, dict):
+                    continue
+                n_correct, n_total = values.get("correct"), values.get("total")
+                if (
+                    type(n_correct) is int and type(n_total) is int
+                    and n_total > 0 and 0 <= n_correct <= n_total
+                ):
+                    correct[stage] += n_correct
+                    total[stage] += n_total
+        return {
+            f"{split}/format/{name}": correct[stage] / total[stage]
+            for stage, name in metric_names.items() if total[stage] > 0
+        }
+
+
     def get_test_metrics(self):
         """Calculates and returns metrics for a validation run."""
         assert not self.is_train, "This method should only be called during validation."
@@ -713,6 +743,7 @@ class AgentModeDaemon:
                 "val/turn_count": 0.0,
             }
             metrics.update(summarize_reward_metrics([], "val"))
+            metrics.update(self._get_format_metrics("val"))
             return metrics
 
         sample_stat_list = []
@@ -743,6 +774,7 @@ class AgentModeDaemon:
                 "val/turn_count": 0.0,
             }
             metrics.update(summarize_reward_metrics(reward_breakdowns, "val"))
+            metrics.update(self._get_format_metrics("val"))
             return metrics
 
         metrics = {
@@ -752,6 +784,7 @@ class AgentModeDaemon:
             "val/turn_count": np.mean([stat["turn_count"] for stat in sample_stat_list]),
         }
         metrics.update(summarize_reward_metrics(reward_breakdowns, "val"))
+        metrics.update(self._get_format_metrics("val"))
         return metrics
 
     def get_train_data_batch(self, max_prompt_length, max_response_length, device):
@@ -957,6 +990,7 @@ class AgentModeDaemon:
             return None, {
                 "agent_mode/n_trunc_sample_because_of_response": n_trunc_sample_because_of_response,
                 "agent_mode/n_sample_to_train": 0,
+                **self._get_format_metrics("train"),
             }
 
         # CHECK
@@ -1016,6 +1050,7 @@ class AgentModeDaemon:
             "agent_mode/n_trunc_sample_because_of_response": n_trunc_sample_because_of_response,
             "agent_mode/n_sample_to_train": n_transition,
         }
+        data_metrics.update(self._get_format_metrics("train"))
         data_metrics.update(summarize_reward_metrics(
             (info["reward_breakdown"] for info in finished_id_to_sample_info.values()),
             "train",

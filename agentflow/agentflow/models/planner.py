@@ -10,6 +10,31 @@ from agentflow.models.formatters import NextStep, QueryAnalysis
 from agentflow.models.memory import Memory
 from agentflow.models.utils import robust_json_loads
 
+def _format_is_valid(response: Any, stage: str) -> bool:
+    """Check planner output without changing the existing parsing path."""
+    if stage in ("analysis", "tool_plan"):
+        schema = QueryAnalysis if stage == "analysis" else NextStep
+        try:
+            if isinstance(response, str):
+                data = json.loads(response)
+            elif isinstance(response, schema):
+                data = response.model_dump()
+            else:
+                return False
+            if not isinstance(data, dict):
+                return False
+            schema.model_validate(data, strict=True)
+        except (ValueError, TypeError, RecursionError):
+            return False
+        return True
+    if stage == "final_answer" and isinstance(response, str):
+        if response.count("<answer>") != 1 or response.count("</answer>") != 1:
+            return False
+        match = re.search(r"<answer>(.*?)</answer>\s*\Z", response, re.DOTALL)
+        return bool(match and match.group(1).strip())
+    return False
+
+
 class Planner:
     def __init__(self, llm_engine_name: str, llm_engine_fixed_name: str,
                  toolbox_metadata: dict = None, available_tools: List = None,
@@ -34,15 +59,19 @@ class Planner:
         self.logs = list()
 
     # [修改目的] 保留原 prompt/response 文本，并记录本次 serving 的真实 token ids。
-    def _append_log(self, prompt: str, response: Any) -> None:
+    def _append_log(self, prompt: str, response: Any, format_stage: str = None) -> None:
         metadata = getattr(self.llm_engine, "last_generation_metadata", None) or {}
-        self.logs.append({
+        log = {
             "prompt": prompt,
             "response": response,
             "prompt_token_ids": metadata.get("prompt_token_ids"),
             "response_token_ids": metadata.get("response_token_ids"),
             "finish_reason": metadata.get("finish_reason"),
-        })
+        }
+        if format_stage is not None:
+            log["format_stage"] = format_stage
+            log["format_valid"] = _format_is_valid(response, format_stage)
+        self.logs.append(log)
 
     def get_image_info(self, image_path: str) -> Dict[str, Any]:
         image_info = {}
@@ -150,7 +179,7 @@ Be biref and precise with insight.
 
         # [原代码保留] self.logs.append({"prompt": input_data[0], "response": self.query_analysis})
         # [修改目的] analysis turn 与本次 serving token 序列保持对应。
-        self._append_log(input_data[0], self.query_analysis)
+        self._append_log(input_data[0], self.query_analysis, format_stage="analysis")
 
         return str(self.query_analysis).strip()
 
@@ -321,7 +350,7 @@ Rules:
 
         # [原代码保留] self.logs.append({"prompt": prompt_generate_next_step, "response": next_step})
         # [修改目的] 工具决策 turn 同样记录本次真实 token ids。
-        self._append_log(prompt_generate_next_step, next_step)
+        self._append_log(prompt_generate_next_step, next_step, format_stage="tool_plan")
 
         return next_step
 
@@ -399,7 +428,7 @@ Instructions:
 
         # [原代码保留] self.logs.append({"prompt": input_data[0], "response": final_output})
         # [修改目的] final-output turn 同样保存真实 token ids / finish_reason。
-        self._append_log(input_data[0], final_output)
+        self._append_log(input_data[0], final_output, format_stage="final_answer")
         return final_output
 
 
