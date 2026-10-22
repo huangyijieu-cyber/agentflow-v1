@@ -58,18 +58,31 @@ def _compute_turn_flags(planner_logs: list, task: str) -> list:
     return flags
 
 
-def _compute_format_counts(planner_logs: list) -> dict:
-    """Count the three observed QA stages before replay or batch filtering."""
+def _extract_answer(output):
+    """Use the existing last-answer-tag extraction for answers and metrics."""
+    matches = re.findall(r"<answer>(.*?)</answer>", output, re.DOTALL)
+    return matches[-1].strip() if matches else None
+
+
+def _compute_extraction_counts(planner_logs: list) -> dict:
+    """Count successful extraction after the existing fallback paths."""
     counts = {
         stage: {"correct": 0, "total": 0}
         for stage in ("analysis", "tool_plan", "final_answer")
     }
     for log in planner_logs:
         stage = log.get("format_stage")
-        valid = log.get("format_valid")
-        if stage in counts and isinstance(valid, bool):
-            counts[stage]["total"] += 1
-            counts[stage]["correct"] += int(valid)
+        if stage not in counts:
+            continue
+        if stage == "final_answer":
+            response = log.get("response")
+            valid = isinstance(response, str) and bool(_extract_answer(response))
+        else:
+            valid = log.get("extraction_valid")
+            if not isinstance(valid, bool):
+                continue
+        counts[stage]["total"] += 1
+        counts[stage]["correct"] += int(valid)
     return counts
 
 
@@ -292,9 +305,9 @@ class RolloutAgent(LitAgent):
             if reward is None or self.task == "rule":
                 ## 纯QA
                 if not output is None:
-                    all_matches = re.findall(r"<answer>(.*?)</answer>", output, re.DOTALL)
-                    if all_matches:
-                        answer = all_matches[-1].strip()
+                    extracted_answer = _extract_answer(output)
+                    if extracted_answer is not None:
+                        answer = extracted_answer
                     else:
                         answer = "No answer"
                 else:
@@ -409,7 +422,7 @@ class RolloutAgent(LitAgent):
             # Pydantic ValidationError for QA rollouts, whose anchor is None.
             metadata = {"turn_flags": _compute_turn_flags(planner_logs, self.task)}
             if self.task == "qa":
-                metadata["format_counts"] = _compute_format_counts(planner_logs)
+                metadata["extraction_counts"] = _compute_extraction_counts(planner_logs)
             if anchor is not None:
                 metadata["anchor"] = anchor
             rollout_package = Rollout(

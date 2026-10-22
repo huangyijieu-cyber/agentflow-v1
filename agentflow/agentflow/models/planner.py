@@ -10,31 +10,6 @@ from agentflow.models.formatters import NextStep, QueryAnalysis
 from agentflow.models.memory import Memory
 from agentflow.models.utils import robust_json_loads
 
-def _format_is_valid(response: Any, stage: str) -> bool:
-    """Check planner output without changing the existing parsing path."""
-    if stage in ("analysis", "tool_plan"):
-        schema = QueryAnalysis if stage == "analysis" else NextStep
-        try:
-            if isinstance(response, str):
-                data = json.loads(response)
-            elif isinstance(response, schema):
-                data = response.model_dump()
-            else:
-                return False
-            if not isinstance(data, dict):
-                return False
-            schema.model_validate(data, strict=True)
-        except (ValueError, TypeError, RecursionError):
-            return False
-        return True
-    if stage == "final_answer" and isinstance(response, str):
-        if response.count("<answer>") != 1 or response.count("</answer>") != 1:
-            return False
-        match = re.search(r"<answer>(.*?)</answer>\s*\Z", response, re.DOTALL)
-        return bool(match and match.group(1).strip())
-    return False
-
-
 class Planner:
     def __init__(self, llm_engine_name: str, llm_engine_fixed_name: str,
                  toolbox_metadata: dict = None, available_tools: List = None,
@@ -71,7 +46,10 @@ class Planner:
         }
         if format_stage is not None:
             log["format_stage"] = format_stage
-            log["format_valid"] = _format_is_valid(response, format_stage)
+            if format_stage == "analysis":
+                log["extraction_valid"] = response is not None and bool(str(response).strip())
+            elif format_stage == "tool_plan":
+                log["extraction_valid"] = False
         self.logs.append(log)
 
     def get_image_info(self, image_path: str) -> Dict[str, Any]:
@@ -187,6 +165,13 @@ Be biref and precise with insight.
         return str(self.query_analysis).strip()
 
     def extract_context_subgoal_and_tool(self, response: Any) -> Tuple[str, str, str]:
+        extraction_log = next(
+            (log for log in reversed(getattr(self, "logs", []))
+             if log.get("format_stage") == "tool_plan" and log.get("response") is response),
+            None,
+        )
+        if extraction_log is not None:
+            extraction_log["extraction_valid"] = False
 
         def normalize_tool_name(tool_name: str) -> str:
             """
@@ -240,6 +225,11 @@ Be biref and precise with insight.
             print(f"Error extracting context, sub-goal, and tool name: {str(e)}")
             return None, None, None
 
+        if extraction_log is not None:
+            extraction_log["extraction_valid"] = (
+                isinstance(context, str) and isinstance(sub_goal, str)
+                and tool_name in self.available_tools
+            )
         return context, sub_goal, tool_name
 
     def generate_next_step(self, question: str, image: str, query_analysis: str, memory: Memory, step_count: int, max_step_count: int, json_data: Any = None, max_tokens: int = 2048) -> Any:
