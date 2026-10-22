@@ -698,15 +698,15 @@ class AgentModeDaemon:
 
     def _get_format_metrics(self, split: str) -> dict:
         metric_names = {
-            "analysis": "analysis_schema_rate",
-            "tool_plan": "tool_plan_schema_rate",
+            "analysis": "analysis_extract_rate",
+            "tool_plan": "tool_plan_extract_rate",
             "final_answer": "final_answer_rate",
         }
         correct = {stage: 0 for stage in metric_names}
         total = {stage: 0 for stage in metric_names}
         for rollout in self._completed_rollouts.values():
             metadata = rollout.metadata or {}
-            counts = metadata.get("format_counts") if isinstance(metadata, dict) else None
+            counts = metadata.get("extraction_counts") if isinstance(metadata, dict) else None
             if not isinstance(counts, dict):
                 continue
             for stage in metric_names:
