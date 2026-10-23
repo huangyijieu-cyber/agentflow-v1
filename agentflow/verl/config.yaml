@@ -14,7 +14,7 @@ data:
   # TRACE 仅在算法包含 slic 且 enabled=true 时启用；关闭后恢复原 SLIC 配对。
   trace:
     enabled: true
-    epsilon: 1.0e-8
+    epsilon: 0.1  # TRACE training gap offset (appendix A.1, table 4)
     k: 1
     gamma: 0.9
     match_epsilon: 0.1

@@ -71,12 +71,12 @@ SLIC loss 继续分别在两个动作各自的原始 Prompt 下计算策略 logP
 | 参数 | 初值 | 含义 |
 | --- | --- | --- |
 | `enabled` | `true` | 仅算法包含 `slic` 时生效；关闭则恢复 legacy SLIC 配对 |
-| `epsilon` | `1e-8` | NLL 比值的数值稳定项 |
+| `epsilon` | `0.1` | 按 TRACE 主实验设置的 training gap offset，控制低 NLL 区域的信用幅度 |
 | `k` | `1` | 信用窗口长度，先验证单步增益 |
 | `gamma` | `0.9` | 多步信用折扣；K=1 时不生效 |
-| `match_epsilon` | `0.1` | 动作前价值差上限；同初始状态下 NLL 比不超过约 `exp(0.1)=1.105` |
-| `positive_threshold` | `0.01` | Chosen 信用须大于此值，约对应 GT 平均 NLL 下降超过 1% |
-| `negative_threshold` | `0.01` | Rejected 信用须小于其负值，约对应 GT 平均 NLL 上升超过 1% |
+| `match_epsilon` | `0.1` | 动作前价值差上限；同初始状态下，偏移后的 gap 比不超过约 `exp(0.1)=1.105` |
+| `positive_threshold` | `0.01` | Chosen 信用须大于此值，约对应偏移后的 gap（NLL + epsilon）下降超过 1% |
+| `negative_threshold` | `0.01` | Rejected 信用须小于其负值，约对应偏移后的 gap（NLL + epsilon）上升超过 1% |
 | `gap_epsilon` | `0.02` | 正负信用差下限；配合严格正负阈值屏蔽接近零的差异 |
 | `length_ratio_max` | `1.8` | 正负 Response 的最大长度比 |
 | `k_pairs_per_group` | `2` | 每个候选组保留的最大对数 |
@@ -85,7 +85,9 @@ SLIC loss 继续分别在两个动作各自的原始 Prompt 下计算策略 logP
 | `gt_alias_strategy` | `first` | 固定第一个非空 GT；当前只支持此策略 |
 | `answer_instruction` | 见上文 | 统一的简短回答指令 |
 
-这些数值是实验起点，不代表已调参最优。观察有效状态、正负信用样本和最终 pair 数量；若负样本稀少，应检查价值分布和阈值，不能放宽为非正样本或用失败轨迹代替。
+`epsilon=0.1` 对齐 [TRACE 原论文 §4.1 和附录 A.1 表 4](https://arxiv.org/html/2607.13988v1#A1.SS1) 及[官方启动脚本](https://github.com/MSR-Orchard/trace/blob/a9270366bab360519705976f1606a08bedddd342/examples/search-r1/trace/run_trace.sh#L212)。这里使用的是训练 gap offset；附录 A.2 离线诊断中的 `epsilon_diag=0.001`，以及表 4 中另列的 legacy transform stabilizer `0.001`，都不是主实验使用的 gap offset。epsilon 同时控制接近零 NLL 时的信用放大幅度，并非只用于防止除零。例如 NLL 从 `0.1` 降至 `0` 时，epsilon=0.1 对应信用 `log(2)`。
+
+其余推荐数值是实验起点，不代表已调参最优；`k=1` 保留本次实验约定。观察有效状态、正负信用样本和最终 pair 数量；若负样本稀少，应检查价值分布和阈值，不能放宽为非正样本或用失败轨迹代替。
 
 从仓库根目录启动，环境变量可以覆盖 YAML 初值，命令行参数会在 YAML 参数之后追加并最终覆盖：
 
@@ -114,6 +116,6 @@ python3 -m unittest discover -s agentflow/tests -p test_vllm_native_token_ids.py
 git diff --check
 ```
 
-45 项新增 CPU 测试和 8 项原生 Token 回归通过，覆盖状态链路、真实 Trainer 方法、GT 掩码、参考模型路由、LoRA adapter 隔离、跨 Turn 配对及关闭 TRACE 的回退。分布式模型前向在 CPU 测试中使用 stub，不代表已完成 GPU/NPU 训练验证。两份启动配置另通过默认值及环境变量/命令行覆盖共 4 组真实 Hydra/OmegaConf 解析验证。
+46 项新增 CPU 测试和 8 项原生 Token 回归通过，覆盖状态链路、真实 Trainer 方法、GT 掩码、参考模型路由、LoRA adapter 隔离、跨 Turn 配对及关闭 TRACE 的回退。分布式模型前向在 CPU 测试中使用 stub，不代表已完成 GPU/NPU 训练验证。两份启动配置另通过默认值及环境变量/命令行覆盖共 4 组真实 Hydra/OmegaConf 解析验证。
 
 现有 `test_slic_prompt_filter.py` 的 5 项旧测试因 fixture 缺少最新配对要求的 `anchor_list` 报错；在未修改的同一远程基线上复现了相同的 5 项错误。该旧 fixture 未在此次修改中重写。

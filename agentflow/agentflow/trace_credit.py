@@ -14,7 +14,8 @@ from typing import Any, Mapping, Optional, Sequence
 @dataclass(frozen=True)
 class TraceConfig:
     enabled: bool = True
-    epsilon: float = 1e-8
+    # TRACE section 4.1 / appendix A.1 table 4: training gap offset.
+    epsilon: float = 0.1
     k: int = 1
     gamma: float = 0.9
     match_epsilon: float = 0.1
@@ -77,7 +78,7 @@ def _finite(value):
 DEFAULT_TRACE_CONFIG = asdict(TraceConfig())
 
 
-def state_values(logps: Sequence[Optional[float]], epsilon: float = 1e-8):
+def state_values(logps: Sequence[Optional[float]], epsilon: float = 0.1):
     """Return log((-ell_0 + eps) / (-ell_t + eps)) for one rollout.
 
     Missing, nonfinite, or positive log probabilities are invalid observations.

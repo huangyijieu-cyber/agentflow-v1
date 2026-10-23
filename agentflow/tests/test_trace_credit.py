@@ -31,12 +31,21 @@ class TraceValueTests(unittest.TestCase):
     def test_value_sign_and_adjacent_credit(self):
         values = state_values([-4.0, -2.0, -8.0])
         self.assertEqual(values[0], 0)
-        self.assertAlmostEqual(values[1], math.log((4.0 + 1e-8) / (2.0 + 1e-8)))
+        self.assertAlmostEqual(values[1], math.log((4.0 + 0.1) / (2.0 + 0.1)))
         self.assertLess(values[2], 0)
         credit = discounted_credits(values)
         self.assertAlmostEqual(credit[0], values[1] - values[0])
         self.assertAlmostEqual(credit[1], values[2] - values[1])
         self.assertTrue(math.isnan(credit[2]))
+
+    def test_training_gap_offset_limits_near_zero_nll_credit(self):
+        # With the paper's training offset, NLL 0.1 -> 0 closes half
+        # the offset-adjusted gap, rather than producing unbounded credit.
+        credit = discounted_credits(state_values([-0.1, 0.0]))
+        self.assertAlmostEqual(credit[0], math.log(2.0))
+        diagnostic_value = state_values([-0.1, 0.0], epsilon=1e-3)[1]
+        self.assertAlmostEqual(diagnostic_value, math.log(101.0))
+        self.assertLess(credit[0], diagnostic_value)
 
     def test_missing_baseline_invalidates_entire_rollout(self):
         for baseline in (None, math.nan, math.inf, 0.1):

@@ -20,7 +20,7 @@ env:
 
   # ----- TRACE 状态价值与 SLIC 配对（仅算法包含 slic 时生效） -----
   TRACE_ENABLED: ${env:TRACE_ENABLED,true}
-  TRACE_EPSILON: ${env:TRACE_EPSILON,1e-8}
+  TRACE_EPSILON: ${env:TRACE_EPSILON,0.1}
   TRACE_K: ${env:TRACE_K,1}
   TRACE_GAMMA: ${env:TRACE_GAMMA,0.9}
   TRACE_MATCH_EPSILON: ${env:TRACE_MATCH_EPSILON,0.1}
