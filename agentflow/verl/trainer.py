@@ -32,6 +32,7 @@ from .daemon import AgentModeDaemon
 from agentflow.rollout_timing import PHASES, profiling_enabled, write_validation_report
 from agentflow.trace_credit import TraceConfig, state_values, discounted_credits, select_pairs
 from agentflow.trace_scoring import encode_state_requests, build_score_tensors, mean_gt_logps
+from agentflow.trace_metrics import summarize_states, summarize_selected_pairs
 
 import os
 import json
@@ -198,6 +199,13 @@ class AgentFlowTrainer(RayPPOTrainer):
             print(f"Validation proceeding with {valid_count} valid rollouts ({valid_count/completed_count:.1%} of completed)")
 
         test_metrics = self.agent_mode_daemon.get_test_metrics()
+        test_metrics.update({
+            "val/queued_rollouts": original_count,
+            "val/completed_rollouts": completed_count,
+            "val/valid_rollouts": valid_count,
+            "val/completion_rate": completion_rate,
+            "val/valid_rollout_rate": valid_count / original_count if original_count else 0.0,
+        })
 
         self.agent_mode_daemon.clear_data_and_server()
         self.async_rollout_manager.sleep()
@@ -242,6 +250,7 @@ class AgentFlowTrainer(RayPPOTrainer):
             answer_instruction=cfg.answer_instruction,
         )
         row_logps = np.full(len(contexts), np.nan, dtype=np.float64)
+        scoring_seconds = 0.0
         if requests:
             pad_id = self.tokenizer.pad_token_id
             if pad_id is None:
@@ -254,7 +263,9 @@ class AgentFlowTrainer(RayPPOTrainer):
             )
             scorer = self.actor_rollout_wg if self.ref_in_actor else self.ref_policy_wg
             probes, probe_padding = pad_dataproto_to_divisor(probes, scorer.world_size)
+            scoring_start = time.perf_counter()
             scored = scorer.compute_ref_log_prob(probes)
+            scoring_seconds = time.perf_counter() - scoring_start
             scored = unpad_dataproto(scored, pad_size=probe_padding)
             probes = unpad_dataproto(probes, pad_size=probe_padding)
             logps = mean_gt_logps(scored.batch["ref_log_prob"], probes.batch["response_mask"])
@@ -285,21 +296,19 @@ class AgentFlowTrainer(RayPPOTrainer):
         batch.non_tensor_batch["trace_value"] = values
         batch.non_tensor_batch["trace_credit"] = credits
         metrics = {"trace/" + key: value for key, value in counters.items()}
-        for name, array in (("gt_logp", row_logps), ("value", values), ("credit", credits)):
-            finite = array[np.isfinite(array)]
-            metrics[f"trace/{name}_count"] = len(finite)
-            if len(finite):
-                for label, value in zip(("p10", "p50", "p90"), np.quantile(finite, [0.1, 0.5, 0.9])):
-                    metrics[f"trace/{name}_{label}"] = float(value)
-        metrics["trace/positive_turns"] = int(np.sum(credits > cfg.positive_threshold))
-        metrics["trace/negative_turns"] = int(np.sum(credits < -cfg.negative_threshold))
-        metrics["trace/unscored_credit_turns"] = int(np.sum(~np.isfinite(credits)))
-        metrics["trace/terminal_turns"] = len(groups)
-        types = batch.non_tensor_batch["trace_turn_type"]
-        for turn_type in sorted(set(str(t) for t in types)):
-            typed = credits[np.array([str(t) == turn_type for t in types])]
-            metrics[f"trace/{turn_type}/positive_turns"] = int(np.sum(typed > cfg.positive_threshold))
-            metrics[f"trace/{turn_type}/negative_turns"] = int(np.sum(typed < -cfg.negative_threshold))
+        metrics.update(summarize_states(
+            row_logps, values, credits, batch.non_tensor_batch["trace_turn_type"],
+            [(str(uid), str(rollout)) for uid, rollout in zip(uids, rollouts)], turns, cfg,
+        ))
+        metrics["trace/scoring_seconds"] = scoring_seconds
+        metrics["trace/scoring_prompt_tokens"] = sum(len(r["prompt_ids"]) for r in requests)
+        metrics["trace/scoring_gt_tokens"] = sum(len(r["target_ids"]) for r in requests)
+        mapped_rows = sum(index is not None for index in row_requests)
+        metrics["trace/scoring_dedup_rate"] = counters.get("deduplicated_states", 0) / mapped_rows if mapped_rows else 0.0
+        metrics["trace/scoring_invalid_result_turns"] = sum(
+            index is not None and not np.isfinite(row_logps[row])
+            for row, index in enumerate(row_requests)
+        )
         return metrics
 
     def _trans_to_trace_batch(self, history_batch_list):
@@ -314,6 +323,7 @@ class AgentFlowTrainer(RayPPOTrainer):
                      "trace_gt_logp", "trace_value", "trace_credit"]
         proto_list = []
         pair_metrics = defaultdict(int)
+        diagnostic_rows, diagnostic_pairs = [], []
         for history in history_batch_list:
             non = history.non_tensor_batch
             missing = set(side_keys) - set(non)
@@ -323,6 +333,7 @@ class AgentFlowTrainer(RayPPOTrainer):
             lengths = masks.sum(dim=-1).cpu().tolist()
             means = ((history.batch["old_log_probs"] * masks).sum(dim=-1)
                      / masks.sum(dim=-1).clamp(min=1)).float().cpu().tolist()
+            outcomes = history.batch["token_level_scores"].sum(dim=-1).float().cpu().tolist()
             drop = history.batch.get("is_drop_mask")
             valid = non.get("trace_valid", np.zeros(len(lengths), dtype=bool))
             dup = non.get("turn_dup_list", np.zeros(len(lengths), dtype=bool))
@@ -341,12 +352,20 @@ class AgentFlowTrainer(RayPPOTrainer):
                     "valid": bool(valid[i]) and not bool(dup[i])
                              and (drop is None or not bool(drop[i].item())),
                     "length": int(length), "old_per_token": means[i],
+                    "outcome_reward": outcomes[i],
                     "action_key": action_keys[i] if action_keys is not None and action_keys[i] is not None else tuple(response),
                 })
                 pair_metrics["trace/invalid_action_turns"] += int(not bool(valid[i]))
                 pair_metrics["trace/duplicate_turns"] += int(bool(dup[i]))
                 pair_metrics["trace/dropped_prompt_turns"] += int(drop is not None and bool(drop[i].item()))
-            for chosen, rejected in select_pairs(rows, cfg):
+            offset = len(diagnostic_rows)
+            diagnostic_rows.extend(dict(row, index=row["index"] + offset) for row in rows)
+            selection_metrics = {}
+            selected_pairs = select_pairs(rows, cfg, metrics=selection_metrics)
+            for key, value in selection_metrics.items():
+                pair_metrics["trace/pair/" + key] += value
+            diagnostic_pairs.extend((chosen + offset, rejected + offset) for chosen, rejected in selected_pairs)
+            for chosen, rejected in selected_pairs:
                 # Preserve the old group-mean per-token baseline convention in
                 # the new same-question/type progress neighborhood.
                 peers = [r for r in rows if r["valid"] and r["length"] > 0
@@ -368,8 +387,29 @@ class AgentFlowTrainer(RayPPOTrainer):
                 proto.meta_info["temperature"] = history.meta_info.get("temperature", 0.7)
                 proto_list.append(proto)
         # Cap unique pairs before the required distributed padding.
+        extra_pairs = max(0, len(proto_list) - cfg.max_pairs_per_step)
+        pair_metrics["trace/pair/rejected_global_cap"] += extra_pairs
         proto_list = proto_list[:cfg.max_pairs_per_step]
+        diagnostic_pairs = diagnostic_pairs[:cfg.max_pairs_per_step]
         pair_metrics["trace/unique_pairs"] = len(proto_list)
+        pair_metrics.update(summarize_selected_pairs(diagnostic_rows, diagnostic_pairs))
+        eligible_groups = pair_metrics["trace/pair/groups_eligible"]
+        eligible_rows = pair_metrics["trace/pair/rows_eligible"]
+        for sign in ("positive", "negative", "neutral"):
+            pair_metrics[f"trace/pair/{sign}_rate"] = pair_metrics[f"trace/pair/{sign}_rows"] / eligible_rows if eligible_rows else 0.0
+        sign_candidates = pair_metrics["trace/pair/candidates_sign"]
+        matched = pair_metrics["trace/pair/after_value_match"]
+        pair_metrics["trace/pair/both_sign_group_rate"] = pair_metrics["trace/pair/groups_both_signs"] / eligible_groups if eligible_groups else 0.0
+        pair_metrics["trace/pair/value_match_rate"] = matched / sign_candidates if sign_candidates else 0.0
+        pair_metrics["trace/pair/selection_rate"] = len(proto_list) / sign_candidates if sign_candidates else 0.0
+        all_questions = {row["uid"] for row in diagnostic_rows}
+        pair_metrics["trace/pair/question_coverage"] = pair_metrics["trace/pair/questions_covered"] / len(all_questions) if all_questions else 0.0
+        pair_metrics["trace/pair/padding_duplicates"] = 0
+        by_index = {row["index"]: row for row in diagnostic_rows}
+        for turn_type in sorted({row["turn_type"] for row in diagnostic_rows}):
+            pair_metrics[f"trace/pair/{turn_type}/selected_unique"] = sum(
+                by_index[chosen]["turn_type"] == turn_type for chosen, _ in diagnostic_pairs
+            )
         self._trace_pair_metrics = dict(pair_metrics)
         if not proto_list:
             return None
@@ -377,6 +417,7 @@ class AgentFlowTrainer(RayPPOTrainer):
         remainder = len(proto_list) % partitions
         if remainder:
             proto_list.extend(random.choices(proto_list, k=partitions - remainder))
+            self._trace_pair_metrics["trace/pair/padding_duplicates"] = partitions - remainder
         return proto_list
 
     ## score=0, score=1, classify(统一划分)
@@ -609,6 +650,9 @@ class AgentFlowTrainer(RayPPOTrainer):
            只在需要训练 DPO 时才做一次 concat，避免每 step 全量拷贝。
         """
         n_size = len(dpo_queue)
+        self._trace_replay_metrics = {"trace/replay/sampled_pairs": 0,
+                                      "trace/replay/unique_sampled_pairs": 0,
+                                      "trace/replay/sample_unique_pair_rate": 0.0}
         if n_size == 0:
             return None
 
@@ -628,6 +672,26 @@ class AgentFlowTrainer(RayPPOTrainer):
             np.random.shuffle(indices)
 
         selected = [dpo_queue[i] for i in indices]
+        if ("slic" in str(getattr(self, "algorithm", "")).split("+")
+                and self.config.data.get("trace", {}).get("enabled", False)):
+            identity_keys = ("uid", "rollout_id_list_a", "turn_index_list_a",
+                             "rollout_id_list_b", "turn_index_list_b", "born_step")
+            identities = [
+                tuple(str(proto.non_tensor_batch[key][0]) for key in identity_keys)
+                if all(key in proto.non_tensor_batch for key in identity_keys) else ("queue_index", i)
+                for i, proto in enumerate(dpo_queue)
+            ]
+            unique_sampled = len({identities[int(i)] for i in indices})
+            sampled_ages = ages[indices]
+            self._trace_replay_metrics = {
+                "trace/replay/sampled_pairs": len(selected),
+                "trace/replay/unique_sampled_pairs": unique_sampled,
+                "trace/replay/sample_unique_pair_rate": unique_sampled / len(selected),
+                "trace/replay/sample_age_p50": float(np.quantile(sampled_ages, 0.5)),
+                "trace/replay/sample_age_p90": float(np.quantile(sampled_ages, 0.9)),
+                "trace/replay/sample_age_max": float(sampled_ages.max()),
+                "trace/replay/buffer_unique_pairs": len(set(identities)),
+            }
         return DataProto.concat(selected)
 
 
@@ -641,6 +705,11 @@ class AgentFlowTrainer(RayPPOTrainer):
 
         algorithm = self.algorithm
         dpo_types = ["abpo", "slic", "simpo", "hspo"]
+        if "slic" in algorithm.split("+") and self.config.data.get("trace", {}).get("enabled", False):
+            metrics.update({"trace/replay/sampled_pairs": 0,
+                            "trace/replay/unique_sampled_pairs": 0,
+                            "trace/replay/sample_unique_pair_rate": 0.0,
+                            "trace/replay/slic_updated": 0})
 
         if "+" in algorithm:
             parts = algorithm.split("+")
@@ -941,6 +1010,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                             
                             print(f"## update dpo ({n_batch}) bs from ({history_length})")
                             sample_batch = self._sample_dpo_data(self._dpo_ring_buffer, bs=n_batch)
+                            if "slic" in algorithm.split("+") and self.config.data.get("trace", {}).get("enabled", False):
+                                metrics.update(self._trace_replay_metrics)
                             
                             if sample_batch is not None and len(sample_batch) > 0:
                                 print(f"{time.strftime('%Y-%m-%d %H-%M-%S')}: >>> Middle-2 DPO")
@@ -950,6 +1021,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                                 # 建议：在DPO前也做长度检查，过滤极端长短样本
                                 # 可在 update_actor_by_dpo 内部或这里加
                                 dpo_output = self.actor_rollout_wg.update_actor_by_dpo(sample_batch)
+                                if "slic" in algorithm.split("+") and self.config.data.get("trace", {}).get("enabled", False):
+                                    metrics["trace/replay/slic_updated"] = 1
                                 dpo_output_metrics = reduce_metrics(dpo_output.meta_info["metrics"])
                                 metrics.update(dpo_output_metrics)
                             else:
@@ -964,6 +1037,9 @@ class AgentFlowTrainer(RayPPOTrainer):
         # compute training metrics
         metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+        if "trace" in timing_raw:
+            metrics["trace/total_seconds"] = timing_raw["trace"]
+            metrics["trace/step_time_fraction"] = timing_raw["trace"] / timing_raw["step"] if timing_raw.get("step", 0) else 0.0
 
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))

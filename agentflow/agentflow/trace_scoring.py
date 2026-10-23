@@ -28,7 +28,10 @@ def encode_state_requests(contexts, ground_truths, tokenizer, *, max_prompt_leng
     if len(contexts) != len(ground_truths):
         raise ValueError("TRACE contexts and ground truths must be aligned")
     requests, row_requests, seen, target_cache = [], [], {}, {}
-    counts = Counter()
+    counts = Counter({key: 0 for key in (
+        "missing_gt", "missing_state", "invalid_gt_length", "overlong_state",
+        "deduplicated_states", "scoring_requests",
+    )})
     for context, raw_gt in zip(contexts, ground_truths):
         answer = first_ground_truth(raw_gt)
         if answer is None:

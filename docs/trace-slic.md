@@ -120,6 +120,8 @@ python train-roma/train_agent.py data.trace.k=1 data.trace.enabled=false
 
 ## 资源与解释限制
 
+新增日志指标及排查顺序见 [TRACE-SLIC 训练观察指标](trace-slic-metrics.md)。
+
 即使 KL loss 关闭，TRACE 仍需要冻结参考模型的 GT logP，因此可能额外加载一份参考模型权重并增加显存/内存占用。每个可训练状态还需额外的 teacher-forcing 前向计算；长上下文和长 GT 会增加耗时，应结合现有 reference micro-batch 配置控制开销。
 
 价值提升衡量的是固定参考模型对 GT 的可预测性改善，并非动作的因果贡献证明。相近标量价值不保证状态拥有相同信息；角色模板变化、参考模型偏差和工具随机性仍可能影响信用。第一版应与 legacy SLIC 对照，重点检查不同类型的信用分布、可用偏好对比例以及最终任务质量。
@@ -134,6 +136,6 @@ python3 -m unittest discover -s agentflow/tests -p test_vllm_native_token_ids.py
 git diff --check
 ```
 
-46 项新增 CPU 测试和 8 项原生 Token 回归通过，覆盖状态链路、真实 Trainer 方法、GT 掩码、参考模型路由、LoRA adapter 隔离、跨 Turn 配对及关闭 TRACE 的回退。分布式模型前向在 CPU 测试中使用 stub，不代表已完成 GPU/NPU 训练验证。两份启动配置另通过默认值及环境变量/命令行覆盖共 4 组真实 Hydra/OmegaConf 解析验证。
+68 项 TRACE CPU 测试和 8 项原生 Token 回归通过，覆盖状态链路、真实 Trainer 方法、GT 掩码、参考模型路由、LoRA adapter 隔离、跨 Turn 配对、监控分母与筛选守恒、Replay 补齐去重及关闭 TRACE 的回退。分布式模型前向在 CPU 测试中使用 stub，不代表已完成 GPU/NPU 训练验证。两份启动配置另通过默认值及环境变量/命令行覆盖共 4 组真实 Hydra/OmegaConf 解析验证。
 
 现有 `test_slic_prompt_filter.py` 的 5 项旧测试因 fixture 缺少最新配对要求的 `anchor_list` 报错；在未修改的同一远程基线上复现了相同的 5 项错误。该旧 fixture 未在此次修改中重写。

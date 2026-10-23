@@ -12,6 +12,7 @@ import io
 from pathlib import Path
 import random
 import sys
+import time
 from types import SimpleNamespace
 import unittest
 
@@ -32,6 +33,7 @@ def load_source_module(name, path):
 
 CREDIT = load_source_module("trace_credit_trainer_test", ROOT / "agentflow/agentflow/trace_credit.py")
 SCORING = load_source_module("trace_scoring_trainer_test", ROOT / "agentflow/agentflow/trace_scoring.py")
+METRICS = load_source_module("trace_metrics_trainer_test", ROOT / "agentflow/agentflow/trace_metrics.py")
 
 
 class Proto:
@@ -80,9 +82,11 @@ def load_trainer_methods():
     if len(methods) != len(names):
         raise AssertionError("Required TRACE trainer methods were not found")
     scope = dict(
-        torch=torch, np=np, random=random, defaultdict=defaultdict, DataProto=Proto,
+        torch=torch, np=np, random=random, defaultdict=defaultdict, DataProto=Proto, time=time,
         TraceConfig=CREDIT.TraceConfig, state_values=CREDIT.state_values,
         discounted_credits=CREDIT.discounted_credits, select_pairs=CREDIT.select_pairs,
+        summarize_states=METRICS.summarize_states,
+        summarize_selected_pairs=METRICS.summarize_selected_pairs,
         encode_state_requests=SCORING.encode_state_requests,
         build_score_tensors=SCORING.build_score_tensors, mean_gt_logps=SCORING.mean_gt_logps,
         pad_dataproto_to_divisor=pad_dataproto_to_divisor, unpad_dataproto=unpad_dataproto,
@@ -209,6 +213,49 @@ def standard_rows(chosen_reward=1.0, rejected_reward=1.0):
 
 
 class TraceTrainerIntegrationTests(unittest.TestCase):
+    def test_metric_coverage_funnel_and_outcome_disagreement_are_actual(self):
+        rows, scores = standard_rows(chosen_reward=0., rejected_reward=1.)
+        trainer, history = make_trainer(scores), make_batch(rows)
+        state_metrics = trainer._annotate_trace_credits(history)
+        self.assertEqual(state_metrics["trace/score_coverage"], 1.)
+        self.assertEqual(state_metrics["trace/credit_expected_turns"], 3)
+        self.assertEqual(state_metrics["trace/credit_coverage"], 1.)
+        self.assertEqual(state_metrics["trace/terminal_turns"], 2)
+        self.assertGreaterEqual(state_metrics["trace/scoring_seconds"], 0.)
+        self.assertEqual(state_metrics["trace/missing_gt"], 0)
+        trainer._trans_to_dpo_batch([history])
+        metrics = trainer._trace_pair_metrics
+        self.assertEqual(metrics["trace/pair/candidates_sign"], 1)
+        self.assertEqual(metrics["trace/pair/after_value_match"], 1)
+        self.assertEqual(metrics["trace/pair/selected_unique"], 1)
+        self.assertEqual(metrics["trace/pair/cross_turn_rate"], 1.)
+        self.assertEqual(metrics["trace/pair/question_coverage"], 1.)
+        self.assertEqual(metrics["trace/pair/chosen_failed_rollout_rate"], 1.)
+        self.assertEqual(metrics["trace/pair/rejected_successful_rollout_rate"], 1.)
+
+    def test_distributed_padding_does_not_inflate_pair_statistics(self):
+        rows, scores = standard_rows()
+        trainer, history = make_trainer(scores), make_batch(rows)
+        trainer.config.trainer.n_gpus_per_node = 8
+        trainer._annotate_trace_credits(history)
+        pairs = trainer._trans_to_dpo_batch([history])
+        self.assertEqual(len(pairs), 8)
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/selected_unique"], 1)
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/padding_duplicates"], 7)
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/credit_gap_count"], 1)
+
+    def test_global_cap_across_history_batches_preserves_funnel_counts(self):
+        rows, scores = standard_rows()
+        trainer = make_trainer(scores, trace={"max_pairs_per_step": 1})
+        first, second = make_batch(rows), make_batch(rows)
+        trainer._annotate_trace_credits(first)
+        trainer._annotate_trace_credits(second)
+        self.assertEqual(len(trainer._trans_to_dpo_batch([first, second])), 1)
+        metrics = trainer._trace_pair_metrics
+        self.assertEqual(metrics["trace/pair/after_distinct_action"], 2)
+        self.assertEqual(metrics["trace/pair/rejected_global_cap"], 1)
+        self.assertEqual(metrics["trace/pair/selected_unique"], 1)
+
     def test_cross_turn_pair_keeps_each_prompt_and_ignores_final_reward(self):
         for chosen_reward, rejected_reward in ((1., 1.), (0., 1.), (1., 0.)):
             with self.subTest(chosen_reward=chosen_reward, rejected_reward=rejected_reward):
@@ -268,6 +315,9 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
         history = make_batch(rows)
         trainer._annotate_trace_credits(history)
         self.assertIsNone(trainer._trans_to_dpo_batch([history]))
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/negative_rows"], 0)
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/selected_unique"], 0)
+        self.assertNotIn("trace/pair/credit_gap_p50", trainer._trace_pair_metrics)
 
     def test_missing_initial_state_and_original_turn_gaps_do_not_create_credit(self):
         rows = [make_row("M1", "missing_initial", 1), make_row("M2", "missing_initial", 2),

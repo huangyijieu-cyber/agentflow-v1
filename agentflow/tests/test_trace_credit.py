@@ -131,6 +131,99 @@ class TracePairTests(unittest.TestCase):
         self.assertEqual(select_pairs([row(0), row(1)]), [])
         self.assertEqual(select_pairs([row(0), row(1, -0.1)], {"enabled": False}), [])
 
+    def test_metrics_funnel_is_ordered_and_conserves_candidates(self):
+        rows = [
+            row(0, uid="value", value=0, length=100, action_key="same"),
+            row(1, -0.1, uid="value", value=0.5, length=1, action_key="same"),
+            row(2, 0.06, uid="gap", length=100, action_key="same"),
+            row(3, -0.06, uid="gap", length=1, action_key="same"),
+            row(4, uid="length", length=19, action_key="same"),
+            row(5, -0.1, uid="length", length=10, action_key="same"),
+            row(6, uid="same", action_key="same"),
+            row(7, -0.1, uid="same", action_key="same"),
+            row(8, uid="pass"), row(9, -0.1, uid="pass"),
+            row(10, uid="positive"), row(11, -0.1, uid="negative"),
+            row(12, 0.01, uid="neutral"), row(13, -0.01, uid="neutral"),
+            row(14, uid="invalid", valid=False),
+        ]
+        metrics = {}
+        self.assertEqual(select_pairs(rows, {"gap_epsilon": 0.15}, metrics), [(8, 9)])
+        expected = {
+            "rows_total": 15, "rows_eligible": 14,
+            "groups_total": 9, "groups_eligible": 8,
+            "groups_no_positive": 2, "groups_no_negative": 2,
+            "groups_both_signs": 5, "positive_rows": 6,
+            "negative_rows": 6, "neutral_rows": 2,
+            "candidates_sign": 5, "after_value_match": 4,
+            "after_credit_gap": 3, "after_length_filter": 2,
+            "after_distinct_action": 1, "rejected_value_match": 1,
+            "rejected_credit_gap": 1, "rejected_length": 1,
+            "rejected_same_action": 1, "rejected_group_cap": 0,
+            "rejected_global_cap": 0, "selected_unique": 1,
+        }
+        self.assertEqual(metrics, expected)
+        stages = ["candidates_sign", "after_value_match", "after_credit_gap",
+                  "after_length_filter", "after_distinct_action"]
+        reasons = ["rejected_value_match", "rejected_credit_gap",
+                   "rejected_length", "rejected_same_action"]
+        for before, after, rejected in zip(stages, stages[1:], reasons):
+            self.assertEqual(metrics[before], metrics[after] + metrics[rejected])
+        self.assertEqual(metrics["after_distinct_action"],
+                         metrics["selected_unique"] + metrics["rejected_group_cap"]
+                         + metrics["rejected_global_cap"])
+
+    def test_metrics_empty_calls_reset_all_keys(self):
+        metrics = {"unrelated": 7}
+        select_pairs([row(0), row(1, -0.1)], metrics=metrics)
+        expected_keys = set(metrics) - {"unrelated"}
+        self.assertEqual(select_pairs([], metrics=metrics), [])
+        self.assertEqual(set(metrics) - {"unrelated"}, expected_keys)
+        self.assertEqual(metrics["unrelated"], 7)
+        self.assertTrue(all(metrics[key] == 0 for key in expected_keys))
+        select_pairs([row(0)], metrics=metrics)
+        self.assertEqual(metrics["groups_no_negative"], 1)
+        self.assertEqual(metrics["candidates_sign"], 0)
+        self.assertEqual(metrics["selected_unique"], 0)
+
+    def test_metrics_invalid_and_nan_rows_do_not_enter_eligible_population(self):
+        rows = [row(0), row(1, -0.1),
+                row(2, value=math.nan), row(3, credit=math.nan),
+                row(4, old_per_token=math.inf), row(5, length=math.nan),
+                row(6, length=0), row(7, valid=False, uid="invalid-only")]
+        metrics = {}
+        self.assertEqual(select_pairs(rows, metrics=metrics), [(0, 1)])
+        self.assertEqual(metrics["rows_total"], 8)
+        self.assertEqual(metrics["rows_eligible"], 2)
+        self.assertEqual(metrics["groups_total"], 2)
+        self.assertEqual(metrics["groups_eligible"], 1)
+        self.assertEqual(metrics["positive_rows"], 1)
+        self.assertEqual(metrics["negative_rows"], 1)
+        self.assertEqual(metrics["neutral_rows"], 0)
+        self.assertEqual(metrics["candidates_sign"], 1)
+
+    def test_metrics_caps_keep_original_selection_and_count_all_survivors(self):
+        rows = [row(0), row(1, -0.1, value=0.21), row(2, -0.2),
+                row(3, -0.3), row(4, uid="q2"), row(5, -0.2, uid="q2")]
+        for group_cap, global_cap, expected in (
+                (1, 1, [(0, 3)]), (1, 2, [(0, 3), (4, 5)]),
+                (2, 2, [(0, 3), (0, 2)]),
+                (2, 256, [(0, 3), (0, 2), (4, 5)])):
+            config = {"k_pairs_per_group": group_cap, "max_pairs_per_step": global_cap}
+            with self.subTest(config=config):
+                metrics = {}
+                self.assertEqual(select_pairs(rows, config), expected)
+                self.assertEqual(select_pairs(rows, config, metrics), expected)
+                self.assertEqual(select_pairs(list(reversed(rows)), config, {}), expected)
+                self.assertEqual(metrics["after_distinct_action"], 4)
+                self.assertEqual(metrics["selected_unique"], len(expected))
+                self.assertEqual(4, metrics["selected_unique"]
+                                 + metrics["rejected_group_cap"]
+                                 + metrics["rejected_global_cap"])
+        metrics = {}
+        select_pairs(rows, {"k_pairs_per_group": 1, "max_pairs_per_step": 1}, metrics)
+        self.assertEqual(metrics["rejected_group_cap"], 2)
+        self.assertEqual(metrics["rejected_global_cap"], 1)
+
 
 class TraceConfigTests(unittest.TestCase):
     def test_defaults_and_mapping(self):
