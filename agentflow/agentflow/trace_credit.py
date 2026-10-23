@@ -17,7 +17,7 @@ class TraceConfig:
     # TRACE section 4.1 / appendix A.1 table 4: training gap offset.
     epsilon: float = 0.1
     k: int = 1
-    gamma: float = 0.9
+    gamma: float = 0.8
     match_epsilon: float = 0.1
     positive_threshold: float = 0.01
     negative_threshold: float = 0.01
@@ -101,7 +101,7 @@ def state_values(logps: Sequence[Optional[float]], epsilon: float = 0.1):
 
 def discounted_credits(values: Sequence[Optional[float]],
                        turn_indices: Optional[Sequence[int]] = None,
-                       k: int = 1, gamma: float = 0.9):
+                       k: int = 1, gamma: float = 0.8):
     """Compute normalized K-step credit without crossing an unobserved turn.
 
     The input is one rollout in its original state order; it must not be

@@ -73,11 +73,11 @@ SLIC loss 继续分别在两个动作各自的原始 Prompt 下计算策略 logP
 | `enabled` | `true` | 仅算法包含 `slic` 时生效；关闭则恢复 legacy SLIC 配对 |
 | `epsilon` | `0.1` | 按 TRACE 主实验设置的 training gap offset，控制低 NLL 区域的信用幅度 |
 | `k` | `1` | 信用窗口长度，先验证单步增益 |
-| `gamma` | `0.9` | 多步信用折扣；K=1 时不生效 |
+| `gamma` | `0.8` | 对齐 TRACE 的 TD discount；K=1 时不生效 |
 | `match_epsilon` | `0.1` | 动作前价值差上限；同初始状态下，偏移后的 gap 比不超过约 `exp(0.1)=1.105` |
 | `positive_threshold` | `0.01` | Chosen 信用须大于此值，约对应偏移后的 gap（NLL + epsilon）下降超过 1% |
 | `negative_threshold` | `0.01` | Rejected 信用须小于其负值，约对应偏移后的 gap（NLL + epsilon）上升超过 1% |
-| `gap_epsilon` | `0.02` | 正负信用差下限；配合严格正负阈值屏蔽接近零的差异 |
+| `gap_epsilon` | `0.02` | 正负信用差下限；当前被两侧严格 0.01 阈值隐含，不额外减少候选 |
 | `length_ratio_max` | `1.8` | 正负 Response 的最大长度比 |
 | `k_pairs_per_group` | `2` | 每个候选组保留的最大对数 |
 | `max_pairs_per_step` | `256` | 每训练 step 新增偏好对上限 |
@@ -87,7 +87,25 @@ SLIC loss 继续分别在两个动作各自的原始 Prompt 下计算策略 logP
 
 `epsilon=0.1` 对齐 [TRACE 原论文 §4.1 和附录 A.1 表 4](https://arxiv.org/html/2607.13988v1#A1.SS1) 及[官方启动脚本](https://github.com/MSR-Orchard/trace/blob/a9270366bab360519705976f1606a08bedddd342/examples/search-r1/trace/run_trace.sh#L212)。这里使用的是训练 gap offset；附录 A.2 离线诊断中的 `epsilon_diag=0.001`，以及表 4 中另列的 legacy transform stabilizer `0.001`，都不是主实验使用的 gap offset。epsilon 同时控制接近零 NLL 时的信用放大幅度，并非只用于防止除零。例如 NLL 从 `0.1` 降至 `0` 时，epsilon=0.1 对应信用 `log(2)`。
 
-其余推荐数值是实验起点，不代表已调参最优；`k=1` 保留本次实验约定。观察有效状态、正负信用样本和最终 pair 数量；若负样本稀少，应检查价值分布和阈值，不能放宽为非正样本或用失败轨迹代替。
+参数来源需逐项区分：
+
+| 来源 | 参数 | 当前处理 |
+| --- | --- | --- |
+| TRACE 主实验 | `epsilon=0.1`、`gamma=0.8`、K-step 归一化 | 采用论文数值和归一化公式；[官方启动脚本](https://github.com/MSR-Orchard/trace/blob/a9270366bab360519705976f1606a08bedddd342/examples/search-r1/trace/run_trace.sh#L211-L220) 也使用相同设置 |
+| 本次实验约定 | `k=1` | 用户指定先用单步；论文主实验为 K=3 |
+| 新增 SLIC 配对参数 | `match_epsilon`、`positive_threshold`、`negative_threshold`、`gap_epsilon` | TRACE 原文不构造偏好对，没有这些参数的推荐值；表中为本项目的待校准初值 |
+| 本项目筛选与采样上限 | `length_ratio_max=1.8`、`k_pairs_per_group=2`、`max_pairs_per_step=256` | 控制长度差与训练剂量，不能归因于 TRACE 论文；长度比 1.8 曾在旧代码中列出，最新 cache 中该过滤未启用，本实现显式启用 |
+| 本项目评分设置 | `max_gt_tokens=256`、`gt_alias_strategy=first`、`answer_instruction` | 分别是资源上限、固定答案选择和按本次约定使用的简短评分指令，均不是论文推荐超参数；超长 GT 应检查跳过比例并按实际数据调整上限 |
+
+论文另有 terminal fill scale=2.0、outcome weight=1.0 和 turn weight=0.2，用于 TRACE 的 GRPO 优势混合。本方案只用局部信用构造 SLIC 标签，遵循严格正负信用及原 SLIC loss 的约定，因此未移植这些优势混合项。论文附录 A.2 的初始 raw logP 差阈值 0.2 用于离线诊断分组，也不能作为本方案状态价值匹配阈值的依据。
+
+配对初值的解释与校准范围如下，范围用于后续消融，不会自动搜索或修改配置：
+
+- `match_epsilon=0.1`：在同初始状态下容许约 10.5% 的偏移后 gap 比例差；可对照 0.05、0.1、0.2。
+- 两侧信用阈值各 0.01：设置约 1% 的偏移后 gap 变化幅度门槛；可对照 0.005、0.01、0.02，并持续要求严格正负。
+- `gap_epsilon=0.02`：两侧严格超过 0.01 已隐含信用差大于 0.02，该默认值不额外过滤；若需独立的强差异条件，可对照 0.03 或 0.05。
+
+观察有效状态、正负信用样本和最终 pair 数量；这些配对初值未经过训练验证。若负样本稀少，应检查价值分布和阈值，不能放宽为非正样本或用失败轨迹代替。
 
 从仓库根目录启动，环境变量可以覆盖 YAML 初值，命令行参数会在 YAML 参数之后追加并最终覆盖：
 

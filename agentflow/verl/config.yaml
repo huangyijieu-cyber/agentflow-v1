@@ -16,7 +16,7 @@ data:
     enabled: true
     epsilon: 0.1  # TRACE training gap offset (appendix A.1, table 4)
     k: 1
-    gamma: 0.9
+    gamma: 0.8  # TRACE TD discount; inactive when k=1
     match_epsilon: 0.1
     positive_threshold: 0.01
     negative_threshold: 0.01
