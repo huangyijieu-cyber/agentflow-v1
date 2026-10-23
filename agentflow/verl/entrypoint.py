@@ -167,7 +167,13 @@ class TaskRunner:
             mapping[Role.RewardModel] = global_pool_id
 
         # use reference model
-        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+        trace_enabled = (
+            "slic" in str(config.data.get("algorithm", "")).split("+")
+            and config.data.get("trace", {}).get("enabled", False)
+        )
+        if trace_enabled and config.actor_rollout_ref.actor.strategy not in ("fsdp", "fsdp2"):
+            raise ValueError("TRACE GT scoring currently requires the FSDP/FSDP2 worker")
+        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss or trace_enabled:
             role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
             mapping[Role.RefPolicy] = global_pool_id
 

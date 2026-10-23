@@ -790,7 +790,9 @@ class AgentModeDaemon:
             # Example triplet.prompt: {"token_ids": [...]}
             # Example triplet.response: {"token_ids": [...]}
             trace_list = [
-                {"prompt_ids": t.prompt.get("token_ids", []), "response_ids": t.response.get("token_ids", [])}
+                {"prompt_ids": t.prompt.get("token_ids", []),
+                 "response_ids": t.response.get("token_ids", []),
+                 "metadata": t.metadata or {}}
                 for t in rollout.triplets
             ]
 
@@ -811,6 +813,7 @@ class AgentModeDaemon:
                 "reward": final_reward,
                 "trace_list": trace_list,
                 "data_id": original_sample["data_id"],
+                "trace_gt": original_sample.get("result"),
                 "anchor_list": anchor_list,
                 "turn_flags": rollout.metadata.get("turn_flags") if rollout.metadata else None,
             }
@@ -840,6 +843,8 @@ class AgentModeDaemon:
         reward_list, data_id_list, rollout_id_list, turn_index_list, is_drop_list = [], [], [], [], []
         anchor_list, traj_id_list, active_mask_list = [], [], []
         turn_valid_list, turn_dup_list = [], []   # DPO pair chosen 端质量标记
+        trace_state_contexts, trace_turn_types, trace_original_turns = [], [], []
+        trace_ground_truths, trace_valid_list, trace_action_keys = [], [], []
         n_trunc_sample_because_of_response = 0
         valid_samples = 0
         all_samples_num = 0
@@ -863,6 +868,9 @@ class AgentModeDaemon:
                 #     turn_reward = sample_info["reward"] * (discount_factor ** (n_turns - 1 - turn_index))
                 # reward_list.append(turn_reward)
                 prompt_ids, response_ids = trace["prompt_ids"], trace["response_ids"]
+                # Keep pre-truncation quality for TRACE pair filtering.
+                trace_response_valid = bool(response_ids) and len(response_ids) <= max_response_length
+                trace_prompt_valid = bool(prompt_ids) and len(prompt_ids) <= max_prompt_length
                 all_samples_num += 1
 
                 if len(prompt_ids) == 0 and len(response_ids) == 0:
@@ -906,6 +914,23 @@ class AgentModeDaemon:
                 _f = _flags[turn_index] if turn_index < len(_flags) else {}
                 turn_valid_list.append(bool(_f.get("valid", True)))
                 turn_dup_list.append(bool(_f.get("dup", False)))
+                trace_metadata = trace["metadata"]
+                state_context = trace_metadata.get("trace_state_context")
+                trace_state_contexts.append(state_context)
+                trace_turn_types.append(trace_metadata.get("trace_turn_type", "unknown"))
+                # Retain original numbering even when an empty turn is skipped.
+                trace_original_turns.append(trace_metadata.get("trace_original_turn", turn_index))
+                trace_ground_truths.append(sample_info["trace_gt"])
+                trace_action_keys.append(trace_metadata.get("trace_action_key"))
+                trace_valid_list.append(bool(
+                    _f.get("trace_valid", _f.get("valid", True))
+                    and not _f.get("trace_dup", _f.get("dup", False))
+                    and not trace_metadata.get("trace_tool_failed", False)
+                    and trace_metadata.get("trace_extraction_valid", True) is not False
+                    and trace_metadata.get("finish_reason") in ("stop", "eos", "end_turn")
+                    and isinstance(state_context, str) and state_context.strip()
+                    and trace_response_valid and trace_prompt_valid
+                ))
 
         logger.info(f"[STEP-WISE DEBUG]: valid response trace length in this training step is [{valid_samples}/{all_samples_num}]")
         if valid_samples == 0:
@@ -979,6 +1004,17 @@ class AgentModeDaemon:
         data_proto.non_tensor_batch["active_mask_list"] = np.array(active_mask_list)
         data_proto.non_tensor_batch["turn_valid_list"] = np.array(turn_valid_list)
         data_proto.non_tensor_batch["turn_dup_list"] = np.array(turn_dup_list)
+        data_proto.non_tensor_batch["trace_state_context"] = np.array(trace_state_contexts, dtype=object)
+        data_proto.non_tensor_batch["trace_turn_type"] = np.array(trace_turn_types, dtype=object)
+        data_proto.non_tensor_batch["trace_action_key"] = np.array(trace_action_keys, dtype=object)
+        data_proto.non_tensor_batch["trace_original_turn"] = np.array(trace_original_turns, dtype=np.int64)
+        # np.array(list_of_equal_length_alias_lists, dtype=object) becomes 2-D.
+        # Assign cells individually to preserve one GT object per training row.
+        trace_gt_array = np.empty(len(trace_ground_truths), dtype=object)
+        for index, ground_truth in enumerate(trace_ground_truths):
+            trace_gt_array[index] = ground_truth
+        data_proto.non_tensor_batch["trace_gt"] = trace_gt_array
+        data_proto.non_tensor_batch["trace_valid"] = np.array(trace_valid_list, dtype=bool)
 
         logger.info(f"[STEP-WISE-DEBUG]: transform {len(input_ids_list)} data to torch tensor.")
         return data_proto, data_metrics

@@ -31,6 +31,7 @@ from filelock import FileLock
 import asyncio
 
 from utils import compute_score, load_and_set_env_from_yaml
+from rollout import _compute_turn_flags, _compute_extraction_counts, _remove_injected_qa_output_format
 from transformers import AutoTokenizer
 
 import logging
@@ -344,19 +345,54 @@ class RolloutAgent(LitAgent):
         # print(f"Return reward value, Rollout data saved to: {save_path}")
 
         def encode_logs(tokenizer, logs):
-            return [Triplet(prompt = {"token_ids": tokenizer.encode(log["prompt"], add_special_tokens=False)},
-                                response = {"token_ids": tokenizer.encode(log["response"], add_special_tokens=False)},
-                                reward = None) for log in logs]
+            triplets = []
+            for turn_index, log in enumerate(logs):
+                prompt_ids = log.get("prompt_token_ids")
+                response_ids = log.get("response_token_ids")
+                finish_reason = log.get("finish_reason")
+
+                if prompt_ids is None or response_ids is None:
+                    raise RuntimeError(
+                        f"Planner turn {turn_index} is missing exact vLLM token ids. "
+                        "Refusing to train/evaluate on re-tokenized text."
+                    )
+
+                triplets.append(
+                    Triplet(
+                        prompt={"token_ids": list(prompt_ids)},
+                        response={"token_ids": list(response_ids)},
+                        reward=None,
+                        metadata={
+                            "finish_reason": finish_reason,
+                            "trace_state_context": log.get("trace_state_context"),
+                            "trace_turn_type": log.get("trace_turn_type", "unknown"),
+                            "trace_original_turn": log.get("trace_original_turn", turn_index),
+                            "trace_action_key": log.get("trace_action_key"),
+                            "trace_tool_failed": bool(log.get("trace_tool_failed", False)),
+                            "trace_extraction_valid": log.get("extraction_valid", True),
+                        },
+                    )
+                )
+            return triplets
 
 
         ## planner logs
         planner_logs = result["planner_logs"]
+        if self.task == "qa":
+            _remove_injected_qa_output_format(planner_logs, prompt, task["question"])
         encoding_started = time.perf_counter() if profile_val else 0.0
         try:
             # Rollout.metadata is declared as Dict[str, Any].  Passing None
             # explicitly bypasses the model's default_factory and causes a
             # Pydantic ValidationError for QA rollouts, whose anchor is None.
-            metadata = {}
+            # This entrypoint historically had no legacy valid/dup flags.
+            # Keep those daemon defaults while adding TRACE-specific quality.
+            metadata = {"turn_flags": [
+                {"trace_valid": flags["trace_valid"], "trace_dup": flags["trace_dup"]}
+                for flags in _compute_turn_flags(planner_logs, self.task)
+            ]}
+            if self.task == "qa":
+                metadata["extraction_counts"] = _compute_extraction_counts(planner_logs)
             if anchor is not None:
                 metadata["anchor"] = anchor
             rollout_package = Rollout(

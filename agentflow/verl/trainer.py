@@ -30,6 +30,8 @@ from verl.utils.tracking import Tracking
 
 from .daemon import AgentModeDaemon
 from agentflow.rollout_timing import PHASES, profiling_enabled, write_validation_report
+from agentflow.trace_credit import TraceConfig, state_values, discounted_credits, select_pairs
+from agentflow.trace_scoring import encode_state_requests, build_score_tensors, mean_gt_logps
 
 import os
 import json
@@ -224,6 +226,159 @@ class AgentFlowTrainer(RayPPOTrainer):
         return SequenceMatcher(None, a, b).ratio() >= thresh
 
 
+    def _annotate_trace_credits(self, batch):
+        """Score actual turn contexts with the frozen reference, then difference neighbors."""
+        cfg = TraceConfig.from_mapping(self.config.data.get("trace", {}))
+        if not self.use_reference_policy:
+            raise RuntimeError("TRACE-SLIC requires a frozen reference policy")
+        contexts = batch.non_tensor_batch.get("trace_state_context")
+        ground_truths = batch.non_tensor_batch.get("trace_gt")
+        if contexts is None or ground_truths is None:
+            raise RuntimeError("TRACE metadata is missing; use a TRACE-aware rollout worker")
+        requests, row_requests, counters = encode_state_requests(
+            contexts, ground_truths, self.tokenizer,
+            max_prompt_length=self.config.data.max_prompt_length,
+            max_gt_tokens=cfg.max_gt_tokens,
+            answer_instruction=cfg.answer_instruction,
+        )
+        row_logps = np.full(len(contexts), np.nan, dtype=np.float64)
+        if requests:
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is None:
+                pad_id = self.tokenizer.eos_token_id
+            if pad_id is None:
+                raise ValueError("TRACE tokenizer needs a pad or EOS token")
+            probes = DataProto.from_dict(
+                tensors=build_score_tensors(requests, pad_id),
+                meta_info={"trace_gt_scoring": True, "temperature": 1.0},
+            )
+            scorer = self.actor_rollout_wg if self.ref_in_actor else self.ref_policy_wg
+            probes, probe_padding = pad_dataproto_to_divisor(probes, scorer.world_size)
+            scored = scorer.compute_ref_log_prob(probes)
+            scored = unpad_dataproto(scored, pad_size=probe_padding)
+            probes = unpad_dataproto(probes, pad_size=probe_padding)
+            logps = mean_gt_logps(scored.batch["ref_log_prob"], probes.batch["response_mask"])
+            for row, request_index in enumerate(row_requests):
+                if request_index is not None:
+                    row_logps[row] = logps[request_index]
+
+        values = np.full(len(contexts), np.nan, dtype=np.float64)
+        credits = np.full(len(contexts), np.nan, dtype=np.float64)
+        groups = defaultdict(list)
+        turns = batch.non_tensor_batch["turn_index_list"]
+        uids = batch.non_tensor_batch["uid"]
+        rollouts = batch.non_tensor_batch["rollout_id_list"]
+        for row, (uid, rollout) in enumerate(zip(uids, rollouts)):
+            groups[(str(uid), str(rollout))].append(row)
+        for rows in groups.values():
+            rows.sort(key=lambda row: int(turns[row]))
+            # An absent initial turn cannot be silently replaced by a later baseline.
+            if int(turns[rows[0]]) != 0:
+                continue
+            rollout_values = state_values(row_logps[rows], epsilon=cfg.epsilon)
+            rollout_credits = discounted_credits(
+                rollout_values, [int(turns[row]) for row in rows], k=cfg.k, gamma=cfg.gamma,
+            )
+            values[rows] = rollout_values
+            credits[rows] = rollout_credits
+        batch.non_tensor_batch["trace_gt_logp"] = row_logps
+        batch.non_tensor_batch["trace_value"] = values
+        batch.non_tensor_batch["trace_credit"] = credits
+        metrics = {"trace/" + key: value for key, value in counters.items()}
+        for name, array in (("gt_logp", row_logps), ("value", values), ("credit", credits)):
+            finite = array[np.isfinite(array)]
+            metrics[f"trace/{name}_count"] = len(finite)
+            if len(finite):
+                for label, value in zip(("p10", "p50", "p90"), np.quantile(finite, [0.1, 0.5, 0.9])):
+                    metrics[f"trace/{name}_{label}"] = float(value)
+        metrics["trace/positive_turns"] = int(np.sum(credits > cfg.positive_threshold))
+        metrics["trace/negative_turns"] = int(np.sum(credits < -cfg.negative_threshold))
+        metrics["trace/unscored_credit_turns"] = int(np.sum(~np.isfinite(credits)))
+        metrics["trace/terminal_turns"] = len(groups)
+        types = batch.non_tensor_batch["trace_turn_type"]
+        for turn_type in sorted(set(str(t) for t in types)):
+            typed = credits[np.array([str(t) == turn_type for t in types])]
+            metrics[f"trace/{turn_type}/positive_turns"] = int(np.sum(typed > cfg.positive_threshold))
+            metrics[f"trace/{turn_type}/negative_turns"] = int(np.sum(typed < -cfg.negative_threshold))
+        return metrics
+
+    def _trans_to_trace_batch(self, history_batch_list):
+        """Keep the existing SLiC loss inputs, replacing only preference selection."""
+        cfg = TraceConfig.from_mapping(self.config.data.get("trace", {}))
+        split_keys = ["input_ids", "attention_mask", "old_log_probs", "position_ids",
+                      "prompts", "response_mask", "responses", "token_level_scores"]
+        if self.use_reference_policy:
+            split_keys.append("ref_log_prob")
+        common_keys = ["data_id_list", "uid", "traj_id_list", "traj_uid"]
+        side_keys = ["turn_index_list", "rollout_id_list", "trace_turn_type",
+                     "trace_gt_logp", "trace_value", "trace_credit"]
+        proto_list = []
+        pair_metrics = defaultdict(int)
+        for history in history_batch_list:
+            non = history.non_tensor_batch
+            missing = set(side_keys) - set(non)
+            if missing:
+                raise RuntimeError(f"TRACE scoring metadata missing: {sorted(missing)}")
+            masks = history.batch["response_mask"]
+            lengths = masks.sum(dim=-1).cpu().tolist()
+            means = ((history.batch["old_log_probs"] * masks).sum(dim=-1)
+                     / masks.sum(dim=-1).clamp(min=1)).float().cpu().tolist()
+            drop = history.batch.get("is_drop_mask")
+            valid = non.get("trace_valid", np.zeros(len(lengths), dtype=bool))
+            dup = non.get("turn_dup_list", np.zeros(len(lengths), dtype=bool))
+            action_keys = non.get("trace_action_key")
+            rows = []
+            for i, length in enumerate(lengths):
+                # The native response IDs supply a stable fallback action identity.
+                response = history.batch["responses"][i][masks[i].bool()].cpu().tolist()
+                rows.append({
+                    "index": i, "uid": str(non["uid"][i]),
+                    "turn_type": str(non["trace_turn_type"][i]),
+                    "rollout_id": str(non["rollout_id_list"][i]),
+                    "turn_index": int(non["turn_index_list"][i]),
+                    "value": float(non["trace_value"][i]),
+                    "credit": float(non["trace_credit"][i]),
+                    "valid": bool(valid[i]) and not bool(dup[i])
+                             and (drop is None or not bool(drop[i].item())),
+                    "length": int(length), "old_per_token": means[i],
+                    "action_key": action_keys[i] if action_keys is not None and action_keys[i] is not None else tuple(response),
+                })
+                pair_metrics["trace/invalid_action_turns"] += int(not bool(valid[i]))
+                pair_metrics["trace/duplicate_turns"] += int(bool(dup[i]))
+                pair_metrics["trace/dropped_prompt_turns"] += int(drop is not None and bool(drop[i].item()))
+            for chosen, rejected in select_pairs(rows, cfg):
+                # Preserve the old group-mean per-token baseline convention in
+                # the new same-question/type progress neighborhood.
+                peers = [r for r in rows if r["valid"] and r["length"] > 0
+                         and r["uid"] == rows[chosen]["uid"]
+                         and r["turn_type"] == rows[chosen]["turn_type"]
+                         and np.isfinite(r["value"]) and np.isfinite(r["old_per_token"])
+                         and abs(r["value"] - rows[chosen]["value"]) <= cfg.match_epsilon]
+                baseline = float(np.mean([r["old_per_token"] for r in peers]))
+                payload = {key + "_a": history.batch[key][chosen:chosen + 1] for key in split_keys}
+                payload.update({key + "_b": history.batch[key][rejected:rejected + 1] for key in split_keys})
+                payload.update({key: non[key][chosen:chosen + 1] for key in common_keys})
+                payload.update({key + "_a": non[key][chosen:chosen + 1] for key in side_keys})
+                payload.update({key + "_b": non[key][rejected:rejected + 1] for key in side_keys})
+                proto = DataProto.from_single_dict(payload)
+                proto.non_tensor_batch["group_baseline"] = np.array([baseline], dtype=np.float32)
+                proto.non_tensor_batch["group_size"] = np.array([len(peers)], dtype=np.int32)
+                proto.non_tensor_batch["born_step"] = np.array([self.global_steps], dtype=np.int64)
+                proto.non_tensor_batch["pair_turn"] = np.array([rows[chosen]["turn_index"]], dtype=np.int32)
+                proto.meta_info["temperature"] = history.meta_info.get("temperature", 0.7)
+                proto_list.append(proto)
+        # Cap unique pairs before the required distributed padding.
+        proto_list = proto_list[:cfg.max_pairs_per_step]
+        pair_metrics["trace/unique_pairs"] = len(proto_list)
+        self._trace_pair_metrics = dict(pair_metrics)
+        if not proto_list:
+            return None
+        partitions = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+        remainder = len(proto_list) % partitions
+        if remainder:
+            proto_list.extend(random.choices(proto_list, k=partitions - remainder))
+        return proto_list
+
     ## score=0, score=1, classify(统一划分)
     def _trans_to_dpo_batch(self, history_batch_list: list):
         """
@@ -243,6 +398,10 @@ class AgentFlowTrainer(RayPPOTrainer):
         if not history_batch_list:
             print("## No DPO data with history")
             return None
+
+        if ("slic" in str(getattr(self, "algorithm", self.config.data.get("algorithm", ""))).split("+")
+                and self.config.data.get("trace", {}).get("enabled", False)):
+            return self._trans_to_trace_batch(history_batch_list)
 
         k_partitions = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
         split_select_keys = [
@@ -588,7 +747,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                 print(f"use_reference_policy: {self.use_reference_policy}")
                 # compute reference log_prob
                 with _timer("ref", timing_raw), torch.no_grad():
-                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                    ref_worker = self.actor_rollout_wg if self.ref_in_actor else self.ref_policy_wg
+                    ref_log_prob = ref_worker.compute_ref_log_prob(batch)
                     print("ref_log_prob:", ref_log_prob)
                     batch = batch.union(ref_log_prob)
 
@@ -601,6 +761,10 @@ class AgentFlowTrainer(RayPPOTrainer):
             # for agent mode, unpad to calculate adv
             # it is important, as adv should be based on the raw traces
             batch = unpad_dataproto(batch, pad_size=pad_size)
+            if ("slic" in algorithm.split("+")
+                    and self.config.data.get("trace", {}).get("enabled", False)):
+                with _timer("trace", timing_raw), torch.no_grad():
+                    metrics.update(self._annotate_trace_credits(batch))
             found = any(k in algorithm for k in dpo_types)
             if found:
                 ## add stale data memory
@@ -611,6 +775,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                     self._dpo_ring_buffer = deque(maxlen=replay_buffer_size)
 
                 new_dpo_pairs = self._trans_to_dpo_batch([batch])
+                if "slic" in algorithm.split("+") and self.config.data.get("trace", {}).get("enabled", False):
+                    metrics.update(self._trace_pair_metrics)
                 if new_dpo_pairs is not None:
                     # uid 全局配额：同一 uid 在 buffer 中最多 M 对（防多轮相邻 turn 冗余）
                     if not hasattr(self, '_uid_pair_count'):

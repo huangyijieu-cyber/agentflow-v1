@@ -40,9 +40,11 @@ def _compute_turn_flags(planner_logs: list, task: str) -> list:
     逐 turn 质量标记：
       valid : 该 turn 的 planner 输出动作格式合法
       dup   : 该 turn 的输出与同轨迹历史某 turn 完全相同（循环动作）
+      trace_valid / trace_dup: TRACE 专用质量过滤，不改变旧算法的 valid / dup
     """
     flags = []
     seen = set()
+    seen_actions = set()
     for log in planner_logs:
         resp = (log.get("response") or "").strip()
         if task == "alfworld":
@@ -52,10 +54,35 @@ def _compute_turn_flags(planner_logs: list, task: str) -> list:
             valid = len(resp) > 0 and not resp.startswith("[ERROR]")
         else:
             valid = len(resp) > 0
+        # Preserve the legacy flags consumed by non-TRACE preference methods.
         dup = (resp in seen) if resp else False
         seen.add(resp)
-        flags.append({"valid": bool(valid), "dup": bool(dup)})
+        action_key = log.get("trace_action_key")
+        trace_valid = (valid and log.get("extraction_valid", True) is not False
+                       and not log.get("trace_tool_failed", False))
+        trace_dup = bool(dup) or bool(action_key and action_key in seen_actions)
+        if action_key:
+            seen_actions.add(action_key)
+        flags.append({"valid": bool(valid), "dup": bool(dup),
+                      "trace_valid": bool(trace_valid), "trace_dup": bool(trace_dup)})
     return flags
+
+
+def _remove_injected_qa_output_format(planner_logs, generation_question, original_question):
+    """Replace only this runner's known question wrapper in scoring metadata.
+
+    The original question may itself contain instructions, including identical
+    answer-tag wording; those remain intact. Generation prompts and native token
+    IDs are never edited.
+    """
+    if generation_question == original_question:
+        return
+    for log in planner_logs:
+        context = log.get("trace_state_context")
+        if isinstance(context, str):
+            log["trace_state_context"] = context.replace(
+                generation_question, original_question, 1,
+            )
 
 
 def _extract_answer(output):
@@ -408,7 +435,15 @@ class RolloutAgent(LitAgent):
                         prompt={"token_ids": list(prompt_ids)},
                         response={"token_ids": list(response_ids)},
                         reward=None,
-                        metadata={"finish_reason": finish_reason},
+                        metadata={
+                            "finish_reason": finish_reason,
+                            "trace_state_context": log.get("trace_state_context"),
+                            "trace_turn_type": log.get("trace_turn_type", "unknown"),
+                            "trace_original_turn": log.get("trace_original_turn", turn_index),
+                            "trace_action_key": log.get("trace_action_key"),
+                            "trace_tool_failed": bool(log.get("trace_tool_failed", False)),
+                            "trace_extraction_valid": log.get("extraction_valid", True),
+                        },
                     )
                 )
             return triplets
@@ -416,6 +451,8 @@ class RolloutAgent(LitAgent):
 
         ## planner logs
         planner_logs = result["planner_logs"]
+        if self.task == "qa":
+            _remove_injected_qa_output_format(planner_logs, prompt, task["question"])
         try:
             # Rollout.metadata is declared as Dict[str, Any].  Passing None
             # explicitly bypasses the model's default_factory and causes a

@@ -11,6 +11,22 @@ agentflow:
 
 data:
   filter_overlong_prompts: false
+  # TRACE 仅在算法包含 slic 且 enabled=true 时启用；关闭后恢复原 SLIC 配对。
+  trace:
+    enabled: true
+    epsilon: 1.0e-8
+    k: 1
+    gamma: 0.9
+    match_epsilon: 0.1
+    positive_threshold: 0.01
+    negative_threshold: 0.01
+    gap_epsilon: 0.02
+    length_ratio_max: 1.8
+    k_pairs_per_group: 2
+    max_pairs_per_step: 256
+    max_gt_tokens: 256
+    gt_alias_strategy: first
+    answer_instruction: Answer the question directly and concisely.
 
 actor_rollout_ref:
   rollout:

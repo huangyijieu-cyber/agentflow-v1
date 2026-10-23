@@ -35,7 +35,8 @@ class Planner:
 
     # [修改目的] 原代码的 Planner log 只保存 prompt/response 文本，训练阶段无法拿到 serving 时真实 token ids。
     # 新增统一日志入口：保留原文本字段，同时附带本次 vLLM 调用的 prompt_token_ids、response_token_ids 和 finish_reason。
-    def _append_log(self, prompt: str, response: Any, format_stage: str = None) -> None:
+    def _append_log(self, prompt: str, response: Any, format_stage: str = None,
+                    trace_state_context: str = None, trace_turn_type: str = None) -> None:
         metadata = getattr(self.llm_engine, "last_generation_metadata", None) or {}
         log = {
             "prompt": prompt,
@@ -43,6 +44,11 @@ class Planner:
             "prompt_token_ids": metadata.get("prompt_token_ids"),
             "response_token_ids": metadata.get("response_token_ids"),
             "finish_reason": metadata.get("finish_reason"),
+            # Captured while constructing the actual prompt, before this action.
+            # Never reconstruct this state later from memory or the response.
+            "trace_state_context": trace_state_context,
+            "trace_turn_type": trace_turn_type or format_stage or "unknown",
+            "trace_original_turn": len(self.logs),
         }
         if format_stage is not None:
             log["format_stage"] = format_stage
@@ -88,23 +94,24 @@ class Planner:
         # [原代码保留]
         # self.logs.append({"prompt": input_data[0], "response": self.base_response})
         # [修改目的] 在不改变 prompt/response 文本的前提下，同时记录本次真实 token ids / finish_reason。
-        self._append_log(input_data[0], self.base_response)
+        self._append_log(input_data[0], self.base_response, trace_state_context=input_data[0], trace_turn_type="base")
         return self.base_response
 
     def analyze_query(self, question: str, image: str, max_tokens: int = 2048) -> str:
         image_info = self.get_image_info(image)
 
         if self.is_multimodal:
-            query_prompt = f"""
-Task: Analyze the given query with accompanying inputs and determine the skills and tools needed to address it effectively.
-
-Available tools: {self.available_tools}
+            trace_state_context = f"""Available tools: {self.available_tools}
 
 Metadata for the tools: {self.toolbox_metadata}
 
 Image: {image_info}
 
-Query: {question}
+Query: {question}"""
+            query_prompt = f"""
+Task: Analyze the given query with accompanying inputs and determine the skills and tools needed to address it effectively.
+
+{trace_state_context}
 
 Instructions:
 1. Carefully read and understand the query and any accompanying inputs.
@@ -122,13 +129,14 @@ Your response should include:
 Please present your analysis in a clear, structured format.
                         """
         else:
+            trace_state_context = f"""Inputs:
+- Query: {question}
+- Available tools: {self.available_tools}
+- Metadata for tools: {self.toolbox_metadata}"""
             query_prompt = f"""
 Task: Analyze the given query to determine necessary skills and tools.
 
-Inputs:
-- Query: {question}
-- Available tools: {self.available_tools}
-- Metadata for tools: {self.toolbox_metadata}
+{trace_state_context}
 
 Instructions:
 1. Identify the main objectives in the query.
@@ -160,7 +168,7 @@ Be biref and precise with insight.
         # [原代码保留]
         # self.logs.append({"prompt": input_data[0], "response": self.query_analysis})
         # [修改目的] 保存 analyze_query 这次真实生成所对应的 token ids / finish_reason。
-        self._append_log(input_data[0], self.query_analysis, format_stage="analysis")
+        self._append_log(input_data[0], self.query_analysis, format_stage="analysis", trace_state_context=trace_state_context)
 
         return str(self.query_analysis).strip()
 
@@ -234,10 +242,7 @@ Be biref and precise with insight.
 
     def generate_next_step(self, question: str, image: str, query_analysis: str, memory: Memory, step_count: int, max_step_count: int, json_data: Any = None, max_tokens: int = 2048) -> Any:
         if self.is_multimodal:
-            prompt_generate_next_step = f"""
-Task: Determine the optimal next step to address the given query based on the provided analysis, available tools, and previous steps taken.
-
-Context:
+            trace_state_context = f"""Context:
 Query: {question}
 Image: {image}
 Query Analysis: {query_analysis}
@@ -252,7 +257,11 @@ Previous Steps and Their Results:
 {memory.get_actions()}
 
 Current Step: {step_count} in {max_step_count} steps
-Remaining Steps: {max_step_count - step_count}
+Remaining Steps: {max_step_count - step_count}"""
+            prompt_generate_next_step = f"""
+Task: Determine the optimal next step to address the given query based on the provided analysis, available tools, and previous steps taken.
+
+{trace_state_context}
 
 Instructions:
 1. Analyze the context thoroughly, including the query, its analysis, any image, available tools and their metadata, and previous steps taken.
@@ -305,15 +314,16 @@ Tool Name: Object_Detector_Tool
 Remember: Your response MUST end with the Context, Sub-Goal, and Tool Name sections, with NO additional content afterwards.
                         """
         else:
-            prompt_generate_next_step = f"""
-Task: Determine the optimal next step to address the query using available tools and previous steps.
-
-Context:
+            trace_state_context = f"""Context:
 - **Query:** {question}
 - **Query Analysis:** {query_analysis}
 - **Available Tools:** {self.available_tools}
 - **Toolbox Metadata:** {self.toolbox_metadata}
-- **Previous Steps:** {memory.get_actions()}
+- **Previous Steps:** {memory.get_actions()}"""
+            prompt_generate_next_step = f"""
+Task: Determine the optimal next step to address the query using available tools and previous steps.
+
+{trace_state_context}
 
 Instructions:
 1. Analyze the query, previous steps, and available tools.
@@ -344,7 +354,7 @@ Rules:
         # [原代码保留]
         # self.logs.append({"prompt": prompt_generate_next_step, "response": next_step})
         # [修改目的] 保存当前 next-step turn 的真实 token ids / finish_reason，保证 turn 与其 serving 轨迹一一对应。
-        self._append_log(prompt_generate_next_step, next_step, format_stage="tool_plan")
+        self._append_log(prompt_generate_next_step, next_step, format_stage="tool_plan", trace_state_context=trace_state_context)
 
         return next_step
 
@@ -352,14 +362,15 @@ Rules:
     def generate_final_output(self, question: str, image: str, memory: Memory, max_tokens: int = 2048) -> str:
         image_info = self.get_image_info(image)
         if self.is_multimodal:
-            prompt_generate_final_output = f"""
-Task: Generate the final output based on the query, image, and tools used in the process.
-
-Context:
+            trace_state_context = f"""Context:
 Query: {question}
 Image: {image_info}
 Actions Taken:
-{memory.get_actions()}
+{memory.get_actions()}"""
+            prompt_generate_final_output = f"""
+Task: Generate the final output based on the query, image, and tools used in the process.
+
+{trace_state_context}
 
 Instructions:
 1. Review the query, image, and all actions taken during the process.
@@ -395,12 +406,13 @@ Your response should be well-organized and include the following sections:
    - If appropriate, suggest potential next steps or areas for further investigation.
 """
         else:
+                trace_state_context = f"""Context:
+- **Query:** {question}
+- **Actions Taken:** {memory.get_actions()}"""
                 prompt_generate_final_output = f"""
 Task: Generate the final output based on the query and the results from all tools used.
 
-Context:
-- **Query:** {question}
-- **Actions Taken:** {memory.get_actions()}
+{trace_state_context}
 
 Instructions:
 1. Review the query and the results from all tool executions.
@@ -423,34 +435,36 @@ Instructions:
         # [原代码保留]
         # self.logs.append({"prompt": input_data[0], "response": final_output})
         # [修改目的] final-output turn 同样保存 serving 端真实 token ids / finish_reason。
-        self._append_log(input_data[0], final_output, format_stage="final_answer")
+        self._append_log(input_data[0], final_output, format_stage="final_answer", trace_state_context=trace_state_context)
         return final_output
 
 
     def generate_direct_output(self, question: str, image: str, memory: Memory, max_tokens: int = 2048) -> str:
         image_info = self.get_image_info(image)
         if self.is_multimodal:
-            prompt_generate_direct_output = f"""
-Context:
+            trace_state_context = f"""Context:
 Query: {question}
 Image: {image_info}
 Initial Analysis:
 {self.query_analysis}
 Actions Taken:
-{memory.get_actions()}
+{memory.get_actions()}"""
+            prompt_generate_direct_output = f"""
+{trace_state_context}
 
 Please generate the concise output based on the query, image information, initial analysis, and actions taken. Break down the process into clear, logical, and conherent steps. Conclude with a precise and direct answer to the query.
 
 Answer:
 """
         else:
+            trace_state_context = f"""Context:
+- **Query:** {question}
+- **Initial Analysis:** {self.query_analysis}
+- **Actions Taken:** {memory.get_actions()}"""
             prompt_generate_direct_output = f"""
 Task: Generate a concise final answer to the query based on all provided context.
 
-Context:
-- **Query:** {question}
-- **Initial Analysis:** {self.query_analysis}
-- **Actions Taken:** {memory.get_actions()}
+{trace_state_context}
 
 Instructions:
 1. Review the query and the results from all actions.
@@ -478,6 +492,6 @@ Output Structure:
         # [原代码保留]
         # self.logs.append({"prompt": input_data[0], "response": final_output})
         # [修改目的] direct-output turn 同样保存 serving 端真实 token ids / finish_reason。
-        self._append_log(input_data[0], final_output)
+        self._append_log(input_data[0], final_output, trace_state_context=trace_state_context, trace_turn_type="direct")
         return final_output
 

@@ -28,6 +28,31 @@ def _serialize_qa_anchor(state):
     return json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _trace_tool_result_failed(result):
+    """Recognize tool failure envelopes, without scanning retrieved prose."""
+    if result is None:
+        return True
+    if isinstance(result, dict):
+        if result.get("success") is False:
+            return True
+        if result.get("status") in ("error", "failed", "failure", "timeout"):
+            return True
+        return any(bool(result.get(key)) for key in ("error", "exception", "error_message"))
+    if isinstance(result, (list, tuple)):
+        return not result or any(_trace_tool_result_failed(item) for item in result)
+    if isinstance(result, str):
+        text = result.strip()
+        # These prefixes are emitted by the executor and search tool adapters.
+        return not text or text.startswith((
+            "Error:", "Error in execute_tool_command:", "Error importing tool '",
+            "Execution timed out after ", "No execution captured from block:",
+            "No result was generated because the tool was not found.",
+            "Error fetching URL:", "Error extracting text:", "Error processing Web RAG:",
+            "Yibu Brave Search gateway request failed.",
+        )) or (text.startswith("Yibu Brave Search tried ") and " but failed. Last error:" in text)
+    return False
+
+
 class Solver:
     def __init__(
         self,
@@ -210,6 +235,15 @@ class Solver:
                             log_info(f"[Result]:\n{json.dumps(result, indent=4)}")
                             log_info(f"[Time]: {round(time.time() - local_start_time, 2)}s")
                     
+                    # Attach execution quality to the exact planner decision that
+                    # produced it. This does not change execution or state history.
+                    action_log = self.planner.logs[-1]
+                    action_log["trace_tool_failed"] = _trace_tool_result_failed(result)
+                    action_log["trace_action_key"] = json.dumps(
+                        [tool_name, command.strip() if isinstance(command, str) else command],
+                        ensure_ascii=False, sort_keys=True,
+                    )
+
                     # Track execution time for the current step
                     execution_time_step = round(time.time() - step_start_time, 2)
                     action_times.append(execution_time_step)

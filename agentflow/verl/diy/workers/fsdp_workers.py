@@ -993,7 +993,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
-        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["temperature"] = 1.0 if data.meta_info.get("trace_gt_scoring", False) else self.config.rollout.temperature
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
@@ -1032,7 +1032,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
-        data.meta_info["temperature"] = self.config.rollout.temperature
+        # GT predictability uses the frozen model's untempered distribution;
+        # action log probabilities keep the existing rollout temperature.
+        data.meta_info["temperature"] = 1.0 if data.meta_info.get("trace_gt_scoring", False) else self.config.rollout.temperature
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
