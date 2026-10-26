@@ -845,6 +845,10 @@ class AgentModeDaemon:
         turn_valid_list, turn_dup_list = [], []   # DPO pair chosen 端质量标记
         trace_state_contexts, trace_turn_types, trace_original_turns = [], [], []
         trace_ground_truths, trace_valid_list, trace_action_keys = [], [], []
+        trace_dup_list = []
+        trace_external_errors, trace_error_types, trace_error_sources = [], [], []
+        trace_final_flags, trace_outcome_valids, trace_outcome_successes = [], [], []
+        trace_outcome_rewards = []
         n_trunc_sample_because_of_response = 0
         valid_samples = 0
         all_samples_num = 0
@@ -914,6 +918,7 @@ class AgentModeDaemon:
                 _f = _flags[turn_index] if turn_index < len(_flags) else {}
                 turn_valid_list.append(bool(_f.get("valid", True)))
                 turn_dup_list.append(bool(_f.get("dup", False)))
+                trace_dup_list.append(bool(_f.get("trace_dup", _f.get("dup", False))))
                 trace_metadata = trace["metadata"]
                 state_context = trace_metadata.get("trace_state_context")
                 trace_state_contexts.append(state_context)
@@ -922,13 +927,28 @@ class AgentModeDaemon:
                 trace_original_turns.append(trace_metadata.get("trace_original_turn", turn_index))
                 trace_ground_truths.append(sample_info["trace_gt"])
                 trace_action_keys.append(trace_metadata.get("trace_action_key"))
+                trace_external_errors.append(bool(trace_metadata.get("trace_external_error", False)))
+                trace_error_types.append(trace_metadata.get("trace_error_type") or "")
+                trace_error_sources.append(trace_metadata.get("trace_error_source") or "")
+                trace_final_flags.append(bool(trace_metadata.get("trace_is_final", False)))
+                trace_outcome_valids.append(bool(trace_metadata.get("trace_outcome_valid", False)))
+                outcome_success = trace_metadata.get("trace_outcome_success")
+                trace_outcome_successes.append(outcome_success if isinstance(outcome_success, bool) else None)
+                outcome_reward = trace_metadata.get("trace_outcome_reward")
+                try:
+                    outcome_reward = float(outcome_reward)
+                except (TypeError, ValueError, OverflowError):
+                    outcome_reward = float("nan")
+                trace_outcome_rewards.append(outcome_reward)
+                outcome_role = (trace_turn_types[-1] == "analysis" or trace_final_flags[-1])
                 trace_valid_list.append(bool(
                     _f.get("trace_valid", _f.get("valid", True))
                     and not _f.get("trace_dup", _f.get("dup", False))
                     and not trace_metadata.get("trace_tool_failed", False)
+                    and not trace_external_errors[-1]
                     and trace_metadata.get("trace_extraction_valid", True) is not False
                     and trace_metadata.get("finish_reason") in ("stop", "eos", "end_turn")
-                    and isinstance(state_context, str) and state_context.strip()
+                    and (outcome_role or (isinstance(state_context, str) and state_context.strip()))
                     and trace_response_valid and trace_prompt_valid
                 ))
 
@@ -1015,6 +1035,14 @@ class AgentModeDaemon:
             trace_gt_array[index] = ground_truth
         data_proto.non_tensor_batch["trace_gt"] = trace_gt_array
         data_proto.non_tensor_batch["trace_valid"] = np.array(trace_valid_list, dtype=bool)
+        data_proto.non_tensor_batch["trace_dup"] = np.array(trace_dup_list, dtype=bool)
+        data_proto.non_tensor_batch["trace_external_error"] = np.array(trace_external_errors, dtype=bool)
+        data_proto.non_tensor_batch["trace_error_type"] = np.array(trace_error_types, dtype=object)
+        data_proto.non_tensor_batch["trace_error_source"] = np.array(trace_error_sources, dtype=object)
+        data_proto.non_tensor_batch["trace_is_final"] = np.array(trace_final_flags, dtype=bool)
+        data_proto.non_tensor_batch["trace_outcome_valid"] = np.array(trace_outcome_valids, dtype=bool)
+        data_proto.non_tensor_batch["trace_outcome_success"] = np.array(trace_outcome_successes, dtype=object)
+        data_proto.non_tensor_batch["trace_outcome_reward"] = np.array(trace_outcome_rewards, dtype=np.float64)
 
         logger.info(f"[STEP-WISE-DEBUG]: transform {len(input_ids_list)} data to torch tensor.")
         return data_proto, data_metrics

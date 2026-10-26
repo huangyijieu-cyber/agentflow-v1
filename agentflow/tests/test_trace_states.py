@@ -2,6 +2,7 @@
 import ast
 import contextlib
 import io
+import importlib.util
 import json
 import logging
 import os
@@ -16,6 +17,10 @@ import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
+EXECUTION_SPEC = importlib.util.spec_from_file_location(
+    "trace_execution_states_test", ROOT / "agentflow/agentflow/trace_execution.py")
+EXECUTION = importlib.util.module_from_spec(EXECUTION_SPEC)
+EXECUTION_SPEC.loader.exec_module(EXECUTION)
 
 
 def extract(path, name, scope):
@@ -111,7 +116,10 @@ class RolloutMetadataTests(unittest.TestCase):
                "finish_reason": "stop", "trace_state_context": "snapshot",
                "trace_turn_type": "analysis", "trace_original_turn": 3,
                "trace_action_key": "search-command",
-               "extraction_valid": True}
+               "extraction_valid": True, "trace_external_error": True,
+               "trace_error_type": "connection_error", "trace_error_source": "external",
+               "trace_is_final": False, "trace_outcome_valid": False,
+               "trace_outcome_success": None, "trace_outcome_reward": 0.0}
         for path in ("train-roma/rollout.py", "train-roma/rollout_main_profiled.py"):
             with self.subTest(path=path):
                 encode = extract(path, "encode_logs", {"Triplet": Triplet})
@@ -122,6 +130,10 @@ class RolloutMetadataTests(unittest.TestCase):
                 self.assertEqual(triplet.metadata["trace_state_context"], "snapshot")
                 self.assertEqual(triplet.metadata["finish_reason"], "stop")
                 self.assertEqual(triplet.metadata["trace_action_key"], "search-command")
+                for key in ("trace_external_error", "trace_error_type", "trace_error_source",
+                            "trace_is_final", "trace_outcome_valid", "trace_outcome_success",
+                            "trace_outcome_reward"):
+                    self.assertEqual(triplet.metadata[key], log[key])
                 missing_ids = dict(log, response_token_ids=None)
                 with self.assertRaisesRegex(RuntimeError, "missing exact vLLM token ids"):
                     encode(None, [missing_ids]) if "profiled" in path else encode([missing_ids])
@@ -160,7 +172,20 @@ class RolloutMetadataTests(unittest.TestCase):
                 self.assertEqual([item["valid"] for item in result], expected_valid)
                 self.assertEqual([item["dup"] for item in result], [False, False, True])
                 self.assertEqual([item["trace_valid"] for item in result], [False] * 3)
-                self.assertEqual([item["trace_dup"] for item in result], [False, True, True])
+                self.assertEqual([item["trace_dup"] for item in result], [False] * 3)
+
+    def test_recovered_retry_is_not_a_trace_duplicate_of_failed_attempt(self):
+        flags = extract("train-roma/rollout.py", "_compute_turn_flags", {"re": re})
+        logs = [
+            {"response": "same rationale", "trace_action_key": "search", "trace_external_error": True},
+            {"response": "same rationale", "trace_action_key": "search"},
+            {"response": "another rationale", "trace_action_key": "search"},
+        ]
+        result = flags(logs, "qa")
+        self.assertEqual([item["valid"] for item in result], [True] * 3)
+        self.assertEqual([item["dup"] for item in result], [False, True, False])
+        self.assertEqual([item["trace_valid"] for item in result], [False, True, True])
+        self.assertEqual([item["trace_dup"] for item in result], [False, False, True])
 
     def test_only_runner_injected_answer_instruction_is_removed_from_score_context(self):
         remove = extract("train-roma/rollout.py", "_remove_injected_qa_output_format", {})
@@ -202,13 +227,14 @@ class RolloutMetadataTests(unittest.TestCase):
             {"trace_valid": True, "trace_dup": False}, {"trace_valid": False, "trace_dup": True}])
 
     def test_failure_detection_checks_envelopes_and_known_errors_without_prose_search(self):
-        failed = extract("agentflow/agentflow/solver.py", "_trace_tool_result_failed", {})
-        for value in (None, [], {"error": "upstream unavailable"}, {"success": False},
+        failed = extract("agentflow/agentflow/solver.py", "_trace_tool_result_failed",
+                         {"classify_tool_result": EXECUTION.classify_tool_result})
+        for value in (None, {"error": "upstream unavailable"}, {"success": False},
                       [{"status": "timeout"}], "Error fetching URL: timed out",
                       "Error in execute_tool_command: failed", "Execution timed out after 3 seconds"):
             with self.subTest(value=value):
                 self.assertTrue(failed(value))
-        for value in ("The article discusses error correction.", "A failed search can still be useful.",
+        for value in ([], "The article discusses error correction.", "A failed search can still be useful.",
                       {"content": "Error: this is quoted source text", "error": None},
                       [{"content": "success", "success": True}], 0, False):
             with self.subTest(value=value):
@@ -301,6 +327,40 @@ class DaemonMetadataTests(unittest.TestCase):
         self.assertEqual(data["trace_state_context"][1], "state-1")
         self.assertEqual(data["trace_turn_type"].tolist(), ["tool_plan"] * 8)
         self.assertEqual(batch.batch["responses"].shape, (8, 4))
+
+    def test_external_failure_and_trusted_outcome_metadata_reach_batch(self):
+        triplets = [
+            self.triplet(0, trace_turn_type="analysis", trace_state_context=None),
+            self.triplet(1, trace_external_error=True, trace_error_type="connection_error",
+                         trace_error_source="external"),
+            self.triplet(2, trace_turn_type="final_answer", trace_is_final=True),
+        ]
+        for triplet in triplets:
+            triplet.metadata.update(trace_outcome_valid=True, trace_outcome_success=True,
+                                    trace_outcome_reward=1.0)
+        batch, _ = self.build_batch(triplets, ground_truth="answer")
+        data = batch.non_tensor_batch
+        self.assertEqual(data["trace_external_error"].tolist(), [False, True, False])
+        self.assertEqual(data["trace_valid"].tolist(), [True, False, True])
+        self.assertEqual(data["trace_is_final"].tolist(), [False, False, True])
+        self.assertEqual(data["trace_outcome_valid"].tolist(), [True] * 3)
+        self.assertEqual(data["trace_outcome_success"].tolist(), [True] * 3)
+        self.assertEqual(data["trace_outcome_reward"].tolist(), [1.0] * 3)
+        self.assertEqual(data["trace_error_type"].tolist(), ["", "connection_error", ""])
+
+    def test_daemon_keeps_trace_retry_eligible_despite_legacy_duplicate(self):
+        compute_flags = extract("train-roma/rollout.py", "_compute_turn_flags", {"re": re})
+        logs = [
+            {"response": "same rationale", "trace_action_key": "search", "trace_external_error": True},
+            {"response": "same rationale", "trace_action_key": "search"},
+        ]
+        flags = compute_flags(logs, "qa")
+        triplets = [self.triplet(index, trace_action_key="search",
+                                trace_external_error=index == 0) for index in range(2)]
+        batch, _ = self.build_batch(triplets, flags, "answer")
+        self.assertEqual(batch.non_tensor_batch["turn_dup_list"].tolist(), [False, True])
+        self.assertEqual(batch.non_tensor_batch["trace_dup"].tolist(), [False, False])
+        self.assertEqual(batch.non_tensor_batch["trace_valid"].tolist(), [False, True])
 
 
 if __name__ == "__main__":

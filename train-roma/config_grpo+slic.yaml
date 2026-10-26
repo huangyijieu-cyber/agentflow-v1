@@ -21,9 +21,13 @@ env:
   # ----- TRACE 状态价值与 SLIC 配对（仅算法包含 slic 时生效） -----
   TRACE_ENABLED: ${env:TRACE_ENABLED,true}
   TRACE_EPSILON: ${env:TRACE_EPSILON,0.1}
-  TRACE_K: ${env:TRACE_K,1}
+  TRACE_K: ${env:TRACE_K,3}
   TRACE_GAMMA: ${env:TRACE_GAMMA,0.8}
-  TRACE_MATCH_EPSILON: ${env:TRACE_MATCH_EPSILON,0.1}
+  TRACE_TERMINAL_FILL_ENABLED: ${env:TRACE_TERMINAL_FILL_ENABLED,true}
+  TRACE_TERMINAL_FILL_SCALE: ${env:TRACE_TERMINAL_FILL_SCALE,2.0}
+  TRACE_OUTCOME_MATCH_VALUE: ${env:TRACE_OUTCOME_MATCH_VALUE,false}
+  TRACE_OUTCOME_SUCCESS_THRESHOLD: ${env:TRACE_OUTCOME_SUCCESS_THRESHOLD,0.5}
+  TRACE_MATCH_EPSILON: ${env:TRACE_MATCH_EPSILON,0.05}
   TRACE_POSITIVE_THRESHOLD: ${env:TRACE_POSITIVE_THRESHOLD,0.01}
   TRACE_NEGATIVE_THRESHOLD: ${env:TRACE_NEGATIVE_THRESHOLD,0.01}
   TRACE_GAP_EPSILON: ${env:TRACE_GAP_EPSILON,0.02}
@@ -144,6 +148,10 @@ python_args:
   data.trace.epsilon: '${TRACE_EPSILON}'
   data.trace.k: '${TRACE_K}'
   data.trace.gamma: '${TRACE_GAMMA}'
+  data.trace.terminal_fill_enabled: '${TRACE_TERMINAL_FILL_ENABLED}'
+  data.trace.terminal_fill_scale: '${TRACE_TERMINAL_FILL_SCALE}'
+  data.trace.outcome_match_value: '${TRACE_OUTCOME_MATCH_VALUE}'
+  data.trace.outcome_success_threshold: '${TRACE_OUTCOME_SUCCESS_THRESHOLD}'
   data.trace.match_epsilon: '${TRACE_MATCH_EPSILON}'
   data.trace.positive_threshold: '${TRACE_POSITIVE_THRESHOLD}'
   data.trace.negative_threshold: '${TRACE_NEGATIVE_THRESHOLD}'

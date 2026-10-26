@@ -34,6 +34,7 @@ def load_source_module(name, path):
 CREDIT = load_source_module("trace_credit_trainer_test", ROOT / "agentflow/agentflow/trace_credit.py")
 SCORING = load_source_module("trace_scoring_trainer_test", ROOT / "agentflow/agentflow/trace_scoring.py")
 METRICS = load_source_module("trace_metrics_trainer_test", ROOT / "agentflow/agentflow/trace_metrics.py")
+EXECUTION = load_source_module("trace_execution_trainer_test", ROOT / "agentflow/agentflow/trace_execution.py")
 
 
 class Proto:
@@ -84,7 +85,7 @@ def load_trainer_methods():
     scope = dict(
         torch=torch, np=np, random=random, defaultdict=defaultdict, DataProto=Proto, time=time,
         TraceConfig=CREDIT.TraceConfig, state_values=CREDIT.state_values,
-        discounted_credits=CREDIT.discounted_credits, select_pairs=CREDIT.select_pairs,
+        annotate_rollout_credits=CREDIT.annotate_rollout_credits, select_pairs=CREDIT.select_pairs,
         summarize_states=METRICS.summarize_states,
         summarize_selected_pairs=METRICS.summarize_selected_pairs,
         encode_state_requests=SCORING.encode_state_requests,
@@ -144,10 +145,13 @@ class FrozenReference:
         return Proto.from_dict({"ref_log_prob": values})
 
 
-def make_row(context, rollout, turn, *, turn_type="tool", old=-1.0, reward=1.0,
-             valid=True, dropped=False, uid="q", gt="AB"):
+def make_row(context, rollout, turn, *, turn_type="tool_plan", old=-1.0, reward=1.0,
+             valid=True, dropped=False, uid="q", gt="AB", external_error=False,
+             is_final=False, outcome_valid=False, outcome_success=None):
     return dict(context=context, rollout=rollout, turn=turn, turn_type=turn_type,
-                old=old, reward=reward, valid=valid, dropped=dropped, uid=uid, gt=gt)
+                old=old, reward=reward, valid=valid, dropped=dropped, uid=uid, gt=gt,
+                external_error=external_error, is_final=is_final,
+                outcome_valid=outcome_valid, outcome_success=outcome_success)
 
 
 def make_batch(rows):
@@ -174,6 +178,11 @@ def make_batch(rows):
         "trace_gt": np.array([r["gt"] for r in rows], dtype=object),
         "trace_turn_type": np.array([r["turn_type"] for r in rows]),
         "trace_valid": np.array([r["valid"] for r in rows]),
+        "trace_external_error": np.array([r["external_error"] for r in rows], dtype=bool),
+        "trace_is_final": np.array([r["is_final"] for r in rows], dtype=bool),
+        "trace_outcome_valid": np.array([r["outcome_valid"] for r in rows], dtype=bool),
+        "trace_outcome_success": np.array([r["outcome_success"] for r in rows], dtype=object),
+        "trace_outcome_reward": np.array([r["reward"] for r in rows], dtype=float),
         "turn_valid_list": np.array([r["valid"] for r in rows]),
         "turn_dup_list": np.zeros(size, dtype=bool),
         "anchor_list": np.array([r["turn_type"] + "\nsame anchor" for r in rows]),
@@ -188,7 +197,8 @@ def make_trainer(scores, trace=None):
     trainer.config = SimpleNamespace(
         trainer=SimpleNamespace(n_gpus_per_node=1, nnodes=1),
         data=ConfigDict(task="qa", algorithm="slic", max_prompt_length=1024,
-                        trace={"enabled": True, **(trace or {})}),
+                        trace={"enabled": True, "k": 1, "terminal_fill_enabled": False, **(trace or {})}),
+        algorithm=ConfigDict(norm_adv_by_std_in_grpo=False),
     )
     trainer.algorithm = "slic"
     trainer.global_steps = 12
@@ -205,9 +215,9 @@ def standard_rows(chosen_reward=1.0, rejected_reward=1.0):
     rows = [
         make_row("A0", "a", 0, turn_type="analysis", reward=chosen_reward),
         make_row("A1", "a", 1, old=-1, reward=chosen_reward),
-        make_row("A2", "a", 2, turn_type="final", reward=chosen_reward),
+        make_row("A2", "a", 2, turn_type="final_answer", reward=chosen_reward),
         make_row("B0", "b", 0, old=-3, reward=rejected_reward),
-        make_row("B1", "b", 1, turn_type="final", reward=rejected_reward),
+        make_row("B1", "b", 1, turn_type="final_answer", reward=rejected_reward),
     ]
     return rows, {"A0": -4., "A1": -4., "A2": -2., "B0": -4., "B1": -8.}
 
@@ -218,7 +228,7 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
         trainer, history = make_trainer(scores), make_batch(rows)
         state_metrics = trainer._annotate_trace_credits(history)
         self.assertEqual(state_metrics["trace/score_coverage"], 1.)
-        self.assertEqual(state_metrics["trace/credit_expected_turns"], 3)
+        self.assertEqual(state_metrics["trace/credit_expected_turns"], 2)
         self.assertEqual(state_metrics["trace/credit_coverage"], 1.)
         self.assertEqual(state_metrics["trace/terminal_turns"], 2)
         self.assertGreaterEqual(state_metrics["trace/scoring_seconds"], 0.)
@@ -230,8 +240,141 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
         self.assertEqual(metrics["trace/pair/selected_unique"], 1)
         self.assertEqual(metrics["trace/pair/cross_turn_rate"], 1.)
         self.assertEqual(metrics["trace/pair/question_coverage"], 1.)
-        self.assertEqual(metrics["trace/pair/chosen_failed_rollout_rate"], 1.)
-        self.assertEqual(metrics["trace/pair/rejected_successful_rollout_rate"], 1.)
+        self.assertEqual(metrics["trace/pair/outcome_pairs_count"], 0)
+        self.assertNotIn("trace/pair/chosen_failed_rollout_rate", metrics)
+
+    def test_analysis_and_final_use_verified_outcomes_without_gt_scores(self):
+        rows = []
+        for rollout, reward, success in (("a", 1., True), ("b", 0.1, False)):
+            rows.extend([
+                make_row(rollout + "0", rollout, 0, turn_type="analysis", gt="",
+                         reward=reward, outcome_valid=True, outcome_success=success),
+                make_row(rollout + "1", rollout, 1, turn_type="final_answer", gt="",
+                         reward=reward, is_final=True, outcome_valid=True, outcome_success=success),
+            ])
+        trainer, history = make_trainer({}), make_batch(rows)
+        metrics = trainer._annotate_trace_credits(history)
+        self.assertEqual(metrics["trace/scoring_requests"], 0)
+        self.assertTrue(np.isnan(history.non_tensor_batch["trace_credit"]).all())
+        pairs = trainer._trans_to_dpo_batch([history])
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual({p.non_tensor_batch["trace_turn_type_a"][0] for p in pairs},
+                         {"analysis", "final_answer"})
+        for pair in pairs:
+            self.assertEqual(pair.non_tensor_batch["rollout_id_list_a"].tolist(), ["a"])
+            self.assertEqual(pair.non_tensor_batch["rollout_id_list_b"].tolist(), ["b"])
+            self.assertEqual(pair.non_tensor_batch["trace_label_source_a"].tolist(), ["outcome"])
+            self.assertTrue(np.isfinite(pair.non_tensor_batch["group_baseline"]).all())
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/outcome_selected_unique"], 2)
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/credit_gap_count"], 0)
+
+    def test_k3_fill_uses_final_decision_and_unique_rollout_outcomes(self):
+        rows, scores = [], {}
+        for rollout, reward, success in (("a", 1., True), ("b", 0., False)):
+            for turn, turn_type in enumerate(("analysis", "tool_plan", "tool_plan", "tool_plan", "final_answer")):
+                context = rollout + str(turn)
+                rows.append(make_row(context, rollout, turn, turn_type=turn_type,
+                                     reward=reward, is_final=turn == 4,
+                                     outcome_valid=True, outcome_success=success))
+                scores[context] = -4.
+        trainer = make_trainer(scores, {"k": 3, "terminal_fill_enabled": True})
+        history = make_batch(rows)
+        trainer._annotate_trace_credits(history)
+        credit = history.non_tensor_batch["trace_credit"]
+        self.assertTrue(np.isnan(credit[[0, 4, 5, 9]]).all())
+        np.testing.assert_allclose(credit[[1, 2, 3]], [0., 0.64, 0.8])
+        np.testing.assert_allclose(credit[[6, 7, 8]], [0., -0.64, -0.8])
+        np.testing.assert_allclose(history.non_tensor_batch["trace_outcome_advantage"][:5], 0.5)
+        np.testing.assert_allclose(history.non_tensor_batch["trace_local_credit"][[1, 2, 3]], 0.)
+        self.assertEqual(history.non_tensor_batch["trace_terminal_reached"].tolist(),
+                         [False, False, True, True, False] * 2)
+        self.assertEqual(len(trainer._trans_to_dpo_batch([history])), 4)
+
+    def test_external_failure_blocks_tool_windows_and_untrusted_outcome_pairs(self):
+        rows, scores = [], {}
+        for rollout, reward, success, trustworthy in (("a", 1., True, True), ("b", 0., False, False)):
+            for turn, turn_type in enumerate(("analysis", "tool_plan", "tool_plan", "tool_plan", "final_answer")):
+                context = rollout + str(turn)
+                rows.append(make_row(context, rollout, turn, turn_type=turn_type,
+                                     reward=reward, is_final=turn == 4,
+                                     external_error=rollout == "b" and turn == 3,
+                                     outcome_valid=trustworthy, outcome_success=success))
+                scores[context] = -4.
+        trainer = make_trainer(scores, {"k": 3, "terminal_fill_enabled": True})
+        history = make_batch(rows)
+        metrics = trainer._annotate_trace_credits(history)
+        self.assertTrue(np.isnan(history.non_tensor_batch["trace_credit"][[6, 7, 8]]).all())
+        self.assertTrue(history.non_tensor_batch["trace_credit_window_blocked"][[6, 7, 8]].all())
+        self.assertEqual(metrics["trace/external_error_turns"], 1)
+        self.assertIsNone(trainer._trans_to_dpo_batch([history]))
+
+    def test_actual_evaluated_answer_can_precede_later_generated_outputs(self):
+        rows = []
+        for rollout, reward in (("a", 1.), ("b", 0.)):
+            rows.extend([
+                make_row(rollout + "0", rollout, 0, turn_type="base", gt="",
+                         reward=reward, is_final=True, outcome_valid=True, outcome_success=bool(reward)),
+                make_row(rollout + "1", rollout, 1, turn_type="analysis", gt="",
+                         reward=reward, outcome_valid=True, outcome_success=bool(reward)),
+                make_row(rollout + "2", rollout, 2, gt="", reward=reward,
+                         outcome_valid=True, outcome_success=bool(reward)),
+            ])
+        trainer, history = make_trainer({}), make_batch(rows)
+        metrics = trainer._annotate_trace_credits(history)
+        self.assertEqual(metrics["trace/post_final_turns"], 4)
+        self.assertEqual(history.non_tensor_batch["trace_outcome_valid"].tolist(),
+                         [True, False, False] * 2)
+        pairs = trainer._trans_to_dpo_batch([history])
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0].non_tensor_batch["trace_turn_type_a"].tolist(), ["base"])
+
+    def test_outcome_routes_never_infer_success_from_untrusted_reward(self):
+        rows = [make_row("A", "a", 0, turn_type="final_answer", is_final=True,
+                         reward=1., outcome_valid=False),
+                make_row("B", "b", 0, turn_type="final_answer", is_final=True,
+                         reward=0., outcome_valid=True, outcome_success=False)]
+        trainer, history = make_trainer(dict(A=-4., B=-4.)), make_batch(rows)
+        trainer._annotate_trace_credits(history)
+        self.assertIsNone(trainer._trans_to_dpo_batch([history]))
+
+    def test_legacy_duplicate_flag_does_not_drop_recovered_trace_action(self):
+        rows, scores = standard_rows()
+        trainer, history = make_trainer(scores), make_batch(rows)
+        # Legacy history counts the failed attempt as seen, while TRACE has
+        # already certified this successful retry as valid and nonduplicate.
+        history.non_tensor_batch["turn_dup_list"][1] = True
+        history.non_tensor_batch["trace_dup"] = np.zeros(len(rows), dtype=bool)
+        trainer._annotate_trace_credits(history)
+        pairs = trainer._trans_to_dpo_batch([history])
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0].non_tensor_batch["turn_index_list_a"].tolist(), [1])
+
+    def test_real_terminal_metadata_flows_into_both_pair_routes(self):
+        rows, scores = [], {}
+        for rollout, success in (("a", True), ("b", False)):
+            logs = [{"trace_turn_type": kind, "response": rollout + str(turn),
+                     "finish_reason": "stop"}
+                    for turn, kind in enumerate(("analysis", "tool_plan", "final_answer"))]
+            EXECUTION.annotate_trace_outcome(
+                logs, {"final_output": rollout + "2"}, float(success),
+                {"success": success, "valid": True})
+            for turn, log in enumerate(logs):
+                context = rollout + str(turn)
+                rows.append(make_row(context, rollout, turn, turn_type=log["trace_turn_type"],
+                                     reward=log["trace_outcome_reward"],
+                                     is_final=log["trace_is_final"],
+                                     outcome_valid=log["trace_outcome_valid"],
+                                     outcome_success=log["trace_outcome_success"],
+                                     external_error=log["trace_external_error"]))
+                scores[context] = -4.
+        trainer = make_trainer(scores, {"k": 3, "terminal_fill_enabled": True})
+        history = make_batch(rows)
+        trainer._annotate_trace_credits(history)
+        pairs = trainer._trans_to_dpo_batch([history])
+        self.assertEqual(len(pairs), 3)
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/trace_selected_unique"], 1)
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/outcome_selected_unique"], 2)
+        np.testing.assert_allclose(history.non_tensor_batch["trace_credit"][[1, 4]], [0.8, -0.8])
 
     def test_distributed_padding_does_not_inflate_pair_statistics(self):
         rows, scores = standard_rows()
@@ -283,7 +426,7 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
     def test_dropped_action_does_not_pollute_baseline(self):
         rows, scores = standard_rows()
         rows.extend([make_row("C0", "c", 0, old=-100, dropped=True),
-                     make_row("C1", "c", 1, turn_type="final")])
+                     make_row("C1", "c", 1, turn_type="final_answer")])
         scores.update(C0=-4., C1=-4.)
         history = make_batch(rows)
         trainer = make_trainer(scores)
@@ -296,8 +439,8 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
 
     def test_invalid_next_action_still_supplies_current_actions_next_state(self):
         rows = [make_row("A0", "a", 0), make_row("A1", "a", 1, valid=False),
-                make_row("A2", "a", 2, turn_type="final"),
-                make_row("B0", "b", 0), make_row("B1", "b", 1, turn_type="final")]
+                make_row("A2", "a", 2, turn_type="final_answer"),
+                make_row("B0", "b", 0), make_row("B1", "b", 1, turn_type="final_answer")]
         trainer = make_trainer(dict(A0=-4., A1=-2., A2=-8., B0=-4., B1=-8.))
         history = make_batch(rows)
         trainer._annotate_trace_credits(history)

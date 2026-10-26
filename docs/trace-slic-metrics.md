@@ -1,27 +1,68 @@
 # TRACE-SLIC 训练观察指标
 
-以下指标已接入原训练 metrics 字典，默认 console logger 会输出，无需另开开关。所有比例均为 0–1。分布没有有效样本时只输出 count，不伪造 0 分位数；应连同 count 看图。
+指标接入原训练 metrics 字典，默认 console logger 输出，无需额外开关。比例为 0–1。没有有效观测的分布只输出 count，不生成假均值或分位数。
+
+本轮有两条标签路线：`trace` 为工具局部信用加终局回填，`outcome` 为 analysis／实际最终回答的可验证奖励标签。观察总体统计时必须同时看来源，不能把奖励正负样本伪装成 GT 信用。
 
 ## 优先观察
 
-| 指标 | 分母与含义 | 如何解读 |
+| 指标 | 分母与含义 | 如何判断 |
 | --- | --- | --- |
-| `val/reward`、`val/completion_rate` | 有非空 triplet 的已完成验证轨迹 reward 均值；完成轨迹数 / 排队轨迹数 | 主要效果指标。只有二值 0/1 reward 时 reward 均值才是成功率；完成率变化会造成样本选择偏差 |
-| `trace/score_coverage` | 有效 GT 平均 LogP 的 Turn 数 / 全部保留 Turn 数 | 通常应较高；下降时看 missing_gt、missing_state、invalid_gt_length、overlong_state、scoring_invalid_result_turns |
-| `trace/credit_coverage` | 有有限信用的非末 Turn 数 / 保留的非末 Turn 数 | 天然没有后继的末 Turn 已排除；下降通常意味着缺初态、缺评分或原 Turn 编号断开 |
-| `trace/credit_p10`、`trace/credit_p50`、`trace/credit_p90` | 所有有限信用的分位数 | 看信号幅度和正负两端；均值可能因正负抵消而接近 0，不能单看均值 |
-| `trace/pair/positive_rate`、`trace/pair/negative_rate`、`trace/pair/neutral_rate` | 通过有效性、长度非空及数值检查的候选行中，各信用类别的比例 | 不要求正负各半。长期没有负信用时，严格配对自然不会产生 Pair，应核对状态、分布与阈值 |
-| `trace/pair/both_sign_group_rate` | 同时有正、负候选的同题同类型组 / 有有效候选行的组 | 全局正负都有，但此值低，说明同一问题和类型内缺少可比较的两侧 |
-| `trace/pair/value_match_rate` | 通过价值匹配的正负组合 / 同题同类型的全部正负组合 | 低时优先检查价值匹配阈值是否过紧、进度分布是否重叠 |
-| `trace/pair/selected_unique`、`trace/pair/question_coverage` | 每步最终原始 Pair 数；被选中 Pair 覆盖的问题数 / 本批已有 Turn 的不同 uid 数 | 看训练数据是否持续供给、是否只覆盖少数问题；计数发生在分布式补齐之前，未返回轨迹不在问题覆盖率分母中 |
-| `trace/pair/value_gap_p90`、`trace/pair/credit_gap_min` | 最终 Pair 的执行前价值差 P90、信用差最小值 | 应分别不超过 match_epsilon、不低于 gap_epsilon；用于核对配对约束 |
-| `trace/pair/cross_turn_rate`、`trace/pair/cross_rollout_rate` | 最终 Pair 中两端 turn 序号不同、rollout 不同的比例 | 确认跨 Turn 配对是否实际发生；不以越高越好作为目标 |
-| `trace/replay/sample_unique_pair_rate` | 本次采样的不同原始 Pair 数 / 采样条数 | 区分真实 Pair 多样性与补齐、重复抽样。明显偏低时，batch 很大也可能只是在反复用少数 Pair |
-| `trace/step_time_fraction` | TRACE 评分及信用汇总区间耗时 / 整个训练 step 耗时 | 观察该段逻辑的成本；不包含单独 action-reference 前向，也不代表全部新增参考模型成本 |
+| `val/reward`、`val/completion_rate`、`val/valid_rollout_rate` | 有效已完成验证轨迹的 reward 均值；完成／有效轨迹数除以排队数 | 完成率与有效率稳定时，reward 改善才具有可比性。只有二值奖励时均值可直接理解为成功率 |
+| `trace/score_coverage` | 有效 GT LogP Turn 数 / 全部保留 Turn 数 | 应稳定；奖励路线不要求 GT，不能把低评分覆盖直接当成所有 Pair 不可用 |
+| `trace/credit_coverage` | 有效信用工具 Turn 数 / 预期计算工具信用的 Turn 数 | 新流程分母通过 tool-only mask 排除 analysis／final；外部故障和评分缺失仍应结合原因计数看 |
+| `trace/local_credit_p10/p50/p90` | 不含终局回填的 K-step 工具信用分位数 | 观察纯局部信号，不要求正负各半 |
+| `trace/terminal_fill_p10/p50/p90` | 工具终局回填项分位数 | 与 local 信用一起看，检查回填是否主导；零填充值可能来自未触及 final 或终局优势为零 |
+| `trace/effective_credit_p10/p50/p90` | 局部信用加终局回填后的有效工具信用 | 工具 Pair 使用这一信号；不能与仅 K=1 的历史信用直接做幅度比较 |
+| `trace/pair/trace_selected_unique`、`outcome_selected_unique` | 补齐前各来源的 Pair 数 | 区分工具监督与终局奖励监督；数量只是运行诊断，不作为质量目标 |
+| `trace/pair/tool_value_match_rate` | 工具正负候选中通过价值匹配的比例 | 评估工具 margin 的实际筛选；混合来源的全局 value_match_rate 含奖励路线跳过匹配，不宜代替它 |
+| `trace/pair/value_gap_p90/max`、`credit_gap_min` | 选中工具 Pair 的动作前价值差、有效信用差 | 应符合工具 match_epsilon、gap_epsilon；小距离或大差距不独立证明真实可比性 |
+| `trace/pair/question_coverage` | Pair 覆盖的问题数 / 本批已有 Turn 的问题数 | 仅描述覆盖，不为提高覆盖放宽可靠性条件；未返回任何 Turn 的问题不在分母 |
+| `trace/external_error_turns`、`trace/credit_windows_blocked_external` | 外部故障 Turn 数、因故障阻断的信用窗口数 | 用于区分基础设施问题与模型质量，不能把过滤量上升直接当策略退化 |
+| `trace/outcome_invalid_rollouts` | 没有可信终局结果的 Rollout 数 | 增长时检查外部中断、实际 final 与 verifier 完成情况；不应自动转为失败负样本 |
+| `trace/replay/sample_unique_pair_rate` | 采样的不同原始 Pair 数 / 采样条数 | 区分真实多样性与分布式补齐／重复抽样 |
+| `trace/replay/slic_updated` | 本 step 是否完成 SLIC worker 更新 | 计划更新且有可靠数据时应为 1；没有合格 Pair 时跳过是允许行为 |
+
+## 状态、信用与终局信号
+
+分布后缀：`count` 为有效有限样本数；`mean/std` 为均值和标准差；`p10/p50/p90` 为分位数。所有分位数应与 count 一起解释。
+
+- `trace/gt_logp_{count,mean,std,p10,p50,p90}`：有效且不大于零的 GT 平均 Token LogP。
+- `trace/value_{count,mean,std,p10,p50,p90}`：相对各自初态的 GT 状态价值。
+- `trace/credit_{count,mean,std,p10,p50,p90}`：有效工具信用，含已启用的终局回填；与 `effective_credit` 在新流程中对应。
+- `trace/local_credit_{count,mean,std,p10,p50,p90}`：未回填的 K-step 工具信用。
+- `trace/terminal_fill_{count,mean,std,p10,p50,p90}`：工具终局优势回填项；`terminal_fill_nonzero_turns` 是非零有限项的数量，不能代表所有触及终局的窗口数。
+- `trace/effective_credit_{count,mean,std,p10,p50,p90}`：回填后的工具信用。
+- `trace/credit_abs_{count,p90}`：有效工具信用绝对值幅度；不追求越大越好。
+- `trace/{positive,negative,neutral}_{turns,rate}`：全部有限工具信用按严格阈值分类，尚未做 Pair 候选的动作质量过滤。
+- `trace/{type}/credit_{count,mean,p10,p50,p90}` 及三类 `turns/rate`：按决策类型拆分。analysis／final 采用奖励标签，其 GT credit count 为 0 是正常的。
+- `trace/label_source/{source}/turns`：来源行数，供观察工具与奖励监督构成。
+
+覆盖率分母：
+
+- `trace/turns_total`：本批全部保留 Turn 数。
+- `trace/terminal_turns`：每条 Rollout 最后可见 Turn 数；这个旧名称不表示确认环境正常终止。
+- `trace/credit_expected_turns`：新流程中预期计算工具信用的行数，排除奖励路线。
+- `trace/credit_missing_nonterminal`：预期工具行中未得到有效信用的数量。
+- `trace/unscored_credit_turns`：全部信用缺失行数，包含本就用奖励标签的 analysis／final，不应追求为零。
+- `trace/outcome_invalid_turns`：没有可信终局标签的行数，逐 Turn 统计；实际 final 后的可选输出也计入。`trace/outcome_invalid_rollouts`：整条 Rollout 没有任何可信终局标签行时才计入；可信 final 之后的无标签输出不会把该 Rollout 判为无效。
+- `trace/credit_windows_blocked`：所有原因导致不可用的信用窗口数，例如外部故障、编号缺口或所需状态缺失；`trace/credit_windows_blocked_external` 只计外部故障原因。两者不能混用。
+
+正常的成功／失败验证都会产生可信结果；verifier 调用或解析失败、外部中断等才是不可信。应优先使用明确的 verifier success 标记，不能根据正的格式奖励推断任务成功。
+
+终局回填的优势均值／标准差仅来自可信终局 Rollout 的去重统计。该人口可能与原 GRPO batch 不同；复用中心化与归一化口径不表示两者优势数值相同，原 GRPO 优势未被回写。
+
+## 评分准备与成本
+
+`trace/missing_gt`、`missing_state`、`invalid_gt_length`、`overlong_state` 是按顺序检查的首个拒绝原因，彼此互斥。超长状态和 GT 跳过，不截断。`scoring_invalid_result_turns` 是发出请求后取得无效 LogP 的 Turn 数；共享请求失败可能影响多行。
+
+`scoring_requests` 为去重后请求数；`deduplicated_states` 为复用行数；`scoring_dedup_rate` 为复用行数 / 成功映射行数。`scoring_prompt_tokens`、`scoring_gt_tokens` 是去重后、分布式补齐前的逻辑 token 数。
+
+`scoring_seconds` 是 GT reference RPC 的墙钟时间；`total_seconds` 还包括评分请求构造和信用汇总；`step_time_fraction` 为该区间占训练 step 比例，不包含所有新增参考模型成本，也不包含所有 Pair／Replay 工作。
 
 ## 配对筛选漏斗
 
-以下均以 `trace/pair/` 为前缀，是每步绝对计数：
+统一前缀 `trace/pair/`，以下为绝对组合数：
 
 ```text
 candidates_sign
@@ -32,61 +73,46 @@ candidates_sign
   -> selected_unique
 ```
 
-各阶段拒绝计数互斥：
+奖励路线默认跳过价值匹配和 TRACE 信用差门槛，但仍计入对应通过阶段，以保持漏斗守恒。因此全局 `value_match_rate=after_value_match/candidates_sign` 包含 bypass；看工具匹配应使用 `trace_after_value_match / trace_candidates_sign`，Trainer 额外汇总为 `tool_value_match_rate`。
 
-- `rejected_value_match`：正负信用都有，但价值差过大。
-- `rejected_credit_gap`：价值相近，但信用差不足。
-- `rejected_length`：前两项通过，但响应长度比过大。
-- `rejected_same_action`：前述通过，但两端为同一动作。
-- `rejected_group_cap`：通过全部质量条件后，受组内对数上限限制。
-- `rejected_global_cap`：通过全部质量条件后，受每步总对数上限限制。
+分来源候选计数：`trace_candidates_sign`、`trace_after_value_match`、`outcome_candidates_sign`、`outcome_after_value_match`。
 
-可核对 `candidates_sign = 所有 rejected 之和 + selected_unique`。`selection_rate` 是 selected_unique / candidates_sign，包含采样上限影响，不能将其低值全部归因于阈值过严。
+互斥拒绝原因：
 
-行与组的分母同时输出：`rows_total`、`rows_eligible`、`positive_rows`、`negative_rows`、`neutral_rows`、`groups_total`、`groups_eligible`、`groups_both_signs`、`groups_no_positive`、`groups_no_negative`。两个 no-sign 组计数可以重叠，例如全中性组同时缺两侧，不能将两者相加当作互斥过滤数。
+- `rejected_value_match`：需要价值匹配但未通过。
+- `rejected_credit_gap`：工具有效信用差不足；不用于奖励路线。
+- `rejected_length`：响应长度比过大。
+- `rejected_same_action`：两侧动作身份相同。
+- `rejected_group_cap`、`rejected_global_cap`：质量条件通过，但受到数量上限限制。
 
-`padding_duplicates` 单列为分布式对齐增加的条数；原有 `replay/n_new_pairs` 含这些条数，评估真实产量优先用 `trace/pair/selected_unique`。
+可核对 `candidates_sign = 全部 rejected 之和 + selected_unique`。`selection_rate` 含上限影响，不是质量正确率。排序先按本路线偏好分数差降序，再按价值距离和旧策略平均 Token LogP 距离依次打破平局。候选统一排序后应用全局上限，两种来源尚无尺度校准；若 `rejected_global_cap>0`，需检查来源占比是否受到影响。
 
-## 信用是否区别于轨迹最终成败
+行与组计数：`rows_total/rows_eligible`、`positive_rows/negative_rows/neutral_rows`、`groups_total/groups_eligible/groups_both_signs/groups_no_positive/groups_no_negative`。合格行中的正负比例与全局信用分类不同；奖励行按成功／失败分池，不应把其比例解释成 GT 正负信用。两个 no-sign 组计数可以重叠。
 
-以下针对最终选中的原始 Pair 计算，分母为 `trace/pair/outcome_pairs_count`：
+`trace/invalid_action_turns`、`duplicate_turns`、`dropped_prompt_turns` 为行级原因，彼此可能重叠。`padding_duplicates` 单列补齐重复数；`trace/unique_pairs` 与 `selected_unique` 均为补齐前数量。原 `replay/n_new_pairs` 可能含补齐，不代表真实多样性。
 
-| 指标 | 含义 |
-| --- | --- |
-| `trace/pair/chosen_failed_rollout_rate` | Chosen 的最终轨迹 reward <= 0 的比例 |
-| `trace/pair/rejected_successful_rollout_rate` | Rejected 的最终轨迹 reward > 0 的比例 |
-| `trace/pair/same_outcome_rate` | 两端轨迹具有相同成功/失败标记的比例 |
+## 最终 Pair 的来源、质量与结果
 
-这些指标直接观察新信用标签何时区别于轨迹 reward；它们不是因果正确率，也不应以越高越好为目标。reward 只用于指标汇总，不参与 TRACE 标签或选对。这里沿用 reward > 0 的成功标记；非二值任务需结合实际 reward 语义解读。
+- `trace_selected_unique`、`outcome_selected_unique`：各来源选中 Pair 数；`label_source_mismatch_pairs` 应为 0。
+- `value_gap_{count,p50,p90,max}`、`credit_gap_{count,p50,p90,min}`、`chosen_credit_{count,mean}`、`rejected_credit_{count,mean}`：仅统计 TRACE 工具 Pair，不把 reward 标签转成假 GT 信用。
+- `outcome_reward_gap_{count,p50,p90,min}`：奖励路线两侧最终 reward 差，单位与 TRACE 对数信用不同。
+- `length_ratio_{count,p90}`：全部 Pair 响应长度比。
+- `questions_covered/question_coverage`、`chosen_rows_unique/rejected_rows_unique/rows_unique`：问题及行覆盖，辅助检查极端样本复用。
+- `cross_turn_rate/cross_rollout_rate`：跨原始 Turn 编号／Rollout 比例，不以越高越好为目标。
+- `{type}/selected_unique`：各类型贡献的 Pair 数。
 
-`chosen_credit_mean`、`rejected_credit_mean`、`credit_gap_p50/p90/min`、`value_gap_p50/p90/max`、`length_ratio_p90` 用于看最终 Pair 的质量分布；`rows_unique`、`chosen_rows_unique`、`rejected_rows_unique`、`questions_covered` 用于看样本重复程度。
+`outcome_pairs_count` 是有双方可信成功标记的 Pair 数。`chosen_failed_rollout_rate`、`rejected_successful_rollout_rate`、`same_outcome_rate` 描述局部标签与最终结果的关系，不是因果正确率。新路径优先 verifier 布尔值；无 `label_source` 的旧诊断行仍按历史 reward > 0 解释。
 
-## 按决策类型拆分
+同样的终局描述按来源输出在 `trace/pair/trace/`、`trace/pair/outcome/` 下。奖励路线本来就按成功／失败选对，其不一致率天然接近 0；新增奖励 Pair 会改变整体比率，所以跨版本比较优先看工具来源的描述。
 
-`trace/{type}/credit_count`、`credit_mean`、`credit_p10/p50/p90`、`positive_rate`、`negative_rate`、`neutral_rate` 按实际出现的 analysis、tool_plan、final_answer 等类型输出。这里的比例分母是该类型的全部有限信用，不做动作有效性过滤；全局 `trace/positive_rate` 等也使用这一口径。进入 Pair 候选后的比例应看 `trace/pair/*_rate`。
+## Replay、验证与原有 Loss
 
-`trace/pair/{type}/selected_unique` 列出每种类型贡献的 Pair 数。单独生成的最终回答通常没有下一状态，信用缺失，因此 final_answer 无 Pair 是当前定义的正常边界。类型分布变化本身也可能影响总体信用分位数。
+- `trace/replay/sampled_pairs/unique_sampled_pairs/sample_unique_pair_rate`：实际采样量及不同原始 Pair 数，不能等同于优化次数。
+- `trace/replay/sample_age_p50/p90/max`：采样年龄，单位训练 step。
+- `trace/replay/buffer_unique_pairs`：缓存不同原始 Pair 数；身份包含出生 step，不代表动作语义已去重。
+- `trace/replay/slic_updated`：实际完成 SLIC 更新的 0/1 标记。
+- 原 `replay/buffer_size/n_dpo_batch`、`dpo_loss/sft_loss/calibration_loss/quality_gap/rewards/accuracy` 保留。后两者是模型拟合偏好标签的程度，不是任务成功率。
+- `rewards/chosen/rejected/margin` 使用整段概率，长响应易下溢，优先结合 per-token gap、损失分项与梯度解释。
+- `val/queued_rollouts/completed_rollouts/valid_rollouts`、`completion_rate/valid_rollout_rate` 保留；两种率分母都是排队轨迹数。`val/reward` 不把未返回轨迹自动记失败。
 
-## 实际训练与成本
-
-- `trace/replay/slic_updated`：本 step 是否完成一次 SLIC worker 更新，0 或 1。
-- `trace/replay/sampled_pairs`、`unique_sampled_pairs`：实际传给 SLIC 的 Pair 条数及不同原始 Pair 数；不是 PPO epoch 展开后的优化次数。
-- `trace/replay/sample_age_p50/p90/max`：采样 Pair 的年龄，单位为训练 step，定义为 current_step - born_step。
-- `trace/replay/buffer_unique_pairs`：缓存中的不同原始 Pair 数。去重身份包含问题、双方 rollout/turn 和出生 step，因此能识别分布式补齐产生的重复条目。
-- 原有 `replay/buffer_size`、`replay/n_dpo_batch` 保留；队列非空和采样条数较大不等于样本多样。
-- `trace/scoring_seconds`：GT 参考模型调用的墙钟耗时，包含 RPC 等待；`trace/total_seconds` 还包含请求构造与信用汇总。
-- `trace/scoring_requests`、`scoring_dedup_rate`：去重后评分请求数及复用比例；`scoring_prompt_tokens`、`scoring_gt_tokens` 是去重后、分布式补齐前的逻辑 token 数，不是硬件实际计算量。
-- `trace/turns_total`、`gt_logp_count`、`value_count`、`credit_count`、`credit_expected_turns`、`credit_missing_nonterminal`、`terminal_turns` 提供覆盖率分母。这里末 Turn 指每条 Rollout 当前可见的最大原始 Turn 编号，不表示已确认环境正常终止。末 Turn 的 NaN 会进入旧 `unscored_credit_turns`，排障应优先用排除了末 Turn 的 `credit_missing_nonterminal`。
-
-原有 SLIC `quality_gap` 是当前模型 Chosen 平均 token LogP 减去 Rejected 的差值，`rewards/accuracy` 是该差值大于 0 的 Pair 比例。它们衡量模型对标签的拟合，不能替代任务成功率。`rewards/chosen/rejected/margin` 使用整段概率，长响应容易下溢，优先看 quality_gap、calibration_loss 与 rewards/accuracy。
-
-验证时同时保留 `val/queued_rollouts`、`completed_rollouts`、`valid_rollouts`、`completion_rate`、`valid_rollout_rate`；完成数可含空轨迹，有效数要求非空 triplet，两种比例的分母都是排队轨迹数。`val/reward` 不将未完成轨迹自动记为失败，因此不是全量任务成功率。`val/turn_count` 是可训练 triplet 数，不是工具调用次数；结合 `val/sum_response_length` 观察交互长度和生成成本。
-
-## 建议的排查顺序
-
-1. Pair 长期为 0：先看 score_coverage、credit_coverage，再看候选 negative_rate 和 both_sign_group_rate。
-2. 两侧都有但仍无 Pair：沿漏斗找首个大量减少的阶段；先确认数据分布，再考虑该阶段的阈值。
-3. Pair 足够但没有训练改善：看 slic_updated、采样唯一率和年龄，再结合 quality_gap 与验证 reward 判断标签拟合是否转化为任务收益。
-4. 训练 reward 上升但验证不升：确认验证完成率与格式提取率稳定，再检查 Pair 的问题覆盖和类型分布。
-
-当前指标通过 CPU 回归校验分母、筛选守恒、补齐去重及采样不变性；尚未进行真实 GPU/NPU 训练观测。
+本轮未修改现有 SLIC Loss 的累计 SFT 或 Replay 倍率；其尺度和更新强度仍需独立对照。CPU 回归只验证指标分母、来源隔离、故障计数与数值行为，不能替代 GPU/NPU 训练效果验证。

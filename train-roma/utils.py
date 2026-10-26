@@ -175,7 +175,8 @@ class AnswerVerification(BaseModel):
 
 
 
-def compute_score(question: str,  groundtruth: str, answer_extracted: str,) -> bool:
+def compute_score(question: str, groundtruth: str, answer_extracted: str,
+                  return_details: bool = False):
     """
     Uses gpt-4o to determine if the extracted answer matches the groundtruth.
     
@@ -185,8 +186,17 @@ def compute_score(question: str,  groundtruth: str, answer_extracted: str,) -> b
         groundtruth: The correct answer label (e.g., "A").
 
     Returns:
-        A boolean indicating whether the answer is correct.
+        By default the original correctness result. With ``return_details``,
+        return a strict boolean verdict and its validity alongside the legacy
+        result, so parsing failures are not used as TRACE negative labels.
     """
+    def finish(value, valid=True):
+        if return_details:
+            return {"valid": bool(valid and isinstance(value, bool)),
+                    "success": value if valid and isinstance(value, bool) else None,
+                    "legacy_result": value}
+        return value
+
     if llm_scorer_engine is None:
         raise RuntimeError("LLM Scorer engine is not available.")
         
@@ -245,7 +255,7 @@ Required JSON structure:
     verification_result = llm_scorer_engine(query_prompt, response_format=AnswerVerification)
 
     if hasattr(verification_result, "true_false"):
-        return verification_result.true_false
+        return finish(verification_result.true_false)
     else:
         print("verification_result:", verification_result)
         ## judger output parsing
@@ -253,14 +263,14 @@ Required JSON structure:
 
         ## failed to load then it is forced to False.
         if judger_response is None:
-            return False
+            return finish(False, valid=False)
         
         if "true_false" in judger_response.keys():
             final_response = judger_response["true_false"]
             # print("final_response:", final_response)
-            return final_response
+            return finish(final_response)
 
-        return False
+        return finish(False, valid=False)
         
     
 

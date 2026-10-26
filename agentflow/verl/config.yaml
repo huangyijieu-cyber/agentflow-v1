@@ -15,9 +15,13 @@ data:
   trace:
     enabled: true
     epsilon: 0.1  # TRACE training gap offset (appendix A.1, table 4)
-    k: 1
-    gamma: 0.8  # TRACE TD discount; inactive when k=1
-    match_epsilon: 0.1
+    k: 3  # Total turn window, including the current turn and a final turn if reached.
+    gamma: 0.8
+    terminal_fill_enabled: true
+    terminal_fill_scale: 2.0
+    outcome_match_value: false
+    outcome_success_threshold: 0.5
+    match_epsilon: 0.05
     positive_threshold: 0.01
     negative_threshold: 0.01
     gap_epsilon: 0.02

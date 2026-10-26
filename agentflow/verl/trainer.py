@@ -30,7 +30,7 @@ from verl.utils.tracking import Tracking
 
 from .daemon import AgentModeDaemon
 from agentflow.rollout_timing import PHASES, profiling_enabled, write_validation_report
-from agentflow.trace_credit import TraceConfig, state_values, discounted_credits, select_pairs
+from agentflow.trace_credit import TraceConfig, state_values, annotate_rollout_credits, select_pairs
 from agentflow.trace_scoring import encode_state_requests, build_score_tensors, mean_gt_logps
 from agentflow.trace_metrics import summarize_states, summarize_selected_pairs
 
@@ -273,33 +273,129 @@ class AgentFlowTrainer(RayPPOTrainer):
                 if request_index is not None:
                     row_logps[row] = logps[request_index]
 
-        values = np.full(len(contexts), np.nan, dtype=np.float64)
-        credits = np.full(len(contexts), np.nan, dtype=np.float64)
+        non = batch.non_tensor_batch
+        size = len(contexts)
+        values = np.full(size, np.nan, dtype=np.float64)
+        credits = np.full(size, np.nan, dtype=np.float64)
+        local_credits = np.full(size, np.nan, dtype=np.float64)
+        terminal_fills = np.full(size, np.nan, dtype=np.float64)
+        blocked = np.zeros(size, dtype=bool)
+        external_blocked = np.zeros(size, dtype=bool)
+        reached = np.zeros(size, dtype=bool)
+        expected_credit = np.zeros(size, dtype=bool)
         groups = defaultdict(list)
-        turns = batch.non_tensor_batch["turn_index_list"]
-        uids = batch.non_tensor_batch["uid"]
-        rollouts = batch.non_tensor_batch["rollout_id_list"]
+        turns = non.get("trace_original_turn", non["turn_index_list"])
+        uids = non["uid"]
+        rollouts = non["rollout_id_list"]
+        types = non["trace_turn_type"]
+        external = np.asarray(non.get("trace_external_error", np.zeros(size)), dtype=bool)
+        final_flags = np.asarray(non.get("trace_is_final", np.zeros(size)), dtype=bool)
+        raw_valid = np.asarray(non.get("trace_outcome_valid", np.zeros(size)), dtype=bool)
+        raw_success = non.get("trace_outcome_success", [None] * size)
+        raw_rewards = non.get("trace_outcome_reward", non.get("reward_list"))
+        if raw_rewards is None:
+            raw_rewards = batch.batch["token_level_scores"].sum(dim=-1).float().cpu().tolist()
+        outcome_valid = np.zeros(size, dtype=bool)
+        outcome_success = np.empty(size, dtype=object)
+        outcome_success[:] = None
+        outcome_rewards = np.asarray(raw_rewards, dtype=np.float64)
+        outcome_advantages = np.full(size, np.nan, dtype=np.float64)
+        within_prefix = np.ones(size, dtype=bool)
+        label_sources = np.full(size, "none", dtype=object)
         for row, (uid, rollout) in enumerate(zip(uids, rollouts)):
             groups[(str(uid), str(rollout))].append(row)
-        for rows in groups.values():
+        reliable = defaultdict(list)
+        for key, rows in groups.items():
             rows.sort(key=lambda row: int(turns[row]))
+            finals = [row for row in rows if final_flags[row]
+                      and str(types[row]) in ("final_answer", "direct", "base")]
+            if len(finals) == 1 and int(final_flags[rows].sum()) == 1:
+                final = finals[0]
+                for row in rows:
+                    within_prefix[row] = int(turns[row]) <= int(turns[final])
+                prefix = [row for row in rows if within_prefix[row]]
+                reward = outcome_rewards[final]
+                trustworthy = (all(raw_valid[row] for row in prefix)
+                               and np.isfinite(reward)
+                               and np.isfinite(outcome_rewards[prefix]).all()
+                               and np.allclose(outcome_rewards[prefix], reward, rtol=0, atol=1e-8))
+                success = raw_success[final]
+                if trustworthy:
+                    if isinstance(success, (bool, np.bool_)):
+                        success = bool(success)
+                    elif success is None:
+                        # Only an explicitly valid scalar verifier may use this
+                        # fallback. Missing/failed verification never becomes 0.
+                        success = bool(reward > cfg.outcome_success_threshold)
+                    else:
+                        trustworthy = False
+                if trustworthy:
+                    outcome_valid[prefix] = True
+                    outcome_success[prefix] = success
+                    reliable[key[0]].append((key, float(reward)))
+            for offset, row in enumerate(rows):
+                if str(types[row]) == "analysis":
+                    label_sources[row] = "outcome"
+                elif final_flags[row] and str(types[row]) in ("final_answer", "direct", "base"):
+                    label_sources[row] = "outcome"
+                elif str(types[row]) == "tool_plan":
+                    label_sources[row] = "trace"
+                    expected_credit[row] = offset < len(rows) - 1 and within_prefix[row]
+
+        algorithm_cfg = getattr(self.config, "algorithm", {})
+        norm_by_std = algorithm_cfg.get("norm_adv_by_std_in_grpo", True)
+        for observations in reliable.values():
+            rewards = np.asarray([reward for _, reward in observations], dtype=np.float64)
+            # Match agent-aware GRPO's one-observation special case and sample
+            # standard deviation, without changing its actual training rewards.
+            mean = float(rewards.mean()) if len(rewards) > 1 else 0.0
+            std = float(rewards.std(ddof=1)) if len(rewards) > 1 else 1.0
+            for key, reward in observations:
+                advantage = (reward - mean) / (std + 1e-6) if norm_by_std else reward - mean
+                for row in groups[key]:
+                    if outcome_valid[row]:
+                        outcome_advantages[row] = advantage
+
+        for rows in groups.values():
             # An absent initial turn cannot be silently replaced by a later baseline.
-            if int(turns[rows[0]]) != 0:
-                continue
-            rollout_values = state_values(row_logps[rows], epsilon=cfg.epsilon)
-            rollout_credits = discounted_credits(
-                rollout_values, [int(turns[row]) for row in rows], k=cfg.k, gamma=cfg.gamma,
+            rollout_values = (state_values(row_logps[rows], epsilon=cfg.epsilon)
+                              if int(turns[rows[0]]) == 0 else [float("nan")] * len(rows))
+            trusted_rows = [row for row in rows if outcome_valid[row]]
+            annotated = annotate_rollout_credits(
+                rollout_values, [int(turns[row]) for row in rows],
+                [str(types[row]) for row in rows], external[rows].tolist(), final_flags[rows].tolist(),
+                outcome_valid=bool(trusted_rows),
+                outcome_advantage=float(outcome_advantages[trusted_rows[0]]) if trusted_rows else float("nan"),
+                config=cfg,
             )
             values[rows] = rollout_values
-            credits[rows] = rollout_credits
-        batch.non_tensor_batch["trace_gt_logp"] = row_logps
-        batch.non_tensor_batch["trace_value"] = values
-        batch.non_tensor_batch["trace_credit"] = credits
+            local_credits[rows] = annotated["local_credit"]
+            terminal_fills[rows] = annotated["terminal_fill"]
+            credits[rows] = annotated["effective_credit"]
+            blocked[rows] = annotated["window_blocked"]
+            external_blocked[rows] = annotated["external_error_blocked"]
+            reached[rows] = annotated["terminal_reached"]
+        non.update({
+            "trace_gt_logp": row_logps, "trace_value": values, "trace_credit": credits,
+            "trace_local_credit": local_credits, "trace_terminal_fill": terminal_fills,
+            "trace_credit_window_blocked": blocked, "trace_terminal_reached": reached,
+            "trace_external_window_blocked": external_blocked,
+            "trace_external_error": external, "trace_is_final": final_flags,
+            "trace_outcome_valid": outcome_valid, "trace_outcome_success": outcome_success,
+            "trace_outcome_reward": outcome_rewards, "trace_outcome_advantage": outcome_advantages,
+            "trace_within_final_prefix": within_prefix, "trace_label_source": label_sources,
+        })
         metrics = {"trace/" + key: value for key, value in counters.items()}
         metrics.update(summarize_states(
-            row_logps, values, credits, batch.non_tensor_batch["trace_turn_type"],
+            row_logps, values, credits, types,
             [(str(uid), str(rollout)) for uid, rollout in zip(uids, rollouts)], turns, cfg,
+            local_credits=local_credits, terminal_fills=terminal_fills, window_blocked=external_blocked,
+            external_errors=external, outcome_valid=outcome_valid, label_sources=label_sources,
+            credit_expected_mask=expected_credit,
         ))
+        metrics["trace/terminal_reached_turns"] = int(reached.sum())
+        metrics["trace/credit_windows_blocked"] = int(blocked.sum())
+        metrics["trace/post_final_turns"] = int((~within_prefix).sum())
         metrics["trace/scoring_seconds"] = scoring_seconds
         metrics["trace/scoring_prompt_tokens"] = sum(len(r["prompt_ids"]) for r in requests)
         metrics["trace/scoring_gt_tokens"] = sum(len(r["target_ids"]) for r in requests)
@@ -320,7 +416,10 @@ class AgentFlowTrainer(RayPPOTrainer):
             split_keys.append("ref_log_prob")
         common_keys = ["data_id_list", "uid", "traj_id_list", "traj_uid"]
         side_keys = ["turn_index_list", "rollout_id_list", "trace_turn_type",
-                     "trace_gt_logp", "trace_value", "trace_credit"]
+                     "trace_gt_logp", "trace_value", "trace_credit",
+                     "trace_local_credit", "trace_terminal_fill", "trace_label_source",
+                     "trace_outcome_valid", "trace_outcome_success", "trace_outcome_reward",
+                     "trace_outcome_advantage", "trace_is_final", "trace_external_error"]
         proto_list = []
         pair_metrics = defaultdict(int)
         diagnostic_rows, diagnostic_pairs = [], []
@@ -333,10 +432,12 @@ class AgentFlowTrainer(RayPPOTrainer):
             lengths = masks.sum(dim=-1).cpu().tolist()
             means = ((history.batch["old_log_probs"] * masks).sum(dim=-1)
                      / masks.sum(dim=-1).clamp(min=1)).float().cpu().tolist()
-            outcomes = history.batch["token_level_scores"].sum(dim=-1).float().cpu().tolist()
+            outcomes = non["trace_outcome_reward"]
             drop = history.batch.get("is_drop_mask")
             valid = non.get("trace_valid", np.zeros(len(lengths), dtype=bool))
-            dup = non.get("turn_dup_list", np.zeros(len(lengths), dtype=bool))
+            # TRACE dedup excludes failed attempts from its seen set. Legacy
+            # response dedup would incorrectly drop a successful identical retry.
+            dup = non.get("trace_dup", np.zeros(len(lengths), dtype=bool))
             action_keys = non.get("trace_action_key")
             rows = []
             for i, length in enumerate(lengths):
@@ -350,9 +451,16 @@ class AgentFlowTrainer(RayPPOTrainer):
                     "value": float(non["trace_value"][i]),
                     "credit": float(non["trace_credit"][i]),
                     "valid": bool(valid[i]) and not bool(dup[i])
+                             and not bool(non["trace_external_error"][i])
+                             and bool(non["trace_within_final_prefix"][i])
                              and (drop is None or not bool(drop[i].item())),
                     "length": int(length), "old_per_token": means[i],
                     "outcome_reward": outcomes[i],
+                    "outcome_valid": bool(non["trace_outcome_valid"][i]),
+                    "outcome_success": non["trace_outcome_success"][i],
+                    "label_source": str(non["trace_label_source"][i]),
+                    "is_final": bool(non["trace_is_final"][i]),
+                    "external_error": bool(non["trace_external_error"][i]),
                     "action_key": action_keys[i] if action_keys is not None and action_keys[i] is not None else tuple(response),
                 })
                 pair_metrics["trace/invalid_action_turns"] += int(not bool(valid[i]))
@@ -371,8 +479,12 @@ class AgentFlowTrainer(RayPPOTrainer):
                 peers = [r for r in rows if r["valid"] and r["length"] > 0
                          and r["uid"] == rows[chosen]["uid"]
                          and r["turn_type"] == rows[chosen]["turn_type"]
-                         and np.isfinite(r["value"]) and np.isfinite(r["old_per_token"])
-                         and abs(r["value"] - rows[chosen]["value"]) <= cfg.match_epsilon]
+                         and r["label_source"] == rows[chosen]["label_source"]
+                         and np.isfinite(r["old_per_token"])
+                         and (r["label_source"] == "trace" or r["outcome_valid"])
+                         and ((r["label_source"] == "outcome" and not cfg.outcome_match_value)
+                              or (np.isfinite(r["value"]) and np.isfinite(rows[chosen]["value"])
+                                  and abs(r["value"] - rows[chosen]["value"]) <= cfg.match_epsilon))]
                 baseline = float(np.mean([r["old_per_token"] for r in peers]))
                 payload = {key + "_a": history.batch[key][chosen:chosen + 1] for key in split_keys}
                 payload.update({key + "_b": history.batch[key][rejected:rejected + 1] for key in split_keys})
@@ -401,6 +513,9 @@ class AgentFlowTrainer(RayPPOTrainer):
         matched = pair_metrics["trace/pair/after_value_match"]
         pair_metrics["trace/pair/both_sign_group_rate"] = pair_metrics["trace/pair/groups_both_signs"] / eligible_groups if eligible_groups else 0.0
         pair_metrics["trace/pair/value_match_rate"] = matched / sign_candidates if sign_candidates else 0.0
+        tool_candidates = pair_metrics["trace/pair/trace_candidates_sign"]
+        pair_metrics["trace/pair/tool_value_match_rate"] = (
+            pair_metrics["trace/pair/trace_after_value_match"] / tool_candidates if tool_candidates else 0.0)
         pair_metrics["trace/pair/selection_rate"] = len(proto_list) / sign_candidates if sign_candidates else 0.0
         all_questions = {row["uid"] for row in diagnostic_rows}
         pair_metrics["trace/pair/question_coverage"] = pair_metrics["trace/pair/questions_covered"] / len(all_questions) if all_questions else 0.0

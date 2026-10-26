@@ -15,6 +15,7 @@ from agentflow.models.memory import Memory
 from agentflow.models.executor import Executor
 from agentflow.models.utils import make_json_serializable_truncated
 from agentflow.rollout_timing import RolloutTiming, is_search_tool, profiling_enabled
+from agentflow.trace_execution import classify_tool_result
 
 
 def log_info(message):
@@ -29,28 +30,8 @@ def _serialize_qa_anchor(state):
 
 
 def _trace_tool_result_failed(result):
-    """Recognize tool failure envelopes, without scanning retrieved prose."""
-    if result is None:
-        return True
-    if isinstance(result, dict):
-        if result.get("success") is False:
-            return True
-        if result.get("status") in ("error", "failed", "failure", "timeout"):
-            return True
-        return any(bool(result.get(key)) for key in ("error", "exception", "error_message"))
-    if isinstance(result, (list, tuple)):
-        return not result or any(_trace_tool_result_failed(item) for item in result)
-    if isinstance(result, str):
-        text = result.strip()
-        # These prefixes are emitted by the executor and search tool adapters.
-        return not text or text.startswith((
-            "Error:", "Error in execute_tool_command:", "Error importing tool '",
-            "Execution timed out after ", "No execution captured from block:",
-            "No result was generated because the tool was not found.",
-            "Error fetching URL:", "Error extracting text:", "Error processing Web RAG:",
-            "Yibu Brave Search gateway request failed.",
-        )) or (text.startswith("Yibu Brave Search tried ") and " but failed. Last error:" in text)
-    return False
+    """Recognize final execution failures without scanning retrieved prose."""
+    return classify_tool_result(result)["failed"]
 
 
 class Solver:
@@ -238,7 +219,11 @@ class Solver:
                     # Attach execution quality to the exact planner decision that
                     # produced it. This does not change execution or state history.
                     action_log = self.planner.logs[-1]
-                    action_log["trace_tool_failed"] = _trace_tool_result_failed(result)
+                    execution_status = classify_tool_result(result)
+                    action_log["trace_tool_failed"] = execution_status["failed"]
+                    action_log["trace_external_error"] = execution_status["external_error"]
+                    action_log["trace_error_type"] = execution_status["error_type"]
+                    action_log["trace_error_source"] = execution_status["error_source"]
                     action_log["trace_action_key"] = json.dumps(
                         [tool_name, command.strip() if isinstance(command, str) else command],
                         ensure_ascii=False, sort_keys=True,

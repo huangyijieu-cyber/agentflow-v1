@@ -1,141 +1,134 @@
-# TRACE 状态价值与 SLIC 配对
+# TRACE 状态信用与分类型 SLIC 配对
 
-本实现用冻结参考模型对 GT 的可预测性变化分配 Turn 信用，再按相近任务进度构造 SLIC 偏好对。默认对包含 `slic` 的算法启用；GRPO 的奖励、优势计算和现有 SLIC loss 代码保持原样。
+本实现按决策类型选择偏好标签：analysis 和实际最终回答使用可验证的最终任务结果，工具 Turn 使用 K-step GT 信用及可选的终局优势回填。配对质量优先；没有合格正负两侧时跳过，不为凑数量放宽条件。SLIC Loss、原 GRPO 训练公式和 Replay 更新剂量保持原样。
+
+本轮待办已完成实现与 CPU 集成回归，修改纳入 `trace` 分支；GPU/NPU 端训练效果尚未验证。修改状态见 [修改记录](trace-slic-change-log.md)。
 
 ## 状态与 GT 评分
 
-每个可训练 Turn 都保存自己的评分上下文：从该次实际使用的 Prompt 中去掉当前决策的 Task、指令和输出格式要求，保留原有问题、上下文与工具信息，再附加统一回答指令：
+每个可训练 Turn 保存自己的 `trace_state_context`：从实际 Prompt 中去掉当前决策指令、Task 和输出格式要求，保留该角色原有问题、工具信息、分析或交互历史。统一附加：
 
 ```text
 Answer the question directly and concisely.
 ```
 
-评分上下文来自该 Turn 的原 Prompt，不通过 memory 另行重建。下一状态使用同一 Rollout 中下一个真实可训练 Turn 的评分上下文。因此 query analysis、工具规划、最终回答等类型都可计算价值与信用；相邻两个状态的角色和模板可能不同，去除决策指令只能减小模板影响，不能保证完全消除。
-
-QA runner 自动追加的 `<answer>` 输出格式要求也只从评分上下文中移除，以便评分裸 GT；使用本次完整输入与原始问题的精确映射，保留用户问题自带的要求。真实生成 Prompt 与原生 Token IDs 保持原样。
-
-对问题 $x$ 的第 $g$ 条 Rollout，在第 $t$ 个状态使用固定 GT $y^*$ 做独立 teacher forcing：
+使用冻结参考模型、温度 1，对固定 GT 做 teacher forcing，只平均 GT Token 的 LogP：
 
 $$
-\bar\ell_{g,t}=\frac{1}{|y^*|}\sum_{j=1}^{|y^*|}
-\log\pi_{\mathrm{ref}}(y^*_j\mid S_{g,t},y^*_{<j}),
+\bar\ell_{g,t}=\frac{1}{|y^*|}\sum_j\log\pi_{\mathrm{ref}}(y_j^*\mid S_{g,t},y_{<j}^*),
 \qquad
 V_{g,t}=\log\frac{-\bar\ell_{g,0}+\epsilon}{-\bar\ell_{g,t}+\epsilon}.
 $$
 
-参考模型冻结，评分温度固定为 1；仅对 GT Token 求平均，不将生成动作的 logP 当作 GT logP。GT 只进入独立评分请求，不写入 agent Prompt、工具输入或 Rollout 采样上下文。GT 有多个别名时，固定选择第一个非空答案，避免随状态选择最高概率别名。
+GT 仅进入独立评分请求，不写入 Rollout 生成上下文；多个别名固定选择第一个非空答案。相同 token 化的状态和 GT 在评分批次内去重。缺失 GT、GT 超长或评分上下文超长时跳过评分，不截断来制造信用。
 
-空 GT、超过 `max_gt_tokens` 的 GT 和无法完整容纳的评分上下文跳过 TRACE 评分，不截断 GT 或状态来制造价值。缺失、非有限的评分不会被当作 0，也不会改用最终奖励补造信用。
-
-## 相邻 Turn 信用
-
-第一版默认 `k=1`：
+工具动作的基本增益仍来自同一 Rollout 中真实相邻 Turn 的动作前状态：
 
 $$
-c_{g,t}=\delta_{g,t}=V_{g,t+1}-V_{g,t}
-=\log\frac{-\bar\ell_{g,t}+\epsilon}{-\bar\ell_{g,t+1}+\epsilon}.
+\delta_t=V_{t+1}-V_t
+=\log\frac{-\bar\ell_t+\epsilon}{-\bar\ell_{t+1}+\epsilon}.
 $$
 
-配置保留 K-step 折扣平均形式，便于后续实验：
+原始 Turn 编号存在缺口、状态缺失或评分非有限时，不跨越缺口拼接。最后可见状态本身并不等于已验证终局；最终回答没有自然 GT 后状态，也不虚构 `delta_final`。
 
-$$
-c_{g,t}^{(K)}=
-\frac{\sum_{u=t}^{h}\gamma^{u-t}(V_{g,u+1}-V_{g,u})}
-{\sum_{u=t}^{h}\gamma^{u-t}},\qquad
-h=\min(t+K-1,N_g-2).
-$$
+## 按类型选择标签
 
-其中 $N_g$ 为实际记录的可训练状态数，$0\leq t<N_g-1$。只使用存在真实后继状态的增益；窗口不会跨 Rollout、缺失 Turn 或无效状态。`k=1` 时 `gamma` 不影响结果。
-
-最后一个可训练 Turn 没有自然后继，其信用记录为 NaN，不进入偏好对。实现不会拼接已生成答案来虚构后状态，也不会把 terminal 价值设置成 0。这意味着典型 QA 轨迹的最后回答 Turn 仍由原 GRPO 训练，但没有 TRACE 偏好监督；这是当前基于“下一个真实 Turn”定义的边界限制。
-
-## 偏好对与 Loss
-
-候选对必须来自同一问题 `uid`、同一决策类型，允许不同 Turn 和不同 Rollout；使用价值匹配取代原先同 turn 的分组限制。类型由生成调用的角色决定，避免将分析、工具规划和回答动作相互比较。
-
-$$
-|V_i-V_j|\leq\epsilon_{\mathrm{match}},\quad
-c_i^{(K)}>\delta_{\mathrm{pos}},\quad
-c_j^{(K)}<-\delta_{\mathrm{neg}},\quad
-c_i^{(K)}-c_j^{(K)}\geq\epsilon_{\mathrm{gap}}.
-$$
-
-Chosen 和 Rejected 必须严格正、负；零信用、中性动作不能充当 Rejected。没有有效负信用样本时直接跳过该组，不以成功/失败轨迹标签、最终 reward 或 Anchor 文本相似度兜底。工具执行失败、重复动作和无效 Response 按有效性标记过滤。保留响应长度比和采样数量限制，避免少数问题产生过多样本对。
-
-SLIC loss 继续分别在两个动作各自的原始 Prompt 下计算策略 logP，执行现有的 per-token calibration 与 Chosen SFT，不把两个动作搬到公共 Prompt。GT 价值只用于选对，不替换 loss 中的策略 logP，也不向 loss 新增 reference ratio。传入 SFT 的 baseline 仍为旧策略的 per-token logP 均值，候选邻域改为同问题、同类型、相近价值的状态；不采用 GT logP 作为 baseline。
-
-## 配置与推荐初值
-
-全部参数位于 `data.trace`；基础声明在 `agentflow/verl/config.yaml`，`train-roma/config.yaml` 与 `train-roma/config_grpo+slic.yaml` 提供对应的 `TRACE_*` 环境变量。
-
-| 参数 | 初值 | 含义 |
+| 决策 | 标签来源 | GT 价值／信用是否必需 |
 | --- | --- | --- |
-| `enabled` | `true` | 仅算法包含 `slic` 时生效；关闭则恢复 legacy SLIC 配对 |
-| `epsilon` | `0.1` | 按 TRACE 主实验设置的 training gap offset，控制低 NLL 区域的信用幅度 |
-| `k` | `1` | 信用窗口长度，先验证单步增益 |
-| `gamma` | `0.8` | 对齐 TRACE 的 TD discount；K=1 时不生效 |
-| `match_epsilon` | `0.1` | 动作前价值差上限；同初始状态下，偏移后的 gap 比不超过约 `exp(0.1)=1.105` |
-| `positive_threshold` | `0.01` | Chosen 信用须大于此值，约对应偏移后的 gap（NLL + epsilon）下降超过 1% |
-| `negative_threshold` | `0.01` | Rejected 信用须小于其负值，约对应偏移后的 gap（NLL + epsilon）上升超过 1% |
-| `gap_epsilon` | `0.02` | 正负信用差下限；当前被两侧严格 0.01 阈值隐含，不额外减少候选 |
-| `length_ratio_max` | `1.8` | 正负 Response 的最大长度比 |
-| `k_pairs_per_group` | `2` | 每个候选组保留的最大对数 |
-| `max_pairs_per_step` | `256` | 每训练 step 新增偏好对上限 |
-| `max_gt_tokens` | `256` | GT Token 上限，超长时跳过而非截断 |
-| `gt_alias_strategy` | `first` | 固定第一个非空 GT；当前只支持此策略 |
-| `answer_instruction` | 见上文 | 统一的简短回答指令 |
+| `analysis` | 所属 Rollout 的可验证最终成功／失败 | 默认不要求；不接收工具 K-step 信用或回填 |
+| 实际用于最终验证的回答（`final_answer`、`direct` 或 `base`） | 可验证最终成功／失败 | 默认不要求自然后继或 GT 信用 |
+| 工具规划 Turn | K-step 局部信用加符合条件的终局优势回填 | 要求有效状态价值和有效窗口信用 |
 
-`epsilon=0.1` 对齐 [TRACE 原论文 §4.1 和附录 A.1 表 4](https://arxiv.org/html/2607.13988v1#A1.SS1) 及[官方启动脚本](https://github.com/MSR-Orchard/trace/blob/a9270366bab360519705976f1606a08bedddd342/examples/search-r1/trace/run_trace.sh#L212)。这里使用的是训练 gap offset；附录 A.2 离线诊断中的 `epsilon_diag=0.001`，以及表 4 中另列的 legacy transform stabilizer `0.001`，都不是主实验使用的 gap offset。epsilon 同时控制接近零 NLL 时的信用放大幅度，并非只用于防止除零。例如 NLL 从 `0.1` 降至 `0` 时，epsilon=0.1 对应信用 `log(2)`。
+最终结果必须可信。verifier 调用／解析失败、外部中断或没有实际完成的最终回答，不应伪装成模型失败；对应结果不能用于奖励 Pair 或终局回填。优先采用明确的 verifier 成功布尔标记；数值奖励的兼容判别由 `outcome_success_threshold` 控制，不能把正的格式分一概当作成功。二值 `0/1` 中，失败的 `0` 是 Rejected 类，不要求存在负数奖励。
 
-参数来源需逐项区分：
+## K=3 与实际 final 边界
 
-| 来源 | 参数 | 当前处理 |
+K 表示包含当前实际 Turn 在内的总窗口，默认 K=3。实际 final 回答本身占一个窗口位置，analysis 不接收工具信用。只对窗口内确实存在的工具转移增益求折扣平均：
+
+$$
+c_t^{(K)}=\frac{\sum_{u\in\mathcal W_t^{\mathrm{tool}}}\gamma^{u-t}\delta_u}
+{\sum_{u\in\mathcal W_t^{\mathrm{tool}}}\gamma^{u-t}},
+\quad
+\mathcal W_t=[t,\min(t+K-1,\text{末可见 Turn})].
+$$
+
+final 的执行结果单独用于终局项，不作为 GT delta 混入局部平均。窗口触及实际已完成且验证可信的 final 时，对工具 Turn 回填：
+
+$$
+\widetilde c_t=c_t^{(K)}+
+\mathbf1[\mathcal W_t\text{触及可信 final}]
+\lambda_{\mathrm{term}}\gamma^{f-t}A_g^{\mathrm{out}},
+$$
+
+其中 f 为真实 final 的原始 Turn 编号，折扣距离与总窗口的计数一致。用于 TRACE 回填的终局优势仅在有可信终局结果的同题 Rollout 中计算，并按 Rollout 去重。复用的是原 GRPO 的中心化、是否除以标准差及单例组特例等计算口径；可信 Rollout 的统计人口可能与实际 GRPO batch 不同，因此两条路径的优势数值不保证相同。它不是直接把原始奖励 R 加到信用上，也不会回写或修改原 GRPO 优势。局部信用、回填项及回填后信用分别保留。
+
+例如 `analysis → tool A → tool B → tool C → final`，K=3：
+
+| 工具 Turn | 窗口 | 是否回填 |
 | --- | --- | --- |
-| TRACE 主实验 | `epsilon=0.1`、`gamma=0.8`、K-step 归一化 | 采用论文数值和归一化公式；[官方启动脚本](https://github.com/MSR-Orchard/trace/blob/a9270366bab360519705976f1606a08bedddd342/examples/search-r1/trace/run_trace.sh#L211-L220) 也使用相同设置 |
-| 本次实验约定 | `k=1` | 用户指定先用单步；论文主实验为 K=3 |
-| 新增 SLIC 配对参数 | `match_epsilon`、`positive_threshold`、`negative_threshold`、`gap_epsilon` | TRACE 原文不构造偏好对，没有这些参数的推荐值；表中为本项目的待校准初值 |
-| 本项目筛选与采样上限 | `length_ratio_max=1.8`、`k_pairs_per_group=2`、`max_pairs_per_step=256` | 控制长度差与训练剂量，不能归因于 TRACE 论文；长度比 1.8 曾在旧代码中列出，最新 cache 中该过滤未启用，本实现显式启用 |
-| 本项目评分设置 | `max_gt_tokens=256`、`gt_alias_strategy=first`、`answer_instruction` | 分别是资源上限、固定答案选择和按本次约定使用的简短评分指令，均不是论文推荐超参数；超长 GT 应检查跳过比例并按实际数据调整上限 |
+| A | A、B、C | 否 |
+| B | B、C、final | 是，系数 `lambda * gamma**2` |
+| C | C、final | 是，系数 `lambda * gamma` |
 
-论文另有 terminal fill scale=2.0、outcome weight=1.0 和 turn weight=0.2，用于 TRACE 的 GRPO 优势混合。本方案只用局部信用构造 SLIC 标签，遵循严格正负信用及原 SLIC loss 的约定，因此未移植这些优势混合项。论文附录 A.2 的初始 raw logP 差阈值 0.2 用于离线诊断分组，也不能作为本方案状态价值匹配阈值的依据。
+因此本项目的 K=3 最多向 final 前两个工具 Turn 回填。这是明确包含 final 的总 Turn 窗口约定；与 TRACE 论文按工具转移计 K 的约定不同，不能同时声称回填最后三个工具 Turn。
 
-配对初值的解释与校准范围如下，范围用于后续消融，不会自动搜索或修改配置：
+## 外部故障与窗口隔离
 
-- `match_epsilon=0.1`：在同初始状态下容许约 10.5% 的偏移后 gap 比例差；可对照 0.05、0.1、0.2。
-- 两侧信用阈值各 0.01：设置约 1% 的偏移后 gap 变化幅度门槛；可对照 0.005、0.01、0.02，并持续要求严格正负。
-- `gap_epsilon=0.02`：两侧严格超过 0.01 已隐含信用差大于 0.02，该默认值不额外过滤；若需独立的强差异条件，可对照 0.03 或 0.05。
+网络请求超时、连接／DNS 失败、服务不可用、网关或外部限流等最终未恢复故障，应标为外部故障；对应 Turn 不能进入 Chosen 或 Rejected。优先识别结构化执行状态及已知适配器错误格式，不扫描网页正文中的普通 error 文本。
 
-观察有效状态、正负信用样本和最终 pair 数量；这些配对初值未经过训练验证。若负样本稀少，应检查价值分布和阈值，不能放宽为非正样本或用失败轨迹代替。
+正常无搜索结果不是网络故障；模型非法工具名／参数也不能自动归为外部故障。内部重试后成功取得结果，按最终成功状态处理。
 
-从仓库根目录启动，环境变量可以覆盖 YAML 初值，命令行参数会在 YAML 参数之后追加并最终覆盖：
+包含外部故障转移的工具 K-step 窗口信用不可用，不参与 Pair。不把故障 delta 填成 0，也不删除故障后连接原本不相邻的状态。故障导致终局无法可靠验证时，analysis／final 奖励 Pair 与工具终局回填也不可使用该结果。
+
+## 配对、排序与 Loss
+
+候选必须同 `uid`、同决策类型和同标签来源，允许不同 Rollout、不同 Turn 序号。两侧均过滤无效响应、执行故障、重复动作、被丢弃的 Prompt 和异常数值。
+
+工具候选要求：
+
+$$
+|V_i-V_j|\leq\epsilon_{\mathrm{match}},\qquad
+\widetilde c_i>\delta_{\mathrm{pos}},\qquad
+\widetilde c_j<-\delta_{\mathrm{neg}},\qquad
+\widetilde c_i-\widetilde c_j\geq\epsilon_{\mathrm{gap}}.
+$$
+
+analysis／final 依据可信成功／失败分池，默认不施加 GT 价值距离门槛；可用 `outcome_match_value=true` 显式开启。工具 Turn 仍要求严格正负有效信用，没有负样本不以终局 reward 兜底。两条路线都保留响应长度比、相同动作排除和数量上限。
+
+通过条件的候选优先按对应偏好分数差降序选择：工具用回填后信用差，奖励路线用最终奖励差。价值距离、旧策略平均 Token LogP 距离仅依次打破平局；奖励路线无有效价值时不制造假值。每组、每步上限在分布式补齐之前应用。全局截断沿用候选的原始差值排序，尚未校准两种来源的分数尺度；触及全局上限时需观察各来源选中占比。
+
+Pair 两侧保留各自原始生成 Prompt、响应及原生 token IDs。仍使用现有 per-token calibration 与 Chosen SFT；不将 GT 信用塞入 Loss，不改变原 GRPO 优势。GT 可预测性接近并不证明证据相同或动作可交换，需要独立状态抽查与验证任务收益确认配对质量。
+
+## 配置
+
+全部位于 `data.trace`；基础声明在 `agentflow/verl/config.yaml`。两份训练启动 YAML 提供同名 `TRACE_*` 环境变量覆盖，Hydra 参数不使用 `+`。
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `enabled` | `true` | 仅算法含 `slic` 时启用；关闭恢复 legacy 配对 |
+| `epsilon` | `0.1` | GT NLL gap offset |
+| `k` | `3` | 包含当前 Turn 和可能的 final 的总窗口大小 |
+| `gamma` | `0.8` | 窗口和终局回填折扣 |
+| `terminal_fill_enabled` | `true` | 启用可信终局优势回填 |
+| `terminal_fill_scale` | `2.0` | 回填系数，可独立消融 |
+| `outcome_match_value` | `false` | analysis／final 是否额外要求 GT 价值匹配 |
+| `outcome_success_threshold` | `0.5` | 兼容数值奖励时的成功阈值；明确 verifier 布尔值优先 |
+| `match_epsilon` | `0.05` | 工具执行前价值差上限；同初态时平滑 NLL 比不超过 `exp(0.05)≈1.051` |
+| `positive_threshold` | `0.01` | 工具有效信用严格正阈值 |
+| `negative_threshold` | `0.01` | 工具有效信用严格负阈值的绝对值 |
+| `gap_epsilon` | `0.02` | 工具正负信用差下限 |
+| `length_ratio_max` | `1.8` | 两侧响应最大长度比 |
+| `k_pairs_per_group` | `2` | 每题、类型及来源组的 Pair 上限 |
+| `max_pairs_per_step` | `256` | 每步原始 Pair 上限 |
+| `max_gt_tokens` | `256` | GT token 上限，超长跳过 |
+| `gt_alias_strategy` | `first` | 固定第一个非空 GT 别名 |
+| `answer_instruction` | 上文统一指令 | 独立 GT 评分提示 |
+
+TRACE 论文提供 epsilon=0.1、gamma=0.8、K-step 归一化、终局回填 scale=2 的参考设置，但本项目按类型配对、包含 final 的窗口计数和阈值均是项目设计，不能称为精确复现。[TRACE §3 与附录 A.1](https://arxiv.org/html/2607.13988v1)
 
 ```bash
-TRACE_MATCH_EPSILON=0.05 TRACE_POSITIVE_THRESHOLD=0.005 python train-roma/train_agent.py
-python train-roma/train_agent.py data.trace.k=1 data.trace.enabled=false
+TRACE_MATCH_EPSILON=0.05 python train-roma/train_agent.py
+python train-roma/train_agent.py data.trace.terminal_fill_enabled=false
 ```
 
-`load_and_set_env_from_yaml` 先解析 `${env:VAR,default}` 并设置环境变量；`train_agent.py` 将 `${TRACE_*}` 展开为独立的 `key=value` 参数交给 Hydra。基础配置已声明 `data.trace.*`，这些参数不使用 `+` 前缀。布尔值请使用 `true/false`；回答指令作为单个参数传递，包含空格时无需修改训练脚本。
-
-`TRACE_ENABLED=false` 或 `data.trace.enabled=false` 恢复原 SLIC 样本构造；不含 `slic` 的算法不会启动 TRACE 评分。
-
-## 资源与解释限制
-
-新增日志指标及排查顺序见 [TRACE-SLIC 训练观察指标](trace-slic-metrics.md)。
-
-即使 KL loss 关闭，TRACE 仍需要冻结参考模型的 GT logP，因此可能额外加载一份参考模型权重并增加显存/内存占用。每个可训练状态还需额外的 teacher-forcing 前向计算；长上下文和长 GT 会增加耗时，应结合现有 reference micro-batch 配置控制开销。
-
-价值提升衡量的是固定参考模型对 GT 的可预测性改善，并非动作的因果贡献证明。相近标量价值不保证状态拥有相同信息；角色模板变化、参考模型偏差和工具随机性仍可能影响信用。第一版应与 legacy SLIC 对照，重点检查不同类型的信用分布、可用偏好对比例以及最终任务质量。
-
-## 本次验证
-
-基线为远程 `cache` 的 `8083f0d7159ed2058b93e4460417c09fe2b11029`。
-
-```bash
-python3 -m unittest discover -s agentflow/tests -p 'test_trace_*.py' -v
-python3 -m unittest discover -s agentflow/tests -p test_vllm_native_token_ids.py -v
-git diff --check
-```
-
-68 项 TRACE CPU 测试和 8 项原生 Token 回归通过，覆盖状态链路、真实 Trainer 方法、GT 掩码、参考模型路由、LoRA adapter 隔离、跨 Turn 配对、监控分母与筛选守恒、Replay 补齐去重及关闭 TRACE 的回退。分布式模型前向在 CPU 测试中使用 stub，不代表已完成 GPU/NPU 训练验证。两份启动配置另通过默认值及环境变量/命令行覆盖共 4 组真实 Hydra/OmegaConf 解析验证。
-
-现有 `test_slic_prompt_filter.py` 的 5 项旧测试因 fixture 缺少最新配对要求的 `anchor_list` 报错；在未修改的同一远程基线上复现了相同的 5 项错误。该旧 fixture 未在此次修改中重写。
+评分依赖冻结参考模型，可能增加显存与前向成本。状态来自实际角色可见输入，历史窗口与模板变化仍可能影响 GT 信用；本轮未重构评分视图。训练指标定义见 [指标说明](trace-slic-metrics.md)。

@@ -24,6 +24,7 @@ from autogen_ext.tools.mcp import StdioServerParams
 from agentflow import Trainer, LitAgent, NamedResources, LLM, reward, configure_logger, DevTaskLoader
 
 from agentflow.solver import construct_solver
+from agentflow.trace_execution import annotate_trace_outcome
 from agentflow.rollout_timing import finish_rollout, profiling_enabled
 from datetime import datetime
 import uuid, json
@@ -39,7 +40,8 @@ configure_logger(logging.INFO)
 
 
 @reward
-async def evaluate(question: str, groundtruth: any, answer_extracted: any, val: bool = False) -> float:
+async def evaluate(question: str, groundtruth: any, answer_extracted: any, val: bool = False,
+                   trace_outcome: Optional[dict] = None) -> float:
     """
     Evaluates if the extracted answer is correct by calling an LLM judge.
     """
@@ -47,12 +49,13 @@ async def evaluate(question: str, groundtruth: any, answer_extracted: any, val: 
     groundtruth_str = str(groundtruth)
     answer_extracted_str = str(answer_extracted)
 
+    score_kwargs = {"return_details": True} if trace_outcome is not None else {}
     is_correct = await asyncio.to_thread(
-        compute_score,
-        question_str,
-        groundtruth_str,
-        answer_extracted_str
+        compute_score, question_str, groundtruth_str, answer_extracted_str, **score_kwargs,
     )
+    if trace_outcome is not None:
+        trace_outcome.update(is_correct)
+        is_correct = is_correct["legacy_result"]
 
     return 1.0 if is_correct else 0.0
 
@@ -277,10 +280,12 @@ class RolloutAgent(LitAgent):
         idx = task.get("extra_info", {}).get("idx", "unknown_idx")
 
         reward_started = time.perf_counter() if profile_val else 0.0
+        verifier_outcome = {}
         if self.task == "qa":
             ## 纯QA
             # Evaluate the answer against the ground truth
-            reward_value = await evaluate(task["question"], str(task["result"]), answer, val)  # reward is tracked with the decorator
+            reward_value = await evaluate(task["question"], str(task["result"]), answer, val,
+                                          trace_outcome=verifier_outcome)
             print("answer: {} ground_truth: {} reward: {}".format(answer, task["result"], reward_value))
             rollout_data = {
                 "step": task.get("step", ""), # TODO: check whether it can be solved
@@ -370,6 +375,13 @@ class RolloutAgent(LitAgent):
                             "trace_action_key": log.get("trace_action_key"),
                             "trace_tool_failed": bool(log.get("trace_tool_failed", False)),
                             "trace_extraction_valid": log.get("extraction_valid", True),
+                            "trace_external_error": bool(log.get("trace_external_error", False)),
+                            "trace_error_type": log.get("trace_error_type", ""),
+                            "trace_error_source": log.get("trace_error_source", ""),
+                            "trace_is_final": bool(log.get("trace_is_final", False)),
+                            "trace_outcome_valid": bool(log.get("trace_outcome_valid", False)),
+                            "trace_outcome_success": log.get("trace_outcome_success"),
+                            "trace_outcome_reward": log.get("trace_outcome_reward"),
                         },
                     )
                 )
@@ -378,6 +390,9 @@ class RolloutAgent(LitAgent):
 
         ## planner logs
         planner_logs = result["planner_logs"]
+        outcome_metadata = annotate_trace_outcome(
+            planner_logs, result, reward_value, verifier_outcome, self.task,
+        )
         if self.task == "qa":
             _remove_injected_qa_output_format(planner_logs, prompt, task["question"])
         encoding_started = time.perf_counter() if profile_val else 0.0
@@ -391,6 +406,7 @@ class RolloutAgent(LitAgent):
                 {"trace_valid": flags["trace_valid"], "trace_dup": flags["trace_dup"]}
                 for flags in _compute_turn_flags(planner_logs, self.task)
             ]}
+            metadata.update(outcome_metadata)
             if self.task == "qa":
                 metadata["extraction_counts"] = _compute_extraction_counts(planner_logs)
             if anchor is not None:
