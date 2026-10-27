@@ -1,5 +1,7 @@
 # TRACE-SLIC 训练观察指标
 
+版本说明：本页的局部信用与 K-step 回填指标对应 **v2_a / trace_fill**。`trace-2b` 默认的 IGPO 指标使用 `trace/igpo/` 与 `trace/pair/igpo_advantage_gap_*`，见 [v2_b 使用说明](trace-2b.md)；该模式不会将累计优势报告成旧信用指标。
+
 指标接入原训练 metrics 字典，默认 console logger 输出，无需额外开关。比例为 0–1。本次精简只改日志统计，不改变信用计算、Pair 选择、训练 Loss 或 Replay 采样，也不新增配置。
 
 `trace` 来源是工具局部信用加终局回填，`outcome` 来源是 analysis／实际最终回答的可信成功／失败标签。两种来源的 Pair 数分开观察；工具信用使用保留的 `credit_*` 名称，已移除与其完全相同的 `effective_credit_*`。

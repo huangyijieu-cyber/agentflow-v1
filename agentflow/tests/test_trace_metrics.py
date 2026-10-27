@@ -169,6 +169,20 @@ class TraceStateMetricTests(unittest.TestCase):
         self.assertEqual(metrics["trace/credit_count"], 2)
         self.assertAlmostEqual(metrics["trace/credit_mean"], -0.025)
 
+    def test_igpo_mode_reports_state_health_without_fake_trace_credit(self):
+        metrics = trace_metrics.summarize_states(
+            [-8, -7], [0, 0.1], [math.nan] * 2,
+            ["tool_plan", "final_answer"], [("q", "r")] * 2, [0, 1], CONFIG,
+            local_credits=[math.nan] * 2, terminal_fills=[math.nan] * 2,
+            window_blocked=[True, False], external_errors=[True, False],
+            outcome_valid=[False, False], include_credit=False,
+        )
+        self.assertEqual(metrics["trace/score_coverage"], 1)
+        self.assertEqual(metrics["trace/external_error_turns"], 1)
+        self.assertEqual(metrics["trace/outcome_invalid_rollouts"], 1)
+        self.assertFalse(any("credit" in key or "terminal_fill" in key for key in metrics))
+        self.assertNotIn("trace/positive_rate", metrics)
+
 
 class TracePairMetricTests(unittest.TestCase):
     def test_pair_gaps_cross_turn_and_question_coverage(self):
@@ -286,6 +300,115 @@ class TracePairMetricTests(unittest.TestCase):
         self.assertEqual(set(metrics), expected)
         self.assertEqual(metrics["trace/pair/trace/outcome_pairs_count"], 1)
         self.assertEqual(metrics["trace/pair/trace/chosen_failed_rollout_rate"], 1)
+
+    def test_igpo_pair_gap_uses_advantage_and_keeps_outcome_separate(self):
+        rows = [row(0, label_source="trace", credit=99, igpo_advantage=2, igpo_valid=True),
+                row(1, label_source="trace", credit=-99, igpo_advantage=-1, igpo_valid=True),
+                row(2, label_source="outcome", outcome_valid=True,
+                    outcome_success=True, outcome_reward=1),
+                row(3, label_source="outcome", outcome_valid=True,
+                    outcome_success=False, outcome_reward=0)]
+        config = SimpleNamespace(pair_score_mode="igpo")
+        metrics = trace_metrics.summarize_selected_pairs(rows, [(0, 1), (2, 3)], config)
+        self.assertEqual(metrics["trace/pair/igpo_advantage_gap_min"], 3)
+        self.assertEqual(metrics["trace/pair/trace_selected_unique"], 1)
+        self.assertEqual(metrics["trace/pair/outcome_selected_unique"], 1)
+        self.assertNotIn("trace/pair/credit_gap_p50", metrics)
+
+    def test_igpo_pair_has_no_legacy_credit_fallback(self):
+        rows = [row(0, pair_score_mode="igpo", credit=1, igpo_advantage=2, igpo_valid=False),
+                row(1, pair_score_mode="igpo", credit=-1, igpo_advantage=-1, igpo_valid=True)]
+        metrics = trace_metrics.summarize_selected_pairs(rows, [(0, 1)])
+        self.assertNotIn("trace/pair/igpo_advantage_gap_p50", metrics)
+        self.assertNotIn("trace/pair/credit_gap_p50", metrics)
+
+
+def igpo_annotations(size, **overrides):
+    fields = ("raw_ig", "normalized_ig", "outcome_z", "raw_ig_return",
+              "ig_return", "terminal_return", "advantage", "remaining_turns")
+    result = {name: [math.nan] * size for name in fields}
+    result.update({name: [False] * size for name in ("valid", "blocked", "external_blocked")})
+    result["metrics"] = {}
+    result.update(overrides)
+    return result
+
+
+class IgpoMetricTests(unittest.TestCase):
+    def test_zero_ig_and_relative_sign_flip_are_reported_without_analysis(self):
+        rows = [row(0, turn_type="tool_plan"), row(1, turn_type="tool_plan"),
+                row(2, turn_type="tool_plan"), row(3, turn_type="analysis")]
+        annotated = igpo_annotations(
+            4, raw_ig=[0, 1, -1, 999], normalized_ig=[0, 1, -1, 999],
+            ig_return=[1, -2, 1, 999], terminal_return=[0, 0, 0, 999],
+            advantage=[1, -2, 1, 999], remaining_turns=[3, 2, 1, 999],
+            valid=[True, True, True, True], metrics={"groups_valid": 1},
+        )
+        metrics = trace_metrics.summarize_igpo(rows, annotated)
+        self.assertEqual(metrics["trace/igpo/raw_ig_count"], 3)
+        self.assertEqual(metrics["trace/igpo/raw_ig_mean"], 0)
+        self.assertEqual(metrics["trace/igpo/advantage_count"], 3)
+        self.assertEqual(metrics["trace/igpo/advantage_coverage"], 1)
+        self.assertEqual(metrics["trace/igpo/sign_compared_turns"], 2)
+        self.assertEqual(metrics["trace/igpo/raw_ig_advantage_sign_flip_rate"], 1)
+        self.assertEqual(metrics["trace/igpo/groups_valid"], 1)
+        self.assertNotIn("trace/credit_mean", metrics)
+
+    def test_outcome_normalization_population_is_one_vote_per_rollout(self):
+        rows = [row(0, turn_type="analysis", outcome_valid=True),
+                row(1, turn_type="final_answer", is_final=True, outcome_valid=True),
+                row(2, turn_type="final_answer", is_final=True, outcome_valid=True),
+                row(3, turn_type="final_answer", uid="q2", is_final=True, outcome_valid=True),
+                row(4, turn_type="final_answer", rollout_id="untrusted", is_final=True,
+                    outcome_valid=False)]
+        annotated = igpo_annotations(5, outcome_z=[999, -1, -1, 1, 999])
+        metrics = trace_metrics.summarize_igpo(rows, annotated)
+        self.assertEqual(metrics["trace/igpo/outcome_z_count"], 2)
+        self.assertEqual(metrics["trace/igpo/outcome_z_mean"], 0)
+
+    def test_invalid_returns_are_not_described_as_eligible_advantages(self):
+        rows = [row(0, turn_type="tool_plan"), row(1, turn_type="tool_plan")]
+        annotated = igpo_annotations(
+            2, raw_ig=[1, -1], normalized_ig=[1, -1],
+            ig_return=[999, 2], terminal_return=[999, 1],
+            advantage=[999, 3], valid=[False, True], remaining_turns=[999, 1],
+        )
+        metrics = trace_metrics.summarize_igpo(rows, annotated)
+        self.assertEqual(metrics["trace/igpo/advantage_count"], 1)
+        self.assertEqual(metrics["trace/igpo/advantage_mean"], 3)
+        self.assertEqual(metrics["trace/igpo/terminal_return_mean"], 1)
+        self.assertEqual(metrics["trace/igpo/advantage_coverage"], 0.5)
+        self.assertEqual(metrics["trace/igpo/advantage_remaining_turns_corr"], 0)
+
+    def test_post_final_tools_do_not_reduce_advantage_coverage(self):
+        rows = [row(0, turn_type="tool_plan", within_final_prefix=True),
+                row(1, turn_type="tool_plan", within_final_prefix=False)]
+        annotated = igpo_annotations(2, advantage=[1, math.nan], valid=[True, False])
+        metrics = trace_metrics.summarize_igpo(rows, annotated)
+        self.assertEqual(metrics["trace/igpo/advantage_coverage"], 1)
+
+    def test_length_correlation_is_finite_for_constants_and_extreme_values(self):
+        rows = [row(0, turn_type="tool_plan"), row(1, turn_type="tool_plan")]
+        annotated = igpo_annotations(
+            2, advantage=[-1e308, 1e308], valid=[True, True], remaining_turns=[1, 2])
+        metrics = trace_metrics.summarize_igpo(rows, annotated)
+        self.assertAlmostEqual(metrics["trace/igpo/advantage_remaining_turns_corr"], 1)
+        self.assertTrue(all(math.isfinite(value) for value in metrics.values()))
+        annotated["advantage"] = [2, 2]
+        metrics = trace_metrics.summarize_igpo(rows, annotated)
+        self.assertEqual(metrics["trace/igpo/advantage_remaining_turns_corr"], 0)
+
+    def test_empty_input_omits_fake_distributions_and_merges_helper_counters(self):
+        annotated = igpo_annotations(0, metrics={
+            "groups_total": 0, "igpo/groups_valid": 0, "trace/igpo/groups_low_ig_std": 0})
+        metrics = trace_metrics.summarize_igpo([], annotated)
+        self.assertEqual(metrics["trace/igpo/advantage_count"], 0)
+        self.assertEqual(metrics["trace/igpo/advantage_coverage"], 0)
+        self.assertEqual(metrics["trace/igpo/groups_low_ig_std"], 0)
+        self.assertNotIn("trace/igpo/advantage_p50", metrics)
+
+    def test_misaligned_igpo_arrays_raise(self):
+        with self.assertRaises(ValueError):
+            trace_metrics.summarize_igpo([row(0)], igpo_annotations(0))
 
 
 if __name__ == "__main__":

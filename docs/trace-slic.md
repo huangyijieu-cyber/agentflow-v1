@@ -1,5 +1,7 @@
 # TRACE 状态信用与分类型 SLIC 配对
 
+版本说明：本页描述 **v2_a**，对应 `data.trace.pair_score_mode=trace_fill`。`trace-2b` 分支默认使用 `igpo` 模式，完整公式、配置与指标见 [v2_b 使用说明](trace-2b.md)。
+
 本实现按决策类型选择偏好标签：analysis 和实际最终回答使用可验证的最终任务结果，工具 Turn 使用 K-step GT 信用及可选的终局优势回填。配对质量优先；没有合格正负两侧时跳过，不为凑数量放宽条件。SLIC Loss、原 GRPO 训练公式和 Replay 更新剂量保持原样。
 
 算法待办已完成实现与 CPU 集成回归，对应提交 `6eb6215` 已推送到 `trace` 分支。其后的指标精简也纳入 `trace` 分支，具体版本见 Git 提交记录；GPU/NPU 端训练效果尚未验证。修改状态见 [修改记录](trace-slic-change-log.md)。

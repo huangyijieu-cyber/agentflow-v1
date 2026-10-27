@@ -14,6 +14,17 @@ from typing import Any, Mapping, Optional, Sequence
 @dataclass(frozen=True)
 class TraceConfig:
     enabled: bool = True
+    pair_score_mode: str = "igpo"
+    igpo_gamma: float = 1.0
+    igpo_ig_weight: float = 1.0
+    igpo_outcome_weight: float = 1.0
+    igpo_norm_epsilon: float = 1e-6
+    igpo_ig_std_min: float = 1e-3
+    igpo_min_rollouts: int = 2
+    igpo_positive_threshold: float = 0.1
+    igpo_negative_threshold: float = 0.1
+    igpo_gap_epsilon: float = 0.5
+    igpo_absolute_ig_guard: str = "none"
     # TRACE section 4.1 / appendix A.1 table 4: training gap offset.
     epsilon: float = 0.1
     k: int = 3
@@ -34,6 +45,10 @@ class TraceConfig:
     gt_alias_strategy: str = "first"
 
     def __post_init__(self):
+        if self.pair_score_mode not in ("igpo", "trace_fill"):
+            raise ValueError("trace.pair_score_mode must be 'igpo' or 'trace_fill'")
+        if self.igpo_absolute_ig_guard not in ("none", "cumulative"):
+            raise ValueError("trace.igpo_absolute_ig_guard must be 'none' or 'cumulative'")
         for name in ("enabled", "terminal_fill_enabled", "outcome_match_value"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"trace.{name} must be a boolean")
@@ -41,9 +56,21 @@ class TraceConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"trace.{name} must be a positive integer")
+        if (isinstance(self.igpo_min_rollouts, bool)
+                or not isinstance(self.igpo_min_rollouts, int)
+                or self.igpo_min_rollouts < 2):
+            raise ValueError("trace.igpo_min_rollouts must be an integer of at least two")
+        for name in ("igpo_gamma", "igpo_ig_weight", "igpo_outcome_weight",
+                     "igpo_norm_epsilon", "igpo_ig_std_min", "igpo_positive_threshold",
+                     "igpo_negative_threshold", "igpo_gap_epsilon"):
+            if not isinstance(getattr(self, name), (int, float)):
+                raise ValueError(f"trace.{name} must be numeric")
         for name in ("epsilon", "gamma", "match_epsilon", "positive_threshold",
                      "negative_threshold", "gap_epsilon", "length_ratio_max",
-                     "terminal_fill_scale", "outcome_success_threshold"):
+                     "terminal_fill_scale", "outcome_success_threshold", "igpo_gamma",
+                     "igpo_ig_weight", "igpo_outcome_weight", "igpo_norm_epsilon",
+                     "igpo_ig_std_min", "igpo_positive_threshold",
+                     "igpo_negative_threshold", "igpo_gap_epsilon"):
             value = getattr(self, name)
             if isinstance(value, bool) or not _finite(value):
                 raise ValueError(f"trace.{name} must be finite")
@@ -51,6 +78,17 @@ class TraceConfig:
             raise ValueError("trace.epsilon must be positive")
         if not 0 <= self.gamma <= 1:
             raise ValueError("trace.gamma must be between 0 and 1")
+        if not 0 < self.igpo_gamma <= 1:
+            raise ValueError("trace.igpo_gamma must be greater than zero and at most one")
+        for name in ("igpo_norm_epsilon", "igpo_ig_std_min"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"trace.{name} must be positive")
+        for name in ("igpo_ig_weight", "igpo_outcome_weight", "igpo_positive_threshold",
+                     "igpo_negative_threshold", "igpo_gap_epsilon"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"trace.{name} must be nonnegative")
+        if self.igpo_ig_weight == 0 and self.igpo_outcome_weight == 0:
+            raise ValueError("At least one IGPO reward weight must be positive")
         for name in ("match_epsilon", "positive_threshold", "negative_threshold", "gap_epsilon"):
             if getattr(self, name) < 0:
                 raise ValueError(f"trace.{name} must be nonnegative")
@@ -296,7 +334,8 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
     ``valid``, ``length``, and ``old_per_token``.  The returned indices are those
     supplied in each row, not positions in a filtered list.  Rollout and turn
     numbers do not restrict pairing.  Analysis and actual final answers use
-    trusted verifier outcomes; tools always require strict signed credit.
+    trusted verifier outcomes; tools require strict signed scores from the
+    configured route. IGPO scores never fall back to legacy TRACE credit.
     Outcome labels never require GT credit and, by default, do not match GT V.
 
     ``metrics`` optionally collects counts for this call, resetting these keys
@@ -306,9 +345,13 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
     Group sign-absence counts may overlap (a neutral-only group lacks both).
     Among eligible pairs, larger credit gaps take priority; state distance and
     old-policy log-probability distance only break ties.  Outcome pairs sort by
-    final reward gap and do not apply the TRACE credit-gap threshold.
+    final reward gap and do not apply tool-score thresholds.
     """
     cfg = TraceConfig.from_mapping(config)
+    igpo = cfg.pair_score_mode == "igpo"
+    positive_threshold = cfg.igpo_positive_threshold if igpo else cfg.positive_threshold
+    negative_threshold = cfg.igpo_negative_threshold if igpo else cfg.negative_threshold
+    gap_threshold = cfg.igpo_gap_epsilon if igpo else cfg.gap_epsilon
     counts = dict.fromkeys((
         "groups_eligible",
         "groups_no_positive", "groups_no_negative", "groups_both_signs",
@@ -340,9 +383,14 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
             score = float(row["outcome_reward"])
             success_flags[row["index"]] = success
         else:
-            if not all(_finite(row.get(name)) for name in ("value", "credit")):
+            score_name = "igpo_advantage" if igpo else "credit"
+            if (not all(_finite(row.get(name)) for name in ("value", score_name))
+                    or (igpo and not row.get("igpo_valid", False))):
                 continue
-            score = float(row["credit"])
+            if (igpo and cfg.igpo_absolute_ig_guard == "cumulative"
+                    and not _finite(row.get("raw_ig_return"))):
+                continue
+            score = float(row[score_name])
         scores[row["index"]] = score
         groups[key].append(row)
 
@@ -355,8 +403,12 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
             positive = [row for row in group_rows if success_flags[row["index"]]]
             negative = [row for row in group_rows if not success_flags[row["index"]]]
         else:
-            positive = [row for row in group_rows if scores[row["index"]] > cfg.positive_threshold]
-            negative = [row for row in group_rows if scores[row["index"]] < -cfg.negative_threshold]
+            positive = [row for row in group_rows if scores[row["index"]] > positive_threshold
+                        and (not igpo or cfg.igpo_absolute_ig_guard == "none"
+                             or float(row["raw_ig_return"]) > 0)]
+            negative = [row for row in group_rows if scores[row["index"]] < -negative_threshold
+                        and (not igpo or cfg.igpo_absolute_ig_guard == "none"
+                             or float(row["raw_ig_return"]) < 0)]
         counts["groups_no_positive"] += not positive
         counts["groups_no_negative"] += not negative
         counts["groups_both_signs"] += bool(positive and negative)
@@ -376,7 +428,7 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
                     continue
                 if not outcome:
                     counts["trace_after_value_match"] += 1
-                if not outcome and credit_gap < cfg.gap_epsilon:
+                if not outcome and credit_gap < gap_threshold:
                     counts["rejected_credit_gap"] += 1
                     continue
                 if length_ratio > cfg.length_ratio_max:

@@ -4,6 +4,12 @@
 
 先前算法待办已完成实现及 CPU 集成回归，提交 `6eb6215` 已推送到 `trace` 分支。后续指标精简于 2026-10-27 纳入 `trace` 分支，具体版本见 Git 提交记录；GPU/NPU 端训练效果尚未验证。
 
+## 2026-10-27：v2_b / trace-2b
+
+原 v2 命名为 v2_a。基于 `5fbe4cc` 的 `trace-2b` 新增 IGPO 风格工具优势：LogP 增量、IG 与终局奖励分别按同题标准化，再全未来折扣累计；替换旧 K=3 与 terminal fill，不重复计算终局奖励。analysis／实际 final 仍按可信终局结果配对。
+
+默认 `pair_score_mode=igpo`，设为 `trace_fill` 可恢复 v2_a。保留状态匹配 margin=0.05、两侧质量过滤与原 GRPO／SLIC Loss／Replay 设置，新增全未来故障隔离及独立优势阈值。179 项 TRACE 和 8 项原生 Token IDs CPU 回归通过，未验证 GPU/NPU 训练收益。完整公式、参数与指标见 [v2_b 说明](trace-2b.md)及[设计方案](trace-2b-design.md)。下文保留 v2_a 的历史记录。
+
 ## 设计原则
 
 - 配对质量优先于数量和覆盖；没有可靠正负两侧时跳过，不为凑数放宽条件。

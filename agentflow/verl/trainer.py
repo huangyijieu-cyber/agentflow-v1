@@ -31,8 +31,9 @@ from verl.utils.tracking import Tracking
 from .daemon import AgentModeDaemon
 from agentflow.rollout_timing import PHASES, profiling_enabled, write_validation_report
 from agentflow.trace_credit import TraceConfig, state_values, annotate_rollout_credits, select_pairs
+from agentflow.igpo_credit import compute_igpo_advantages
 from agentflow.trace_scoring import encode_state_requests, build_score_tensors, mean_gt_logps
-from agentflow.trace_metrics import summarize_states, summarize_selected_pairs
+from agentflow.trace_metrics import summarize_states, summarize_selected_pairs, summarize_igpo
 
 import os
 import json
@@ -235,7 +236,7 @@ class AgentFlowTrainer(RayPPOTrainer):
 
 
     def _annotate_trace_credits(self, batch):
-        """Score actual turn contexts with the frozen reference, then difference neighbors."""
+        """Score GT states, then build the configured SLIC tool preference signal."""
         cfg = TraceConfig.from_mapping(self.config.data.get("trace", {}))
         if not self.use_reference_policy:
             raise RuntimeError("TRACE-SLIC requires a frozen reference policy")
@@ -342,24 +343,28 @@ class AgentFlowTrainer(RayPPOTrainer):
                     label_sources[row] = "trace"
                     expected_credit[row] = offset < len(rows) - 1 and within_prefix[row]
 
-        algorithm_cfg = getattr(self.config, "algorithm", {})
-        norm_by_std = algorithm_cfg.get("norm_adv_by_std_in_grpo", True)
-        for observations in reliable.values():
-            rewards = np.asarray([reward for _, reward in observations], dtype=np.float64)
-            # Match agent-aware GRPO's one-observation special case and sample
-            # standard deviation, without changing its actual training rewards.
-            mean = float(rewards.mean()) if len(rewards) > 1 else 0.0
-            std = float(rewards.std(ddof=1)) if len(rewards) > 1 else 1.0
-            for key, reward in observations:
-                advantage = (reward - mean) / (std + 1e-6) if norm_by_std else reward - mean
-                for row in groups[key]:
-                    if outcome_valid[row]:
-                        outcome_advantages[row] = advantage
+        if cfg.pair_score_mode == "trace_fill":
+            algorithm_cfg = getattr(self.config, "algorithm", {})
+            norm_by_std = algorithm_cfg.get("norm_adv_by_std_in_grpo", True)
+            for observations in reliable.values():
+                rewards = np.asarray([reward for _, reward in observations], dtype=np.float64)
+                # Preserve v2_a's GRPO-style statistics only in its own mode.
+                # IGPO uses separate population normalization in its helper.
+                mean = float(rewards.mean()) if len(rewards) > 1 else 0.0
+                std = float(rewards.std(ddof=1)) if len(rewards) > 1 else 1.0
+                for key, reward in observations:
+                    advantage = (reward - mean) / (std + 1e-6) if norm_by_std else reward - mean
+                    for row in groups[key]:
+                        if outcome_valid[row]:
+                            outcome_advantages[row] = advantage
 
         for rows in groups.values():
             # An absent initial turn cannot be silently replaced by a later baseline.
             rollout_values = (state_values(row_logps[rows], epsilon=cfg.epsilon)
                               if int(turns[rows[0]]) == 0 else [float("nan")] * len(rows))
+            values[rows] = rollout_values
+            if cfg.pair_score_mode == "igpo":
+                continue
             trusted_rows = [row for row in rows if outcome_valid[row]]
             annotated = annotate_rollout_credits(
                 rollout_values, [int(turns[row]) for row in rows],
@@ -368,13 +373,45 @@ class AgentFlowTrainer(RayPPOTrainer):
                 outcome_advantage=float(outcome_advantages[trusted_rows[0]]) if trusted_rows else float("nan"),
                 config=cfg,
             )
-            values[rows] = rollout_values
             local_credits[rows] = annotated["local_credit"]
             terminal_fills[rows] = annotated["terminal_fill"]
             credits[rows] = annotated["effective_credit"]
             blocked[rows] = annotated["window_blocked"]
             external_blocked[rows] = annotated["external_error_blocked"]
             reached[rows] = annotated["terminal_reached"]
+
+        igpo_rows, igpo = [], None
+        if cfg.pair_score_mode == "igpo":
+            action_valid = non.get("trace_valid", np.zeros(size, dtype=bool))
+            duplicates = non.get("trace_dup", np.zeros(size, dtype=bool))
+            action_keys = non.get("trace_action_key", [None] * size)
+            drop = batch.batch.get("is_drop_mask")
+            masks = batch.batch["response_mask"].bool()
+            for row in range(size):
+                response = tuple(batch.batch["responses"][row][masks[row]].cpu().tolist())
+                usable = (bool(action_valid[row]) and not bool(duplicates[row])
+                          and not bool(external[row]) and bool(within_prefix[row])
+                          and bool(response)
+                          and (drop is None or not bool(drop[row].item()))
+                          and bool(torch.isfinite(batch.batch["old_log_probs"][row][masks[row]]).all().item()))
+                igpo_rows.append({
+                    "index": row, "uid": str(uids[row]), "rollout_id": str(rollouts[row]),
+                    "turn_index": int(turns[row]), "turn_type": str(types[row]),
+                    "gt_logp": float(row_logps[row]), "value": float(values[row]),
+                    "valid": usable, "external_error": bool(external[row]),
+                    "within_final_prefix": bool(within_prefix[row]),
+                    "is_final": bool(final_flags[row]),
+                    "outcome_valid": bool(outcome_valid[row]),
+                    "outcome_reward": float(outcome_rewards[row]),
+                    "action_key": action_keys[row] if action_keys[row] is not None else response,
+                    "response_key": response,
+                })
+            igpo = compute_igpo_advantages(igpo_rows, cfg)
+            for key in ("raw_ig", "normalized_ig", "outcome_z", "raw_ig_return", "ig_return",
+                        "terminal_return", "advantage", "remaining_turns"):
+                non["trace_igpo_" + key] = np.asarray(igpo[key], dtype=np.float64)
+            for key in ("valid", "blocked", "external_blocked"):
+                non["trace_igpo_" + key] = np.asarray(igpo[key], dtype=bool)
         non.update({
             "trace_gt_logp": row_logps, "trace_value": values, "trace_credit": credits,
             "trace_local_credit": local_credits, "trace_terminal_fill": terminal_fills,
@@ -384,6 +421,7 @@ class AgentFlowTrainer(RayPPOTrainer):
             "trace_outcome_valid": outcome_valid, "trace_outcome_success": outcome_success,
             "trace_outcome_reward": outcome_rewards, "trace_outcome_advantage": outcome_advantages,
             "trace_within_final_prefix": within_prefix, "trace_label_source": label_sources,
+            "trace_pair_score_mode": np.full(size, cfg.pair_score_mode, dtype=object),
         })
         metrics = {"trace/" + key: value for key, value in counters.items()}
         metrics.update(summarize_states(
@@ -392,9 +430,13 @@ class AgentFlowTrainer(RayPPOTrainer):
             local_credits=local_credits, terminal_fills=terminal_fills, window_blocked=external_blocked,
             external_errors=external, outcome_valid=outcome_valid, label_sources=label_sources,
             credit_expected_mask=expected_credit,
+            include_credit=cfg.pair_score_mode == "trace_fill",
         ))
-        metrics["trace/terminal_reached_turns"] = int(reached.sum())
-        metrics["trace/credit_windows_blocked"] = int(blocked.sum())
+        if igpo is not None:
+            metrics.update(summarize_igpo(igpo_rows, igpo, cfg))
+        else:
+            metrics["trace/terminal_reached_turns"] = int(reached.sum())
+            metrics["trace/credit_windows_blocked"] = int(blocked.sum())
         metrics["trace/post_final_turns"] = int((~within_prefix).sum())
         metrics["trace/scoring_seconds"] = scoring_seconds
         metrics["trace/scoring_invalid_result_turns"] = sum(
@@ -415,7 +457,12 @@ class AgentFlowTrainer(RayPPOTrainer):
                      "trace_gt_logp", "trace_value", "trace_credit",
                      "trace_local_credit", "trace_terminal_fill", "trace_label_source",
                      "trace_outcome_valid", "trace_outcome_success", "trace_outcome_reward",
-                     "trace_outcome_advantage", "trace_is_final", "trace_external_error"]
+                     "trace_outcome_advantage", "trace_is_final", "trace_external_error",
+                     "trace_pair_score_mode"]
+        if cfg.pair_score_mode == "igpo":
+            side_keys += ["trace_igpo_" + key for key in (
+                "raw_ig", "normalized_ig", "outcome_z", "raw_ig_return", "ig_return",
+                "terminal_return", "advantage", "valid", "remaining_turns")]
         proto_list = []
         pair_metrics = defaultdict(int)
         diagnostic_rows, diagnostic_pairs = [], []
@@ -458,7 +505,14 @@ class AgentFlowTrainer(RayPPOTrainer):
                     "is_final": bool(non["trace_is_final"][i]),
                     "external_error": bool(non["trace_external_error"][i]),
                     "action_key": action_keys[i] if action_keys is not None and action_keys[i] is not None else tuple(response),
+                    "pair_score_mode": cfg.pair_score_mode,
                 })
+                if cfg.pair_score_mode == "igpo":
+                    rows[-1].update({
+                        "igpo_advantage": float(non["trace_igpo_advantage"][i]),
+                        "igpo_valid": bool(non["trace_igpo_valid"][i]),
+                        "raw_ig_return": float(non["trace_igpo_raw_ig_return"][i]),
+                    })
                 pair_metrics["trace/invalid_action_turns"] += int(not bool(valid[i]))
                 pair_metrics["trace/duplicate_turns"] += int(bool(dup[i]))
                 pair_metrics["trace/dropped_prompt_turns"] += int(drop is not None and bool(drop[i].item()))
@@ -499,7 +553,7 @@ class AgentFlowTrainer(RayPPOTrainer):
         pair_metrics["trace/pair/rejected_global_cap"] += extra_pairs
         proto_list = proto_list[:cfg.max_pairs_per_step]
         diagnostic_pairs = diagnostic_pairs[:cfg.max_pairs_per_step]
-        pair_metrics.update(summarize_selected_pairs(diagnostic_rows, diagnostic_pairs))
+        pair_metrics.update(summarize_selected_pairs(diagnostic_rows, diagnostic_pairs, config=cfg))
         # These counts only supply the two diagnostic denominators. Publishing
         # both the counts and rates would duplicate the same funnel information.
         eligible_groups = pair_metrics.pop("trace/pair/groups_eligible", 0)

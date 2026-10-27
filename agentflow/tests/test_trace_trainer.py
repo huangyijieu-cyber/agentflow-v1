@@ -35,6 +35,7 @@ CREDIT = load_source_module("trace_credit_trainer_test", ROOT / "agentflow/agent
 SCORING = load_source_module("trace_scoring_trainer_test", ROOT / "agentflow/agentflow/trace_scoring.py")
 METRICS = load_source_module("trace_metrics_trainer_test", ROOT / "agentflow/agentflow/trace_metrics.py")
 EXECUTION = load_source_module("trace_execution_trainer_test", ROOT / "agentflow/agentflow/trace_execution.py")
+IGPO = load_source_module("igpo_credit_trainer_test", ROOT / "agentflow/agentflow/igpo_credit.py")
 
 
 class Proto:
@@ -86,8 +87,10 @@ def load_trainer_methods():
         torch=torch, np=np, random=random, defaultdict=defaultdict, DataProto=Proto, time=time,
         TraceConfig=CREDIT.TraceConfig, state_values=CREDIT.state_values,
         annotate_rollout_credits=CREDIT.annotate_rollout_credits, select_pairs=CREDIT.select_pairs,
+        compute_igpo_advantages=IGPO.compute_igpo_advantages,
         summarize_states=METRICS.summarize_states,
         summarize_selected_pairs=METRICS.summarize_selected_pairs,
+        summarize_igpo=METRICS.summarize_igpo,
         encode_state_requests=SCORING.encode_state_requests,
         build_score_tensors=SCORING.build_score_tensors, mean_gt_logps=SCORING.mean_gt_logps,
         pad_dataproto_to_divisor=pad_dataproto_to_divisor, unpad_dataproto=unpad_dataproto,
@@ -197,7 +200,8 @@ def make_trainer(scores, trace=None):
     trainer.config = SimpleNamespace(
         trainer=SimpleNamespace(n_gpus_per_node=1, nnodes=1),
         data=ConfigDict(task="qa", algorithm="slic", max_prompt_length=1024,
-                        trace={"enabled": True, "k": 1, "terminal_fill_enabled": False, **(trace or {})}),
+                        trace={"enabled": True, "pair_score_mode": "trace_fill", "k": 1,
+                               "terminal_fill_enabled": False, **(trace or {})}),
         algorithm=ConfigDict(norm_adv_by_std_in_grpo=False),
     )
     trainer.algorithm = "slic"
@@ -552,6 +556,155 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
         self.assertEqual(pairs[0].non_tensor_batch["rollout_id_list_a"].tolist(), ["a"])
         self.assertEqual(pairs[0].non_tensor_batch["rollout_id_list_b"].tolist(), ["b"])
         self.assertEqual(pairs[0].non_tensor_batch["group_baseline"].tolist(), [-2.])
+
+
+def igpo_rows():
+    rows, scores = [], {}
+    for rollout, reward, success, tool_scores in (
+            ("a", 1., True, (-8., -6., -4., -2.)),
+            ("b", 0., False, (-8., -7., -6., -5.))):
+        for turn, turn_type in enumerate(("analysis", "tool_plan", "tool_plan", "tool_plan", "final_answer")):
+            context = rollout + str(turn)
+            rows.append(make_row(context, rollout, turn, turn_type=turn_type,
+                                 old=-1. if rollout == "a" else -3., reward=reward,
+                                 is_final=turn == 4, outcome_valid=True, outcome_success=success))
+            scores[context] = -8. if turn == 0 else tool_scores[turn - 1]
+    return rows, scores
+
+
+class IgpoTrainerIntegrationTests(unittest.TestCase):
+    def trainer(self, scores, **overrides):
+        return make_trainer(scores, {"pair_score_mode": "igpo", **overrides})
+
+    def test_full_return_uses_population_z_and_does_not_apply_legacy_fill(self):
+        rows, scores = igpo_rows()
+        trainer = self.trainer(scores, k=1, terminal_fill_enabled=True, terminal_fill_scale=999.)
+        history = make_batch(rows)
+        history.batch["advantages"] = torch.full((len(rows), 3), 42.)
+        original = {key: value.clone() for key, value in history.batch.items()}
+        metrics = trainer._annotate_trace_credits(history)
+        non = history.non_tensor_batch
+        unit = 1. / (1. + 2e-6)
+        np.testing.assert_allclose(non["trace_igpo_advantage"][[1, 2, 3]],
+                                   np.array([4., 3., 2.]) * unit)
+        np.testing.assert_allclose(non["trace_igpo_advantage"][[6, 7, 8]],
+                                   -np.array([4., 3., 2.]) * unit)
+        np.testing.assert_allclose(non["trace_igpo_terminal_return"][[1, 2, 3]], unit)
+        self.assertTrue(np.isnan(non["trace_igpo_advantage"][[0, 4, 5, 9]]).all())
+        for key in ("trace_credit", "trace_local_credit", "trace_terminal_fill", "trace_outcome_advantage"):
+            self.assertTrue(np.isnan(non[key]).all(), key)
+        for key, before in original.items():
+            self.assertTrue(torch.equal(history.batch[key], before), key)
+        self.assertNotIn("trace/credit_mean", metrics)
+        self.assertNotIn("trace/terminal_fill_mean", metrics)
+        self.assertEqual(metrics["trace/igpo/advantage_coverage"], 1.)
+
+    def test_relative_advantage_can_pair_two_absolutely_positive_ig_actions(self):
+        rows, scores = igpo_rows()
+        trainer, history = self.trainer(scores), make_batch(rows)
+        trainer._annotate_trace_credits(history)
+        pairs = trainer._trans_to_dpo_batch([history])
+        tool_pairs = [pair for pair in pairs if pair.non_tensor_batch["trace_turn_type_a"][0] == "tool_plan"]
+        self.assertGreater(len(tool_pairs), 0)
+        first = tool_pairs[0]
+        self.assertGreater(first.non_tensor_batch["trace_igpo_raw_ig_a"][0], 0)
+        self.assertGreater(first.non_tensor_batch["trace_igpo_raw_ig_b"][0], 0)
+        self.assertGreater(first.non_tensor_batch["trace_igpo_advantage_a"][0], 0)
+        self.assertLess(first.non_tensor_batch["trace_igpo_advantage_b"][0], 0)
+        self.assertEqual(first.non_tensor_batch["group_baseline"].tolist(), [-2.])
+        self.assertEqual(first.non_tensor_batch["trace_pair_score_mode_a"].tolist(), ["igpo"])
+        self.assertTrue(torch.equal(first.batch["prompts_a"], history.batch["prompts"][1:2]))
+        self.assertTrue(torch.equal(first.batch["prompts_b"], history.batch["prompts"][6:7]))
+        self.assertIn("trace/pair/igpo_advantage_gap_p50", trainer._trace_pair_metrics)
+        self.assertNotIn("trace/pair/credit_gap_p50", trainer._trace_pair_metrics)
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/outcome_selected_unique"], 2)
+
+    def test_discount_uses_original_distance_and_reaches_earliest_tool(self):
+        rows, scores = igpo_rows()
+        trainer, history = self.trainer(scores, igpo_gamma=0.8), make_batch(rows)
+        trainer._annotate_trace_credits(history)
+        unit = 1. / (1. + 2e-6)
+        self.assertAlmostEqual(history.non_tensor_batch["trace_igpo_advantage"][1],
+                               (1. + .8 + .8**2 + .8**3) * unit)
+        self.assertAlmostEqual(history.non_tensor_batch["trace_igpo_terminal_return"][1],
+                               .8**3 * unit)
+
+    def test_all_failed_rollouts_still_get_igpo_tool_pairs(self):
+        rows, scores = igpo_rows()
+        for row in rows:
+            row.update(reward=0., outcome_success=False)
+        trainer, history = self.trainer(scores), make_batch(rows)
+        trainer._annotate_trace_credits(history)
+        np.testing.assert_allclose(history.non_tensor_batch["trace_igpo_outcome_z"], 0.)
+        pairs = trainer._trans_to_dpo_batch([history])
+        self.assertGreater(len(pairs), 0)
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/outcome_selected_unique"], 0)
+        self.assertGreater(trainer._trace_pair_metrics["trace/pair/trace_selected_unique"], 0)
+
+    def test_constant_ig_does_not_fall_back_to_outcome_only_tool_pairs(self):
+        rows, scores = igpo_rows()
+        for turn, score in enumerate((-8., -8., -6., -4., -2.)):
+            scores["b" + str(turn)] = score
+        trainer, history = self.trainer(scores), make_batch(rows)
+        trainer._annotate_trace_credits(history)
+        self.assertFalse(history.non_tensor_batch["trace_igpo_valid"].any())
+        pairs = trainer._trans_to_dpo_batch([history])
+        self.assertEqual(len(pairs), 2)  # Trusted analysis and final routes remain.
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/trace_selected_unique"], 0)
+
+    def test_invalid_future_turn_blocks_prefix_but_preserves_clean_suffix(self):
+        rows, scores = igpo_rows()
+        rows[2]["valid"] = False
+        trainer, history = self.trainer(scores), make_batch(rows)
+        trainer._annotate_trace_credits(history)
+        non = history.non_tensor_batch
+        self.assertTrue(non["trace_igpo_blocked"][[1, 2]].all())
+        self.assertTrue(np.isnan(non["trace_igpo_advantage"][[1, 2]]).all())
+        self.assertTrue(non["trace_igpo_valid"][[3, 6, 7, 8]].all())
+        self.assertFalse(non["trace_igpo_external_blocked"].any())
+
+    def test_untrusted_terminal_and_duplicates_do_not_create_mixed_returns(self):
+        rows, scores = igpo_rows()
+        for row in rows[5:]:
+            row["outcome_valid"] = False
+        trainer, history = self.trainer(scores), make_batch(rows)
+        trainer._annotate_trace_credits(history)
+        self.assertFalse(history.non_tensor_batch["trace_igpo_valid"].any())
+        self.assertIsNone(trainer._trans_to_dpo_batch([history]))
+        # A duplicate inside a future return is a barrier even with trusted R.
+        rows, scores = igpo_rows()
+        history = make_batch(rows)
+        history.non_tensor_batch["trace_dup"] = np.array([False] * len(rows))
+        history.non_tensor_batch["trace_dup"][2] = True
+        trainer = self.trainer(scores)
+        trainer._annotate_trace_credits(history)
+        self.assertTrue(history.non_tensor_batch["trace_igpo_blocked"][[1, 2]].all())
+        self.assertTrue(history.non_tensor_batch["trace_igpo_valid"][3])
+
+    def test_absolute_cumulative_guard_is_optional_and_never_changes_population(self):
+        rows, scores = igpo_rows()
+        for row in rows:
+            row.update(reward=0., outcome_success=False)
+        guarded = self.trainer(scores, igpo_absolute_ig_guard="cumulative")
+        history = make_batch(rows)
+        guarded._annotate_trace_credits(history)
+        self.assertTrue(history.non_tensor_batch["trace_igpo_valid"][[1, 2, 3, 6, 7, 8]].all())
+        self.assertIsNone(guarded._trans_to_dpo_batch([history]))
+
+    def test_outcome_routes_work_without_gt_in_igpo_mode(self):
+        rows = []
+        for rollout, reward, success in (("a", 1., True), ("b", 0., False)):
+            rows.extend([
+                make_row(rollout + "0", rollout, 0, turn_type="analysis", gt="",
+                         reward=reward, outcome_valid=True, outcome_success=success),
+                make_row(rollout + "1", rollout, 1, turn_type="final_answer", gt="",
+                         reward=reward, is_final=True, outcome_valid=True, outcome_success=success),
+            ])
+        trainer, history = self.trainer({}), make_batch(rows)
+        trainer._annotate_trace_credits(history)
+        pairs = trainer._trans_to_dpo_batch([history])
+        self.assertEqual(len(pairs), 2)
+        self.assertTrue(np.isnan(history.non_tensor_batch["trace_igpo_advantage"]).all())
 
 
 if __name__ == "__main__":

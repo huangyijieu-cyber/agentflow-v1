@@ -20,6 +20,17 @@ env:
 
   # ----- TRACE 状态价值与 SLIC 配对（仅算法包含 slic 时生效） -----
   TRACE_ENABLED: ${env:TRACE_ENABLED,true}
+  TRACE_PAIR_SCORE_MODE: ${env:TRACE_PAIR_SCORE_MODE,igpo}
+  TRACE_IGPO_GAMMA: ${env:TRACE_IGPO_GAMMA,1.0}
+  TRACE_IGPO_IG_WEIGHT: ${env:TRACE_IGPO_IG_WEIGHT,1.0}
+  TRACE_IGPO_OUTCOME_WEIGHT: ${env:TRACE_IGPO_OUTCOME_WEIGHT,1.0}
+  TRACE_IGPO_NORM_EPSILON: ${env:TRACE_IGPO_NORM_EPSILON,1.0e-6}
+  TRACE_IGPO_IG_STD_MIN: ${env:TRACE_IGPO_IG_STD_MIN,1.0e-3}
+  TRACE_IGPO_MIN_ROLLOUTS: ${env:TRACE_IGPO_MIN_ROLLOUTS,2}
+  TRACE_IGPO_POSITIVE_THRESHOLD: ${env:TRACE_IGPO_POSITIVE_THRESHOLD,0.1}
+  TRACE_IGPO_NEGATIVE_THRESHOLD: ${env:TRACE_IGPO_NEGATIVE_THRESHOLD,0.1}
+  TRACE_IGPO_GAP_EPSILON: ${env:TRACE_IGPO_GAP_EPSILON,0.5}
+  TRACE_IGPO_ABSOLUTE_IG_GUARD: ${env:TRACE_IGPO_ABSOLUTE_IG_GUARD,none}
   TRACE_EPSILON: ${env:TRACE_EPSILON,0.1}
   TRACE_K: ${env:TRACE_K,3}
   TRACE_GAMMA: ${env:TRACE_GAMMA,0.8}
@@ -145,6 +156,17 @@ python_args:
 
   # data.trace 已在 agentflow/verl/config.yaml 声明，无需 + 前缀。
   data.trace.enabled: '${TRACE_ENABLED}'
+  data.trace.pair_score_mode: '${TRACE_PAIR_SCORE_MODE}'
+  data.trace.igpo_gamma: '${TRACE_IGPO_GAMMA}'
+  data.trace.igpo_ig_weight: '${TRACE_IGPO_IG_WEIGHT}'
+  data.trace.igpo_outcome_weight: '${TRACE_IGPO_OUTCOME_WEIGHT}'
+  data.trace.igpo_norm_epsilon: '${TRACE_IGPO_NORM_EPSILON}'
+  data.trace.igpo_ig_std_min: '${TRACE_IGPO_IG_STD_MIN}'
+  data.trace.igpo_min_rollouts: '${TRACE_IGPO_MIN_ROLLOUTS}'
+  data.trace.igpo_positive_threshold: '${TRACE_IGPO_POSITIVE_THRESHOLD}'
+  data.trace.igpo_negative_threshold: '${TRACE_IGPO_NEGATIVE_THRESHOLD}'
+  data.trace.igpo_gap_epsilon: '${TRACE_IGPO_GAP_EPSILON}'
+  data.trace.igpo_absolute_ig_guard: '${TRACE_IGPO_ABSOLUTE_IG_GUARD}'
   data.trace.epsilon: '${TRACE_EPSILON}'
   data.trace.k: '${TRACE_K}'
   data.trace.gamma: '${TRACE_GAMMA}'

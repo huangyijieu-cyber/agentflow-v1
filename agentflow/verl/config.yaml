@@ -14,6 +14,17 @@ data:
   # TRACE 仅在算法包含 slic 且 enabled=true 时启用；关闭后恢复原 SLIC 配对。
   trace:
     enabled: true
+    pair_score_mode: igpo  # trace_fill restores v2_a scoring; legacy K/fill are ignored in igpo.
+    igpo_gamma: 1.0
+    igpo_ig_weight: 1.0
+    igpo_outcome_weight: 1.0
+    igpo_norm_epsilon: 1.0e-6
+    igpo_ig_std_min: 1.0e-3
+    igpo_min_rollouts: 2
+    igpo_positive_threshold: 0.1
+    igpo_negative_threshold: 0.1
+    igpo_gap_epsilon: 0.5
+    igpo_absolute_ig_guard: none
     epsilon: 0.1  # TRACE training gap offset (appendix A.1, table 4)
     k: 3  # Total turn window, including the current turn and a final turn if reached.
     gamma: 0.8

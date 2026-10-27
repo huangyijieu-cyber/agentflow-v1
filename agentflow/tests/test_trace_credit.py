@@ -17,7 +17,10 @@ TraceConfig = trace_credit.TraceConfig
 state_values = trace_credit.state_values
 discounted_credits = trace_credit.discounted_credits
 annotate_rollout_credits = trace_credit.annotate_rollout_credits
-select_pairs = trace_credit.select_pairs
+def select_pairs(rows, config=None, metrics=None):
+    """Keep v2_a regressions explicitly on their original scoring route."""
+    return trace_credit.select_pairs(
+        rows, {"pair_score_mode": "trace_fill", **(config or {})}, metrics)
 
 
 def row(index, credit=0.1, **kwargs):
@@ -385,10 +388,117 @@ class TracePairTests(unittest.TestCase):
         self.assertEqual(metrics["rejected_global_cap"], 1)
 
 
+class IgpoPairTests(unittest.TestCase):
+    def igpo_row(self, index, advantage=0.8, **kwargs):
+        return row(index, credit=math.nan, turn_type="tool_plan", igpo_valid=True,
+                   igpo_advantage=advantage, **kwargs)
+
+    def test_default_igpo_route_uses_advantage_instead_of_old_credit(self):
+        rows = [self.igpo_row(0), self.igpo_row(1, -0.8)]
+        self.assertEqual(trace_credit.select_pairs(rows), [(0, 1)])
+        rows[0]["credit"], rows[1]["credit"] = -10, 10
+        self.assertEqual(trace_credit.select_pairs(rows), [(0, 1)])
+        self.assertEqual(trace_credit.select_pairs(rows, {
+            "positive_threshold": 100, "negative_threshold": 100, "gap_epsilon": 100}), [(0, 1)])
+
+    def test_missing_or_invalid_igpo_advantage_never_falls_back(self):
+        legacy_rows = [row(0, 1), row(1, -1)]
+        self.assertEqual(trace_credit.select_pairs(legacy_rows), [])
+        for updates in ({"igpo_valid": False}, {"igpo_advantage": math.nan},
+                        {"igpo_advantage": math.inf}, {"value": math.nan}):
+            for side in (0, 1):
+                rows = [self.igpo_row(0), self.igpo_row(1, -0.8)]
+                for item in rows:
+                    item["credit"] = 10 if item["index"] == 0 else -10
+                rows[side].update(updates)
+                with self.subTest(side=side, updates=updates):
+                    self.assertEqual(trace_credit.select_pairs(rows), [])
+        rows = [self.igpo_row(0), self.igpo_row(1, -0.8)]
+        del rows[0]["igpo_valid"]
+        self.assertEqual(trace_credit.select_pairs(rows), [])
+
+    def test_igpo_thresholds_are_strict_and_gap_is_independent(self):
+        self.assertEqual(trace_credit.select_pairs(
+            [self.igpo_row(0, 0.1), self.igpo_row(1, -0.8)]), [])
+        self.assertEqual(trace_credit.select_pairs(
+            [self.igpo_row(0, 0.8), self.igpo_row(1, -0.1)]), [])
+        rows = [self.igpo_row(0, 0.2), self.igpo_row(1, -0.2)]
+        self.assertEqual(trace_credit.select_pairs(rows), [])
+        self.assertEqual(trace_credit.select_pairs(rows, {"igpo_gap_epsilon": 0.4}), [(0, 1)])
+        self.assertEqual(trace_credit.select_pairs(rows, {"igpo_positive_threshold": 0.3}), [])
+        self.assertEqual(trace_credit.select_pairs(rows, {"igpo_negative_threshold": 0.3}), [])
+
+    def test_relative_advantage_does_not_require_raw_ig_sign(self):
+        rows = [self.igpo_row(0, raw_ig=-0.2, raw_ig_return=-0.1),
+                self.igpo_row(1, -0.8, raw_ig=0.2, raw_ig_return=0.3)]
+        self.assertEqual(trace_credit.select_pairs(rows), [(0, 1)])
+        self.assertEqual(trace_credit.select_pairs(rows, {"igpo_absolute_ig_guard": "cumulative"}), [])
+
+    def test_cumulative_guard_is_strict_and_missing_values_fail_closed(self):
+        config = {"igpo_absolute_ig_guard": "cumulative"}
+        rows = [self.igpo_row(0, raw_ig=-0.2, raw_ig_return=0.4),
+                self.igpo_row(1, -0.8, raw_ig=0.2, raw_ig_return=-0.4)]
+        self.assertEqual(trace_credit.select_pairs(rows, config), [(0, 1)])
+        for side in (0, 1):
+            for value in (0, math.nan, math.inf, None):
+                candidate = [dict(item) for item in rows]
+                candidate[side]["raw_ig_return"] = value
+                with self.subTest(side=side, value=value):
+                    self.assertEqual(trace_credit.select_pairs(candidate, config), [])
+        del rows[0]["raw_ig_return"]
+        self.assertEqual(trace_credit.select_pairs(rows, config), [])
+
+    def test_advantage_gap_priority_keeps_hard_value_and_quality_filters(self):
+        rows = [self.igpo_row(0), self.igpo_row(1, -0.3, value=0.2),
+                self.igpo_row(2, -1.2, value=0.24),
+                self.igpo_row(3, -5, value=0.3)]
+        config = {"k_pairs_per_group": 1}
+        self.assertEqual(trace_credit.select_pairs(rows, config), [(0, 2)])
+        self.assertEqual(trace_credit.select_pairs(list(reversed(rows)), config), [(0, 2)])
+        for side in (0, 1):
+            for updates in ({"valid": False}, {"external_error": True}, {"length": 0}):
+                candidate = [self.igpo_row(0), self.igpo_row(1, -0.8)]
+                candidate[side].update(updates)
+                with self.subTest(side=side, updates=updates):
+                    self.assertEqual(trace_credit.select_pairs(candidate), [])
+
+    def test_igpo_funnel_accounts_for_gap_and_value_rejections(self):
+        rows = [self.igpo_row(0, 0.2), self.igpo_row(1, -0.2),
+                self.igpo_row(2, -0.9), self.igpo_row(3, -1.2, value=0.4)]
+        metrics = {}
+        self.assertEqual(trace_credit.select_pairs(rows, metrics=metrics), [(0, 2)])
+        self.assertEqual(metrics["candidates_sign"], 3)
+        self.assertEqual(metrics["rejected_value_match"], 1)
+        self.assertEqual(metrics["rejected_credit_gap"], 1)
+        self.assertEqual(metrics["selected_unique"], 1)
+
+    def test_outcome_route_ignores_igpo_requirements_and_guards(self):
+        rows = [row(0, math.nan, turn_type="analysis", value=math.nan,
+                    outcome_valid=True, outcome_success=True, outcome_reward=1),
+                row(1, math.nan, turn_type="analysis", value=math.nan,
+                    outcome_valid=True, outcome_success=False, outcome_reward=0)]
+        config = {"igpo_positive_threshold": 100, "igpo_negative_threshold": 100,
+                  "igpo_gap_epsilon": 100, "igpo_absolute_ig_guard": "cumulative"}
+        self.assertEqual(trace_credit.select_pairs(rows, config), [(0, 1)])
+
+    def test_explicit_trace_fill_recovers_original_selection(self):
+        rows = [self.igpo_row(0), self.igpo_row(1, -0.8)]
+        for item in rows:
+            item["credit"] = 0.1 if item["index"] == 0 else -0.1
+            item["igpo_valid"] = False
+        self.assertEqual(trace_credit.select_pairs(rows), [])
+        self.assertEqual(trace_credit.select_pairs(rows, {"pair_score_mode": "trace_fill"}), [(0, 1)])
+
+
 class TraceConfigTests(unittest.TestCase):
     def test_defaults_and_mapping(self):
         self.assertEqual(TraceConfig.from_mapping().k, 3)
         self.assertEqual(TraceConfig.from_mapping().match_epsilon, 0.05)
+        self.assertEqual(TraceConfig.from_mapping().pair_score_mode, "igpo")
+        self.assertEqual(TraceConfig.from_mapping().igpo_gamma, 1.0)
+        self.assertEqual(TraceConfig.from_mapping().igpo_ig_std_min, 1e-3)
+        self.assertEqual(TraceConfig.from_mapping().igpo_min_rollouts, 2)
+        self.assertEqual(TraceConfig.from_mapping().igpo_absolute_ig_guard, "none")
         self.assertEqual(TraceConfig.from_mapping({"match_epsilon": 0.2}).match_epsilon, 0.2)
 
     def test_reject_invalid_configuration(self):
@@ -401,6 +511,24 @@ class TraceConfigTests(unittest.TestCase):
                        {"outcome_match_value": 1}, {"terminal_fill_scale": -1},
                        {"terminal_fill_scale": math.inf},
                        {"outcome_success_threshold": math.nan}, {"unknown": 1}):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                TraceConfig.from_mapping(config)
+
+    def test_reject_invalid_igpo_configuration(self):
+        for config in (
+                {"pair_score_mode": "gigpo"}, {"pair_score_mode": None},
+                {"igpo_absolute_ig_guard": "single_step"},
+                {"igpo_gamma": 0}, {"igpo_gamma": 1.1},
+                {"igpo_gamma": math.nan}, {"igpo_gamma": "0.8"},
+                {"igpo_ig_weight": -1}, {"igpo_outcome_weight": -1},
+                {"igpo_ig_weight": 0, "igpo_outcome_weight": 0},
+                {"igpo_ig_weight": math.inf}, {"igpo_outcome_weight": True},
+                {"igpo_norm_epsilon": 0}, {"igpo_norm_epsilon": math.nan},
+                {"igpo_ig_std_min": 0}, {"igpo_ig_std_min": -1},
+                {"igpo_min_rollouts": 1}, {"igpo_min_rollouts": True},
+                {"igpo_min_rollouts": 2.0},
+                {"igpo_positive_threshold": -1}, {"igpo_negative_threshold": -1},
+                {"igpo_gap_epsilon": math.inf}, {"igpo_gap_epsilon": "0.5"}):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 TraceConfig.from_mapping(config)
 
