@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import unittest
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "agentflow" / "trace_metrics.py"
+MODULE_PATH = Path(__file__).resolve().parents[1] / "agentflow" / "trace" / "metrics.py"
 SPEC = importlib.util.spec_from_file_location("trace_metrics", MODULE_PATH)
 trace_metrics = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(trace_metrics)

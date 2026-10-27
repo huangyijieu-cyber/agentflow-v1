@@ -30,10 +30,21 @@ from verl.utils.tracking import Tracking
 
 from .daemon import AgentModeDaemon
 from agentflow.rollout_timing import PHASES, profiling_enabled, write_validation_report
-from agentflow.trace_credit import TraceConfig, state_values, annotate_rollout_credits, select_pairs
-from agentflow.igpo_credit import compute_igpo_advantages
-from agentflow.trace_scoring import encode_state_requests, build_score_tensors, mean_gt_logps
-from agentflow.trace_metrics import summarize_states, summarize_selected_pairs, summarize_igpo
+from agentflow.trace.credit import (
+    TraceConfig,
+    annotate_rollout_credits,
+    build_score_tensors,
+    encode_state_requests,
+    mean_gt_logps,
+    select_pairs,
+    state_values,
+)
+from agentflow.trace.igpo import compute_igpo_advantages
+from agentflow.trace.metrics import (
+    summarize_igpo,
+    summarize_selected_pairs,
+    summarize_states,
+)
 
 import os
 import json
