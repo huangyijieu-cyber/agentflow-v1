@@ -9,7 +9,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
-    "igpo_credit_test", ROOT / "agentflow/agentflow/igpo_credit.py")
+    "igpo_credit_test", ROOT / "agentflow/agentflow/trace/igpo.py")
 IGPO = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(IGPO)
 

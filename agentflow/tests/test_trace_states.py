@@ -18,7 +18,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[2]
 EXECUTION_SPEC = importlib.util.spec_from_file_location(
-    "trace_execution_states_test", ROOT / "agentflow/agentflow/trace_execution.py")
+    "trace_execution_states_test", ROOT / "agentflow/agentflow/trace/execution.py")
 EXECUTION = importlib.util.module_from_spec(EXECUTION_SPEC)
 EXECUTION_SPEC.loader.exec_module(EXECUTION)
 

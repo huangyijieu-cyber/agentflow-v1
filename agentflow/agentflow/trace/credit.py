@@ -1,13 +1,13 @@
-"""TRACE state values, adjacent-turn credit, and SLIC pair selection.
+"""TRACE GT scoring, state credit, and SLIC pair selection.
 
 This module intentionally has no distributed-training dependencies.  Invalid
 model actions can still provide state observations; external execution failures
 additionally invalidate every tool-credit window that includes the failure.
 """
 
-from dataclasses import asdict, dataclass, fields
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, fields
 from typing import Any, Mapping, Optional, Sequence
 
 
@@ -48,7 +48,9 @@ class TraceConfig:
         if self.pair_score_mode not in ("igpo", "trace_fill"):
             raise ValueError("trace.pair_score_mode must be 'igpo' or 'trace_fill'")
         if self.igpo_absolute_ig_guard not in ("none", "cumulative"):
-            raise ValueError("trace.igpo_absolute_ig_guard must be 'none' or 'cumulative'")
+            raise ValueError(
+                "trace.igpo_absolute_ig_guard must be 'none' or 'cumulative'"
+            )
         for name in ("enabled", "terminal_fill_enabled", "outcome_match_value"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"trace.{name} must be a boolean")
@@ -56,21 +58,45 @@ class TraceConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"trace.{name} must be a positive integer")
-        if (isinstance(self.igpo_min_rollouts, bool)
-                or not isinstance(self.igpo_min_rollouts, int)
-                or self.igpo_min_rollouts < 2):
-            raise ValueError("trace.igpo_min_rollouts must be an integer of at least two")
-        for name in ("igpo_gamma", "igpo_ig_weight", "igpo_outcome_weight",
-                     "igpo_norm_epsilon", "igpo_ig_std_min", "igpo_positive_threshold",
-                     "igpo_negative_threshold", "igpo_gap_epsilon"):
+        if (
+            isinstance(self.igpo_min_rollouts, bool)
+            or not isinstance(self.igpo_min_rollouts, int)
+            or self.igpo_min_rollouts < 2
+        ):
+            raise ValueError(
+                "trace.igpo_min_rollouts must be an integer of at least two"
+            )
+        for name in (
+            "igpo_gamma",
+            "igpo_ig_weight",
+            "igpo_outcome_weight",
+            "igpo_norm_epsilon",
+            "igpo_ig_std_min",
+            "igpo_positive_threshold",
+            "igpo_negative_threshold",
+            "igpo_gap_epsilon",
+        ):
             if not isinstance(getattr(self, name), (int, float)):
                 raise ValueError(f"trace.{name} must be numeric")
-        for name in ("epsilon", "gamma", "match_epsilon", "positive_threshold",
-                     "negative_threshold", "gap_epsilon", "length_ratio_max",
-                     "terminal_fill_scale", "outcome_success_threshold", "igpo_gamma",
-                     "igpo_ig_weight", "igpo_outcome_weight", "igpo_norm_epsilon",
-                     "igpo_ig_std_min", "igpo_positive_threshold",
-                     "igpo_negative_threshold", "igpo_gap_epsilon"):
+        for name in (
+            "epsilon",
+            "gamma",
+            "match_epsilon",
+            "positive_threshold",
+            "negative_threshold",
+            "gap_epsilon",
+            "length_ratio_max",
+            "terminal_fill_scale",
+            "outcome_success_threshold",
+            "igpo_gamma",
+            "igpo_ig_weight",
+            "igpo_outcome_weight",
+            "igpo_norm_epsilon",
+            "igpo_ig_std_min",
+            "igpo_positive_threshold",
+            "igpo_negative_threshold",
+            "igpo_gap_epsilon",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not _finite(value):
                 raise ValueError(f"trace.{name} must be finite")
@@ -79,24 +105,39 @@ class TraceConfig:
         if not 0 <= self.gamma <= 1:
             raise ValueError("trace.gamma must be between 0 and 1")
         if not 0 < self.igpo_gamma <= 1:
-            raise ValueError("trace.igpo_gamma must be greater than zero and at most one")
+            raise ValueError(
+                "trace.igpo_gamma must be greater than zero and at most one"
+            )
         for name in ("igpo_norm_epsilon", "igpo_ig_std_min"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"trace.{name} must be positive")
-        for name in ("igpo_ig_weight", "igpo_outcome_weight", "igpo_positive_threshold",
-                     "igpo_negative_threshold", "igpo_gap_epsilon"):
+        for name in (
+            "igpo_ig_weight",
+            "igpo_outcome_weight",
+            "igpo_positive_threshold",
+            "igpo_negative_threshold",
+            "igpo_gap_epsilon",
+        ):
             if getattr(self, name) < 0:
                 raise ValueError(f"trace.{name} must be nonnegative")
         if self.igpo_ig_weight == 0 and self.igpo_outcome_weight == 0:
             raise ValueError("At least one IGPO reward weight must be positive")
-        for name in ("match_epsilon", "positive_threshold", "negative_threshold", "gap_epsilon"):
+        for name in (
+            "match_epsilon",
+            "positive_threshold",
+            "negative_threshold",
+            "gap_epsilon",
+        ):
             if getattr(self, name) < 0:
                 raise ValueError(f"trace.{name} must be nonnegative")
         if self.terminal_fill_scale < 0:
             raise ValueError("trace.terminal_fill_scale must be nonnegative")
         if self.length_ratio_max < 1:
             raise ValueError("trace.length_ratio_max must be at least 1")
-        if not isinstance(self.answer_instruction, str) or not self.answer_instruction.strip():
+        if (
+            not isinstance(self.answer_instruction, str)
+            or not self.answer_instruction.strip()
+        ):
             raise ValueError("trace.answer_instruction must be a nonempty string")
         if self.gt_alias_strategy != "first":
             raise ValueError("trace.gt_alias_strategy currently supports only 'first'")
@@ -145,9 +186,12 @@ def state_values(logps: Sequence[Optional[float]], epsilon: float = 0.1):
     return result
 
 
-def discounted_credits(values: Sequence[Optional[float]],
-                       turn_indices: Optional[Sequence[int]] = None,
-                       k: int = 1, gamma: float = 0.8):
+def discounted_credits(
+    values: Sequence[Optional[float]],
+    turn_indices: Optional[Sequence[int]] = None,
+    k: int = 1,
+    gamma: float = 0.8,
+):
     """Compute normalized K-step credit without crossing an unobserved turn.
 
     The input is one rollout in its original state order; it must not be
@@ -170,16 +214,20 @@ def discounted_credits(values: Sequence[Optional[float]],
         left, right = turn_indices[index], turn_indices[index + 1]
         # Checking both the gap and integral indices avoids silently accepting
         # fractional turn numbers or joining duplicated turns.
-        continuous = (_finite(left) and _finite(right)
-                      and float(left).is_integer() and float(right).is_integer()
-                      and float(right) == float(left) + 1)
+        continuous = (
+            _finite(left)
+            and _finite(right)
+            and float(left).is_integer()
+            and float(right).is_integer()
+            and float(right) == float(left) + 1
+        )
         if continuous and _finite(values[index]) and _finite(values[index + 1]):
             deltas[index] = float(values[index + 1]) - float(values[index])
     result = [math.nan] * size
     for index in range(size - 1):
         weighted_sum, weight_sum = 0.0, 0.0
-        for offset, delta in enumerate(deltas[index:min(index + k, size - 1)]):
-            weight = gamma ** offset
+        for offset, delta in enumerate(deltas[index : min(index + k, size - 1)]):
+            weight = gamma**offset
             if weight == 0:
                 continue
             if not _finite(delta):
@@ -192,13 +240,17 @@ def discounted_credits(values: Sequence[Optional[float]],
     return result
 
 
-def annotate_rollout_credits(values: Sequence[Optional[float]],
-                             turn_indices: Sequence[int],
-                             turn_types: Sequence[str],
-                             external_errors: Sequence[bool],
-                             final_flags: Sequence[bool], *,
-                             outcome_valid: bool,
-                             outcome_advantage: Optional[float], config=None):
+def annotate_rollout_credits(
+    values: Sequence[Optional[float]],
+    turn_indices: Sequence[int],
+    turn_types: Sequence[str],
+    external_errors: Sequence[bool],
+    final_flags: Sequence[bool],
+    *,
+    outcome_valid: bool,
+    outcome_advantage: Optional[float],
+    config=None,
+):
     """Assign tool credit without crossing missing turns or external failures.
 
     K counts original decision positions, including the current decision and
@@ -213,20 +265,29 @@ def annotate_rollout_credits(values: Sequence[Optional[float]],
     """
     cfg = TraceConfig.from_mapping(config)
     size = len(values)
-    if any(len(items) != size for items in
-           (turn_indices, turn_types, external_errors, final_flags)):
+    if any(
+        len(items) != size
+        for items in (turn_indices, turn_types, external_errors, final_flags)
+    ):
         raise ValueError("TRACE rollout credit inputs must have the same length")
-    result = {key: [math.nan] * size for key in
-              ("local_credit", "terminal_fill", "effective_credit")}
-    result.update({key: [False] * size for key in
-                   ("window_blocked", "external_error_blocked", "terminal_reached")})
+    result = {
+        key: [math.nan] * size
+        for key in ("local_credit", "terminal_fill", "effective_credit")
+    }
+    result.update(
+        {
+            key: [False] * size
+            for key in ("window_blocked", "external_error_blocked", "terminal_reached")
+        }
+    )
     finals = [i for i, flag in enumerate(final_flags) if bool(flag)]
     final_position = finals[0] if len(finals) == 1 else None
 
     def valid_index(position):
         value = turn_indices[position]
-        return (not isinstance(value, bool) and _finite(value)
-                and float(value).is_integer())
+        return (
+            not isinstance(value, bool) and _finite(value) and float(value).is_integer()
+        )
 
     for start in range(size):
         if str(turn_types[start]) != "tool_plan":
@@ -241,9 +302,11 @@ def annotate_rollout_credits(values: Sequence[Optional[float]],
         blocked = False
         reached = False
         for position in range(start, size):
-            if (not valid_index(position)
-                    or (position > start and float(turn_indices[position])
-                        != float(turn_indices[position - 1]) + 1)):
+            if not valid_index(position) or (
+                position > start
+                and float(turn_indices[position])
+                != float(turn_indices[position - 1]) + 1
+            ):
                 blocked = True
                 break
             turn = int(turn_indices[position])
@@ -261,8 +324,10 @@ def annotate_rollout_credits(values: Sequence[Optional[float]],
                 break
             if position + 1 >= size:
                 break  # An observed prefix can have no terminal answer.
-            if (not valid_index(position + 1)
-                    or float(turn_indices[position + 1]) != turn + 1):
+            if (
+                not valid_index(position + 1)
+                or float(turn_indices[position + 1]) != turn + 1
+            ):
                 blocked = True
                 break
             weight = cfg.gamma ** (turn - int(turn_indices[start]))
@@ -287,13 +352,19 @@ def annotate_rollout_credits(values: Sequence[Optional[float]],
             continue
         result["local_credit"][start] = local
         fill = 0.0
-        if (cfg.terminal_fill_enabled and cfg.terminal_fill_scale > 0
-                and reached and outcome_valid):
+        if (
+            cfg.terminal_fill_enabled
+            and cfg.terminal_fill_scale > 0
+            and reached
+            and outcome_valid
+        ):
             if not _finite(outcome_advantage):
                 result["window_blocked"][start] = True
                 continue
             distance = int(turn_indices[final_position]) - int(turn_indices[start])
-            fill = cfg.terminal_fill_scale * cfg.gamma ** distance * float(outcome_advantage)
+            fill = (
+                cfg.terminal_fill_scale * cfg.gamma**distance * float(outcome_advantage)
+            )
         if not _finite(fill) or not _finite(local + fill):
             result["window_blocked"][start] = True
             continue
@@ -352,14 +423,25 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
     positive_threshold = cfg.igpo_positive_threshold if igpo else cfg.positive_threshold
     negative_threshold = cfg.igpo_negative_threshold if igpo else cfg.negative_threshold
     gap_threshold = cfg.igpo_gap_epsilon if igpo else cfg.gap_epsilon
-    counts = dict.fromkeys((
-        "groups_eligible",
-        "groups_no_positive", "groups_no_negative", "groups_both_signs",
-        "candidates_sign", "rejected_value_match", "rejected_credit_gap",
-        "rejected_length", "rejected_same_action", "rejected_group_cap",
-        "rejected_global_cap", "selected_unique",
-        "trace_candidates_sign", "trace_after_value_match",
-    ), 0)
+    counts = dict.fromkeys(
+        (
+            "groups_eligible",
+            "groups_no_positive",
+            "groups_no_negative",
+            "groups_both_signs",
+            "candidates_sign",
+            "rejected_value_match",
+            "rejected_credit_gap",
+            "rejected_length",
+            "rejected_same_action",
+            "rejected_group_cap",
+            "rejected_global_cap",
+            "selected_unique",
+            "trace_candidates_sign",
+            "trace_after_value_match",
+        ),
+        0,
+    )
     if metrics is not None:
         metrics.update(counts)
     if not cfg.enabled:
@@ -370,25 +452,36 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
         source = _pair_label_source(row)
         turn_type = row.get("turn_type")
         key = (row.get("uid"), turn_type, source)
-        if (source is None or not row.get("valid", True) or row.get("external_error", False)
-                or not all(_finite(row.get(key)) for key in ("old_per_token", "length"))
-                or float(row["length"]) <= 0):
+        if (
+            source is None
+            or not row.get("valid", True)
+            or row.get("external_error", False)
+            or not all(_finite(row.get(key)) for key in ("old_per_token", "length"))
+            or float(row["length"]) <= 0
+        ):
             continue
         if source == "outcome":
             success = _outcome_success(row, cfg)
-            if (not row.get("outcome_valid", False) or success is None
-                    or not _finite(row.get("outcome_reward"))
-                    or (cfg.outcome_match_value and not _finite(row.get("value")))):
+            if (
+                not row.get("outcome_valid", False)
+                or success is None
+                or not _finite(row.get("outcome_reward"))
+                or (cfg.outcome_match_value and not _finite(row.get("value")))
+            ):
                 continue
             score = float(row["outcome_reward"])
             success_flags[row["index"]] = success
         else:
             score_name = "igpo_advantage" if igpo else "credit"
-            if (not all(_finite(row.get(name)) for name in ("value", score_name))
-                    or (igpo and not row.get("igpo_valid", False))):
+            if not all(_finite(row.get(name)) for name in ("value", score_name)) or (
+                igpo and not row.get("igpo_valid", False)
+            ):
                 continue
-            if (igpo and cfg.igpo_absolute_ig_guard == "cumulative"
-                    and not _finite(row.get("raw_ig_return"))):
+            if (
+                igpo
+                and cfg.igpo_absolute_ig_guard == "cumulative"
+                and not _finite(row.get("raw_ig_return"))
+            ):
                 continue
             score = float(row[score_name])
         scores[row["index"]] = score
@@ -403,12 +496,26 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
             positive = [row for row in group_rows if success_flags[row["index"]]]
             negative = [row for row in group_rows if not success_flags[row["index"]]]
         else:
-            positive = [row for row in group_rows if scores[row["index"]] > positive_threshold
-                        and (not igpo or cfg.igpo_absolute_ig_guard == "none"
-                             or float(row["raw_ig_return"]) > 0)]
-            negative = [row for row in group_rows if scores[row["index"]] < -negative_threshold
-                        and (not igpo or cfg.igpo_absolute_ig_guard == "none"
-                             or float(row["raw_ig_return"]) < 0)]
+            positive = [
+                row
+                for row in group_rows
+                if scores[row["index"]] > positive_threshold
+                and (
+                    not igpo
+                    or cfg.igpo_absolute_ig_guard == "none"
+                    or float(row["raw_ig_return"]) > 0
+                )
+            ]
+            negative = [
+                row
+                for row in group_rows
+                if scores[row["index"]] < -negative_threshold
+                and (
+                    not igpo
+                    or cfg.igpo_absolute_ig_guard == "none"
+                    or float(row["raw_ig_return"]) < 0
+                )
+            ]
         counts["groups_no_positive"] += not positive
         counts["groups_no_negative"] += not negative
         counts["groups_both_signs"] += bool(positive and negative)
@@ -418,11 +525,15 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
         for chosen in positive:
             for rejected in negative:
                 match_value = not outcome or cfg.outcome_match_value
-                value_gap = (abs(float(chosen["value"]) - float(rejected["value"]))
-                             if match_value else 0.0)
+                value_gap = (
+                    abs(float(chosen["value"]) - float(rejected["value"]))
+                    if match_value
+                    else 0.0
+                )
                 credit_gap = scores[chosen["index"]] - scores[rejected["index"]]
-                length_ratio = max(float(chosen["length"]), float(rejected["length"])) / min(
-                    float(chosen["length"]), float(rejected["length"]))
+                length_ratio = max(
+                    float(chosen["length"]), float(rejected["length"])
+                ) / min(float(chosen["length"]), float(rejected["length"]))
                 if match_value and value_gap > cfg.match_epsilon:
                     counts["rejected_value_match"] += 1
                     continue
@@ -434,14 +545,29 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
                 if length_ratio > cfg.length_ratio_max:
                     counts["rejected_length"] += 1
                     continue
-                chosen_key, rejected_key = chosen.get("action_key"), rejected.get("action_key")
-                if chosen_key is not None and rejected_key is not None and chosen_key == rejected_key:
+                chosen_key, rejected_key = chosen.get("action_key"), rejected.get(
+                    "action_key"
+                )
+                if (
+                    chosen_key is not None
+                    and rejected_key is not None
+                    and chosen_key == rejected_key
+                ):
                     counts["rejected_same_action"] += 1
                     continue
-                priority = (-credit_gap, value_gap,
-                            abs(float(chosen["old_per_token"]) - float(rejected["old_per_token"])),
-                            chosen["index"], rejected["index"])
-                candidates.append((priority, group_key, chosen["index"], rejected["index"]))
+                priority = (
+                    -credit_gap,
+                    value_gap,
+                    abs(
+                        float(chosen["old_per_token"])
+                        - float(rejected["old_per_token"])
+                    ),
+                    chosen["index"],
+                    rejected["index"],
+                )
+                candidates.append(
+                    (priority, group_key, chosen["index"], rejected["index"])
+                )
 
     candidates.sort(key=lambda item: item[0])
     per_group = defaultdict(int)
@@ -461,3 +587,127 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
     if metrics is not None:
         metrics.update(counts)
     return pairs
+
+
+def first_ground_truth(value):
+    """Use a fixed first nonempty alias, never the alias easiest for a state."""
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        for alias in value:
+            answer = first_ground_truth(alias)
+            if answer is not None:
+                return answer
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value) if math.isfinite(value) else None
+    return None
+
+
+def encode_state_requests(
+    contexts,
+    ground_truths,
+    tokenizer,
+    *,
+    max_prompt_length,
+    max_gt_tokens,
+    answer_instruction,
+):
+    """Return unique probes and their row mapping; never truncate a state or GT."""
+    if len(contexts) != len(ground_truths):
+        raise ValueError("TRACE contexts and ground truths must be aligned")
+    requests, row_requests, seen, target_cache = [], [], {}, {}
+    counts = Counter(
+        {
+            key: 0
+            for key in (
+                "missing_gt",
+                "missing_state",
+                "invalid_gt_length",
+                "overlong_state",
+                "scoring_requests",
+            )
+        }
+    )
+    for context, raw_gt in zip(contexts, ground_truths):
+        answer = first_ground_truth(raw_gt)
+        if answer is None:
+            counts["missing_gt"] += 1
+            row_requests.append(None)
+            continue
+        if not isinstance(context, str) or not context.strip():
+            counts["missing_state"] += 1
+            row_requests.append(None)
+            continue
+        if answer not in target_cache:
+            target_cache[answer] = tokenizer.encode(answer, add_special_tokens=False)
+        target_ids = target_cache[answer]
+        if not target_ids or len(target_ids) > max_gt_tokens:
+            counts["invalid_gt_length"] += 1
+            row_requests.append(None)
+            continue
+        content = context.strip() + "\n\n" + answer_instruction
+        prompt_ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": content}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        if not prompt_ids or len(prompt_ids) > max_prompt_length:
+            counts["overlong_state"] += 1
+            row_requests.append(None)
+            continue
+        key = (tuple(prompt_ids), tuple(target_ids))
+        if key not in seen:
+            seen[key] = len(requests)
+            requests.append(
+                {"prompt_ids": list(prompt_ids), "target_ids": list(target_ids)}
+            )
+        row_requests.append(seen[key])
+    counts["scoring_requests"] = len(requests)
+    return requests, row_requests, dict(counts)
+
+
+def build_score_tensors(requests, pad_token_id):
+    import torch
+
+    if not requests:
+        raise ValueError("Cannot build an empty TRACE scoring batch")
+    prompt_width = max(len(r["prompt_ids"]) for r in requests)
+    target_width = max(len(r["target_ids"]) for r in requests)
+    prompts = torch.full((len(requests), prompt_width), pad_token_id, dtype=torch.long)
+    responses = torch.full(
+        (len(requests), target_width), pad_token_id, dtype=torch.long
+    )
+    prompt_mask = torch.zeros_like(prompts)
+    response_mask = torch.zeros_like(responses)
+    for row, request in enumerate(requests):
+        p, r = request["prompt_ids"], request["target_ids"]
+        prompts[row, -len(p) :] = torch.tensor(p, dtype=torch.long)
+        responses[row, : len(r)] = torch.tensor(r, dtype=torch.long)
+        prompt_mask[row, -len(p) :] = 1
+        response_mask[row, : len(r)] = 1
+    attention_mask = torch.cat((prompt_mask, response_mask), dim=-1)
+    return {
+        "prompts": prompts,
+        "responses": responses,
+        "input_ids": torch.cat((prompts, responses), dim=-1),
+        "attention_mask": attention_mask,
+        "position_ids": (attention_mask.cumsum(dim=-1) - 1).clamp(min=0),
+        "response_mask": response_mask,
+    }
+
+
+def mean_gt_logps(logps, response_mask):
+    """Average only GT tokens, rejecting invalid scores even in mixed batches."""
+    import torch
+
+    if logps.shape != response_mask.shape:
+        raise ValueError("TRACE log probabilities and GT mask have different shapes")
+    mask = response_mask.bool().to(logps.device)
+    scores = logps.float().masked_fill(~mask, 0.0)
+    valid = ((torch.isfinite(scores) & (scores <= 0)) | ~mask).all(dim=-1)
+    lengths = mask.sum(dim=-1)
+    means = scores.sum(dim=-1) / lengths.clamp(min=1)
+    return means.masked_fill(~valid | (lengths == 0), float("nan")).cpu().tolist()

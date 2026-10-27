@@ -7,7 +7,7 @@ import sys
 import unittest
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "agentflow" / "trace_credit.py"
+MODULE_PATH = Path(__file__).resolve().parents[1] / "agentflow" / "trace" / "credit.py"
 SPEC = importlib.util.spec_from_file_location("trace_credit", MODULE_PATH)
 trace_credit = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = trace_credit

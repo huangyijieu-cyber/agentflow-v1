@@ -148,7 +148,7 @@ IG 和 outcome 默认分别标准化；不启用 curriculum、二次优势归一
 
 ## 8. 改动范围与验证
 
-已新增 `agentflow/agentflow/igpo_credit.py`，独立实现奖励标准化和回传；已修改 `trace_credit.py` 的分数模式与阈值、`trainer.py` 的接入和 Pair 元数据、`trace_metrics.py` 的少量必要指标，以及 3 份 YAML、测试与文档。复用 Solver、Daemon 和 Rollout 的既有元数据链路。
+奖励标准化和回传独立实现于 `agentflow/agentflow/trace/igpo.py`；分数模式与阈值、GT 评分输入及 TRACE 信用集中于同包的 `credit.py`，指标位于 `metrics.py`，执行状态位于 `execution.py`。`trainer.py` 负责接入和 Pair 元数据，3 份 YAML 提供配置；复用 Solver、Daemon 和 Rollout 的既有元数据链路。该子包由原有 5 个平铺实现文件整理而来，业务逻辑保持不变。
 
 必要指标：原始 IG、归一化 IG、归一化终局奖励和累计优势分布；有效组／Rollout 数；近零方差跳过；故障阻断；raw IG 与最终优势的符号差异；优势与剩余 Turn 数的关系；各来源 Pair 构成。全局 cap 仍沿用 v2_a，若触发，须检查不同来源分数尺度对选中占比的影响。
 
