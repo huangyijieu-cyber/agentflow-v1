@@ -6,20 +6,6 @@ v2_b 在 `v2_a@5fbe4cc` 上实现，分支为 `trace-2b`。它替换工具 Pair 
 
 当前默认 `data.trace.pair_score_mode=igpo`；设置为 `trace_fill` 可恢复 v2_a 的 K=3 与终局回填构造。设计依据和取舍见 [设计方案](trace-2b-design.md)。
 
-## 代码组织
-
-TRACE／IGPO 实现统一位于 `agentflow/agentflow/trace/` 子包：
-
-| 文件 | 职责 |
-| --- | --- |
-| `credit.py` | 配置、GT 评分输入、TRACE 信用与 Pair 筛选 |
-| `igpo.py` | IGPO 奖励标准化与全后缀优势 |
-| `execution.py` | 工具故障分类与可信终局元数据 |
-| `metrics.py` | 状态、Pair 与 IGPO 指标 |
-| `__init__.py` | 轻量包入口，不预加载训练依赖 |
-
-本次只整理文件与导入关系，沿用现有测试，不改变公式、默认参数、筛选规则、指标或训练行为。
-
 ## 信号与公式
 
 沿用 v2_a 的评分上下文、冻结 reference、温度 1 和 GT Token 平均 LogP。GT 仅进入独立评分请求，不进入 agent 的生成上下文。状态价值继续用于配对前的进度匹配：

@@ -23,7 +23,7 @@ from autogen_ext.tools.mcp import StdioServerParams
 from agentflow import Trainer, LitAgent, NamedResources, LLM, reward, configure_logger, DevTaskLoader
 
 from agentflow.solver import construct_solver
-from agentflow.trace.execution import annotate_trace_outcome
+from agentflow.trace_execution import annotate_trace_outcome
 from datetime import datetime
 import uuid, json
 from filelock import FileLock

@@ -11,7 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
-    "trace_execution_test", ROOT / "agentflow/agentflow/trace/execution.py")
+    "trace_execution_test", ROOT / "agentflow/agentflow/trace_execution.py")
 EXECUTION = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(EXECUTION)
 REWARD_SPEC = importlib.util.spec_from_file_location("trace_reward_test", ROOT / "agentflow/reward.py")
