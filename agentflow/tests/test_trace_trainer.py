@@ -31,10 +31,10 @@ def load_source_module(name, path):
     return module
 
 
-CREDIT = load_source_module("trace_credit_trainer_test", ROOT / "agentflow/agentflow/trace_credit.py")
-SCORING = load_source_module("trace_scoring_trainer_test", ROOT / "agentflow/agentflow/trace_scoring.py")
-METRICS = load_source_module("trace_metrics_trainer_test", ROOT / "agentflow/agentflow/trace_metrics.py")
-EXECUTION = load_source_module("trace_execution_trainer_test", ROOT / "agentflow/agentflow/trace_execution.py")
+CREDIT = load_source_module("trace_credit_trainer_test", ROOT / "agentflow/agentflow/trace/credit.py")
+SCORING = CREDIT
+METRICS = load_source_module("trace_metrics_trainer_test", ROOT / "agentflow/agentflow/trace/metrics.py")
+EXECUTION = load_source_module("trace_execution_trainer_test", ROOT / "agentflow/agentflow/trace/execution.py")
 
 
 class Proto:

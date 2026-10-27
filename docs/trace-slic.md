@@ -99,6 +99,10 @@ analysis／final 依据可信成功／失败分池，默认不施加 GT 价值�
 
 Pair 两侧保留各自原始生成 Prompt、响应及原生 token IDs。仍使用现有 per-token calibration 与 Chosen SFT；不将 GT 信用塞入 Loss，不改变原 GRPO 优势。GT 可预测性接近并不证明证据相同或动作可交换，需要独立状态抽查与验证任务收益确认配对质量。
 
+## 代码组织
+
+实现统一位于 `agentflow/agentflow/trace/` 子包：`credit.py` 包含原信用计算与 GT 评分，`execution.py` 负责故障和可信终局，`metrics.py` 负责指标，`__init__.py` 为轻量包入口。原 4 个平铺文件整理为 4 个包内文件，生产文件总数不变。该结构整理保持 `trace` 分支的公式、默认参数、筛选规则和训练行为不变。
+
 ## 配置
 
 全部位于 `data.trace`；基础声明在 `agentflow/verl/config.yaml`。两份训练启动 YAML 提供同名 `TRACE_*` 环境变量覆盖，Hydra 参数不使用 `+`。

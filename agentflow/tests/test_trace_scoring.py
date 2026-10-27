@@ -3,6 +3,7 @@ import ast
 from contextlib import contextmanager, nullcontext
 import importlib.util
 import math
+import sys
 from pathlib import Path
 from types import SimpleNamespace, MethodType
 import unittest
@@ -10,8 +11,9 @@ import unittest
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
-spec = importlib.util.spec_from_file_location("trace_scoring_under_test", ROOT / "agentflow/agentflow/trace_scoring.py")
+spec = importlib.util.spec_from_file_location("trace_scoring_under_test", ROOT / "agentflow/agentflow/trace/credit.py")
 scoring = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = scoring
 spec.loader.exec_module(scoring)
 
 

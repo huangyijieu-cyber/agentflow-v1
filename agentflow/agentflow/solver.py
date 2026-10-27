@@ -15,7 +15,7 @@ from agentflow.models.memory import Memory
 from agentflow.models.executor import Executor
 from agentflow.models.utils import make_json_serializable_truncated
 from agentflow.rollout_timing import RolloutTiming, is_search_tool, profiling_enabled
-from agentflow.trace_execution import classify_tool_result
+from agentflow.trace.execution import classify_tool_result
 
 
 def log_info(message):
