@@ -2,7 +2,7 @@
 
 记录日期：2026-10-26。
 
-先前待办已完成实现及 CPU 集成回归，下表按最终实现更新。修改纳入 `trace` 分支，具体版本见 Git 提交记录；GPU/NPU 端训练效果尚未验证。
+先前算法待办已完成实现及 CPU 集成回归，提交 `6eb6215` 已推送到 `trace` 分支。后续指标精简于 2026-10-27 纳入 `trace` 分支，具体版本见 Git 提交记录；GPU/NPU 端训练效果尚未验证。
 
 ## 设计原则
 
@@ -75,10 +75,10 @@
 - [x] 普通与 profiling Rollout 均透传外部故障、实际 final、终局有效性及 verifier 成功标记。
 - [x] 保留现有 GRPO 奖励路径；本轮不将外部中断自动改写成其它 GRPO 奖励。
 
-### 指标与验证
+### 指标与验证（按精简后口径）
 
-- [x] 分开输出 local_credit、terminal_fill、effective_credit，analysis／final 不伪装 GT 信用。
-- [x] 区分 trace／outcome Pair 数、工具匹配率、奖励差分布和终局结果描述。
+- [x] 分开输出 local_credit、terminal_fill、credit；`credit` 即有效信用，不再重复输出 effective_credit，analysis／final 不伪装 GT 信用。
+- [x] 区分 trace／outcome Pair 数、工具匹配率与工具信用／终局结果的关系；奖励路线的固定奖励差和定义恒定比例已删除。
 - [x] 明确工具信用覆盖率分母，排除天然不使用 GT 信用的 analysis／final。
 - [x] 输出外部故障、受影响窗口、不可信终局与回填触发计数。
 - [x] CPU 集成回归覆盖类型分流、K 计数、final 触发、故障隔离、正常无结果、重试成功、verifier 失败和两入口元数据。
@@ -88,9 +88,44 @@
 
 SLIC 累计 SFT 的长度尺度、Replay 的 16 倍采样、跨 Prompt 似然校正等属于诊断建议，不在当前待办实施范围。本轮不更改 Loss、Replay 更新强度或原 GRPO 优势算法。
 
-## 本地验证
+## 指标精简（2026-10-27 提交）
+
+只精简日志及对应测试，不修改状态价值、信用、Pair 筛选和排序、SLIC Loss、GRPO 优势、Replay 采样或配置。小价值距离、大信用差仍只是代理信号，不代表已经证明状态可比。
+
+| 删除的指标或指标族 | 原因与替代观察项 |
+| --- | --- |
+| `trace/effective_credit_*` | 与 `trace/credit_*` 完全相同，统一保留后者 |
+| `trace/{type}/credit_*`、按类型的正／负／中性计数及比例 | 仅工具使用 GT 信用；重复总体工具统计，analysis／final 的空统计没有诊断价值 |
+| `trace/value_*` | 不同问题和初态的总体分布难以判断可比性；保留最终工具 Pair 的 `value_gap_*` |
+| `trace/gt_logp_{std,p10,p50,p90}` | 保留 GT LogP 数量和均值确认评分水平；匹配质量直接看 Pair 距离 |
+| `trace/{credit,local_credit,terminal_fill}_std`、`trace/credit_abs_*` | 已有三组信用的均值与分位数，删除重复幅度统计 |
+| `trace/{positive,negative,neutral}_turns`、`trace/neutral_rate` | 保留有限信用数与正／负比例；中性比例可推导 |
+| `trace/label_source/{source}/turns` | 输入行构成不等于实际监督构成；保留分来源选中 Pair 数 |
+| `trace/unscored_credit_turns`、`trace/credit_missing_nonterminal` | 前者混入天然无信用的 analysis／final；覆盖率与预期工具行数已足够解释缺失 |
+| `trace/terminal_turns`、`trace/outcome_invalid_turns` | 最后可见 Turn 不一定是真实 final，final 后附加输出也会无标签；改看实际边界与无可信结果的 Rollout 数 |
+| `trace/unique_pairs` | 重复 `trace/pair/selected_unique` |
+| `trace/pair/after_*` 累计通过计数 | 可由候选数与六种互斥拒绝计数还原；工具匹配内部计数只用于计算比例，不外发 |
+| `trace/pair/{rows_total,rows_eligible,groups_total,groups_eligible,groups_both_signs}` | 保留缺正／缺负组数、`both_sign_group_rate` 及实际 Pair 数；必要分母留作内部统计 |
+| `trace/pair/{positive,negative,neutral}_{rows,rate}` | 混合工具信用标签与终局奖励标签，不能解释为统一 GT 信用分布 |
+| `trace/pair/{trace_candidates_sign,trace_after_value_match,outcome_candidates_sign,outcome_after_value_match}` | 工具计数仅内部派生匹配率；奖励路线默认跳过匹配，重复通过数没有独立信息 |
+| `trace/pair/value_match_rate`、`trace/pair/selection_rate` | 混合来源匹配率含奖励 bypass；选择率同时受数量上限影响，保留工具匹配率和拒绝原因 |
+| `trace/pair/{chosen_rows_unique,rejected_rows_unique,rows_unique,questions_covered}` | 精简覆盖计数，保留 `question_coverage` 与 Replay 采样多样性 |
+| `trace/pair/cross_rollout_rate` | 保留跨原始 Turn 比例描述配对形式；跨 Rollout 比例不是质量目标 |
+| `trace/pair/value_gap_count`、`credit_gap_count` | 只统计最终工具 Pair，使用 `trace_selected_unique` 确认样本量 |
+| `trace/pair/{chosen_credit,rejected_credit}_*` | 有效信用及信用差分布已覆盖主要诊断，删除重复两侧统计 |
+| `trace/pair/length_ratio_*` | 长度比仍有硬过滤并保留 `rejected_length`，无需重复输出通过样本分布 |
+| `trace/pair/outcome_reward_gap_*` | 二值任务通常固定为 1，奖励路线直接保留可信成功／失败分流与选中数 |
+| 总体 `trace/pair/{outcome_pairs_count,chosen_failed_rollout_rate,rejected_successful_rollout_rate,same_outcome_rate}` | 混合两种标签来源难以解释；只保留 `trace/pair/trace/` 下的工具终局关系 |
+| `trace/pair/outcome/{outcome_pairs_count,chosen_failed_rollout_rate,rejected_successful_rollout_rate,same_outcome_rate}`、`label_source_mismatch_pairs` | 前者由奖励配对定义决定，后者是选择逻辑不变量，依赖测试保障 |
+| `trace/{deduplicated_states,scoring_dedup_rate,scoring_prompt_tokens,scoring_gt_tokens}` | 删除细碎评分开销统计，保留请求数、评分异常、耗时和 step 占比 |
+| `trace/total_seconds` | 已有训练 step 时间及 `step_time_fraction`；单独保留 RPC 耗时定位评分成本 |
+| `trace/replay/{unique_sampled_pairs,buffer_unique_pairs,sample_age_p50,sample_age_max}` | 保留采样量、不同 Pair 比例、年龄 p90 与实际更新标记，减少重复统计 |
+
+保留指标的完整定义见 [指标说明](trace-slic-metrics.md)。精简后 TRACE CPU 回归 122 项通过，覆盖保留指标语义、已删指标不再输出、有限数值、空样本、来源隔离、漏斗守恒、信用和配对结果不变。文档变更通过 `git diff --check`。
+
+## 算法提交验证（`6eb6215`）
 
 - TRACE CPU 回归 118 项通过，覆盖状态评分、类型分流、K=3 与 final 计数、可信终局、故障窗口隔离、重试恢复、两入口元数据、Pair 排序和指标统计。
 - 原生 token IDs 回归 8 项通过；3 份 YAML、新环境变量及 Python 默认值已核对一致。
-- 实际 final 后的可选输出不会使可信 Rollout 被计入 `outcome_invalid_rollouts`；Turn 级无效计数仍逐行保留。
+- 实际 final 后的可选输出不会使可信 Rollout 被计入 `outcome_invalid_rollouts`；后续指标精简已移除 Turn 级无效计数。
 - `git diff --check` 通过；尚无真实 GPU/NPU 训练效果结论。

@@ -302,30 +302,21 @@ class TracePairTests(unittest.TestCase):
         metrics = {}
         self.assertEqual(select_pairs(rows, {"gap_epsilon": 0.15}, metrics), [(8, 9)])
         expected = {
-            "rows_total": 15, "rows_eligible": 14,
-            "groups_total": 9, "groups_eligible": 8,
+            "groups_eligible": 8,
             "groups_no_positive": 2, "groups_no_negative": 2,
-            "groups_both_signs": 5, "positive_rows": 6,
-            "negative_rows": 6, "neutral_rows": 2,
-            "candidates_sign": 5, "after_value_match": 4,
-            "after_credit_gap": 3, "after_length_filter": 2,
-            "after_distinct_action": 1, "rejected_value_match": 1,
+            "groups_both_signs": 5,
+            "candidates_sign": 5, "rejected_value_match": 1,
             "rejected_credit_gap": 1, "rejected_length": 1,
             "rejected_same_action": 1, "rejected_group_cap": 0,
             "rejected_global_cap": 0, "selected_unique": 1,
             "trace_candidates_sign": 5, "trace_after_value_match": 4,
-            "outcome_candidates_sign": 0, "outcome_after_value_match": 0,
         }
         self.assertEqual(metrics, expected)
-        stages = ["candidates_sign", "after_value_match", "after_credit_gap",
-                  "after_length_filter", "after_distinct_action"]
         reasons = ["rejected_value_match", "rejected_credit_gap",
-                   "rejected_length", "rejected_same_action"]
-        for before, after, rejected in zip(stages, stages[1:], reasons):
-            self.assertEqual(metrics[before], metrics[after] + metrics[rejected])
-        self.assertEqual(metrics["after_distinct_action"],
-                         metrics["selected_unique"] + metrics["rejected_group_cap"]
-                         + metrics["rejected_global_cap"])
+                   "rejected_length", "rejected_same_action", "rejected_group_cap",
+                   "rejected_global_cap"]
+        self.assertEqual(metrics["candidates_sign"],
+                         metrics["selected_unique"] + sum(metrics[key] for key in reasons))
 
     def test_metrics_empty_calls_reset_all_keys(self):
         metrics = {"unrelated": 7}
@@ -347,14 +338,28 @@ class TracePairTests(unittest.TestCase):
                 row(6, length=0), row(7, valid=False, uid="invalid-only")]
         metrics = {}
         self.assertEqual(select_pairs(rows, metrics=metrics), [(0, 1)])
-        self.assertEqual(metrics["rows_total"], 8)
-        self.assertEqual(metrics["rows_eligible"], 2)
-        self.assertEqual(metrics["groups_total"], 2)
         self.assertEqual(metrics["groups_eligible"], 1)
-        self.assertEqual(metrics["positive_rows"], 1)
-        self.assertEqual(metrics["negative_rows"], 1)
-        self.assertEqual(metrics["neutral_rows"], 0)
+        self.assertEqual(metrics["groups_both_signs"], 1)
+        self.assertEqual(metrics["groups_no_positive"], 0)
+        self.assertEqual(metrics["groups_no_negative"], 0)
         self.assertEqual(metrics["candidates_sign"], 1)
+
+    def test_metrics_omit_redundant_counts_and_keep_tool_match_denominator(self):
+        rows = [row(0), row(1, -0.1), row(2, -0.1, value=0.5),
+                self.outcome_row(3, 1), self.outcome_row(4, 0)]
+        metrics = {}
+        self.assertEqual(select_pairs(rows, metrics=metrics), [(3, 4), (0, 1)])
+        self.assertEqual(metrics["candidates_sign"], 3)
+        self.assertEqual(metrics["trace_candidates_sign"], 2)
+        self.assertEqual(metrics["trace_after_value_match"], 1)
+        self.assertEqual(metrics["rejected_value_match"], 1)
+        removed = {
+            "rows_total", "rows_eligible", "groups_total", "positive_rows",
+            "negative_rows", "neutral_rows", "after_value_match", "after_credit_gap",
+            "after_length_filter", "after_distinct_action", "outcome_candidates_sign",
+            "outcome_after_value_match",
+        }
+        self.assertTrue(removed.isdisjoint(metrics))
 
     def test_metrics_caps_keep_original_selection_and_count_all_survivors(self):
         rows = [row(0), row(1, -0.1, value=0.21), row(2, -0.2),
@@ -369,7 +374,7 @@ class TracePairTests(unittest.TestCase):
                 self.assertEqual(select_pairs(rows, config), expected)
                 self.assertEqual(select_pairs(rows, config, metrics), expected)
                 self.assertEqual(select_pairs(list(reversed(rows)), config, {}), expected)
-                self.assertEqual(metrics["after_distinct_action"], 4)
+                self.assertEqual(metrics["candidates_sign"], 4)
                 self.assertEqual(metrics["selected_unique"], len(expected))
                 self.assertEqual(4, metrics["selected_unique"]
                                  + metrics["rejected_group_cap"]

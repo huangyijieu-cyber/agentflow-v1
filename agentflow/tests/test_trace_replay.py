@@ -43,11 +43,12 @@ class ReplayMetricTests(unittest.TestCase):
         selected = sample(trainer, queue, bs=3)
         self.assertEqual(len(selected), 3)
         metrics = trainer._trace_replay_metrics
-        self.assertEqual(metrics["trace/replay/buffer_unique_pairs"], 2)
-        self.assertEqual(metrics["trace/replay/unique_sampled_pairs"], 2)
+        self.assertEqual(metrics["trace/replay/sampled_pairs"], 3)
         self.assertAlmostEqual(metrics["trace/replay/sample_unique_pair_rate"], 2 / 3)
-        self.assertEqual(metrics["trace/replay/sample_age_p50"], 3)
-        self.assertEqual(metrics["trace/replay/sample_age_max"], 3)
+        self.assertEqual(metrics["trace/replay/sample_age_p90"], 3)
+        self.assertEqual(set(metrics), {"trace/replay/sampled_pairs",
+                                      "trace/replay/sample_unique_pair_rate",
+                                      "trace/replay/sample_age_p90"})
 
     def test_replacement_sampling_and_metric_collection_do_not_change_draws(self):
         queue = deque([Proto("one", 7), Proto("two", 9)])
@@ -57,7 +58,7 @@ class ReplayMetricTests(unittest.TestCase):
         np.random.seed(53)
         second = sample(disabled, queue, bs=5)
         self.assertEqual([id(p) for p in first], [id(p) for p in second])
-        self.assertEqual(enabled._trace_replay_metrics["trace/replay/unique_sampled_pairs"], 2)
+        self.assertEqual(enabled._trace_replay_metrics["trace/replay/sampled_pairs"], 5)
         self.assertEqual(enabled._trace_replay_metrics["trace/replay/sample_unique_pair_rate"], 0.4)
         self.assertEqual(len(queue), 2)
 
@@ -66,7 +67,7 @@ class ReplayMetricTests(unittest.TestCase):
         sample(trainer, deque([Proto("one", 9)]), bs=1)
         self.assertIsNone(sample(trainer, deque(), bs=1))
         self.assertEqual(trainer._trace_replay_metrics["trace/replay/sampled_pairs"], 0)
-        self.assertNotIn("trace/replay/sample_age_p50", trainer._trace_replay_metrics)
+        self.assertNotIn("trace/replay/sample_age_p90", trainer._trace_replay_metrics)
 
 
 if __name__ == "__main__":

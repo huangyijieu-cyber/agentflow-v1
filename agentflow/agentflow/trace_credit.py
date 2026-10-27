@@ -310,31 +310,22 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
     """
     cfg = TraceConfig.from_mapping(config)
     counts = dict.fromkeys((
-        "rows_total", "rows_eligible", "groups_total", "groups_eligible",
+        "groups_eligible",
         "groups_no_positive", "groups_no_negative", "groups_both_signs",
-        "positive_rows", "negative_rows", "neutral_rows", "candidates_sign",
-        "after_value_match", "after_credit_gap", "after_length_filter",
-        "after_distinct_action", "rejected_value_match", "rejected_credit_gap",
+        "candidates_sign", "rejected_value_match", "rejected_credit_gap",
         "rejected_length", "rejected_same_action", "rejected_group_cap",
         "rejected_global_cap", "selected_unique",
         "trace_candidates_sign", "trace_after_value_match",
-        "outcome_candidates_sign", "outcome_after_value_match",
     ), 0)
-    counts["rows_total"] = len(rows)
     if metrics is not None:
         metrics.update(counts)
     if not cfg.enabled:
         return []
     groups = defaultdict(list)
-    raw_group_keys = set()
     scores, success_flags = {}, {}
     for row in rows:
-        # Invalid observations still contribute to the raw group population.
         source = _pair_label_source(row)
         turn_type = row.get("turn_type")
-        raw_source = row.get("label_source") or (
-            "outcome" if turn_type in ("analysis", "final_answer", "direct", "base") else "trace")
-        raw_group_keys.add((row.get("uid"), turn_type, raw_source))
         key = (row.get("uid"), turn_type, source)
         if (source is None or not row.get("valid", True) or row.get("external_error", False)
                 or not all(_finite(row.get(key)) for key in ("old_per_token", "length"))
@@ -354,9 +345,7 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
             score = float(row["credit"])
         scores[row["index"]] = score
         groups[key].append(row)
-        counts["rows_eligible"] += 1
 
-    counts["groups_total"] = len(raw_group_keys)
     counts["groups_eligible"] = len(groups)
 
     candidates = []
@@ -368,14 +357,12 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
         else:
             positive = [row for row in group_rows if scores[row["index"]] > cfg.positive_threshold]
             negative = [row for row in group_rows if scores[row["index"]] < -cfg.negative_threshold]
-        counts["positive_rows"] += len(positive)
-        counts["negative_rows"] += len(negative)
-        counts["neutral_rows"] += len(group_rows) - len(positive) - len(negative)
         counts["groups_no_positive"] += not positive
         counts["groups_no_negative"] += not negative
         counts["groups_both_signs"] += bool(positive and negative)
         counts["candidates_sign"] += len(positive) * len(negative)
-        counts[group_key[2] + "_candidates_sign"] += len(positive) * len(negative)
+        if not outcome:
+            counts["trace_candidates_sign"] += len(positive) * len(negative)
         for chosen in positive:
             for rejected in negative:
                 match_value = not outcome or cfg.outcome_match_value
@@ -387,21 +374,18 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
                 if match_value and value_gap > cfg.match_epsilon:
                     counts["rejected_value_match"] += 1
                     continue
-                counts["after_value_match"] += 1
-                counts[group_key[2] + "_after_value_match"] += 1
+                if not outcome:
+                    counts["trace_after_value_match"] += 1
                 if not outcome and credit_gap < cfg.gap_epsilon:
                     counts["rejected_credit_gap"] += 1
                     continue
-                counts["after_credit_gap"] += 1
                 if length_ratio > cfg.length_ratio_max:
                     counts["rejected_length"] += 1
                     continue
-                counts["after_length_filter"] += 1
                 chosen_key, rejected_key = chosen.get("action_key"), rejected.get("action_key")
                 if chosen_key is not None and rejected_key is not None and chosen_key == rejected_key:
                     counts["rejected_same_action"] += 1
                     continue
-                counts["after_distinct_action"] += 1
                 priority = (-credit_gap, value_gap,
                             abs(float(chosen["old_per_token"]) - float(rejected["old_per_token"])),
                             chosen["index"], rejected["index"])

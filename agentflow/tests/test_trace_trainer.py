@@ -230,17 +230,16 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
         self.assertEqual(state_metrics["trace/score_coverage"], 1.)
         self.assertEqual(state_metrics["trace/credit_expected_turns"], 2)
         self.assertEqual(state_metrics["trace/credit_coverage"], 1.)
-        self.assertEqual(state_metrics["trace/terminal_turns"], 2)
         self.assertGreaterEqual(state_metrics["trace/scoring_seconds"], 0.)
         self.assertEqual(state_metrics["trace/missing_gt"], 0)
         trainer._trans_to_dpo_batch([history])
         metrics = trainer._trace_pair_metrics
         self.assertEqual(metrics["trace/pair/candidates_sign"], 1)
-        self.assertEqual(metrics["trace/pair/after_value_match"], 1)
+        self.assertEqual(metrics["trace/pair/tool_value_match_rate"], 1.)
         self.assertEqual(metrics["trace/pair/selected_unique"], 1)
         self.assertEqual(metrics["trace/pair/cross_turn_rate"], 1.)
         self.assertEqual(metrics["trace/pair/question_coverage"], 1.)
-        self.assertEqual(metrics["trace/pair/outcome_pairs_count"], 0)
+        self.assertEqual(metrics["trace/pair/trace/outcome_pairs_count"], 0)
         self.assertNotIn("trace/pair/chosen_failed_rollout_rate", metrics)
 
     def test_analysis_and_final_use_verified_outcomes_without_gt_scores(self):
@@ -266,7 +265,27 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
             self.assertEqual(pair.non_tensor_batch["trace_label_source_a"].tolist(), ["outcome"])
             self.assertTrue(np.isfinite(pair.non_tensor_batch["group_baseline"]).all())
         self.assertEqual(trainer._trace_pair_metrics["trace/pair/outcome_selected_unique"], 2)
-        self.assertEqual(trainer._trace_pair_metrics["trace/pair/credit_gap_count"], 0)
+        self.assertNotIn("trace/pair/credit_gap_p50", trainer._trace_pair_metrics)
+
+    def test_pruned_metrics_keep_pair_selection_and_hide_internal_counters(self):
+        rows, scores = standard_rows()
+        trainer, history = make_trainer(scores), make_batch(rows)
+        state_metrics = trainer._annotate_trace_credits(history)
+        pairs = trainer._trans_to_dpo_batch([history])
+        self.assertEqual(len(pairs), 1)
+        metrics = trainer._trace_pair_metrics
+        self.assertEqual(metrics["trace/pair/question_coverage"], 1.)
+        self.assertEqual(metrics["trace/pair/tool_value_match_rate"], 1.)
+        self.assertEqual(metrics["trace/pair/both_sign_group_rate"], 1.)
+        for key in ("groups_eligible", "groups_both_signs", "trace_candidates_sign",
+                    "trace_after_value_match", "after_value_match", "after_credit_gap",
+                    "after_length_filter", "after_distinct_action", "value_match_rate",
+                    "selection_rate", "questions_covered", "rows_unique"):
+            self.assertNotIn("trace/pair/" + key, metrics)
+        self.assertNotIn("trace/unique_pairs", metrics)
+        for key in ("scoring_prompt_tokens", "scoring_gt_tokens", "scoring_dedup_rate",
+                    "deduplicated_states", "effective_credit_mean", "outcome_invalid_turns"):
+            self.assertNotIn("trace/" + key, state_metrics)
 
     def test_k3_fill_uses_final_decision_and_unique_rollout_outcomes(self):
         rows, scores = [], {}
@@ -385,7 +404,7 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
         self.assertEqual(len(pairs), 8)
         self.assertEqual(trainer._trace_pair_metrics["trace/pair/selected_unique"], 1)
         self.assertEqual(trainer._trace_pair_metrics["trace/pair/padding_duplicates"], 7)
-        self.assertEqual(trainer._trace_pair_metrics["trace/pair/credit_gap_count"], 1)
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/trace_selected_unique"], 1)
 
     def test_global_cap_across_history_batches_preserves_funnel_counts(self):
         rows, scores = standard_rows()
@@ -395,7 +414,7 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
         trainer._annotate_trace_credits(second)
         self.assertEqual(len(trainer._trans_to_dpo_batch([first, second])), 1)
         metrics = trainer._trace_pair_metrics
-        self.assertEqual(metrics["trace/pair/after_distinct_action"], 2)
+        self.assertEqual(metrics["trace/pair/candidates_sign"], 2)
         self.assertEqual(metrics["trace/pair/rejected_global_cap"], 1)
         self.assertEqual(metrics["trace/pair/selected_unique"], 1)
 
@@ -458,7 +477,7 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
         history = make_batch(rows)
         trainer._annotate_trace_credits(history)
         self.assertIsNone(trainer._trans_to_dpo_batch([history]))
-        self.assertEqual(trainer._trace_pair_metrics["trace/pair/negative_rows"], 0)
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/groups_no_negative"], 1)
         self.assertEqual(trainer._trace_pair_metrics["trace/pair/selected_unique"], 0)
         self.assertNotIn("trace/pair/credit_gap_p50", trainer._trace_pair_metrics)
 

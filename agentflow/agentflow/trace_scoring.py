@@ -30,7 +30,7 @@ def encode_state_requests(contexts, ground_truths, tokenizer, *, max_prompt_leng
     requests, row_requests, seen, target_cache = [], [], {}, {}
     counts = Counter({key: 0 for key in (
         "missing_gt", "missing_state", "invalid_gt_length", "overlong_state",
-        "deduplicated_states", "scoring_requests",
+        "scoring_requests",
     )})
     for context, raw_gt in zip(contexts, ground_truths):
         answer = first_ground_truth(raw_gt)
@@ -62,8 +62,6 @@ def encode_state_requests(contexts, ground_truths, tokenizer, *, max_prompt_leng
         if key not in seen:
             seen[key] = len(requests)
             requests.append({"prompt_ids": list(prompt_ids), "target_ids": list(target_ids)})
-        else:
-            counts["deduplicated_states"] += 1
         row_requests.append(seen[key])
     counts["scoring_requests"] = len(requests)
     return requests, row_requests, dict(counts)

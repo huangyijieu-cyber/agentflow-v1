@@ -35,7 +35,7 @@ class ScorePreparationTests(unittest.TestCase):
         requests, mapping, counts = self.encode(["question", "question", "next state"], [["", "SECRET", "alias"]] * 3)
         self.assertEqual(mapping, [0, 0, 1])
         self.assertEqual(len(requests), 2)
-        self.assertEqual(counts["deduplicated_states"], 1)
+        self.assertNotIn("deduplicated_states", counts)
         self.assertEqual(requests[0]["target_ids"], Tokenizer().encode("SECRET"))
         self.assertNotIn("SECRET", "".join(chr(t) for t in requests[0]["prompt_ids"]))
 

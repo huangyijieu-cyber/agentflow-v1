@@ -397,10 +397,6 @@ class AgentFlowTrainer(RayPPOTrainer):
         metrics["trace/credit_windows_blocked"] = int(blocked.sum())
         metrics["trace/post_final_turns"] = int((~within_prefix).sum())
         metrics["trace/scoring_seconds"] = scoring_seconds
-        metrics["trace/scoring_prompt_tokens"] = sum(len(r["prompt_ids"]) for r in requests)
-        metrics["trace/scoring_gt_tokens"] = sum(len(r["target_ids"]) for r in requests)
-        mapped_rows = sum(index is not None for index in row_requests)
-        metrics["trace/scoring_dedup_rate"] = counters.get("deduplicated_states", 0) / mapped_rows if mapped_rows else 0.0
         metrics["trace/scoring_invalid_result_turns"] = sum(
             index is not None and not np.isfinite(row_logps[row])
             for row, index in enumerate(row_requests)
@@ -503,22 +499,16 @@ class AgentFlowTrainer(RayPPOTrainer):
         pair_metrics["trace/pair/rejected_global_cap"] += extra_pairs
         proto_list = proto_list[:cfg.max_pairs_per_step]
         diagnostic_pairs = diagnostic_pairs[:cfg.max_pairs_per_step]
-        pair_metrics["trace/unique_pairs"] = len(proto_list)
         pair_metrics.update(summarize_selected_pairs(diagnostic_rows, diagnostic_pairs))
-        eligible_groups = pair_metrics["trace/pair/groups_eligible"]
-        eligible_rows = pair_metrics["trace/pair/rows_eligible"]
-        for sign in ("positive", "negative", "neutral"):
-            pair_metrics[f"trace/pair/{sign}_rate"] = pair_metrics[f"trace/pair/{sign}_rows"] / eligible_rows if eligible_rows else 0.0
-        sign_candidates = pair_metrics["trace/pair/candidates_sign"]
-        matched = pair_metrics["trace/pair/after_value_match"]
-        pair_metrics["trace/pair/both_sign_group_rate"] = pair_metrics["trace/pair/groups_both_signs"] / eligible_groups if eligible_groups else 0.0
-        pair_metrics["trace/pair/value_match_rate"] = matched / sign_candidates if sign_candidates else 0.0
-        tool_candidates = pair_metrics["trace/pair/trace_candidates_sign"]
+        # These counts only supply the two diagnostic denominators. Publishing
+        # both the counts and rates would duplicate the same funnel information.
+        eligible_groups = pair_metrics.pop("trace/pair/groups_eligible", 0)
+        both_sign_groups = pair_metrics.pop("trace/pair/groups_both_signs", 0)
+        pair_metrics["trace/pair/both_sign_group_rate"] = both_sign_groups / eligible_groups if eligible_groups else 0.0
+        tool_candidates = pair_metrics.pop("trace/pair/trace_candidates_sign", 0)
+        tool_matched = pair_metrics.pop("trace/pair/trace_after_value_match", 0)
         pair_metrics["trace/pair/tool_value_match_rate"] = (
-            pair_metrics["trace/pair/trace_after_value_match"] / tool_candidates if tool_candidates else 0.0)
-        pair_metrics["trace/pair/selection_rate"] = len(proto_list) / sign_candidates if sign_candidates else 0.0
-        all_questions = {row["uid"] for row in diagnostic_rows}
-        pair_metrics["trace/pair/question_coverage"] = pair_metrics["trace/pair/questions_covered"] / len(all_questions) if all_questions else 0.0
+            tool_matched / tool_candidates if tool_candidates else 0.0)
         pair_metrics["trace/pair/padding_duplicates"] = 0
         by_index = {row["index"]: row for row in diagnostic_rows}
         for turn_type in sorted({row["turn_type"] for row in diagnostic_rows}):
@@ -766,7 +756,6 @@ class AgentFlowTrainer(RayPPOTrainer):
         """
         n_size = len(dpo_queue)
         self._trace_replay_metrics = {"trace/replay/sampled_pairs": 0,
-                                      "trace/replay/unique_sampled_pairs": 0,
                                       "trace/replay/sample_unique_pair_rate": 0.0}
         if n_size == 0:
             return None
@@ -800,12 +789,8 @@ class AgentFlowTrainer(RayPPOTrainer):
             sampled_ages = ages[indices]
             self._trace_replay_metrics = {
                 "trace/replay/sampled_pairs": len(selected),
-                "trace/replay/unique_sampled_pairs": unique_sampled,
                 "trace/replay/sample_unique_pair_rate": unique_sampled / len(selected),
-                "trace/replay/sample_age_p50": float(np.quantile(sampled_ages, 0.5)),
                 "trace/replay/sample_age_p90": float(np.quantile(sampled_ages, 0.9)),
-                "trace/replay/sample_age_max": float(sampled_ages.max()),
-                "trace/replay/buffer_unique_pairs": len(set(identities)),
             }
         return DataProto.concat(selected)
 
@@ -822,7 +807,6 @@ class AgentFlowTrainer(RayPPOTrainer):
         dpo_types = ["abpo", "slic", "simpo", "hspo"]
         if "slic" in algorithm.split("+") and self.config.data.get("trace", {}).get("enabled", False):
             metrics.update({"trace/replay/sampled_pairs": 0,
-                            "trace/replay/unique_sampled_pairs": 0,
                             "trace/replay/sample_unique_pair_rate": 0.0,
                             "trace/replay/slic_updated": 0})
 
@@ -1153,7 +1137,6 @@ class AgentFlowTrainer(RayPPOTrainer):
         metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         if "trace" in timing_raw:
-            metrics["trace/total_seconds"] = timing_raw["trace"]
             metrics["trace/step_time_fraction"] = timing_raw["trace"] / timing_raw["step"] if timing_raw.get("step", 0) else 0.0
 
         n_gpus = self.resource_pool_manager.get_n_gpus()
