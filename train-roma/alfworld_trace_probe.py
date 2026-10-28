@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""Sample one ALFWorld task once; edit a probe and rescore saved trajectories.
+
+Run without a subcommand for the local editor, or use sample / score / run.
+Heavy environment/model imports happen only in the operation that needs them.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import copy
+import csv
+from datetime import datetime, timezone
+import hashlib
+import html
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib
+import io
+import json
+import math
+import os
+from pathlib import Path
+import re
+import sys
+import threading
+import traceback
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
+import uuid
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+DEFAULT_DATASET = "data/train/alfworld/train_all_alfworld_3305.parquet"
+DEFAULT_CONFIG = {
+    "dataset": {"path": DEFAULT_DATASET, "row_index": 0},
+    "sampling": {
+        "trajectories": 4, "max_steps": 50, "history_length": 4,
+        "temperature": 0.7, "top_p": 0.9, "max_tokens": 512, "seed": 42,
+        "base_url": "http://127.0.0.1:19998/v1",
+        "model": "Qwen3-30B-A3B-Instruct-2507", "api_key_env": "OPENAI_API_KEY",
+        "timeout": 180, "return_token_ids": True,
+        "alfworld_root": "", "alfworld_data": "",
+    },
+    "scorer": {
+        "backend": "vllm", "base_url": "http://127.0.0.1:19998/v1",
+        "model": "Qwen3-30B-A3B-Instruct-2507",
+        "tokenizer": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "api_key_env": "OPENAI_API_KEY", "timeout": 180,
+        "max_context_tokens": 16384, "device": "auto",
+    },
+    "probe": {
+        "prompt": (
+            "Forecast whether the agent will successfully complete its task within "
+            "the remaining action budget, starting from the state above. "
+            "Use the recorded observations and actions as evidence; unknown facts "
+            "remain unknown. The task goal is not evidence that it has already "
+            "been achieved. Consider known alternatives and recovery paths.\n"
+            "Remaining actions: {remaining_steps}.\n"
+            "Answer with exactly one of these sentences:\n"
+            "The episode will end in success.\n"
+            "The episode will end in failure."
+        ),
+        "response": "The episode will end in success.",
+        "epsilon": 0.1, "k": 3, "gamma": 0.8, "max_response_tokens": 256,
+    },
+}
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def jsonable(value):
+    if hasattr(value, "tolist"):
+        return jsonable(value.tolist())
+    if isinstance(value, dict):
+        return {str(k): jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(v) for v in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    return str(value)
+
+
+def atomic_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    temp.write_text(json.dumps(jsonable(value), ensure_ascii=False, indent=2,
+                               allow_nan=False) + "\n", encoding="utf-8")
+    os.replace(temp, path)
+
+
+def read_json(path, default=None):
+    path = Path(path)
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
+
+
+def scalar(value):
+    value = jsonable(value)
+    while isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    return value
+
+
+def flag(value):
+    value = scalar(value)
+    return bool(value) if isinstance(value, (bool, int, float)) and value in (0, 1) else None
+
+
+def deep_update(target, changes):
+    for key, value in changes.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            deep_update(target[key], value)
+        else:
+            target[key] = value
+    return target
+
+
+def resolve_dataset(raw_path):
+    path = Path(raw_path).expanduser()
+    candidates = [path] if path.is_absolute() else [Path.cwd() / path, REPO_ROOT / path,
+                                                    REPO_ROOT.parent / path]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    raise FileNotFoundError(f"Dataset not found: {raw_path}. Set --dataset to its absolute path.")
+
+
+def select_row(raw_path, index):
+    """Read only as far as the requested row; task index comes from question."""
+    if type(index) is not int or index < 0:
+        raise ValueError("row_index must be a nonnegative integer")
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as error:
+        raise RuntimeError("Reading the dataset requires pyarrow (pip install pyarrow).") from error
+    path = resolve_dataset(raw_path)
+    parquet = pq.ParquetFile(path)
+    if index >= parquet.metadata.num_rows:
+        raise IndexError(f"Row {index} exceeds dataset size {parquet.metadata.num_rows}")
+    offset = 0
+    for batch in parquet.iter_batches(batch_size=256):
+        if offset + batch.num_rows > index:
+            row = batch.slice(index - offset, 1).to_pylist()[0]
+            break
+        offset += batch.num_rows
+    question = row.get("question")
+    match = re.fullmatch(r"(train|val_seen|val_unseen)_(.+)_alfworld_(\d+)", str(question))
+    if not match:
+        raise ValueError(f"Unsupported ALFWorld task identifier: {question!r}")
+    return {
+        "path": str(path), "row_index": index, "num_rows": parquet.metadata.num_rows,
+        "question": question, "source_row": jsonable(row),
+        "reset": {"data_type": match[1], "task_type": match[2], "question_id": int(match[3])},
+    }
+
+
+def make_environment(sampling):
+    source = sampling.get("alfworld_root")
+    if source:
+        sys.path.insert(0, str(Path(source).expanduser().resolve()))
+    # Import the inner, lightweight agentflow package, avoiding the RL trainer.
+    sys.path.insert(0, str(REPO_ROOT / "agentflow"))
+    try:
+        module = importlib.import_module("agentflow.envs.alfworld.alfworld_env")
+    except ImportError as error:
+        raise RuntimeError(
+            f"Cannot load ALFWorld: {error}. Run in the existing ALFWorld environment; "
+            "use --alfworld-root for its source directory and --alfworld-data for "
+            "the directory containing json_2.1.1/ and logic/. Scoring saved trajectories "
+            "does not import or require ALFWorld."
+        ) from error
+    if sampling.get("alfworld_data"):
+        module.data_path = str(Path(sampling["alfworld_data"]).expanduser().resolve())
+    return module.AlfWorldEnv(history_length=sampling["history_length"],
+                              max_step=sampling["max_steps"])
+
+
+def request_action(prompt, sampling, trajectory_index, turn_index):
+    """One genuine policy completion; scoring never calls this function."""
+    payload = {
+        "model": sampling["model"], "messages": [{"role": "user", "content": prompt}],
+        "temperature": sampling["temperature"], "top_p": sampling["top_p"],
+        "max_tokens": sampling["max_tokens"], "stream": False,
+        "seed": sampling["seed"] + 100000 * trajectory_index + turn_index,
+    }
+    if sampling.get("return_token_ids"):
+        payload["return_token_ids"] = True
+    key = os.environ.get(sampling.get("api_key_env", "OPENAI_API_KEY"), "EMPTY")
+    request = Request(sampling["base_url"].rstrip("/") + "/chat/completions",
+                      data=json.dumps(payload).encode(), method="POST",
+                      headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
+    try:
+        with urlopen(request, timeout=sampling["timeout"]) as response:
+            result = json.load(response)
+    except HTTPError as error:
+        detail = error.read().decode(errors="replace")[:2000]
+        raise RuntimeError(f"Policy HTTP {error.code}: {detail}") from error
+    except (URLError, TimeoutError) as error:
+        raise RuntimeError(f"Policy request failed: {error}") from error
+    choice = result["choices"][0]
+    text = choice.get("message", {}).get("content")
+    if not isinstance(text, str) or not text.strip():
+        raise RuntimeError("Policy returned no action text; trajectory checkpoint was preserved.")
+    return {"response": text, "finish_reason": choice.get("finish_reason"),
+            "prompt_token_ids": result.get("prompt_token_ids"),
+            "response_token_ids": choice.get("token_ids"), "usage": result.get("usage")}
+
+
+def state_snapshot(env, actor_prompt, info, index, sampling, *, prior_turns=(), done=False):
+    """Snapshot before the next action; error branches cannot reuse stale context."""
+    info = jsonable(info or {})
+    observation = scalar(info.get("anchor"))
+    if not isinstance(observation, str) or observation.startswith("["):
+        observation = scalar(info.get("observation_text"))
+    if not isinstance(observation, str):
+        observation = getattr(env, "prev_text_obs", "") or actor_prompt
+    actions = info.get("admissible_commands", getattr(env, "prev_admissible_command", []))
+    if isinstance(actions, list) and len(actions) == 1 and isinstance(actions[0], list):
+        actions = actions[0]
+    is_error = any(flag(info.get(k)) is True for k in ("env_error", "format_error", "invalid_action"))
+    context = None if is_error else getattr(env, "trace_state_context", None)
+    if not isinstance(context, str) or not context.strip():
+        recent = list(prior_turns)[-sampling["history_length"]:] if sampling["history_length"] else []
+        history = [{"action": t.get("action"), "observation": t.get("observation_before")}
+                   for t in recent]
+        context = (f"Task: {getattr(env, 'task', '')}\n\n"
+                   f"Recent observations and actions: {json.dumps(history, ensure_ascii=False)}\n\n"
+                   f"Current observation: {observation}\n\n"
+                   f"Available actions: {json.dumps(actions, ensure_ascii=False)}")
+    return {"state_index": index, "state_context": context, "observation": observation,
+            "available_actions": actions, "remaining_steps": max(0, sampling["max_steps"] - index),
+            "is_post_state": index > 0, "is_terminal_state": bool(done),
+            "env_info": info, "scoring_valid": flag(info.get("env_error")) is not True}
+
+
+def summarize_outcome(info, reward, done):
+    info = info or {}
+    external = flag(info.get("env_error")) is True
+    truncated = flag(info.get("truncated")) is True or flag(info.get("truncated_by_max_step")) is True
+    terminated = flag(info.get("terminated"))
+    if terminated is None:
+        terminated = bool(done and not truncated and not external)
+    success = flag(info.get("won"))
+    if success is None and done and not external:
+        # The wrapper's normal reward is binary; do not infer from positive format bonuses.
+        raw = scalar(reward)
+        success = raw == 1.0 if isinstance(raw, (int, float)) and raw in (0, 1) else None
+    reason = ("environment_error" if external else "format_error" if flag(info.get("format_error"))
+              else "invalid_action" if flag(info.get("invalid_action")) else "max_steps" if truncated
+              else "success" if success else "task_failure" if done else "incomplete")
+    return {"reward": scalar(reward), "success": success,
+            "valid": bool(done and not external and success is not None),
+            "terminated": terminated, "truncated": truncated, "reason": reason}
+
+
+def capture_trajectories(snapshot, sampling, save, *, env_factory=make_environment,
+                         policy=request_action, progress=None):
+    """Resume incomplete capture by replaying saved actions, never resampling them."""
+    progress = progress or (lambda message: None)
+    if snapshot.get("complete"):
+        progress("Saved trajectories already complete; reusing without policy requests.")
+        return snapshot
+    if snapshot["sampling"] != sampling:
+        raise ValueError("Sampling settings differ from the saved session. Use the saved settings or a new work-dir.")
+    count = sampling["trajectories"]
+    for trajectory_index in range(count):
+        trajectories = snapshot["trajectories"]
+        trajectory = trajectories[trajectory_index] if trajectory_index < len(trajectories) else None
+        if trajectory and trajectory.get("status") in ("completed", "external_error"):
+            continue
+        env = env_factory(sampling)
+        try:
+            actor_prompt, info = env.reset(**snapshot["dataset"]["reset"])
+            initial = state_snapshot(env, actor_prompt, info, 0, sampling)
+            if trajectory is None:
+                if trajectories:
+                    first = trajectories[0]
+                    same_game = first.get("initial_gamefile") == jsonable(info.get("extra.gamefile"))
+                    same_state = first["states"][0]["state_context"] == initial["state_context"]
+                    if not (same_game and same_state):
+                        raise RuntimeError("The selected task reset changed across rollouts; refusing to mix initial states.")
+                trajectory = {"trajectory_id": f"traj_{trajectory_index + 1:02d}",
+                              "goal": getattr(env, "task", ""),
+                              "initial_gamefile": jsonable(info.get("extra.gamefile")),
+                              "status": "running", "outcome": None,
+                              "states": [initial], "turns": []}
+                trajectories.append(trajectory)
+                save(snapshot)
+            elif trajectory["states"][0]["state_context"] != initial["state_context"]:
+                raise RuntimeError("Reset changed the saved initial state; refusing to mix trajectories.")
+            done = False
+            reward = 0.0
+            # An interrupted request may be retried, but every already saved action is replayed.
+            for turn in trajectory["turns"]:
+                if actor_prompt != turn["action_prompt"]:
+                    raise RuntimeError("Environment replay diverged before a saved action.")
+                actor_prompt, reward, done, info = env.step(turn["action_response"])
+                observed = state_snapshot(env, actor_prompt, info, turn["turn_index"] + 1,
+                                          sampling, prior_turns=trajectory["turns"][:turn["turn_index"] + 1],
+                                          done=done)
+                expected = trajectory["states"][turn["turn_index"] + 1]
+                if observed["state_context"] != expected["state_context"]:
+                    raise RuntimeError("Environment replay diverged after a saved action.")
+            while not done and len(trajectory["turns"]) < sampling["max_steps"]:
+                index = len(trajectory["turns"])
+                progress(f"Sampling {trajectory_index + 1}/{count}, turn {index + 1}; saved actions are retained.")
+                generated = policy(actor_prompt, sampling, trajectory_index, index)
+                response = generated["response"]
+                match = re.search(r"<action>(.*?)</action>", response, re.DOTALL)
+                turn = {"turn_index": index, "action_prompt": actor_prompt,
+                        "action_response": response, "action": match[1].strip() if match else None,
+                        "observation_before": trajectory["states"][-1]["observation"],
+                        "finish_reason": generated.get("finish_reason"),
+                        "prompt_token_ids": generated.get("prompt_token_ids"),
+                        "response_token_ids": generated.get("response_token_ids"),
+                        "usage": generated.get("usage")}
+                try:
+                    next_prompt, reward, done, info = env.step(response)
+                except Exception as error:
+                    next_prompt = "Environment execution failed."
+                    reward, done = None, True
+                    info = {"env_error": True, "env_error_type": type(error).__name__,
+                            "observation_text": str(error), "terminated": False, "truncated": False}
+                info = jsonable(info or {})
+                if index + 1 >= sampling["max_steps"] and not done:
+                    done = True
+                    info.update({"truncated": True, "truncated_by_max_step": True})
+                turn.update({"reward": scalar(reward), "done": bool(done),
+                             "action": info.get("trace_env_action", turn["action"]),
+                             "external_error": flag(info.get("env_error")) is True,
+                             "format_error": flag(info.get("format_error")) is True,
+                             "invalid_action": flag(info.get("invalid_action")) is True,
+                             "env_info": info})
+                trajectory["turns"].append(turn)
+                trajectory["states"].append(state_snapshot(
+                    env, next_prompt, info, index + 1, sampling,
+                    prior_turns=trajectory["turns"], done=done))
+                actor_prompt = next_prompt
+                if done:
+                    trajectory["outcome"] = summarize_outcome(info, reward, done)
+                    trajectory["status"] = "external_error" if turn["external_error"] else "completed"
+                save(snapshot)
+            if trajectory["outcome"] is None:
+                trajectory["outcome"] = summarize_outcome(info, reward, True)
+                trajectory["status"] = "completed"
+            save(snapshot)
+        finally:
+            env.close()
+    snapshot["complete"] = True
+    snapshot["completed_at"] = utc_now()
+    save(snapshot)
+    return snapshot
+
+
+def export_csv(result):
+    buffer = io.StringIO()
+    fields = ["trajectory_id", "turn_index", "mean_logp", "value", "next_value", "delta",
+              "credit", "credit_valid", "credit_error", "action", "action_prompt",
+              "action_response", "scoring_prompt", "response"]
+    writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for trajectory in result.get("trajectories", []):
+        for turn in trajectory["turns"]:
+            writer.writerow(dict(turn, trajectory_id=trajectory["trajectory_id"]))
+    return buffer.getvalue()
+
+
+def export_report(result):
+    esc = lambda value: html.escape(str(value if value is not None else "invalid"))
+    blocks = ["<!doctype html><meta charset='utf-8'><title>ALFWorld TRACE probe</title>",
+              "<style>body{font:15px system-ui;max-width:1200px;margin:32px auto;padding:16px}"
+              "pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f5f7;padding:12px}"
+              "table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:8px}"
+              "details{margin:14px 0}summary{cursor:pointer}</style>",
+              "<h1>ALFWorld TRACE probe</h1>", f"<p>Run: {esc(result.get('id'))}</p>",
+              f"<pre>{esc(json.dumps(result.get('probe'), ensure_ascii=False, indent=2))}</pre>"]
+    for trajectory in result.get("trajectories", []):
+        blocks.append(f"<h2>{esc(trajectory['trajectory_id'])}</h2><pre>{esc(trajectory.get('outcome'))}</pre>")
+        blocks.append("<table><tr><th>Turn</th><th>Action</th><th>Mean LogP</th><th>V</th><th>Delta</th><th>Credit</th></tr>")
+        for turn in trajectory["turns"]:
+            blocks.append("<tr>" + "".join(f"<td>{esc(turn.get(key))}</td>" for key in
+                           ("turn_index", "action", "mean_logp", "value", "delta", "credit")) + "</tr>")
+        blocks.append("</table>")
+        for turn in trajectory["turns"]:
+            blocks.append(f"<details><summary>Turn {esc(turn['turn_index'])}: full prompts and responses</summary>")
+            for key in ("action_prompt", "action_response", "scoring_prompt", "response", "credit_error"):
+                blocks.append(f"<h3>{esc(key)}</h3><pre>{esc(turn.get(key))}</pre>")
+            blocks.append("</details>")
+        for state in trajectory.get("states", [])[-1:]:
+            blocks.append("<details><summary>Final post-action scoring state</summary>")
+            for key in ("scoring_prompt", "response", "mean_logp", "value", "error"):
+                blocks.append(f"<h3>{esc(key)}</h3><pre>{esc(state.get(key))}</pre>")
+            blocks.append("</details>")
+    return "\n".join(blocks)
+
+
+class Experiment:
+    def __init__(self, directory, overrides=None, config_path=None):
+        self.directory = Path(directory).resolve()
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.config_path = Path(config_path).resolve() if config_path else self.directory / "config.json"
+        self.config = deep_update(copy.deepcopy(DEFAULT_CONFIG), read_json(self.config_path, {}))
+        deep_update(self.config, overrides or {})
+        self.validate_config(self.config)
+        atomic_json(self.config_path, self.config)
+        self.lock = threading.RLock()
+        self.job = {"status": "idle", "phase": "", "message": "", "error": None}
+
+    @staticmethod
+    def validate_config(config):
+        probe, sampling = config["probe"], config["sampling"]
+        for key in ("prompt", "response"):
+            if not isinstance(probe[key], str) or not probe[key].strip():
+                raise ValueError(f"probe.{key} must be nonempty text")
+        if re.search(r"\{(?:remaining_steps|turn_index)\}", probe["response"]):
+            raise ValueError("Response must remain fixed across turns; only {goal} is allowed.")
+        if type(probe["k"]) is not int or probe["k"] < 1:
+            raise ValueError("K must be a positive integer")
+        if not math.isfinite(float(probe["epsilon"])) or float(probe["epsilon"]) <= 0:
+            raise ValueError("epsilon must be positive and finite")
+        if not math.isfinite(float(probe["gamma"])) or not 0 <= float(probe["gamma"]) <= 1:
+            raise ValueError("gamma must be between 0 and 1")
+        for key in ("trajectories", "max_steps", "max_tokens"):
+            if type(sampling[key]) is not int or sampling[key] < 1:
+                raise ValueError(f"sampling.{key} must be a positive integer")
+        if type(sampling["history_length"]) is not int or sampling["history_length"] < 0:
+            raise ValueError("history_length must be a nonnegative integer")
+
+    @contextlib.contextmanager
+    def session_lock(self):
+        import fcntl
+        with (self.directory / ".session.lock").open("a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise RuntimeError("Another process is using this work-dir.") from error
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+    def progress(self, message):
+        with self.lock:
+            self.job["message"] = message
+        print(message, flush=True)
+
+    def save_probe(self, probe):
+        with self.lock:
+            new_config = copy.deepcopy(self.config)
+            if set(probe) - set(new_config["probe"]):
+                raise ValueError("Unknown probe configuration key")
+            new_config["probe"].update(probe)
+            self.validate_config(new_config)
+            atomic_json(self.config_path, new_config)
+            self.config = new_config
+
+    def sample(self, *, env_factory=make_environment, policy=request_action):
+        with self.session_lock():
+            snapshot = read_json(self.directory / "trajectories.json")
+            if snapshot and snapshot.get("complete"):
+                self.progress("Reusing trajectories.json; no new sampling.")
+                return snapshot
+            config = copy.deepcopy(self.config)
+            if snapshot is None:
+                dataset = select_row(config["dataset"]["path"], config["dataset"]["row_index"])
+                snapshot = {"schema_version": 1, "snapshot_id": uuid.uuid4().hex,
+                            "created_at": utc_now(), "dataset": dataset,
+                            "sampling": config["sampling"], "complete": False, "trajectories": []}
+            return capture_trajectories(
+                snapshot, config["sampling"],
+                lambda data: atomic_json(self.directory / "trajectories.json", data),
+                env_factory=env_factory, policy=policy, progress=self.progress)
+
+    def score(self, *, scorer=None):
+        with self.session_lock():
+            snapshot = read_json(self.directory / "trajectories.json")
+            if not snapshot or not snapshot.get("complete"):
+                raise RuntimeError("Complete the initial sampling first. Scoring never samples automatically.")
+            config = copy.deepcopy(self.config)
+            if scorer is None:
+                from alfworld_trace_probe_scoring import score_snapshots
+                scorer = score_snapshots
+            result = scorer(snapshot, config["probe"], config["scorer"], progress=self.progress)
+            run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
+            result.update({"id": run_id, "created_at": utc_now(),
+                           "snapshot_id": snapshot["snapshot_id"], "probe": config["probe"],
+                           "scorer": config["scorer"],
+                           "snapshot_sha256": hashlib.sha256(
+                               (self.directory / "trajectories.json").read_bytes()).hexdigest()})
+            result = jsonable(result)
+            atomic_json(self.directory / "runs" / f"{run_id}.json", result)
+            atomic_json(self.directory / "latest.json", result)
+            (self.directory / "latest.csv").write_text(export_csv(result), encoding="utf-8-sig")
+            (self.directory / "report.html").write_text(export_report(result), encoding="utf-8")
+            self.progress(f"Saved scoring run {run_id}; original trajectories unchanged.")
+            return result
+
+    def state(self):
+        with self.lock:
+            runs = []
+            for path in sorted((self.directory / "runs").glob("*.json"), reverse=True):
+                item = read_json(path)
+                runs.append({key: item.get(key) for key in ("id", "created_at", "probe", "summary")})
+            runs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+            return {"config": copy.deepcopy(self.config), "config_path": str(self.config_path),
+                    "work_dir": str(self.directory),
+                    "snapshot": read_json(self.directory / "trajectories.json"),
+                    "latest": read_json(self.directory / "latest.json"),
+                    "runs": runs, "job": dict(self.job)}
+
+    def start(self, phase, probe=None):
+        with self.lock:
+            if self.job["status"] == "running":
+                raise RuntimeError("A job is already running.")
+            if phase == "sample":
+                snapshot = read_json(self.directory / "trajectories.json")
+                if snapshot and snapshot.get("complete"):
+                    raise ValueError("Trajectories already saved. Use score; a new work-dir is needed for a new sample.")
+            if probe is not None:
+                self.save_probe(probe)
+            self.job = {"status": "running", "phase": phase, "message": "Starting…", "error": None}
+
+        def run():
+            try:
+                self.sample() if phase == "sample" else self.score()
+            except Exception as error:
+                traceback.print_exc()
+                with self.lock:
+                    self.job.update(status="error", error=str(error), message=str(error))
+            else:
+                with self.lock:
+                    self.job.update(status="done", error=None)
+        threading.Thread(target=run, daemon=True).start()
+
+
+def serve(experiment, host, port):
+    class Handler(BaseHTTPRequestHandler):
+        def send(self, data, content_type="application/json; charset=utf-8", status=200, filename=None):
+            if not isinstance(data, (bytes, str)):
+                data = json.dumps(jsonable(data), ensure_ascii=False, allow_nan=False)
+            data = data.encode("utf-8") if isinstance(data, str) else data
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            if filename:
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            try:
+                if parsed.path == "/":
+                    return self.send((SCRIPT_DIR / "alfworld_trace_probe.html").read_bytes(), "text/html; charset=utf-8")
+                if parsed.path == "/api/state":
+                    return self.send(experiment.state())
+                if parsed.path == "/api/run":
+                    run_id = parse_qs(parsed.query).get("id", [""])[0]
+                    if not re.fullmatch(r"\d{8}T\d{6}-[0-9a-f]{8}", run_id):
+                        raise ValueError("Invalid run id")
+                    return self.send(read_json(experiment.directory / "runs" / f"{run_id}.json") or {})
+                if parsed.path == "/api/export":
+                    name = parse_qs(parsed.query).get("name", [""])[0]
+                    files = {"trajectories": ("trajectories.json", "application/json"),
+                             "latest": ("latest.json", "application/json"),
+                             "csv": ("latest.csv", "text/csv; charset=utf-8"),
+                             "report": ("report.html", "text/html; charset=utf-8")}
+                    if name not in files:
+                        raise ValueError("Unknown export")
+                    filename, content_type = files[name]
+                    return self.send((experiment.directory / filename).read_bytes(), content_type, filename=filename)
+                self.send({"error": "Not found"}, status=404)
+            except (ValueError, FileNotFoundError) as error:
+                self.send({"error": str(error)}, status=400)
+
+        def do_POST(self):
+            try:
+                if self.headers.get_content_type() != "application/json":
+                    raise ValueError("Expected application/json")
+                origin = self.headers.get("Origin")
+                if origin and urlparse(origin).netloc != self.headers.get("Host"):
+                    raise ValueError("Cross-origin mutations are not accepted")
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 1024 * 1024:
+                    raise ValueError("Invalid request length")
+                payload = json.loads(self.rfile.read(length))
+                if not isinstance(payload, dict):
+                    raise ValueError("Expected a JSON object")
+                with experiment.lock:
+                    if experiment.job["status"] == "running":
+                        raise RuntimeError("A job is running; wait before changing the probe.")
+                    if self.path == "/api/config":
+                        experiment.save_probe(payload["probe"])
+                    elif self.path == "/api/sample":
+                        experiment.start("sample")
+                    elif self.path == "/api/score":
+                        experiment.start("score", payload.get("probe"))
+                    else:
+                        return self.send({"error": "Not found"}, status=404)
+                self.send({"ok": True})
+            except (ValueError, KeyError, TypeError, RuntimeError) as error:
+                self.send({"error": str(error)}, status=400)
+
+        def log_message(self, fmt, *args):
+            if self.path != "/api/state":
+                super().log_message(fmt, *args)
+
+    server = ThreadingHTTPServer((host, port), Handler)
+    print(f"Editor: http://{host}:{server.server_port}\nWork directory: {experiment.directory}\n"
+          "Sampling starts only when you click the initial-sampling button. Ctrl+C to stop.", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", nargs="?", choices=("serve", "sample", "score", "run"), default="serve")
+    parser.add_argument("--work-dir", default=str(REPO_ROOT / "outputs" / "alfworld_trace_probe"))
+    parser.add_argument("--config", help="JSON configuration; defaults to WORK_DIR/config.json")
+    parser.add_argument("--dataset")
+    parser.add_argument("--row-index", type=int)
+    parser.add_argument("--trajectories", type=int)
+    parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--temperature", type=float)
+    parser.add_argument("--policy-base-url")
+    parser.add_argument("--policy-model")
+    parser.add_argument("--score-base-url")
+    parser.add_argument("--score-model")
+    parser.add_argument("--tokenizer", help="Tokenizer directory/name matching the frozen scoring model")
+    parser.add_argument("--backend", choices=("vllm", "hf"))
+    parser.add_argument("--alfworld-root", help="Source directory containing the alfworld Python package")
+    parser.add_argument("--alfworld-data", help="Directory containing json_2.1.1/ and logic/")
+    parser.add_argument("--host", choices=("127.0.0.1", "localhost"), default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    args = parser.parse_args(argv)
+    overrides = {}
+    mappings = {
+        "dataset": ("dataset", "path"), "row_index": ("dataset", "row_index"),
+        "trajectories": ("sampling", "trajectories"), "max_steps": ("sampling", "max_steps"),
+        "seed": ("sampling", "seed"), "temperature": ("sampling", "temperature"),
+        "policy_base_url": ("sampling", "base_url"), "policy_model": ("sampling", "model"),
+        "score_base_url": ("scorer", "base_url"), "score_model": ("scorer", "model"),
+        "tokenizer": ("scorer", "tokenizer"), "backend": ("scorer", "backend"),
+        "alfworld_root": ("sampling", "alfworld_root"), "alfworld_data": ("sampling", "alfworld_data"),
+    }
+    for name, (section, key) in mappings.items():
+        value = getattr(args, name)
+        if value is not None:
+            overrides.setdefault(section, {})[key] = value
+    experiment = Experiment(args.work_dir, overrides, args.config)
+    if args.mode == "serve":
+        serve(experiment, args.host, args.port)
+    elif args.mode == "sample":
+        experiment.sample()
+    elif args.mode == "score":
+        experiment.score()
+    else:
+        experiment.sample()
+        experiment.score()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, ValueError, FileNotFoundError, ImportError) as error:
+        raise SystemExit(str(error))

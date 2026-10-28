@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ALFWorld · TRACE 探针</title>
+<style>
+:root{color-scheme:light;--ink:#202824;--muted:#68736c;--line:#dfe5df;--paper:#fff;--bg:#f3f5f1;--green:#256044;--green-soft:#e7f1e9;--red:#ad3e3a;--red-soft:#fbece9;--amber:#906526;--radius:14px;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}button,input,textarea,select{font:inherit}button,a,input,textarea,select{outline-offset:3px}button,a{touch-action:manipulation}button{border:1px solid var(--line);border-radius:8px;padding:9px 15px;background:#fff;color:var(--ink);cursor:pointer;font-weight:600}button:hover:not(:disabled){background:#f0f4ef}button:disabled{opacity:.45;cursor:not-allowed}button.primary{background:var(--green);border-color:var(--green);color:white}button.primary:hover:not(:disabled){background:#1b4c35}button.small{font-size:12px;padding:4px 10px}a{color:var(--green);text-decoration:none}a:hover{text-decoration:underline}code,.mono{font-family:var(--mono)}main{max-width:1400px;margin:0 auto;padding:32px 28px 72px}header{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;margin-bottom:25px}h1{font-size:26px;line-height:1.3;letter-spacing:-.5px;margin:7px 0 8px}h2{font-size:17px;margin:0}h3{font-size:15px;margin:0}p{margin:5px 0}.eyebrow{font-size:11px;font-weight:700;letter-spacing:1.5px;color:var(--green)}.muted{color:var(--muted)}.small-text{font-size:12px}.badge{display:inline-flex;gap:7px;align-items:center;border:1px solid var(--line);padding:5px 10px;border-radius:99px;background:var(--paper);white-space:nowrap;font-size:12px}.dot{width:7px;height:7px;border-radius:50%;background:#99a29c}.badge.connected .dot{background:var(--green)}.badge.running .dot{background:var(--amber);animation:pulse 1.4s ease-in-out infinite}.badge.error .dot{background:var(--red)}@keyframes pulse{50%{opacity:.3}}.card{border:1px solid var(--line);border-radius:var(--radius);background:var(--paper);padding:22px;margin-bottom:18px}.card-head{display:flex;justify-content:space-between;align-items:center;gap:18px;margin-bottom:15px}.step{font-size:11px;letter-spacing:1px;color:var(--muted);font-weight:600;margin-right:8px}.summary-grid{display:grid;grid-template-columns:minmax(0,1fr) 130px 130px 150px;gap:20px}.stat-label{font-size:12px;color:var(--muted);margin-bottom:3px}.stat-value{font-size:21px;line-height:1.5;font-weight:600;font-variant-numeric:tabular-nums}.stat-value.question{font:13px/1.7 var(--mono);word-break:break-all}.dataset-path{font-size:11px;color:var(--muted);word-break:break-all;margin-top:3px}.row{display:flex;align-items:center;flex-wrap:wrap;gap:12px}.between{justify-content:space-between}.note{padding:11px 13px;background:#f5f7f3;border-radius:8px;color:var(--muted);font-size:12px}.notice{border-left:3px solid var(--green);background:var(--green-soft);padding:11px 14px;font-size:13px;border-radius:0 8px 8px 0;margin-bottom:18px}.notice.error{border-color:var(--red);background:var(--red-soft);color:#8c302d}.notice[hidden]{display:none}.editor-grid{display:grid;grid-template-columns:1.5fr 1fr;gap:18px}label.field{display:block;font-size:12px;font-weight:600}.field-title{display:flex;justify-content:space-between;gap:12px;margin-bottom:6px}.field-title span:last-child{font-weight:400;color:var(--muted);font-size:11px}textarea{display:block;width:100%;resize:vertical;border:1px solid #ced7cf;border-radius:9px;padding:12px;background:#fcfdfb;color:var(--ink);font:13px/1.7 var(--mono);min-height:250px;tab-size:2}textarea:focus,input:focus,select:focus{border-color:var(--green);outline:2px solid #2560441a}input[type=number],select{border:1px solid #ced7cf;background:white;border-radius:7px;padding:7px 9px;min-height:36px;color:var(--ink)}input[type=number]{width:93px;font-family:var(--mono)}.parameter-row{display:flex;justify-content:space-between;align-items:flex-end;gap:18px;flex-wrap:wrap;margin-top:18px}.parameters{display:flex;gap:16px;flex-wrap:wrap}.parameter label{display:block;font-size:11px;color:var(--muted);margin-bottom:4px}.dirty{color:var(--amber);font-size:12px}.formula{font:12px/1.8 var(--mono);background:#f5f7f3;border:1px solid #edf0eb;padding:11px 13px;border-radius:8px;margin-top:15px;overflow:auto}.job-box{display:flex;gap:11px;align-items:flex-start}.job-box .spinner{display:none;width:15px;height:15px;border:2px solid #d7e0d8;border-top-color:var(--green);border-radius:50%;animation:spin .8s linear infinite;flex:none;margin-top:3px}.job-box.busy .spinner{display:block}@keyframes spin{to{transform:rotate(360deg)}}.job-title{font-weight:600}.job-message{color:var(--muted);font-size:12px;white-space:pre-wrap;word-break:break-word}.result-controls{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end}.result-controls label{font-size:11px;color:var(--muted);display:block;margin-bottom:4px}.result-controls select{max-width:310px;min-width:180px;font-size:12px}.exports{display:flex;gap:15px;flex-wrap:wrap;font-size:12px}.empty{padding:38px 20px;text-align:center;border:1px dashed #d1dacf;border-radius:10px;background:#fcfdfb;color:var(--muted)}.empty strong{display:block;color:var(--ink);margin-bottom:6px;font-size:15px}.trajectory{border:1px solid var(--line);border-radius:11px;margin-top:18px;overflow:hidden}.trajectory-head{padding:16px 18px;background:#fafcf8;border-bottom:1px solid var(--line)}.trajectory-title{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap}.trajectory-meta{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:5px}.outcome{font-size:11px;font-weight:600;border-radius:5px;padding:3px 8px;background:#edf0ed;color:var(--muted)}.outcome.good{color:var(--green);background:var(--green-soft)}.outcome.bad{color:var(--red);background:var(--red-soft)}.goal{font-size:12px;color:#46564a;margin-top:8px;white-space:pre-wrap}.table-scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}thead{background:#fafcf8;text-align:right;color:var(--muted);font-size:11px}th,td{padding:10px 13px;border-bottom:1px solid #e9ede7;white-space:nowrap}th:first-child,td:first-child{text-align:left}td{text-align:right;font-family:var(--mono)}th.action-col,td.action-col{text-align:left;max-width:310px;min-width:150px}td.action-col{font:12px/1.5 var(--mono);white-space:normal;word-break:break-word}.num-positive{color:var(--green);font-weight:600}.num-negative{color:var(--red);font-weight:600}.num-invalid{color:#8b948e}.turn-row:hover{background:#fbfcf9}.turn-row.active{background:#f0f5ed}.detail-row td{padding:18px;background:#f8faf6;text-align:left;white-space:normal}.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.detail-block{min-width:0}.detail-block.wide{grid-column:1/-1}.detail-label{font:600 11px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;color:var(--muted);margin-bottom:6px}.detail-block pre,.readonly-json{margin:0;padding:12px;background:white;border:1px solid var(--line);border-radius:7px;font:12px/1.7 var(--mono);white-space:pre-wrap;word-break:break-word;max-height:430px;overflow:auto}.error-text{font-size:12px;color:var(--red);white-space:pre-wrap;margin:0 0 13px;word-break:break-word}.terminal{padding:12px 18px;background:#fcfdfb;font-size:12px}.terminal summary{cursor:pointer;color:var(--muted)}.terminal .detail-grid{margin-top:12px}.comparison-note{font-size:12px;color:var(--muted);margin-top:10px}.services{margin-top:16px}.services summary{cursor:pointer;color:var(--muted);font-size:12px}.service-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px}.service{padding:11px 13px;border:1px solid var(--line);border-radius:8px;font-size:12px;min-width:0}.service code{display:block;word-break:break-all;font-size:11px;margin-top:4px}.run-probe{margin:13px 0 0}.run-probe summary{cursor:pointer;color:var(--muted);font-size:12px}.run-probe .detail-grid{margin-top:12px}footer{font-size:11px;color:var(--muted);margin-top:22px;display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+@media(max-width:900px){.summary-grid{grid-template-columns:1fr 1fr}.summary-grid>div:first-child{grid-column:1/-1}.editor-grid{grid-template-columns:1fr}textarea{min-height:180px}.detail-grid,.service-grid{grid-template-columns:1fr}.detail-block.wide{grid-column:auto}.result-controls{width:100%}.card-head{align-items:flex-start;flex-wrap:wrap}}
+@media(max-width:560px){main{padding:20px 14px 50px}header{gap:10px}h1{font-size:22px}.card{padding:17px}.summary-grid{gap:14px}.summary-grid>div:first-child{grid-column:1/-1}.summary-grid>div:last-child{grid-column:1/-1}.parameter-row{align-items:stretch}.parameter-row>.row{width:100%}.parameter-row button{flex:1}.result-controls select{max-width:100%;min-width:0;width:100%}.result-controls>div{flex:1;min-width:150px}.trajectory-head{padding:13px}.detail-row td{padding:13px}th,td{padding:9px 10px}}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <div class="eyebrow">LOCAL EXPERIMENT · FIXED TRAJECTORIES</div>
+      <h1>ALFWorld · TRACE 探针</h1>
+      <p class="muted">同一题采样 4 条轨迹，反复调整评分 Prompt / Response，逐 Turn 查看 LogP 与信用。</p>
+    </div>
+    <div id="connection" class="badge"><span class="dot"></span><span id="connectionText">正在连接</span></div>
+  </header>
+
+  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+
+  <section class="card" aria-labelledby="sampleHeading">
+    <div class="card-head">
+      <h2 id="sampleHeading"><span class="step">01</span>固定轨迹</h2>
+      <button id="sampleButton" type="button" disabled>首次采样 4 条轨迹</button>
+    </div>
+    <div class="summary-grid">
+      <div><div class="stat-label">选中数据</div><div id="sampleQuestion" class="stat-value question">尚未采样</div><div id="datasetPath" class="dataset-path"></div></div>
+      <div><div class="stat-label">已保存轨迹</div><div id="trajectoryCount" class="stat-value">—</div></div>
+      <div><div class="stat-label">动作总数</div><div id="turnCount" class="stat-value">—</div></div>
+      <div><div class="stat-label">轨迹缓存</div><div id="cacheStatus" class="stat-value" style="font-size:16px">未建立</div></div>
+    </div>
+    <div id="sampleNote" class="note" style="margin-top:16px">首次采样会保存原始动作、观测和全部逐步状态。建立缓存后，修改下面的评分文本只会重算 LogP，不再调用环境采样。</div>
+    <details class="services">
+      <summary>查看采样与评分服务配置</summary>
+      <div class="service-grid">
+        <div class="service"><strong>采样模型</strong><code id="policyModel">—</code><code id="policyUrl">—</code></div>
+        <div class="service"><strong>冻结评分模型</strong><code id="scoreModel">—</code><code id="scoreUrl">—</code></div>
+      </div>
+      <p class="small-text muted" style="margin-top:9px">模型、服务地址、数据行及采样参数在启动时的 JSON 配置中设置。这里仅编辑评分探针。</p>
+    </details>
+  </section>
+
+  <section class="card" aria-labelledby="probeHeading">
+    <div class="card-head"><h2 id="probeHeading"><span class="step">02</span>修改评分探针</h2><span id="dirtyState" class="small-text muted">配置尚未加载</span></div>
+    <div class="editor-grid">
+      <label class="field" for="probePrompt"><span class="field-title"><span>Prompt</span><span>追加在每个 Turn 的状态之后</span></span><textarea id="probePrompt" spellcheck="false" placeholder="输入状态之后追加的评分指令…" disabled></textarea></label>
+      <label class="field" for="probeResponse"><span class="field-title"><span>Response</span><span>固定文本 · teacher forcing 目标</span></span><textarea id="probeResponse" spellcheck="false" placeholder="输入要计算平均 LogP 的固定回答…" disabled></textarea></label>
+    </div>
+    <div class="parameter-row">
+      <div class="parameters">
+        <div class="parameter"><label for="epsilon">ε · NLL offset</label><input id="epsilon" type="number" value="0.1" min="0.000001" step="0.01" disabled></div>
+        <div class="parameter"><label for="k">K · 动作窗口</label><input id="k" type="number" value="3" min="1" step="1" disabled></div>
+        <div class="parameter"><label for="gamma">γ · 折扣</label><input id="gamma" type="number" value="0.8" min="0" max="1" step="0.05" disabled></div>
+      </div>
+      <div class="row"><button id="saveButton" type="button" disabled>保存探针</button><button id="scoreButton" class="primary" type="button" disabled>保存并重新评分</button></div>
+    </div>
+    <div class="formula">state + Prompt → 固定 Response 的平均 LogP ℓ → Vₜ = log[(-ℓ₀ + ε) / (-ℓₜ + ε)] → Δₜ = Vₜ₊₁ − Vₜ → K-step 折扣平均</div>
+    <p class="small-text muted" style="margin-top:9px">仅评分固定 Response 的 token。最后动作后的状态也会评分；不添加终局优势回填。每次结果保留当时的探针与分数，便于对照。</p>
+  </section>
+
+  <section class="card" aria-labelledby="resultHeading">
+    <div class="card-head">
+      <h2 id="resultHeading"><span class="step">03</span>逐 Turn 结果</h2>
+      <div class="result-controls">
+        <div><label for="runSelect">查看评分记录</label><select id="runSelect"><option value="">尚无评分记录</option></select></div>
+        <div><label for="compareSelect">对比信用</label><select id="compareSelect"><option value="">不对比</option></select></div>
+      </div>
+    </div>
+    <div id="jobBox" class="job-box" role="status" aria-live="polite"><span class="spinner" aria-hidden="true"></span><div><div id="jobTitle" class="job-title">等待连接</div><div id="jobMessage" class="job-message"></div></div></div>
+    <div class="row between" style="margin-top:18px;gap:14px"><p id="resultSummary" class="small-text muted">采样后可查看原始轨迹，评分后显示数值。</p><div class="exports"><a href="/api/export?name=trajectories" id="exportTrajectories">轨迹 JSON</a><a href="/api/export?name=latest" id="exportLatest">最新评分 JSON</a><a href="/api/export?name=csv" id="exportCsv">CSV</a><a href="/api/export?name=report" id="exportReport" target="_blank" rel="noopener">离线报告</a></div></div>
+    <details id="viewedProbe" class="run-probe" hidden><summary>查看此记录实际使用的 Prompt / Response</summary><div id="viewedProbeBody" class="detail-grid"></div></details>
+    <p id="comparisonNote" class="comparison-note" hidden></p>
+    <div id="results" style="margin-top:16px"><div class="empty"><strong>等待固定轨迹</strong>首次采样后，轨迹会一直保留在当前实验目录中。</div></div>
+  </section>
+  <footer><span>ALFWorld / TRACE · 本地实验窗口</span><span>数值为探针文本产生的状态信用代理，请结合实际动作和终局检查。</span></footer>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const runCache = new Map();
+let state = null, connected = false, dirty = false, editorLoaded = false, pending = false;
+let selectedRunId = '', selectedCompareId = '', followLatest = true, renderKey = '', noticeTimer = null;
+let activeRun = null, comparisonRun = null;
+const editorIds = ['probePrompt', 'probeResponse', 'epsilon', 'k', 'gamma'];
+const toText = value => typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value, null, 2);
+const first = (...values) => values.find(value => value !== undefined && value !== null);
+const validNumber = value => typeof value === 'number' && Number.isFinite(value);
+function node(tag, className, text) { const out = document.createElement(tag); if (className) out.className = className; if (text !== undefined) out.textContent = toText(text); return out; }
+function number(value, signed) { if (!validNumber(value)) return '—'; if (Object.is(value, -0)) value = 0; return (signed && value > 0 ? '+' : '') + value.toFixed(6); }
+function errorMessage(value) { return toText(first(value && value.credit_error, value && value.error, value && value.invalid_reason, value && value.reason, '')); }
+function stateList(trajectory) { return Array.isArray(trajectory.states) ? trajectory.states : []; }
+function turnList(trajectory) { return Array.isArray(trajectory.turns) ? trajectory.turns : []; }
+function trajectoryList(value) { return value && Array.isArray(value.trajectories) ? value.trajectories : []; }
+function busy() { return pending || !!(state && state.job && state.job.status === 'running'); }
+function showNotice(message, isError) {
+  clearTimeout(noticeTimer); $('notice').textContent = message; $('notice').className = 'notice' + (isError ? ' error' : ''); $('notice').hidden = false;
+  if (!isError) noticeTimer = setTimeout(() => { $('notice').hidden = true; }, 6500);
+}
+async function api(path, body) {
+  const options = body === undefined ? {cache:'no-store'} : {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)};
+  const response = await fetch(path, options);
+  const text = await response.text(); let data;
+  try { data = text ? JSON.parse(text) : {}; } catch (_) { throw new Error('服务返回了无效 JSON：' + text.slice(0, 300)); }
+  if (!response.ok || data.ok === false) throw new Error(toText(first(data.error, data.message, '请求失败，HTTP ' + response.status)));
+  return data;
+}
+function getProbe() {
+  const probe = {prompt:$('probePrompt').value, response:$('probeResponse').value, epsilon:Number($('epsilon').value), k:Number($('k').value), gamma:Number($('gamma').value)};
+  if (!probe.response.trim()) throw new Error('Response 不能为空；它是每个状态要评分的固定文本。');
+  if (!Number.isFinite(probe.epsilon) || probe.epsilon <= 0) throw new Error('ε 必须大于 0。');
+  if (!Number.isInteger(probe.k) || probe.k < 1) throw new Error('K 必须为正整数。');
+  if (!Number.isFinite(probe.gamma) || probe.gamma < 0 || probe.gamma > 1) throw new Error('γ 必须在 0 到 1 之间。');
+  return probe;
+}
+function updateControls() {
+  const locked = !connected || busy();
+  editorIds.forEach(id => { $(id).disabled = locked; });
+  $('sampleButton').disabled = locked || !!(state && state.snapshot && state.snapshot.complete !== false);
+  $('saveButton').disabled = locked || !editorLoaded;
+  $('scoreButton').disabled = locked || !editorLoaded || !(state && state.snapshot) || state.snapshot.complete === false;
+  $('dirtyState').textContent = !editorLoaded ? '配置尚未加载' : dirty ? '有未保存修改' : '已保存';
+  $('dirtyState').className = dirty ? 'dirty' : 'small-text muted';
+  $('exportTrajectories').style.display = state && state.snapshot ? '' : 'none';
+  ['exportLatest','exportCsv','exportReport'].forEach(id => { $(id).style.display = state && state.latest ? '' : 'none'; });
+}
+function applyEditor(probe) {
+  if (!probe || dirty) return;
+  $('probePrompt').value = toText(probe.prompt); $('probeResponse').value = toText(probe.response);
+  $('epsilon').value = first(probe.epsilon, 0.1); $('k').value = first(probe.k, 3); $('gamma').value = first(probe.gamma, 0.8); editorLoaded = true;
+}
+function renderMetadata() {
+  const config = state.config || {}, sampling = config.sampling || {}, scorer = config.scorer || {}, policy = sampling.policy || config.policy || sampling;
+  const snapshot = state.snapshot, trajectories = trajectoryList(snapshot);
+  const sample = snapshot && first(snapshot.sample, snapshot.selected_sample, snapshot.dataset && snapshot.dataset.sample, snapshot.dataset && snapshot.dataset.row, {});
+  const selectedQuestion = snapshot && first(sample && sample.question, snapshot.dataset && snapshot.dataset.question, snapshot.question, snapshot.task_id, snapshot.selection && snapshot.selection.question, '已保存数据样本');
+  const selectedRow = snapshot && first(snapshot.dataset && snapshot.dataset.row_index, snapshot.row_index);
+  $('sampleQuestion').textContent = snapshot ? toText(selectedQuestion) + (selectedRow !== undefined && selectedRow !== null ? ' · row ' + selectedRow : '') : '尚未采样';
+  $('datasetPath').textContent = toText(first(snapshot && snapshot.dataset_path, snapshot && snapshot.dataset && snapshot.dataset.path, sampling.dataset, sampling.dataset_path, 'data/train/alfworld/train_all_alfworld_3305.parquet'));
+  $('trajectoryCount').textContent = snapshot ? trajectories.length + ' / ' + first(sampling.num_trajectories, sampling.trajectories, 4) : '0 / 4';
+  $('turnCount').textContent = snapshot ? String(trajectories.reduce((sum, trajectory) => sum + turnList(trajectory).length, 0)) : '—';
+  $('cacheStatus').textContent = snapshot ? snapshot.complete === false ? '采样未完成 · 已保存' : '已保存 · 可复用' : '未建立';
+  $('cacheStatus').style.color = snapshot ? 'var(--green)' : 'var(--ink)';
+  $('sampleButton').textContent = snapshot ? snapshot.complete === false ? '继续首次采样' : '轨迹已固定' : '首次采样 4 条轨迹';
+  $('sampleNote').textContent = snapshot ? snapshot.complete === false ? '首次采样尚未完成。继续时会重放并校验已保存的动作，不重新请求这些动作；只为未完成部分调用采样模型。全部完成后即可固定复用。' : '采样缓存已建立。下面的保存与重新评分仅使用这份缓存，不再调用采样模型或环境。需要另一题时，请使用新的实验目录。' : '首次采样会保存原始动作、观测和全部逐步状态。建立缓存后，修改下面的评分文本只会重算 LogP，不再调用环境采样。';
+  $('policyModel').textContent = toText(first(policy.model, sampling.model, config.policy_model, '未配置'));
+  $('policyUrl').textContent = toText(first(policy.base_url, sampling.base_url, config.policy_base_url, '未配置'));
+  $('scoreModel').textContent = toText(first(scorer.model, '未配置'));
+  $('scoreUrl').textContent = scorer.backend === 'hf' ? '本地 Hugging Face · ' + toText(first(scorer.device, 'auto')) : toText(first(scorer.base_url, '未配置'));
+  const job = state.job || {}, running = job.status === 'running', isError = job.status === 'error';
+  $('jobBox').className = 'job-box' + (running ? ' busy' : '');
+  $('jobTitle').textContent = running ? (job.phase === 'sample' || job.phase === 'sampling' ? '正在首次采样' : '正在评分固定轨迹') : isError ? '本次操作失败' : job.status === 'done' ? '操作已完成' : snapshot ? '轨迹已就绪' : '等待首次采样';
+  $('jobTitle').style.color = isError ? 'var(--red)' : 'var(--ink)';
+  $('jobMessage').textContent = toText(isError ? first(job.error, job.message, '请检查服务配置和终端日志。') : first(job.message, running ? '页面会自动更新进度，请保持窗口打开。' : ''));
+  $('connection').className = 'badge ' + (running ? 'running' : isError ? 'error' : 'connected');
+  $('connectionText').textContent = running ? '运行中' : isError ? '需要检查' : '本地服务已连接';
+}
+function runLabel(run) {
+  let label = toText(first(run.id, run.run_id, '记录'));
+  if (run.created_at) { const parsed = new Date(run.created_at); label = (Number.isNaN(parsed.getTime()) ? run.created_at : parsed.toLocaleString('zh-CN', {hour12:false})) + ' · ' + label; }
+  return label;
+}
+function updateRunSelectors() {
+  const runs = Array.isArray(state.runs) ? state.runs.slice() : [];
+  const latest = state.latest;
+  if (latest && Array.isArray(latest.trajectories)) runCache.set(toText(first(latest.id, latest.run_id, 'latest')), latest);
+  const latestId = latest && toText(first(latest.id, latest.run_id, 'latest'));
+  if (latest && !runs.some(run => toText(first(run.id, run.run_id)) === latestId)) runs.unshift(latest);
+  if (followLatest && latestId) selectedRunId = latestId;
+  const key = runs.map(run => toText(first(run.id, run.run_id)) + ':' + toText(run.created_at)).join('|');
+  if ($('runSelect').dataset.key !== key) {
+    $('runSelect').replaceChildren(); $('compareSelect').replaceChildren(node('option', '', '不对比')); $('compareSelect').firstChild.value = '';
+    if (!runs.length) { const option = node('option', '', '尚无评分记录'); option.value = ''; $('runSelect').append(option); }
+    runs.forEach(run => { const id = toText(first(run.id, run.run_id)); [ $('runSelect'), $('compareSelect') ].forEach(select => { const option = node('option', '', runLabel(run)); option.value = id; select.append(option); }); });
+    $('runSelect').dataset.key = key;
+  }
+  $('runSelect').value = selectedRunId; $('compareSelect').value = selectedCompareId;
+  $('runSelect').disabled = !runs.length; $('compareSelect').disabled = !runs.length;
+  activeRun = runCache.get(selectedRunId) || (latestId === selectedRunId ? latest : null);
+  comparisonRun = runCache.get(selectedCompareId) || null;
+  if (selectedRunId && !runCache.has(selectedRunId)) loadRun(selectedRunId, false);
+  if (selectedCompareId && !runCache.has(selectedCompareId)) loadRun(selectedCompareId, true);
+}
+const loadingRuns = new Set();
+async function loadRun(id, comparison) {
+  if (!id || loadingRuns.has(id)) return;
+  loadingRuns.add(id);
+  try { const data = await api('/api/run?id=' + encodeURIComponent(id)); const run = data.run || data.result || data; runCache.set(id, run); if (comparison && selectedCompareId === id) comparisonRun = run; if (!comparison && selectedRunId === id) activeRun = run; renderResults(true); }
+  catch (error) { showNotice('读取评分记录失败：' + error.message, true); }
+  finally { loadingRuns.delete(id); }
+}
+function detailBlock(title, value, wide) { const block = node('div', 'detail-block' + (wide ? ' wide' : '')); block.append(node('div', 'detail-label', title), node('pre', '', value == null ? '—' : value)); return block; }
+function foldedBlock(title, value) { const block = node('details', 'detail-block wide'), summary = node('summary', 'detail-label', title); summary.style.cursor = 'pointer'; block.append(summary, node('pre', '', value)); return block; }
+function valueCell(value, signed) { const cell = node('td', !validNumber(value) ? 'num-invalid' : signed && value > 0 ? 'num-positive' : signed && value < 0 ? 'num-negative' : '', number(value, signed)); return cell; }
+function findCompareTurn(trajectoryId, index) {
+  const trajectory = trajectoryList(comparisonRun).find(item => toText(first(item.trajectory_id, item.id)) === trajectoryId);
+  return trajectory && turnList(trajectory).find((turn, position) => first(turn.turn_index, position) === index);
+}
+function renderResults(force) {
+  const source = activeRun || state.snapshot;
+  const key = [selectedRunId, selectedCompareId, source && first(source.id, source.snapshot_id, source.created_at), trajectoryList(source).map(t => toText(first(t.trajectory_id,t.id)) + ':' + turnList(t).length + ':' + stateList(t).length).join('|'), !!activeRun, !!comparisonRun].join('::');
+  if (!force && key === renderKey) return; renderKey = key;
+  const trajectories = trajectoryList(source), scored = !!activeRun;
+  $('results').replaceChildren();
+  if (!trajectories.length) { const empty = node('div', 'empty'); empty.append(node('strong', '', state.snapshot ? '缓存中暂无可展示轨迹' : '等待固定轨迹'), node('span', '', state.snapshot ? '采样进行中时会自动更新；错误详情见上方。' : '首次采样后，轨迹会一直保留在当前实验目录中。')); $('results').append(empty); }
+  const totalTurns = trajectories.reduce((sum, t) => sum + turnList(t).length, 0);
+  const validCredits = trajectories.reduce((sum, t) => sum + turnList(t).filter(turn => validNumber(turn.credit)).length, 0);
+  const summary = activeRun && activeRun.summary || {};
+  $('resultSummary').textContent = trajectories.length ? trajectories.length + ' 条轨迹 · ' + totalTurns + ' 个动作' + (scored ? ' · ' + first(summary.valid_credit_turns, validCredits) + ' 个有效信用' : ' · 尚未评分，可先检查原始动作') : '采样后可查看原始轨迹，评分后显示数值。';
+  $('viewedProbe').hidden = !(activeRun && activeRun.probe);
+  $('viewedProbeBody').replaceChildren();
+  if (activeRun && activeRun.probe) $('viewedProbeBody').append(detailBlock('此记录的 Prompt', activeRun.probe.prompt), detailBlock('此记录的固定 Response', activeRun.probe.response));
+  $('comparisonNote').hidden = !selectedCompareId;
+  $('comparisonNote').textContent = selectedCompareId ? 'Δcredit = 当前记录信用 − 对比记录信用。无效值不参与相减；请结合实际 Prompt / Response 检查变化。' : '';
+  trajectories.forEach((trajectory, trajectoryPosition) => {
+    const id = toText(first(trajectory.trajectory_id, trajectory.id, String(trajectoryPosition))), turns = turnList(trajectory), states = stateList(trajectory), outcome = trajectory.outcome || {};
+    const card = node('article', 'trajectory'), head = node('div', 'trajectory-head'), title = node('div', 'trajectory-title');
+    title.append(node('h3', '', '轨迹 ' + (trajectoryPosition + 1) + ' · ' + id));
+    const success = outcome.success, trusted = outcome.valid !== false;
+    title.append(node('span', 'outcome ' + (trusted && success === true ? 'good' : trusted && success === false ? 'bad' : ''), !trusted ? '终局不可信' : success === true ? '成功' : success === false ? '失败' : '结果未确认'));
+    head.append(title);
+    const meta = node('div', 'trajectory-meta'); meta.append(node('span', '', turns.length + ' 个动作'), node('span', '', states.length + ' 个状态'), node('span', '', 'Reward ' + (validNumber(outcome.reward) ? String(outcome.reward) : '—'))); if (outcome.reason) meta.append(node('span', '', outcome.reason)); head.append(meta);
+    if (trajectory.goal) head.append(node('p', 'goal', trajectory.goal)); card.append(head);
+    const scroll = node('div', 'table-scroll'), table = node('table'), thead = node('thead'), header = node('tr');
+    ['Turn', '实际动作', 'Mean LogP', 'Vₜ', 'Δₜ', 'Credit'].concat(selectedCompareId ? ['对比 Credit', 'Δcredit'] : []).concat(['明细']).forEach((label, index) => header.append(node('th', index === 1 ? 'action-col' : '', label))); thead.append(header); table.append(thead); const tbody = node('tbody');
+    turns.forEach((turn, position) => {
+      const index = first(turn.turn_index, position), before = states.find((item, i) => first(item.state_index, i) === index) || states[position] || {}, after = states.find((item, i) => first(item.state_index, i) === index + 1) || states[position + 1] || {};
+      const row = node('tr', 'turn-row'); row.append(node('td', '', 't=' + index)); row.append(node('td', 'action-col', first(turn.action, turn.action_response, '—')));
+      row.append(valueCell(first(turn.mean_logp, before.mean_logp), false), valueCell(first(turn.value, before.value), false), valueCell(turn.delta, true), valueCell(turn.credit, true));
+      if (selectedCompareId) { const other = findCompareTurn(id, index), compared = other && other.credit; row.append(valueCell(compared, true), valueCell(validNumber(turn.credit) && validNumber(compared) ? turn.credit - compared : null, true)); }
+      const buttonCell = node('td'), button = node('button', 'small', '查看'); button.type = 'button'; button.setAttribute('aria-expanded', 'false'); buttonCell.append(button); row.append(buttonCell); tbody.append(row);
+      const detailsRow = node('tr', 'detail-row'); detailsRow.hidden = true; const detailsCell = node('td'); detailsCell.colSpan = selectedCompareId ? 9 : 7;
+      const errors = [errorMessage(turn), errorMessage(before)].filter(Boolean); if (turn.external_error) errors.unshift('外部执行故障：该动作及受影响信用窗口不可用。'); if (scored && !validNumber(turn.credit) && !errors.length) errors.push('此动作信用无效；检查状态评分、连续性和窗口边界。'); if (errors.length) detailsCell.append(node('p', 'error-text', Array.from(new Set(errors)).join('\n')));
+      const grid = node('div', 'detail-grid');
+      grid.append(detailBlock('原动作 Prompt · 实际生成输入', turn.action_prompt), detailBlock('原动作 Response · 模型实际回答', turn.action_response));
+      grid.append(detailBlock('完整评分 Prompt · 状态 + 可编辑 Prompt', first(turn.scoring_prompt, before.scoring_prompt)), detailBlock('固定评分 Response · 只对这段文本计 LogP', first(turn.response, before.response)));
+      const renderedPrompt = first(turn.scoring_rendered_prompt, before.scoring_rendered_prompt); if (renderedPrompt) grid.append(foldedBlock('查看 chat template 后实际送入评分模型的 Prompt', renderedPrompt));
+      if (after.state_context || after.scoring_prompt) grid.append(detailBlock('动作后状态 · 用于下一状态价值', first(after.state_context, after.scoring_prompt), true));
+      if (Array.isArray(before.token_logps)) grid.append(detailBlock('Response 逐 token LogP', before.token_logps, true));
+      detailsCell.append(grid); detailsRow.append(detailsCell); tbody.append(detailsRow);
+      button.addEventListener('click', () => { detailsRow.hidden = !detailsRow.hidden; button.textContent = detailsRow.hidden ? '查看' : '收起'; button.setAttribute('aria-expanded', String(!detailsRow.hidden)); row.classList.toggle('active', !detailsRow.hidden); });
+    });
+    table.append(tbody); scroll.append(table); card.append(scroll);
+    if (states.length > turns.length) { const terminalState = states[states.length - 1], terminal = node('details', 'terminal'); terminal.append(node('summary', '', '最后动作后的评分状态（仅评分，不是额外动作） · Mean LogP ' + number(terminalState.mean_logp, false) + ' · V ' + number(terminalState.value, false))); const grid = node('div', 'detail-grid'); grid.append(detailBlock('末状态完整评分 Prompt', first(terminalState.scoring_prompt, terminalState.state_context)), detailBlock('固定评分 Response', terminalState.response)); if (terminalState.scoring_rendered_prompt) grid.append(foldedBlock('查看 chat template 后实际送入评分模型的末状态 Prompt', terminalState.scoring_rendered_prompt)); if (errorMessage(terminalState)) terminal.append(node('p', 'error-text', errorMessage(terminalState))); terminal.append(grid); card.append(terminal); }
+    $('results').append(card);
+  });
+}
+async function refresh() {
+  try { state = await api('/api/state'); connected = true; applyEditor((state.config || {}).probe); renderMetadata(); updateRunSelectors(); renderResults(false); updateControls(); }
+  catch (error) { connected = false; $('connection').className = 'badge error'; $('connectionText').textContent = '连接失败'; $('jobTitle').textContent = '无法连接本地服务'; $('jobMessage').textContent = error.message + '\n请检查脚本是否仍在运行。'; $('jobBox').className = 'job-box'; updateControls(); }
+}
+async function mutate(path, getBody, successMessage) {
+  if (busy() || !connected) return;
+  let body; try { body = getBody(); } catch (error) { showNotice(error.message, true); return; }
+  pending = true; updateControls();
+  try { await api(path, body); if (body.probe) dirty = false; if (path === '/api/score') { followLatest = true; selectedRunId = ''; } showNotice(successMessage, false); await refresh(); }
+  catch (error) { showNotice(error.message, true); }
+  finally { pending = false; updateControls(); }
+}
+editorIds.forEach(id => $(id).addEventListener('input', () => { dirty = true; updateControls(); }));
+$('saveButton').addEventListener('click', () => mutate('/api/config', () => ({probe:getProbe()}), '评分探针已保存。'));
+$('sampleButton').addEventListener('click', () => { if (state && state.snapshot && state.snapshot.complete !== false) return; mutate('/api/sample', () => ({}), state && state.snapshot ? '已提交继续采样；已保存的动作会重放校验，不重新请求。' : '首次采样任务已提交，完成后即可反复复用轨迹。'); });
+$('scoreButton').addEventListener('click', () => mutate('/api/score', () => ({probe:getProbe()}), '评分任务已提交；仅使用已保存的轨迹。'));
+$('runSelect').addEventListener('change', async () => { selectedRunId = $('runSelect').value; followLatest = state && state.latest && selectedRunId === toText(first(state.latest.id,state.latest.run_id,'latest')); activeRun = runCache.get(selectedRunId) || null; if (!activeRun && selectedRunId) await loadRun(selectedRunId, false); else renderResults(true); });
+$('compareSelect').addEventListener('change', async () => { selectedCompareId = $('compareSelect').value; comparisonRun = runCache.get(selectedCompareId) || null; if (!comparisonRun && selectedCompareId) await loadRun(selectedCompareId, true); else renderResults(true); });
+window.addEventListener('beforeunload', event => { if (dirty) { event.preventDefault(); event.returnValue = ''; } });
+(async function poll() { await refresh(); setTimeout(poll, document.hidden ? 5000 : busy() ? 1200 : 3500); })();
+</script>
+</body>
+</html>
