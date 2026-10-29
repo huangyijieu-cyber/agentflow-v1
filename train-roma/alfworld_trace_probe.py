@@ -47,6 +47,7 @@ DEFAULT_CONFIG = {
         "model": "Qwen3-30B-A3B-Instruct-2507", "api_key_env": "OPENAI_API_KEY",
         "timeout": 180, "return_token_ids": True,
         "alfworld_root": "", "alfworld_data": "",
+        "trace_goals_path": "",
     },
     "scorer": {
         "backend": "vllm", "base_url": "http://127.0.0.1:19998/v1",
@@ -246,7 +247,33 @@ def select_row(raw_path, index):
     }
 
 
+def _configured_goal_store(sampling, *, required=True):
+    """Resolve the prebuilt artifact; never create one during an experiment."""
+    value = sampling.get("trace_goals_path") or os.environ.get("ALFWORLD_TRACE_GOALS", "")
+    if not value:
+        if not required:
+            return None
+        raise ValueError(
+            "A prebuilt ALFWorld goal store is required. First run "
+            "python agentflow/agentflow/trace/alfworld_goal_store.py build "
+            "--games-root /path/to/json_2.1.1 --output /path/to/alfworld_trace_goals.sqlite, "
+            "then pass --trace-goals /path/to/alfworld_trace_goals.sqlite "
+            "or set ALFWORLD_TRACE_GOALS. Runtime conversion is disabled."
+        )
+    path = Path(value).expanduser().resolve()
+    if required and not path.is_file():
+        raise FileNotFoundError(f"Prebuilt ALFWorld goal store does not exist: {path}")
+    return str(path)
+
+
+def _goal_store_identity(sampling):
+    path = _configured_goal_store(sampling, required=False)
+    stat = Path(path).stat() if path and Path(path).is_file() else None
+    return (path, stat.st_mtime_ns, stat.st_size) if stat else (path, None, None)
+
+
 def make_environment(sampling):
+    goals_path = _configured_goal_store(sampling)
     source = sampling.get("alfworld_root")
     if source:
         sys.path.insert(0, str(Path(source).expanduser().resolve()))
@@ -264,7 +291,8 @@ def make_environment(sampling):
     if sampling.get("alfworld_data"):
         module.data_path = str(Path(sampling["alfworld_data"]).expanduser().resolve())
     return module.AlfWorldEnv(history_length=sampling["history_length"],
-                              max_step=sampling["max_steps"], trace_enabled=True)
+                              max_step=sampling["max_steps"], trace_enabled=True,
+                              trace_goals_path=goals_path)
 
 
 def request_action(prompt, sampling, trajectory_index, turn_index):
@@ -309,9 +337,21 @@ def _goal_module():
     return sys.modules[name]
 
 
+def _goal_store_module():
+    name = "_alfworld_probe_goal_store"
+    if name not in sys.modules:
+        path = REPO_ROOT / "agentflow/agentflow/trace/alfworld_goal_store.py"
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
 def goal_metadata(spec):
     keys = ("gamefile", "goal_source", "goal_task_type", "task_type", "template_version",
-            "source_sha256", "goal_spec_hash", "goal_ast", "goal_validation_status")
+            "source_sha256", "goal_spec_hash", "goal_ast", "goal_validation_status",
+            "goal_store_path", "goal_store_id", "goal_store_entry", "goal_store_spec_sha256")
     return {key: jsonable(spec[key]) for key in keys if key in spec}
 
 
@@ -415,6 +455,14 @@ def capture_trajectories(snapshot, sampling, save, *, env_factory=make_environme
         try:
             actor_prompt, info = env.reset(**snapshot["dataset"]["reset"])
             initial = state_snapshot(env, actor_prompt, info, 0, sampling)
+            spec = getattr(env, "trace_goal_spec", None)
+            # An artifact path can be supplied to resume an older session, but
+            # the already recorded target must never change mid-trajectory.
+            if spec is not None:
+                for recorded in (trajectory, trajectories[0] if trajectories else None):
+                    if (recorded and recorded.get("goal_spec_hash") and
+                            recorded["goal_spec_hash"] != spec.get("goal_spec_hash")):
+                        raise ValueError("Prebuilt goal differs from the saved trajectory target; use the original goal store.")
             if trajectory is None:
                 if trajectories:
                     first = trajectories[0]
@@ -427,7 +475,6 @@ def capture_trajectories(snapshot, sampling, save, *, env_factory=make_environme
                               "initial_gamefile": jsonable(info.get("extra.gamefile")),
                               "status": "running", "outcome": None,
                               "states": [initial], "turns": []}
-                spec = getattr(env, "trace_goal_spec", None)
                 if spec is not None:
                     _save_goal_fields(trajectory, spec)
                 trajectories.append(trajectory)
@@ -631,6 +678,7 @@ def _capture_parallel_worker(trajectory_index, dataset, sampling, snapshot_id, d
     env_key = (
         sampling.get("alfworld_root"), sampling.get("alfworld_data"),
         sampling["history_length"], sampling["max_steps"],
+        _goal_store_identity(sampling),
     )
     if _PROCESS_ENV is None or _PROCESS_ENV_KEY != env_key:
         if _PROCESS_ENV is not None:
@@ -725,24 +773,30 @@ def capture_parallel_trajectories(snapshot, sampling, save, directory, progress=
     return snapshot
 
 
-def enrich_snapshot(snapshot, *, replay=False, env_factory=make_environment, progress=None):
-    """Add official goal metadata/full states in memory; never generate actions."""
+def enrich_snapshot(snapshot, *, replay=False, env_factory=make_environment, progress=None,
+                    trace_goals_path=None):
+    """Read preconverted goals and recover states; never convert or generate actions."""
     if not snapshot.get("complete"):
         raise ValueError("Finish the initial sampling before enriching its cache")
     progress = progress or (lambda message: None)
     converted = copy.deepcopy(snapshot)
     module = _goal_module()
+    sampling = dict(converted["sampling"])
+    if trace_goals_path is not None:
+        sampling["trace_goals_path"] = trace_goals_path
+    store_path = _configured_goal_store(sampling)
+    store = _goal_store_module()
     specs = {}
     for trajectory in converted.get("trajectories", []):
         gamefile = module.normalize_gamefile(trajectory.get("initial_gamefile"))
         key = str(gamefile)
         if key not in specs:
-            specs[key] = module.load_goal_spec(gamefile)
+            specs[key] = store.read_goal_spec(store_path, gamefile)
         spec = specs[key]
         _save_goal_fields(trajectory, spec)
         if replay:
             progress(f"Enriching {trajectory['trajectory_id']} by replay only; no policy requests")
-            env = env_factory(converted["sampling"])
+            env = env_factory(sampling)
             try:
                 reset = dict(converted["dataset"]["reset"])
                 actor_prompt, info = env.reset(**reset, gamefile=str(gamefile))
@@ -891,6 +945,8 @@ class Experiment:
         self.config_path = Path(config_path).resolve() if config_path else self.directory / "config.json"
         self.config = deep_update(copy.deepcopy(DEFAULT_CONFIG), read_json(self.config_path, {}))
         deep_update(self.config, overrides or {})
+        if not self.config["sampling"].get("trace_goals_path"):
+            self.config["sampling"]["trace_goals_path"] = os.environ.get("ALFWORLD_TRACE_GOALS", "")
         self.validate_config(self.config)
         atomic_json(self.config_path, self.config)
         self.lock = threading.RLock()
@@ -921,6 +977,8 @@ class Experiment:
                 raise ValueError(f"sampling.{key} must be a positive integer")
         if type(sampling["history_length"]) is not int or sampling["history_length"] < 0:
             raise ValueError("history_length must be a nonnegative integer")
+        if not isinstance(sampling.get("trace_goals_path", ""), str):
+            raise ValueError("sampling.trace_goals_path must be a path string")
 
     @contextlib.contextmanager
     def session_lock(self):
@@ -963,7 +1021,9 @@ class Experiment:
                         "This work directory already holds a different ALFWorld task. "
                         "Use a new --work-dir to sample another dataset row."
                     )
-                if snapshot["sampling"] != config["sampling"]:
+                saved_sampling = {k: v for k, v in snapshot["sampling"].items() if k != "trace_goals_path"}
+                requested_sampling = {k: v for k, v in config["sampling"].items() if k != "trace_goals_path"}
+                if saved_sampling != requested_sampling:
                     raise RuntimeError(
                         "Sampling settings differ from saved trajectories. "
                         "Use a new --work-dir or restore the original settings."
@@ -971,6 +1031,9 @@ class Experiment:
                 if snapshot.get("complete"):
                     self.progress("Reusing trajectories.json; no new sampling.")
                     return snapshot
+                # Adding the offline artifact to a pre-existing incomplete
+                # session does not change its actions or generation settings.
+                snapshot["sampling"]["trace_goals_path"] = config["sampling"]["trace_goals_path"]
             if snapshot is None:
                 dataset = select_row(config["dataset"]["path"], config["dataset"]["row_index"])
                 snapshot = {"schema_version": 2, "snapshot_id": uuid.uuid4().hex,
@@ -993,7 +1056,9 @@ class Experiment:
             if not snapshot:
                 raise ValueError("No saved trajectories to enrich")
             source_hash = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
-            converted = enrich_snapshot(snapshot, replay=replay, env_factory=env_factory, progress=self.progress)
+            converted = enrich_snapshot(snapshot, replay=replay, env_factory=env_factory,
+                                        progress=self.progress,
+                                        trace_goals_path=self.config["sampling"].get("trace_goals_path"))
             payload = _enrichment_payload(snapshot, converted, source_hash)
             atomic_json(self.directory / "goal_metadata.json", payload)
             self.progress("Saved goal_metadata.json; original trajectories and actions are unchanged.")
@@ -1015,7 +1080,8 @@ class Experiment:
             if len(hashes) != 1:
                 raise ValueError("Saved goal specifications differ across rollouts")
             return snapshot
-        converted = enrich_snapshot(snapshot, replay=False, progress=self.progress)
+        converted = enrich_snapshot(snapshot, replay=False, progress=self.progress,
+                                    trace_goals_path=self.config["sampling"].get("trace_goals_path"))
         payload = _enrichment_payload(snapshot, converted, source_hash)
         atomic_json(self.directory / "goal_metadata.json", payload)
         return _merge_enrichment(snapshot, payload, source_hash)
@@ -1160,7 +1226,11 @@ class SampleWorkspace:
         path = self._sample_path(sample_id)
         if not (path / "config.json").is_file():
             raise ValueError("Saved sample does not have a config.json")
-        instance = Experiment(path)
+        saved = read_json(path / "config.json", {})
+        root_goals = self.instances["legacy"].config["sampling"].get("trace_goals_path")
+        overrides = ({"sampling": {"trace_goals_path": root_goals}}
+                     if root_goals and not (saved.get("sampling") or {}).get("trace_goals_path") else None)
+        instance = Experiment(path, overrides=overrides)
         self.instances[sample_id] = instance
         return instance
 
@@ -1550,6 +1620,7 @@ def main(argv=None):
     parser.add_argument("--backend", choices=("vllm", "hf"))
     parser.add_argument("--alfworld-root", help="Source directory containing the alfworld Python package")
     parser.add_argument("--alfworld-data", help="Directory containing json_2.1.1/ and logic/")
+    parser.add_argument("--trace-goals", help="Prebuilt ALFWorld goal SQLite file; defaults to ALFWORLD_TRACE_GOALS")
     parser.add_argument("--host", choices=("127.0.0.1", "localhost"), default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
@@ -1563,6 +1634,7 @@ def main(argv=None):
         "score_base_url": ("scorer", "base_url"), "score_model": ("scorer", "model"),
         "tokenizer": ("scorer", "tokenizer"), "backend": ("scorer", "backend"),
         "alfworld_root": ("sampling", "alfworld_root"), "alfworld_data": ("sampling", "alfworld_data"),
+        "trace_goals": ("sampling", "trace_goals_path"),
     }
     for name, (section, key) in mappings.items():
         value = getattr(args, name)

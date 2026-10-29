@@ -3,6 +3,7 @@ import copy
 import importlib.util
 import io
 import json
+import os
 from email.message import Message
 from pathlib import Path
 import sys
@@ -79,8 +80,10 @@ class FakeScorer:
 class SessionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        self.store_path = (Path(self.temp.name) / "trace_goals.sqlite").resolve()
+        self.store_path.write_bytes(b"test store")
         self.experiment = probe.Experiment(self.temp.name, {
-            "sampling": {"max_steps": 3},
+            "sampling": {"max_steps": 3, "trace_goals_path": str(self.store_path)},
             "probe": {"prompt": "forecast {remaining_steps}", "response": "success", "k": 1, "state_view": "saved", "terminal_fill_enabled": False},
         })
         self.selection = {"path": "/dataset.parquet", "row_index": 0,
@@ -184,10 +187,13 @@ class SessionTests(unittest.TestCase):
 
     def goal_tools(self):
         spec = {"goal_response": "A clean cup is on the table.", "goal_spec_hash": "same-goal",
-                "goal_source": "traj_data.json", "goal_task_type": "pick_clean_then_place_in_recep"}
+                "goal_source": "traj_data.json", "goal_task_type": "pick_clean_then_place_in_recep",
+                "goal_store_path": str(self.store_path), "goal_store_id": "persisted-store-v1",
+                "goal_store_entry": "train/example/game.tw-pddl", "goal_store_spec_sha256": "saved-payload"}
         return SimpleNamespace(
             normalize_gamefile=lambda value: Path(value[0] if isinstance(value, list) else value),
-            load_goal_spec=lambda path: spec,
+            load_goal_spec=mock.Mock(side_effect=AssertionError("runtime must not convert")),
+            read_goal_spec=mock.Mock(return_value=spec),
             normalize_facts=lambda facts: sorted(facts),
             evaluate_goal=lambda spec, facts: "s2" in facts,
             render_full_state=lambda spec, facts, **kwargs: "full facts " + " ".join(facts)), spec
@@ -202,7 +208,8 @@ class SessionTests(unittest.TestCase):
         probe.atomic_json(path, snapshot)
         original = path.read_bytes()
         tools, _ = self.goal_tools()
-        with mock.patch.object(probe, "_goal_module", return_value=tools):
+        with mock.patch.object(probe, "_goal_module", return_value=tools), mock.patch.object(
+                probe, "_goal_store_module", return_value=tools):
             converted = self.experiment.enrich()
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(converted["trajectories"][0]["goal_response"], "A clean cup is on the table.")
@@ -210,10 +217,16 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.experiment.state()["snapshot"]["trajectories"][0]["state_view"], "full_state")
         metadata = probe.read_json(Path(self.temp.name) / "goal_metadata.json")
         self.assertEqual(metadata["source_snapshot_sha256"], __import__("hashlib").sha256(original).hexdigest())
+        provenance = converted["trajectories"][0]["goal_metadata"]
+        self.assertEqual(provenance["goal_store_id"], "persisted-store-v1")
+        self.assertEqual(provenance["goal_store_entry"], "train/example/game.tw-pddl")
+        tools.load_goal_spec.assert_not_called()
+        tools.read_goal_spec.assert_called_once_with(str(self.store_path), Path("same-game"))
         bad = copy.deepcopy(snapshot)
         bad["trajectories"][0]["states"][1]["env_info"]["won"] = [True]
-        with mock.patch.object(probe, "_goal_module", return_value=tools):
-            invalid = probe.enrich_snapshot(bad)
+        with mock.patch.object(probe, "_goal_module", return_value=tools), mock.patch.object(
+                probe, "_goal_store_module", return_value=tools):
+            invalid = probe.enrich_snapshot(bad, trace_goals_path=str(self.store_path))
         self.assertFalse(invalid["trajectories"][0]["states"][1]["goal_check_valid"])
         self.assertFalse(invalid["trajectories"][0]["states"][1]["scoring_valid"])
 
@@ -238,7 +251,8 @@ class SessionTests(unittest.TestCase):
             def step(self, response):
                 replayed.append(response)
                 return self.details(super().step(response))
-        with mock.patch.object(probe, "_goal_module", return_value=tools):
+        with mock.patch.object(probe, "_goal_module", return_value=tools), mock.patch.object(
+                probe, "_goal_store_module", return_value=tools):
             with self.assertRaisesRegex(ValueError, "enrich --replay"):
                 self.experiment.enrich()
             converted = self.experiment.enrich(replay=True, env_factory=ReplayEnv)
@@ -246,12 +260,106 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), original)
         self.assertTrue(all(state["state_view"] == "full_state" for t in converted["trajectories"] for state in t["states"]))
         self.experiment.save_probe({"response": "{goal_response}", "state_view": "full_state"})
+        self.store_path.unlink()  # A complete immutable sidecar is sufficient for future scoring.
         fake = FakeScorer()
         with mock.patch.object(scoring, "_get_scorer", return_value=fake), mock.patch.object(
-                probe, "make_environment", side_effect=AssertionError("scoring must not load an environment")):
+                probe, "make_environment", side_effect=AssertionError("scoring must not load an environment")), mock.patch.object(
+                probe, "_goal_store_module", side_effect=AssertionError("scoring must not read a store")):
             result = self.experiment.score(scorer=scoring.score_snapshots)
         self.assertTrue(result["trajectories"][0]["turns"][-1]["outcome_valid"])
         self.assertEqual(path.read_bytes(), original)
+
+    def test_enrichment_without_store_never_falls_back_to_conversion(self):
+        snapshot = self.sample()
+        for trajectory in snapshot["trajectories"]:
+            for state in trajectory["states"]:
+                state["facts"] = [f"s{state['state_index']}"]
+        snapshot["sampling"]["trace_goals_path"] = ""
+        tools, _ = self.goal_tools()
+        with mock.patch.dict(os.environ, {"ALFWORLD_TRACE_GOALS": ""}), mock.patch.object(
+                probe, "_goal_module", return_value=tools), mock.patch.object(probe, "_goal_store_module") as reader:
+            with self.assertRaisesRegex(ValueError, "prebuilt ALFWorld goal store"):
+                probe.enrich_snapshot(snapshot)
+        tools.load_goal_spec.assert_not_called()
+        reader.assert_not_called()
+
+    def test_make_environment_requires_store_before_importing_runtime(self):
+        sampling = {**self.experiment.config["sampling"], "trace_goals_path": ""}
+        with mock.patch.dict(os.environ, {"ALFWORLD_TRACE_GOALS": ""}), mock.patch.object(
+                probe.importlib, "import_module") as runtime:
+            with self.assertRaisesRegex(ValueError, "Runtime conversion is disabled"):
+                probe.make_environment(sampling)
+        runtime.assert_not_called()
+
+    def test_make_environment_passes_saved_store_and_env_default(self):
+        sampling = {**self.experiment.config["sampling"], "trace_goals_path": ""}
+        runtime = SimpleNamespace(AlfWorldEnv=mock.Mock(return_value="fake environment"))
+        with mock.patch.dict(os.environ, {"ALFWORLD_TRACE_GOALS": str(self.store_path)}), mock.patch.object(
+                probe.importlib, "import_module", return_value=runtime):
+            self.assertEqual(probe.make_environment(sampling), "fake environment")
+        runtime.AlfWorldEnv.assert_called_once_with(history_length=4, max_step=3,
+                                                   trace_enabled=True, trace_goals_path=str(self.store_path))
+
+    def test_store_change_invalidates_persistent_worker_identity(self):
+        sampling = self.experiment.config["sampling"]
+        before = probe._goal_store_identity(sampling)
+        self.store_path.write_bytes(b"a replacement store with new contents")
+        self.assertNotEqual(before, probe._goal_store_identity(sampling))
+
+    def test_resume_cannot_mix_a_different_prebuilt_goal_target(self):
+        snapshot = self.sample()
+        snapshot["complete"] = False
+        first = snapshot["trajectories"][0]
+        first["status"] = "running"
+        first["goal_spec_hash"] = "original-fixed-target"
+        class DifferentStoreEnv(FakeEnv):
+            trace_goal_spec = {"goal_response": "different target", "goal_spec_hash": "replacement-target"}
+        policy = mock.Mock(side_effect=AssertionError("do not issue policy calls"))
+        with self.assertRaisesRegex(ValueError, "differs from the saved trajectory target"):
+            probe.capture_trajectories(snapshot, snapshot["sampling"], lambda value: None,
+                                       env_factory=DifferentStoreEnv, policy=policy)
+        policy.assert_not_called()
+
+    def test_cli_trace_goals_is_saved_in_sampling_config(self):
+        with mock.patch.object(probe, "Experiment") as experiment:
+            probe.main(["score", "--work-dir", self.temp.name, "--trace-goals", str(self.store_path)])
+        overrides = experiment.call_args.args[1]
+        self.assertEqual(overrides["sampling"]["trace_goals_path"], str(self.store_path))
+        experiment.return_value.score.assert_called_once_with()
+
+    def test_complete_saved_cache_scores_without_store_or_source_access(self):
+        snapshot = self.sample()
+        for trajectory in snapshot["trajectories"]:
+            for state in trajectory["states"]:
+                state["facts"] = [f"s{state['state_index']}"]
+        tools, _ = self.goal_tools()
+        with mock.patch.object(probe, "_goal_module", return_value=tools), mock.patch.object(
+                probe, "_goal_store_module", return_value=tools):
+            complete = probe.enrich_snapshot(snapshot)
+        path = Path(self.temp.name) / "trajectories.json"
+        probe.atomic_json(path, complete)
+        original = path.read_bytes()
+        self.experiment.save_probe({"response": "{goal_response}", "state_view": "full_state"})
+        self.store_path.unlink()
+        fake = FakeScorer()
+        with mock.patch.object(scoring, "_get_scorer", return_value=fake), mock.patch.object(
+                probe, "_goal_store_module", side_effect=AssertionError("no artifact access")), mock.patch.object(
+                probe, "_goal_module", side_effect=AssertionError("no source or converter access")):
+            scored = self.experiment.score(scorer=scoring.score_snapshots)
+        self.assertEqual(scored["trajectories"][0]["goal_metadata"]["goal_store_id"], "persisted-store-v1")
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_historical_sample_without_store_inherits_configured_workspace_store(self):
+        workspace = probe.SampleWorkspace(self.experiment)
+        with mock.patch.object(probe, "select_row", return_value=self.selection), mock.patch.object(
+                probe.Experiment, "start"):
+            created = workspace.create_sample({"row_index": 1})
+        path = workspace.current.config_path
+        config = probe.read_json(path)
+        config["sampling"].pop("trace_goals_path")
+        probe.atomic_json(path, config)
+        workspace.instances.pop(created["sample_id"])
+        self.assertEqual(workspace.current.config["sampling"]["trace_goals_path"], str(self.store_path))
 
     def test_goal_sidecar_cannot_be_reused_for_a_changed_cache(self):
         self.sample()
@@ -289,7 +397,8 @@ class SessionTests(unittest.TestCase):
         self.assertIsNone(before["snapshot"])
         self.assertFalse(before["goal_enrichment"])
         tools, _ = self.goal_tools()
-        with mock.patch.object(probe, "_goal_module", return_value=tools):
+        with mock.patch.object(probe, "_goal_module", return_value=tools), mock.patch.object(
+                probe, "_goal_store_module", return_value=tools):
             selected.enrich()
         after = workspace.state()
         self.assertNotEqual(before["snapshot_version"], after["snapshot_version"])
@@ -317,7 +426,8 @@ class SessionTests(unittest.TestCase):
                 state["facts"] = [f"s{state['state_index']}"]
         probe.atomic_json(selected.directory / "trajectories.json", selected_snapshot)
         tools, _ = self.goal_tools()
-        with mock.patch.object(probe, "_goal_module", return_value=tools):
+        with mock.patch.object(probe, "_goal_module", return_value=tools), mock.patch.object(
+                probe, "_goal_store_module", return_value=tools):
             selected.enrich()
         server = mock.Mock(server_port=8765)
         with mock.patch.object(probe, "SampleWorkspace", return_value=workspace), mock.patch.object(

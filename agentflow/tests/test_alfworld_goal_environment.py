@@ -57,12 +57,18 @@ class Tools:
         return Path(path)
 
     @classmethod
-    def load_goal_spec(cls, path):
+    def read_goal_spec(cls, store_path, path):
         return {"gamefile": str(cls.normalize_gamefile(path)), "goal_response": "A clean mug is in a cabinet.",
                 "goal_source": "traj_data.json", "goal_task_type": "pick_clean_then_place_in_recep",
                 "template_version": "test", "source_sha256": {"game": "abc"},
                 "goal_ast": ["isclean", "mug0"], "answer_instruction": "Judge the recorded state.",
-                "goal_spec_hash": "stable-spec"}
+                "goal_spec_hash": "stable-spec", "goal_store_path": store_path,
+                "goal_store_id": "persisted-store", "goal_store_entry": "train/actual/game.tw-pddl",
+                "goal_store_spec_sha256": "persisted-spec"}
+
+    @staticmethod
+    def load_goal_spec(path):
+        raise AssertionError("Training must never convert goals")
 
     @staticmethod
     def normalize_facts(facts):
@@ -107,7 +113,7 @@ class EnvironmentTests(unittest.TestCase):
     def setUp(self):
         self.scope = {"os": os, "np": np, "deepcopy": copy.deepcopy, "re": re,
                       "SimpleMemory": Memory, "ALFWORLD_TRACE_INSTRUCTION": "fallback instruction",
-                      "_goal_tools": lambda: Tools,
+                      "_goal_tools": lambda: Tools, "_saved_goal_tools": lambda: Tools,
                       "ALFWORLD_TEMPLATE_NO_HIS": "ACTOR {current_observation} {admissible_actions}",
                       "ALFWORLD_TEMPLATE": "ACTOR {task_description} {action_history} {current_observation} {admissible_actions}"}
         for name in ("_environment_scalar", "_environment_flag", "parse_gamefile", "set_gamefile"):
@@ -116,7 +122,7 @@ class EnvironmentTests(unittest.TestCase):
 
     def env(self, simulator=None, *, trace=True, max_step=50):
         simulator = simulator or Simulator()
-        env = self.cls(trace_enabled=trace, max_step=max_step)
+        env = self.cls(trace_enabled=trace, max_step=max_step, trace_goals_path="/saved/goals.sqlite")
         base = NS(game_files=["indexed/game.tw-pddl"], init_env=mock.Mock(return_value=simulator))
         env._env_instances[("train", "all")] = base
         env._env_gamefiles[("train", "all")] = list(base.game_files)
@@ -139,6 +145,8 @@ class EnvironmentTests(unittest.TestCase):
         self.assertIn("secret", initial)
         self.assertEqual(env.trace_gt, "A clean mug is in a cabinet.")
         self.assertEqual(env.trace_answer_instruction, "Judge the recorded state.")
+        self.assertEqual(env.trace_goal_metadata["goal_store_id"], "persisted-store")
+        self.assertEqual(env.trace_goal_metadata["goal_store_path"], "/saved/goals.sqlite")
         self.assertFalse(env.trace_goal_check)
         self.assertTrue(env.trace_goal_check_valid)
         actor, reward, done, info = self.step(env, "<action>place mug</action>")
@@ -149,6 +157,90 @@ class EnvironmentTests(unittest.TestCase):
         self.assertIn("inreceptacle", env.trace_state_context)
         self.assertNotIn("secret", actor)
         self.assertEqual(env.trace_gt, "A clean mug is in a cabinet.")
+
+    def test_separate_training_sessions_only_read_the_saved_store(self):
+        with mock.patch.object(Tools, "read_goal_spec", wraps=Tools.read_goal_spec) as read, \
+             mock.patch.object(Tools, "load_goal_spec", side_effect=AssertionError("conversion forbidden")) as convert:
+            first, _ = self.env()
+            self.reset(first, question_id=0)
+            second, _ = self.env()
+            self.reset(second, question_id=0)
+        self.assertEqual(read.call_args_list, [mock.call("/saved/goals.sqlite", ["actual/game.tw-pddl"])] * 2)
+        convert.assert_not_called()
+        self.assertEqual(first.trace_goal_spec, second.trace_goal_spec)
+
+    def test_restarted_environment_resets_load_the_same_persisted_file_without_conversion(self):
+        import test_alfworld_goal_conversion as fixtures
+        store_path = ROOT / "agentflow/agentflow/trace/alfworld_goal_store.py"
+        module_spec = importlib.util.spec_from_file_location("saved_goal_environment_integration", store_path)
+        store = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(store)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            builder = fixtures.GoalTests()
+            builder.root = root / "games"
+            builder.root.mkdir()
+            gamefile = builder.create()
+            output = root / "goals.sqlite"
+            store.build_goal_store(builder.root, output)
+            original = output.read_bytes()
+            self.scope["_saved_goal_tools"] = lambda: store
+            self.scope["_goal_tools"] = lambda: fixtures.converter
+
+            class SavedSimulator(Simulator):
+                def reset(self):
+                    observation, info = super().reset()
+                    info["extra.gamefile"] = [str(gamefile)]
+                    info["facts"] = [fixtures.INITIAL]
+                    return observation, info
+
+            with mock.patch.object(store, "_converter", side_effect=AssertionError("runtime conversion forbidden")) as convert:
+                first, _ = self.env(SavedSimulator())
+                first.trace_goals_path = str(output)
+                self.reset(first, question_id=0)
+                second, _ = self.env(SavedSimulator())
+                second.trace_goals_path = str(output)
+                self.reset(second, question_id=0)
+            convert.assert_not_called()
+            self.assertEqual(first.trace_gt, second.trace_gt)
+            self.assertEqual(first.trace_goal_metadata["goal_store_id"], second.trace_goal_metadata["goal_store_id"])
+            self.assertTrue(first.trace_goal_check_valid)
+            self.assertTrue(second.trace_goal_check_valid)
+            self.assertEqual(output.read_bytes(), original)
+
+    def test_missing_store_configuration_fails_before_environment_registration(self):
+        with mock.patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(ValueError, "Build it offline"):
+            self.cls(trace_enabled=True)
+        with mock.patch.dict(os.environ, {"ALFWORLD_TRACE_GOALS": "   "}, clear=True), \
+             self.assertRaisesRegex(ValueError, "prebuilt goal store"):
+            self.cls(trace_enabled=True)
+
+    def test_configured_store_and_explicit_probe_path_are_supported(self):
+        with mock.patch.dict(os.environ, {"ALFWORLD_TRACE_GOALS": "/shared/train-goals.sqlite"}, clear=True):
+            from_env = self.cls(trace_enabled=True)
+            explicit = self.cls(trace_enabled=True, trace_goals_path=Path("/probe/frozen-goals.sqlite"))
+        self.assertEqual(from_env.trace_goals_path, "/shared/train-goals.sqlite")
+        self.assertEqual(explicit.trace_goals_path, "/probe/frozen-goals.sqlite")
+
+    def test_missing_or_stale_store_has_no_online_conversion_fallback(self):
+        for failure in (FileNotFoundError("missing saved goal store"), ValueError("stale saved source hash")):
+            env, _ = self.env()
+            with mock.patch.object(Tools, "read_goal_spec", side_effect=failure), \
+                 mock.patch.object(Tools, "load_goal_spec", side_effect=AssertionError("conversion forbidden")) as convert, \
+                 self.assertRaises(type(failure)):
+                self.reset(env, question_id=0)
+            convert.assert_not_called()
+            self.assertIsNone(env.trace_goal_spec)
+
+    def test_trace_disabled_does_not_require_or_read_a_goal_store(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            env = self.cls(trace_enabled=False)
+        self.assertEqual(env.trace_goals_path, "")
+        with mock.patch.object(Tools, "read_goal_spec") as read:
+            # Normal non-TRACE reset contract is independently covered below.
+            env, _ = self.env(trace=False)
+            self.reset(env, question_id=0)
+        read.assert_not_called()
 
     def test_actual_saved_gamefile_overrides_question_index(self):
         env, base = self.env()

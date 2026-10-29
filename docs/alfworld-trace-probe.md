@@ -2,7 +2,7 @@
 
 入口：train-roma/alfworld_trace_probe.py。
 
-当前默认使用“实际 PDDL → 固定英文 GT → 完整环境状态评分”，并与 QA 共用终局路由和回填。转换来源、正式训练接入及配置见 [alfworld-trace-goals.md](alfworld-trace-goals.md)。
+当前默认使用“离线实际 PDDL → 保存的固定英文 GT → 完整环境状态评分”，并与 QA 共用终局路由和回填。转换来源、正式训练接入及配置见 [alfworld-trace-goals.md](alfworld-trace-goals.md)。
 
 默认选 data/train/alfworld/train_all_alfworld_3305.parquet 第 0 行，即 train_all_alfworld_0；从 question 解析环境编号 0，而不是使用该行的 id=1。同一题采样 4 条轨迹，每条最多 50 个动作，策略 temperature=0.7、history_length=4。
 
@@ -10,10 +10,13 @@
 
 ## 启动窗口
 
+先按 [离线构建步骤](alfworld-trace-goals.md#规则来源与转换) 生成 `alfworld_trace_goals.sqlite`。新采样和旧缓存补 GT 都只读取这个文件，不在窗口中执行转换。已经保存完整 GT/状态的轨迹可以直接评分，无需再次读取转换文件。
+
 在平时能运行 ALFWorld 的 Python 环境、仓库根目录中执行。下面的模型名、服务地址和 tokenizer 路径须对应实际部署；采样与评分可使用不同服务。
 
 ```bash
 python train-roma/alfworld_trace_probe.py \
+  --trace-goals /absolute/path/to/artifacts/alfworld_trace_goals.sqlite \
   --policy-base-url http://127.0.0.1:19998/v1 \
   --policy-model Qwen3-30B-A3B-Instruct-2507 \
   --score-base-url http://127.0.0.1:19998/v1 \
@@ -50,6 +53,7 @@ python -c "import pyarrow, transformers; print('probe dependencies OK')"
 | 数据表 | --dataset | 指向 train_all_alfworld_3305.parquet 的绝对路径 |
 | ALFWorld 源码 | --alfworld-root | 包含 alfworld/ Python 包的源码目录；已有默认布局可省略 |
 | 环境数据 | --alfworld-data | 同时包含 json_2.1.1/ 和 logic/ 的目录；不是 Parquet 所在目录 |
+| 离线 GT 文件 | --trace-goals 或 ALFWORLD_TRACE_GOALS | 由离线 build 命令生成的 alfworld_trace_goals.sqlite；必须覆盖当前游戏 |
 | 动作生成服务 | --policy-base-url、--policy-model | base URL 以 /v1 结尾；模型名用该服务 /v1/models 返回的 id |
 | 冻结评分服务 | --score-base-url、--score-model | 需要支持 /v1/completions echo 和 prompt token LogP；评分期间固定 checkpoint |
 | 评分 tokenizer | --tokenizer | 评分模型对应的本地目录，不能误用动作模型的 tokenizer |
@@ -64,6 +68,7 @@ python train-roma/alfworld_trace_probe.py serve \
   --dataset /path/to/data/train/alfworld/train_all_alfworld_3305.parquet \
   --alfworld-root /path/to/alfworld-master \
   --alfworld-data /path/to/alfworld-master/json_data \
+  --trace-goals /absolute/path/to/artifacts/alfworld_trace_goals.sqlite \
   --policy-base-url http://127.0.0.1:19998/v1 \
   --policy-model POLICY_MODEL \
   --score-base-url http://127.0.0.1:19998/v1 \
@@ -105,7 +110,9 @@ alfworld-root 内应包含 alfworld Python 包。alfworld-data 指向包含 json
 第一次创建配置及采样：
 
 ```bash
-python train-roma/alfworld_trace_probe.py sample --work-dir outputs/probe_case_01
+python train-roma/alfworld_trace_probe.py sample \
+  --trace-goals /absolute/path/to/artifacts/alfworld_trace_goals.sqlite \
+  --work-dir outputs/probe_case_01
 ```
 
 第一次启动会在实验目录生成 config.json。可提前用窗口启动一次生成配置，再编辑其中 sampling 和 scorer 的服务及模型设置。也可以直接在命令行使用上面的服务、tokenizer 参数。
@@ -131,13 +138,16 @@ score 模式从不自动采样，也不导入 ALFWorld；缓存缺失或尚未�
 若旧轨迹已保存完整 facts，可直接离线补齐：
 
 ```bash
-python train-roma/alfworld_trace_probe.py enrich --work-dir /path/to/old_probe
+python train-roma/alfworld_trace_probe.py enrich \
+  --trace-goals /absolute/path/to/artifacts/alfworld_trace_goals.sqlite \
+  --work-dir /path/to/old_probe
 ```
 
 只有可见观察的旧缓存，需要在原 ALFWorld 数据与环境中重放保存的动作：
 
 ```bash
 python train-roma/alfworld_trace_probe.py enrich --replay \
+  --trace-goals /absolute/path/to/artifacts/alfworld_trace_goals.sqlite \
   --work-dir /path/to/old_probe \
   --alfworld-root /path/to/alfworld-master \
   --alfworld-data /path/to/alfworld-master/json_data
@@ -158,7 +168,7 @@ user content 使用评分模型 tokenizer 的 chat template；只计算 assistan
 
 Prompt 支持 {goal}、{goal_response}、{remaining_steps}、{turn_index} 占位符。Response 支持 {goal}、{goal_response}，确保同一题、不同 Turn 的评分目标一致；其他普通大括号保持原样，方便直接写 JSON 或自然语言。
 
-默认 Response 为 {goal_response}，在每道题中替换为实际 PDDL 确定性转换得到的完整成功状态描述。Prompt 根据完整规则、初始状态、当前状态和动作历史，要求描述当前状态。Response 表达目标状态，不作为当前已成功的证据。也可切换到手写固定 Response（例如原来的 The episode will end in success.）作为对照；比较时应记录 state_view。文本似然未自动做双候选归一化或成功率校准。
+默认 Response 为 {goal_response}，在每道题中替换为实际 PDDL 确定性转换并保存的完整成功状态描述。Prompt 根据完整规则、初始状态、当前状态和动作历史，要求描述当前状态。Response 表达目标状态，不作为当前已成功的证据。也可切换到手写固定 Response（例如原来的 The episode will end in success.）作为对照；比较时应记录 state_view。文本似然未自动做双候选归一化或成功率校准。
 
 ## TRACE 计算口径
 

@@ -86,6 +86,12 @@ def _goal_tools():
     return alfworld
 
 
+def _saved_goal_tools():
+    # Training reads a prebuilt artifact; offline conversion is never a reset side effect.
+    from agentflow.trace import alfworld_goal_store
+    return alfworld_goal_store
+
+
 def _create_trace_environment(base_env, batch_size=1):
     """Mirror official TW registration, additionally requesting actual facts.
 
@@ -160,7 +166,7 @@ def set_gamefile(info, gamefile):
 
 
 class AlfWorldEnv:
-    def __init__(self, history_length=4, max_step=50, trace_enabled=None):
+    def __init__(self, history_length=4, max_step=50, trace_enabled=None, trace_goals_path=None):
         # ====== 延迟导入：确保 JVM 只在 worker 进程内启动 ======
         self.env = None
         self.seed = 44
@@ -185,6 +191,15 @@ class AlfWorldEnv:
                 and os.environ.get("TRACE_ENABLED", "true").lower() not in ("0", "false", "no")
             )
         self.trace_enabled = bool(trace_enabled)
+        configured_goals = os.environ.get("ALFWORLD_TRACE_GOALS", "") if trace_goals_path is None else trace_goals_path
+        self.trace_goals_path = os.fspath(configured_goals) if configured_goals else ""
+        if self.trace_enabled and not self.trace_goals_path.strip():
+            raise ValueError(
+                "ALFWorld TRACE requires a prebuilt goal store. Build it offline with "
+                "alfworld_goal_store.py build --games-root DATA_ROOT --output GOALS.sqlite, "
+                "then set ALFWORLD_TRACE_GOALS=/absolute/path/GOALS.sqlite. "
+                "Training never converts missing goals automatically."
+            )
         self.trace_goal_spec = None
         self.trace_goal_metadata = None
         self.trace_gt = None
@@ -202,15 +217,16 @@ class AlfWorldEnv:
         self._env_gamefiles = {}
 
     def _load_trace_goal(self, info):
-        tools = _goal_tools()
-        self.trace_goal_spec = tools.load_goal_spec(info.get("extra.gamefile"))
+        self.trace_goal_spec = _saved_goal_tools().read_goal_spec(
+            self.trace_goals_path, info.get("extra.gamefile"))
         self.trace_gt = self.trace_goal_spec["goal_response"]
         self.trace_answer_instruction = self.trace_goal_spec.get(
             "answer_instruction", ALFWORLD_TRACE_INSTRUCTION)
         self.trace_goal_metadata = {
             key: deepcopy(self.trace_goal_spec.get(key))
             for key in ("gamefile", "goal_source", "goal_task_type", "template_version",
-                        "source_sha256", "goal_ast", "goal_validation_status", "goal_spec_hash")
+                        "source_sha256", "goal_ast", "goal_validation_status", "goal_spec_hash",
+                        "goal_store_path", "goal_store_id", "goal_store_entry", "goal_store_spec_sha256")
         }
         self.trace_action_history = []
 

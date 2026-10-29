@@ -63,8 +63,9 @@
       <div class="service-grid">
         <div class="service"><strong>采样模型</strong><code id="policyModel">—</code><code id="policyUrl">—</code></div>
         <div class="service"><strong>冻结评分模型</strong><code id="scoreModel">—</code><code id="scoreUrl">—</code></div>
+        <div class="service"><strong>离线 GT 文件</strong><code id="goalStorePath">—</code></div>
       </div>
-      <p class="small-text muted" style="margin-top:9px">模型、服务地址、数据行及采样参数在启动时的 JSON 配置中设置。这里仅编辑评分探针。</p>
+      <p class="small-text muted" style="margin-top:9px">先离线运行 alfworld_goal_store.py build 保存 GT，再通过 --trace-goals 或 ALFWORLD_TRACE_GOALS 指定文件。采样和旧缓存补全只读取该文件，不实时转换。模型、服务地址和采样参数在启动配置中设置。</p>
     </details>
   </section>
 
@@ -86,7 +87,7 @@
       <div class="row"><button id="saveButton" type="button" disabled>保存探针</button><button id="scoreButton" class="primary" type="button" disabled>保存并重新评分</button></div>
     </div>
     <div class="formula">state + Prompt → 固定 Response 的平均 LogP ℓ → Vₜ = log[(-ℓ₀ + ε) / (-ℓₜ + ε)] → Δₜ = Vₜ₊₁ − Vₜ → K-step 折扣平均</div>
-    <p class="small-text muted" style="margin-top:9px">默认 Response 使用 {goal_response}，由实际 PDDL Goal 确定性生成，同题所有状态保持固定。完整状态包含环境先验和隐藏事实，仅评分模型可见。复用 QA：真实终局动作走 outcome，K 包含该动作，末状态只作诊断；默认终局回填开启，系数为 2。旧缓存先点“补全”，只重放已有动作，不调用采样模型。</p>
+    <p class="small-text muted" style="margin-top:9px">默认 Response 使用 {goal_response}，从预先保存的 GT 文件读取，同题所有状态保持固定。完整状态包含环境先验和隐藏事实，仅评分模型可见。复用 QA：真实终局动作走 outcome，K 包含该动作，末状态只作诊断；默认终局回填开启，系数为 2。旧缓存补全读取保存的 GT 并重放已有动作，不调用采样模型；已完整保存的缓存可直接重新评分。</p>
   </section>
 
   <section class="card" aria-labelledby="resultHeading">
@@ -232,6 +233,7 @@ function renderMetadata() {
   $('policyUrl').textContent = toText(first(policy.base_url, sampling.base_url, config.policy_base_url, '未配置'));
   $('scoreModel').textContent = toText(first(scorer.model, '未配置'));
   $('scoreUrl').textContent = scorer.backend === 'hf' ? '本地 Hugging Face · ' + toText(first(scorer.device, 'auto')) : toText(first(scorer.base_url, '未配置'));
+  $('goalStorePath').textContent = toText(first(sampling.trace_goals_path, '未配置；新采样 / 补全前请设置 --trace-goals'));
   const job = state.job || {}, running = job.status === 'running', isError = job.status === 'error';
   $('jobBox').className = 'job-box' + (running ? ' busy' : '');
   $('jobTitle').textContent = running ? (job.phase === 'sample' || job.phase === 'sampling' ? '正在采样' : job.phase === 'enrich' ? '正在重放已有动作并补全 GT' : '正在评分固定轨迹') :
