@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import copy
 import csv
+import gzip
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 from datetime import datetime, timezone
@@ -750,8 +751,30 @@ class Experiment:
             self.progress(f"Saved scoring run {run_id}; original trajectories unchanged.")
             return result
 
-    def state(self):
+    def state(self, *, lightweight=False):
         with self.lock:
+            if lightweight:
+                # Full snapshot and scoring details are fetched on demand, not
+                # attached to the frequently polled status endpoint.
+                runs = [
+                    {"id": path.stem,
+                     "created_at": datetime.fromtimestamp(
+                         path.stat().st_mtime, timezone.utc
+                     ).isoformat()}
+                    for path in sorted((self.directory / "runs").glob("*.json"), reverse=True)
+                ]
+                snap_path = self.directory / "trajectories.json"
+                stat = snap_path.stat() if snap_path.is_file() else None
+                return {
+                    "config": copy.deepcopy(self.config),
+                    "config_path": str(self.config_path),
+                    "work_dir": str(self.directory),
+                    "snapshot": None,
+                    "snapshot_version": f"{stat.st_mtime_ns}:{stat.st_size}" if stat else None,
+                    "latest": runs[0] if runs and (self.directory / "latest.json").is_file() else None,
+                    "runs": runs,
+                    "job": dict(self.job),
+                }
             runs = []
             for path in sorted((self.directory / "runs").glob("*.json"), reverse=True):
                 item = read_json(path)
@@ -801,6 +824,7 @@ class SampleWorkspace:
         self.samples_dir.mkdir(parents=True, exist_ok=True)
         self.active_file = self.root / "active_sample.json"
         self.instances = {"legacy": experiment}
+        self._snapshot_summary_cache = {}
         stored = read_json(self.active_file, {})
         selected = stored.get("sample_id", "legacy") if isinstance(stored, dict) else "legacy"
         if selected != "legacy" and not self._sample_path(selected).is_dir():
@@ -834,6 +858,26 @@ class SampleWorkspace:
         if self.current.job["status"] == "running":
             raise RuntimeError("Finish the current sampling or scoring job before switching samples.")
 
+    def _snapshot_summary(self, file):
+        """Read each large saved snapshot only when it changes."""
+        if not file.is_file():
+            return None
+        stat = file.stat()
+        version = (stat.st_mtime_ns, stat.st_size)
+        cache_key = str(file)
+        cached = self._snapshot_summary_cache.get(cache_key)
+        if cached and cached[0] == version:
+            return cached[1]
+        snapshot = read_json(file)
+        value = {
+            "dataset": (snapshot or {}).get("dataset") or {},
+            "created_at": (snapshot or {}).get("created_at"),
+            "complete": bool((snapshot or {}).get("complete")),
+            "trajectory_count": len((snapshot or {}).get("trajectories") or []),
+        }
+        self._snapshot_summary_cache[cache_key] = (version, value)
+        return value
+
     def list_samples(self):
         ids = ["legacy"] + sorted(
             (p.name for p in self.samples_dir.iterdir()
@@ -844,7 +888,7 @@ class SampleWorkspace:
         for sample_id in ids:
             directory = self.root if sample_id == "legacy" else self._sample_path(sample_id)
             config = read_json(directory / "config.json", {})
-            snapshot = read_json(directory / "trajectories.json")
+            snapshot = self._snapshot_summary(directory / "trajectories.json")
             has_score = (directory / "latest.json").is_file()
             info = read_json(directory / "sample_info.json", {})
             dataset = config.get("dataset") or {}
@@ -852,7 +896,7 @@ class SampleWorkspace:
             meta = (snapshot or {}).get("dataset") or {}
             instance = self.instances.get(sample_id)
             job = instance.job if instance else None
-            trajectories = (snapshot or {}).get("trajectories", [])
+            trajectory_count = (snapshot or {}).get("trajectory_count", 0)
             status = (
                 "running" if job and job.get("status") == "running" else
                 "error" if job and job.get("status") == "error" else
@@ -863,7 +907,7 @@ class SampleWorkspace:
                 "id": sample_id, "row_index": dataset.get("row_index"),
                 "question": meta.get("question"),
                 "created_at": (snapshot or {}).get("created_at") or info.get("created_at"),
-                "trajectories": len(trajectories),
+                "trajectories": trajectory_count,
                 "expected_trajectories": sampling.get("trajectories"),
                 "status": status, "has_score": has_score,
                 "legacy": sample_id == "legacy",
@@ -872,7 +916,7 @@ class SampleWorkspace:
 
     def state(self):
         with self.lock:
-            value = self.current.state()
+            value = self.current.state(lightweight=True)
             value.update(active_sample_id=self.active_id, samples=self.list_samples(),
                          workspace_dir=str(self.root))
             return value
@@ -943,8 +987,14 @@ def serve(experiment, host, port):
             if not isinstance(data, (bytes, str)):
                 data = json.dumps(jsonable(data), ensure_ascii=False, allow_nan=False)
             data = data.encode("utf-8") if isinstance(data, str) else data
+            compressed = False
+            if len(data) > 65536 and "gzip" in self.headers.get("Accept-Encoding", "").lower():
+                data = gzip.compress(data, compresslevel=5)
+                compressed = True
             self.send_response(status)
             self.send_header("Content-Type", content_type)
+            if compressed:
+                self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
             if filename:
@@ -959,6 +1009,11 @@ def serve(experiment, host, port):
                     return self.send((SCRIPT_DIR / "alfworld_trace_probe.html").read_bytes(), "text/html; charset=utf-8")
                 if parsed.path == "/api/state":
                     return self.send(workspace.state())
+                if parsed.path == "/api/snapshot":
+                    snapshot = read_json(workspace.directory / "trajectories.json")
+                    if snapshot is None:
+                        raise FileNotFoundError("No saved trajectories yet.")
+                    return self.send(snapshot)
                 if parsed.path == "/api/run":
                     run_id = parse_qs(parsed.query).get("id", [""])[0]
                     if not re.fullmatch(r"\d{8}T\d{6}-[0-9a-f]{8}", run_id):
