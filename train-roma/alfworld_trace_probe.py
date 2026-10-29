@@ -92,6 +92,14 @@ def jsonable(value):
     return str(value)
 
 
+def compact_env_info(info):
+    """Drop repeated heavyweight simulator facts already recorded in states[].facts."""
+    if not isinstance(info, dict):
+        return info
+    return {key: value for key, value in info.items()
+            if key not in ("facts", "trace_full_facts", "trace_goal_metadata")}
+
+
 def atomic_json(path, value):
     """Durable replace with disk verification and a last-known-good trajectory backup.
 
@@ -354,7 +362,7 @@ def state_snapshot(env, actor_prompt, info, index, sampling, *, prior_turns=(), 
     return {"state_index": index, "state_context": context, "observation": observation,
             "available_actions": actions, "remaining_steps": max(0, sampling["max_steps"] - index),
             "is_post_state": index > 0, "is_terminal_state": bool(done),
-            "env_info": info, "facts": facts,
+            "env_info": compact_env_info(info), "facts": facts,
             "state_view": "full_state" if facts is not None else "legacy_observed",
             "goal_check": info.get("trace_goal_check"),
             "goal_check_valid": info.get("trace_goal_check_valid"),
@@ -468,7 +476,7 @@ def capture_trajectories(snapshot, sampling, save, *, env_factory=make_environme
                              "external_error": flag(info.get("env_error")) is True,
                              "format_error": flag(info.get("format_error")) is True,
                              "invalid_action": flag(info.get("invalid_action")) is True,
-                             "env_info": info})
+                             "env_info": compact_env_info(info)})
                 trajectory["turns"].append(turn)
                 trajectory["states"].append(state_snapshot(
                     env, next_prompt, info, index + 1, sampling,
