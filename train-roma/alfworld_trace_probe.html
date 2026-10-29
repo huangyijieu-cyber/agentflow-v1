@@ -104,6 +104,7 @@ const runCache = new Map();
 let state = null, connected = false, dirty = false, editorLoaded = false, pending = false;
 let selectedRunId = '', selectedCompareId = '', followLatest = true, renderKey = '', noticeTimer = null;
 let activeRun = null, comparisonRun = null, activeSampleId = null, sampleEditorReady = false;
+let snapshotCache = null, snapshotCacheKey = '';
 const editorIds = ['probePrompt', 'probeResponse', 'epsilon', 'k', 'gamma'];
 const toText = value => typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value, null, 2);
 const first = (...values) => values.find(value => value !== undefined && value !== null);
@@ -189,6 +190,7 @@ function updateSampleSelector() {
 }
 function resetForSampleChange() {
   runCache.clear(); loadingRuns.clear();
+  snapshotCache = null; snapshotCacheKey = '';
   selectedRunId = ''; selectedCompareId = ''; followLatest = true; renderKey = '';
   activeRun = null; comparisonRun = null; dirty = false; editorLoaded = false;
   sampleEditorReady = false;
@@ -320,6 +322,23 @@ async function refresh() {
       activeSampleId = next.active_sample_id || 'legacy';
     }
     state = next; connected = true;
+    // The lightweight /api/state contains only metadata. Fetch heavy saved
+    // trajectories once per filesystem version, instead of on every poll.
+    const version = next.snapshot_version;
+    if (version) {
+      const key = activeSampleId + ':' + version;
+      if (snapshotCacheKey !== key) {
+        const snapshot = await api('/api/snapshot');
+        if (activeSampleId !== (next.active_sample_id || 'legacy')) return;
+        snapshotCache = snapshot;
+        snapshotCacheKey = key;
+      }
+      state.snapshot = snapshotCache;
+    } else {
+      state.snapshot = null;
+      snapshotCache = null;
+      snapshotCacheKey = '';
+    }
     applyEditor((state.config || {}).probe);
     updateSampleSelector(); renderMetadata(); updateRunSelectors(); renderResults(false); updateControls();
   }
