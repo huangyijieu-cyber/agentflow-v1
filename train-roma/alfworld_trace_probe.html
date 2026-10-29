@@ -44,7 +44,10 @@
     </div>
     <div class="card-head">
       <h2 id="sampleHeading"><span class="step">01</span>固定轨迹</h2>
-      <button id="sampleButton" type="button" disabled>采样当前样本</button>
+      <div class="row">
+        <button id="repairButton" type="button" hidden disabled>从检查点恢复轨迹</button>
+        <button id="sampleButton" type="button" disabled>采样当前样本</button>
+      </div>
     </div>
     <div class="summary-grid">
       <div><div class="stat-label">选中数据</div><div id="sampleQuestion" class="stat-value question">尚未采样</div><div id="datasetPath" class="dataset-path"></div></div>
@@ -139,7 +142,10 @@ function getProbe() {
 function updateControls() {
   const locked = !connected || busy();
   editorIds.forEach(id => { $(id).disabled = locked; });
-  $('sampleButton').disabled = locked || !!(state && state.snapshot && state.snapshot.complete !== false);
+  $('sampleButton').disabled = locked || !!(state && state.snapshot && state.snapshot.complete !== false) || !!(state && state.snapshot_error);
+  const currentSample = ((state && state.samples) || []).find(s => s.id === state.active_sample_id);
+  $('repairButton').hidden = !(state && state.snapshot_error);
+  $('repairButton').disabled = locked || !currentSample || !currentSample.can_recover;
   $('sampleSelect').disabled = locked;
   $('newSampleButton').disabled = locked;
   ['newRowIndex','newTrajectories','newWorkers','newSeed','newTemperature'].forEach(id => { $(id).disabled = locked; });
@@ -155,7 +161,7 @@ function applyEditor(probe) {
   $('probePrompt').value = toText(probe.prompt); $('probeResponse').value = toText(probe.response);
   $('epsilon').value = first(probe.epsilon, 0.1); $('k').value = first(probe.k, 3); $('gamma').value = first(probe.gamma, 0.8); editorLoaded = true;
 }
-const sampleStatuses = {running:'运行中',error:'出错',complete:'已完成',partial:'可继续',not_started:'尚未采样'};
+const sampleStatuses = {running:'运行中',error:'出错',corrupt:'轨迹文件损坏',complete:'已完成',partial:'可继续',not_started:'尚未采样'};
 function updateSampleSelector() {
   const samples = Array.isArray(state.samples) ? state.samples : [];
   const active = state.active_sample_id || 'legacy';
@@ -207,21 +213,28 @@ function renderMetadata() {
   $('datasetPath').textContent = toText(first(snapshot && snapshot.dataset_path, snapshot && snapshot.dataset && snapshot.dataset.path, sampling.dataset, sampling.dataset_path, 'data/train/alfworld/train_all_alfworld_3305.parquet'));
   $('trajectoryCount').textContent = snapshot ? trajectories.length + ' / ' + first(sampling.num_trajectories, sampling.trajectories, 4) : '0 / 4';
   $('turnCount').textContent = snapshot ? String(trajectories.reduce((sum, trajectory) => sum + turnList(trajectory).length, 0)) : '—';
-  $('cacheStatus').textContent = snapshot ? snapshot.complete === false ? '采样未完成 · 已保存' : '已保存 · 可复用' : '未建立';
-  $('cacheStatus').style.color = snapshot ? 'var(--green)' : 'var(--ink)';
+  $('cacheStatus').textContent = state.snapshot_error ? '轨迹文件损坏' : snapshot ? snapshot.complete === false ? '采样未完成 · 已保存' : '已保存 · 可复用' : '未建立';
+  $('cacheStatus').style.color = state.snapshot_error ? 'var(--red)' : snapshot ? 'var(--green)' : 'var(--ink)';
   $('sampleButton').textContent = snapshot ? snapshot.complete === false ? '继续采样当前样本' : '轨迹已保存' : '采样当前样本';
-  $('sampleNote').textContent = snapshot ? snapshot.complete === false ? '首次采样尚未完成。继续时会重放并校验已保存的动作，不重新请求这些动作；只为未完成部分调用采样模型。全部完成后即可固定复用。' : '当前样本已保存。可切换历史样本，或在上方输入行号创建新样本并发采样；旧记录不会丢失。' : '首次采样会保存原始动作、观测和全部逐步状态。建立缓存后，修改下面的评分文本只会重算 LogP，不再调用环境采样。';
+  $('sampleNote').textContent = state.snapshot_error ?
+    '当前样本的轨迹 JSON 无法解析，旧文件未删除。若存在独立轨迹检查点，可点击“从检查点恢复轨迹”；没有检查点时可先切换其他样本。' :
+    snapshot ? snapshot.complete === false ? '采样尚未完成。继续时会重放并校验已保存的动作；只对未完成部分请求采样模型。' : '当前样本已保存。可切换历史样本，或在上方输入行号创建新样本并发采样；旧记录不会丢失。' :
+    '首次采样会保存原始动作、观测和全部逐步状态。建立缓存后，修改评分文本只会重算 LogP。';
   $('policyModel').textContent = toText(first(policy.model, sampling.model, config.policy_model, '未配置'));
   $('policyUrl').textContent = toText(first(policy.base_url, sampling.base_url, config.policy_base_url, '未配置'));
   $('scoreModel').textContent = toText(first(scorer.model, '未配置'));
   $('scoreUrl').textContent = scorer.backend === 'hf' ? '本地 Hugging Face · ' + toText(first(scorer.device, 'auto')) : toText(first(scorer.base_url, '未配置'));
   const job = state.job || {}, running = job.status === 'running', isError = job.status === 'error';
   $('jobBox').className = 'job-box' + (running ? ' busy' : '');
-  $('jobTitle').textContent = running ? (job.phase === 'sample' || job.phase === 'sampling' ? '正在首次采样' : '正在评分固定轨迹') : isError ? '本次操作失败' : job.status === 'done' ? '操作已完成' : snapshot ? '轨迹已就绪' : '等待首次采样';
+  $('jobTitle').textContent = running ? (job.phase === 'sample' || job.phase === 'sampling' ? '正在采样' : '正在评分固定轨迹') :
+    isError ? '本次操作失败' : state.snapshot_error ? '当前样本的轨迹文件损坏' :
+    job.status === 'done' ? '操作已完成' : snapshot ? '轨迹已就绪' : '等待采样';
   $('jobTitle').style.color = isError ? 'var(--red)' : 'var(--ink)';
-  $('jobMessage').textContent = toText(isError ? first(job.error, job.message, '请检查服务配置和终端日志。') : first(job.message, running ? '页面会自动更新进度，请保持窗口打开。' : ''));
-  $('connection').className = 'badge ' + (running ? 'running' : isError ? 'error' : 'connected');
-  $('connectionText').textContent = running ? '运行中' : isError ? '需要检查' : '本地服务已连接';
+  $('jobMessage').textContent = toText(isError ? first(job.error, job.message, '请检查服务配置和终端日志。') :
+    state.snapshot_error || first(job.message, running ? '页面会自动更新进度。' : ''));
+  $('connection').className = 'badge ' + (running ? 'running' : isError || state.snapshot_error ? 'error' : 'connected');
+  $('connectionText').textContent = running ? '运行中' : state.snapshot_error ? '服务已连接 · 文件损坏' :
+    isError ? '任务执行出错' : '本地服务已连接';
 }
 function runLabel(run) {
   let label = toText(first(run.id, run.run_id, '记录'));
@@ -356,6 +369,10 @@ editorIds.forEach(id => $(id).addEventListener('input', () => { dirty = true; up
 $('saveButton').addEventListener('click', () => mutate('/api/config', () => ({probe:getProbe()}), '评分探针已保存。'));
 $('sampleButton').addEventListener('click', () => { if (state && state.snapshot && state.snapshot.complete !== false) return; mutate('/api/sample', () => ({}), state && state.snapshot ? '已提交继续采样；已保存的动作会重放校验，不重新请求。' : '首次采样任务已提交，完成后即可反复复用轨迹。'); });
 $('scoreButton').addEventListener('click', () => mutate('/api/score', () => ({probe:getProbe()}), '评分任务已提交；仅使用已保存的轨迹。'));
+$('repairButton').addEventListener('click', () => {
+  if (!window.confirm('从保存的逐轨迹检查点恢复当前样本？恢复前会备份损坏的 trajectories.json。')) return;
+  mutate('/api/recover-snapshot', () => ({}), '已恢复可用的轨迹检查点，损坏文件已备份。');
+});
 function allowSwitch() {
   return !dirty || window.confirm('当前 Prompt / Response 有未保存的修改。切换样本会丢弃这些修改，是否继续？');
 }
