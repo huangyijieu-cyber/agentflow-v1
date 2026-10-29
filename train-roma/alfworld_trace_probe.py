@@ -269,12 +269,15 @@ def capture_trajectories(snapshot, sampling, save, *, env_factory=make_environme
     if snapshot["sampling"] != sampling:
         raise ValueError("Sampling settings differ from the saved session. Use the saved settings or a new work-dir.")
     count = sampling["trajectories"]
+    # Keep the ALFWorld wrapper and its game-file cache across rollouts.
+    env = None
     for trajectory_index in range(count):
         trajectories = snapshot["trajectories"]
         trajectory = trajectories[trajectory_index] if trajectory_index < len(trajectories) else None
         if trajectory and trajectory.get("status") in ("completed", "external_error"):
             continue
-        env = env_factory(sampling)
+        if env is None:
+            env = env_factory(sampling)
         try:
             actor_prompt, info = env.reset(**snapshot["dataset"]["reset"])
             initial = state_snapshot(env, actor_prompt, info, 0, sampling)
