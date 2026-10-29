@@ -10,6 +10,8 @@ import argparse
 import contextlib
 import copy
 import csv
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 from datetime import datetime, timezone
 import hashlib
 import html
@@ -36,7 +38,7 @@ DEFAULT_DATASET = "data/train/alfworld/train_all_alfworld_3305.parquet"
 DEFAULT_CONFIG = {
     "dataset": {"path": DEFAULT_DATASET, "row_index": 0},
     "sampling": {
-        "trajectories": 4, "max_steps": 50, "history_length": 4,
+        "trajectories": 4, "workers": 4, "max_steps": 50, "history_length": 4,
         "temperature": 0.7, "top_p": 0.9, "max_tokens": 512, "seed": 42,
         "base_url": "http://127.0.0.1:19998/v1",
         "model": "Qwen3-30B-A3B-Instruct-2507", "api_key_env": "OPENAI_API_KEY",
@@ -260,7 +262,7 @@ def summarize_outcome(info, reward, done):
 
 
 def capture_trajectories(snapshot, sampling, save, *, env_factory=make_environment,
-                         policy=request_action, progress=None):
+                         policy=request_action, progress=None, trajectory_offset=0):
     """Resume incomplete capture by replaying saved actions, never resampling them."""
     progress = progress or (lambda message: None)
     if snapshot.get("complete"):
@@ -288,7 +290,7 @@ def capture_trajectories(snapshot, sampling, save, *, env_factory=make_environme
                     same_state = first["states"][0]["state_context"] == initial["state_context"]
                     if not (same_game and same_state):
                         raise RuntimeError("The selected task reset changed across rollouts; refusing to mix initial states.")
-                trajectory = {"trajectory_id": f"traj_{trajectory_index + 1:02d}",
+                trajectory = {"trajectory_id": f"traj_{trajectory_index + trajectory_offset + 1:02d}",
                               "goal": getattr(env, "task", ""),
                               "initial_gamefile": jsonable(info.get("extra.gamefile")),
                               "status": "running", "outcome": None,
@@ -312,8 +314,8 @@ def capture_trajectories(snapshot, sampling, save, *, env_factory=make_environme
                     raise RuntimeError("Environment replay diverged after a saved action.")
             while not done and len(trajectory["turns"]) < sampling["max_steps"]:
                 index = len(trajectory["turns"])
-                progress(f"Sampling {trajectory_index + 1}/{count}, turn {index + 1}; saved actions are retained.")
-                generated = policy(actor_prompt, sampling, trajectory_index, index)
+                progress(f"Sampling trajectory {trajectory_index + trajectory_offset + 1}, turn {index + 1}; saved actions are retained.")
+                generated = policy(actor_prompt, sampling, trajectory_index + trajectory_offset, index)
                 response = generated["response"]
                 match = re.search(r"<action>(.*?)</action>", response, re.DOTALL)
                 turn = {"turn_index": index, "action_prompt": actor_prompt,
@@ -355,6 +357,84 @@ def capture_trajectories(snapshot, sampling, save, *, env_factory=make_environme
             save(snapshot)
         finally:
             env.close()
+    snapshot["complete"] = True
+    snapshot["completed_at"] = utc_now()
+    save(snapshot)
+    return snapshot
+
+
+def _capture_parallel_worker(trajectory_index, dataset, sampling, snapshot_id, directory, original):
+    """Each spawned process owns its ALFWorld instance and checkpoint file."""
+    checkpoint = Path(directory) / "partial_trajectories" / f"traj_{trajectory_index + 1:02d}.json"
+    worker_sampling = {**sampling, "trajectories": 1}
+    saved = read_json(checkpoint)
+    if saved is not None:
+        if saved.get("snapshot_id") != snapshot_id or saved.get("sampling") != worker_sampling:
+            raise RuntimeError(
+                f"Checkpoint belongs to another sampling session: {checkpoint}. "
+                "Use a fresh --work-dir for another task or sampling configuration."
+            )
+        candidate = (saved.get("trajectories") or [None])[0]
+        if candidate and (original is None or len(candidate.get("turns", [])) >= len(original.get("turns", []))):
+            original = candidate
+    worker_snapshot = {
+        "schema_version": 1, "snapshot_id": snapshot_id,
+        "dataset": dataset, "sampling": worker_sampling,
+        "complete": False, "trajectories": [original] if original else [],
+    }
+    capture_trajectories(
+        worker_snapshot, worker_sampling, lambda data: atomic_json(checkpoint, data),
+        progress=lambda message: print(f"[worker {trajectory_index + 1}] {message}", flush=True),
+        trajectory_offset=trajectory_index,
+    )
+    result = worker_snapshot["trajectories"][0]
+    if result.get("trajectory_id") != f"traj_{trajectory_index + 1:02d}":
+        raise RuntimeError("Parallel worker returned a mismatched trajectory ID.")
+    return result
+
+
+def capture_parallel_trajectories(snapshot, sampling, save, directory, progress=None):
+    """Parallel rollouts with independent native environments and durable turn checkpoints."""
+    progress = progress or (lambda message: None)
+    if snapshot.get("complete"):
+        return snapshot
+    if snapshot["sampling"] != sampling:
+        raise ValueError("Sampling settings differ from saved session; use a new --work-dir.")
+    count = sampling["trajectories"]
+    workers = min(sampling["workers"], count)
+    indexed = {t["trajectory_id"]: t for t in snapshot["trajectories"]}
+    expected_ids = {f"traj_{i + 1:02d}" for i in range(count)}
+    if set(indexed) - expected_ids:
+        raise RuntimeError("Saved snapshot contains unexpected trajectory IDs.")
+    save(snapshot)
+    progress(f"Starting {workers} independent ALFWorld rollout processes for {count} trajectories.")
+    with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as executor:
+        futures = {
+            executor.submit(
+                _capture_parallel_worker, i, snapshot["dataset"], sampling,
+                snapshot["snapshot_id"], str(directory), indexed.get(f"traj_{i + 1:02d}"),
+            ): i for i in range(count)
+            if indexed.get(f"traj_{i + 1:02d}", {}).get("status") not in ("completed", "external_error")
+        }
+        for future in as_completed(futures):
+            i = futures[future]
+            trajectory = future.result()
+            indexed[trajectory["trajectory_id"]] = trajectory
+            snapshot["trajectories"] = [indexed[f"traj_{j + 1:02d}"]
+                                        for j in range(count) if f"traj_{j + 1:02d}" in indexed]
+            first = snapshot["trajectories"][0]
+            for other in snapshot["trajectories"][1:]:
+                if (other["initial_gamefile"] != first["initial_gamefile"]
+                        or other["states"][0]["state_context"] != first["states"][0]["state_context"]):
+                    raise RuntimeError("Parallel rollouts reset to different initial games/states.")
+            save(snapshot)
+            progress(f"Finished trajectory {i + 1}/{count}; {len(indexed)}/{count} collected.")
+    if len(indexed) != count or any(
+        indexed[f"traj_{i + 1:02d}"].get("status") not in ("completed", "external_error")
+        for i in range(count)
+    ):
+        raise RuntimeError("Not all parallel trajectories finished; resume with the same work directory.")
+    snapshot["trajectories"] = [indexed[f"traj_{i + 1:02d}"] for i in range(count)]
     snapshot["complete"] = True
     snapshot["completed_at"] = utc_now()
     save(snapshot)
@@ -429,7 +509,7 @@ class Experiment:
             raise ValueError("epsilon must be positive and finite")
         if not math.isfinite(float(probe["gamma"])) or not 0 <= float(probe["gamma"]) <= 1:
             raise ValueError("gamma must be between 0 and 1")
-        for key in ("trajectories", "max_steps", "max_tokens"):
+        for key in ("trajectories", "workers", "max_steps", "max_tokens"):
             if type(sampling[key]) is not int or sampling[key] < 1:
                 raise ValueError(f"sampling.{key} must be a positive integer")
         if type(sampling["history_length"]) is not int or sampling["history_length"] < 0:
@@ -466,18 +546,37 @@ class Experiment:
     def sample(self, *, env_factory=make_environment, policy=request_action):
         with self.session_lock():
             snapshot = read_json(self.directory / "trajectories.json")
-            if snapshot and snapshot.get("complete"):
-                self.progress("Reusing trajectories.json; no new sampling.")
-                return snapshot
             config = copy.deepcopy(self.config)
+            if snapshot is not None:
+                saved_dataset = snapshot["dataset"]
+                requested_path = str(resolve_dataset(config["dataset"]["path"]))
+                if (saved_dataset["path"] != requested_path or
+                        saved_dataset["row_index"] != config["dataset"]["row_index"]):
+                    raise RuntimeError(
+                        "This work directory already holds a different ALFWorld task. "
+                        "Use a new --work-dir to sample another dataset row."
+                    )
+                if snapshot["sampling"] != config["sampling"]:
+                    raise RuntimeError(
+                        "Sampling settings differ from saved trajectories. "
+                        "Use a new --work-dir or restore the original settings."
+                    )
+                if snapshot.get("complete"):
+                    self.progress("Reusing trajectories.json; no new sampling.")
+                    return snapshot
             if snapshot is None:
                 dataset = select_row(config["dataset"]["path"], config["dataset"]["row_index"])
                 snapshot = {"schema_version": 1, "snapshot_id": uuid.uuid4().hex,
                             "created_at": utc_now(), "dataset": dataset,
                             "sampling": config["sampling"], "complete": False, "trajectories": []}
+            save = lambda data: atomic_json(self.directory / "trajectories.json", data)
+            if (config["sampling"]["workers"] > 1 and
+                    env_factory is make_environment and policy is request_action):
+                return capture_parallel_trajectories(
+                    snapshot, config["sampling"], save, self.directory, progress=self.progress)
+            # Custom test callbacks run serially; they may not be picklable.
             return capture_trajectories(
-                snapshot, config["sampling"],
-                lambda data: atomic_json(self.directory / "trajectories.json", data),
+                snapshot, config["sampling"], save,
                 env_factory=env_factory, policy=policy, progress=self.progress)
 
     def score(self, *, scorer=None):
@@ -634,6 +733,7 @@ def main(argv=None):
     parser.add_argument("--dataset")
     parser.add_argument("--row-index", type=int)
     parser.add_argument("--trajectories", type=int)
+    parser.add_argument("--workers", type=int, help="Concurrent independent ALFWorld rollout processes")
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--temperature", type=float)
@@ -651,7 +751,8 @@ def main(argv=None):
     overrides = {}
     mappings = {
         "dataset": ("dataset", "path"), "row_index": ("dataset", "row_index"),
-        "trajectories": ("sampling", "trajectories"), "max_steps": ("sampling", "max_steps"),
+        "trajectories": ("sampling", "trajectories"), "workers": ("sampling", "workers"),
+        "max_steps": ("sampling", "max_steps"),
         "seed": ("sampling", "seed"), "temperature": ("sampling", "temperature"),
         "policy_base_url": ("sampling", "base_url"), "policy_model": ("sampling", "model"),
         "score_base_url": ("scorer", "base_url"), "score_model": ("scorer", "model"),
