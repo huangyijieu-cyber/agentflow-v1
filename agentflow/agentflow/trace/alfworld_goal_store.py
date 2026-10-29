@@ -14,7 +14,9 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import sys
 import tempfile
+import time
 from urllib.parse import quote
 
 
@@ -124,13 +126,14 @@ def _source_hashes(gamefile):
         raise GoalStoreError(f"Cannot verify actual game's source files: {error}") from error
 
 
-def build_goal_store(games_root, output, *, overwrite=False):
+def build_goal_store(games_root, output, *, overwrite=False, progress=None):
     """Convert all supported games once and atomically publish one SQLite file.
 
     The root can be the official json_2.1.1 folder or a particular split. The
     official TextWorld exclusions (movable/Sliced and unsolvable games) apply;
     every other conversion error aborts the build and preserves any old file.
     """
+    started = time.monotonic()
     root = _path(games_root, "games root")
     destination = _path(output, "goal store output")
     if not root.is_dir():
@@ -147,7 +150,19 @@ def build_goal_store(games_root, output, *, overwrite=False):
     connection = None
     records = []
     skipped_unsupported = skipped_unsolvable = 0
+
+    def report(phase, processed, total, game=None):
+        if progress is not None:
+            progress({"phase": phase, "processed": processed, "total": total,
+                      "converted": len(records), "skipped_unsupported": skipped_unsupported,
+                      "skipped_unsolvable": skipped_unsolvable,
+                      "elapsed_seconds": time.monotonic() - started, "current_game": game})
+
     try:
+        report("scanning", 0, None)
+        games = sorted(root.rglob("game.tw-pddl"))
+        total = len(games)
+        report("converting", 0, total)
         connection = sqlite3.connect(str(temporary))
         connection.executescript("""
             CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -160,10 +175,11 @@ def build_goal_store(games_root, output, *, overwrite=False):
             );
             CREATE INDEX goals_sources ON goals (game_sha256, traj_sha256);
         """)
-        for game in sorted(root.rglob("game.tw-pddl")):
+        for processed, game in enumerate(games, 1):
             key = game.relative_to(root).as_posix()
             if "movable" in key or "Sliced" in key:
                 skipped_unsupported += 1
+                report("progress", processed, total, key)
                 continue
             try:
                 raw_game = json.loads(game.read_bytes())
@@ -173,6 +189,7 @@ def build_goal_store(games_root, output, *, overwrite=False):
                 raise GoalStoreError(f"Game must be a JSON object: {game}")
             if raw_game.get("solvable") is False:
                 skipped_unsolvable += 1
+                report("progress", processed, total, key)
                 continue
             try:
                 spec = converter.load_goal_spec(game)
@@ -184,8 +201,10 @@ def build_goal_store(games_root, output, *, overwrite=False):
             connection.execute("INSERT INTO goals VALUES (?, ?, ?, ?, ?)",
                                (key, sources["gamefile"], sources["traj_data"], payload_hash, payload))
             records.append([key, spec["goal_spec_hash"], payload_hash])
+            report("progress", processed, total, key)
         if not records:
             raise GoalStoreError("No supported solvable games were found; refusing to publish an empty goal store")
+        report("saving", total, total)
         store_id = _sha(_json({"format": STORE_FORMAT_VERSION,
                               "template": converter.TEMPLATE_VERSION, "records": records}).encode("utf-8"))
         summary = {"goal_store_path": str(destination), "goal_store_id": store_id,
@@ -203,6 +222,7 @@ def build_goal_store(games_root, output, *, overwrite=False):
         else:
             os.link(temporary, destination)  # atomic publish; refuses a racing writer
             temporary.unlink()
+        report("complete", total, total)
         return summary
     except (sqlite3.Error, OSError) as error:
         raise GoalStoreError(f"Cannot build goal store {destination}: {error}") from error
@@ -261,6 +281,54 @@ def read_goal_spec(store_path, gamefile):
     return spec
 
 
+def _duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _progress_printer(every=25, stream=None):
+    """Flush human-readable progress to stderr; stdout remains JSON only."""
+    stream = sys.stderr if stream is None else stream
+    last_elapsed = -5.0
+
+    def print_progress(event):
+        nonlocal last_elapsed
+        phase, processed, total = event["phase"], event["processed"], event["total"]
+        elapsed = event["elapsed_seconds"]
+        if phase == "scanning":
+            print("[scan] Finding game.tw-pddl files...", file=stream, flush=True)
+            return
+        if (phase == "progress" and processed not in (1, total)
+                and processed % every and elapsed - last_elapsed < 5.0):
+            return
+        last_elapsed = elapsed
+        skipped = event["skipped_unsupported"] + event["skipped_unsolvable"]
+        percent = 100.0 * processed / total if total else 0.0
+        eta = _duration(elapsed * (total - processed) / processed) if processed and total else "unknown"
+        prefix = {"converting": "convert", "progress": "convert", "saving": "saving", "complete": "complete"}[phase]
+        line = (f"[{prefix}] {processed}/{total} ({percent:.1f}%) "
+                f"converted={event['converted']} skipped={skipped} "
+                f"elapsed={_duration(elapsed)} ETA={eta}")
+        if event["current_game"]:
+            line += " game=" + event["current_game"]
+        if phase == "saving":
+            line += " | Writing and publishing the goal store..."
+        elif phase == "complete":
+            line += " | Goal store saved successfully."
+        print(line, file=stream, flush=True)
+
+    return print_progress
+
+
+def _positive_int(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -268,13 +336,18 @@ def main(argv=None):
     build.add_argument("--games-root", required=True)
     build.add_argument("--output", required=True)
     build.add_argument("--overwrite", action="store_true")
+    build.add_argument("--progress-every", type=_positive_int, default=25,
+                       help="Report every N files (default: 25); first, last and timed updates always print")
+    build.add_argument("--quiet", action="store_true", help="Hide progress; keep the final JSON summary")
     show = commands.add_parser("show", help="Inspect/export a saved goal without reconversion")
     show.add_argument("--store", required=True)
     show.add_argument("--gamefile", required=True)
     show.add_argument("--output")
     args = parser.parse_args(argv)
     if args.command == "build":
-        print(json.dumps(build_goal_store(args.games_root, args.output, overwrite=args.overwrite), ensure_ascii=False, indent=2))
+        progress = None if args.quiet else _progress_printer(args.progress_every)
+        print(json.dumps(build_goal_store(args.games_root, args.output, overwrite=args.overwrite,
+                                         progress=progress), ensure_ascii=False, indent=2))
     else:
         content = json.dumps(read_goal_spec(args.store, args.gamefile), ensure_ascii=False, indent=2) + "\n"
         if args.output:

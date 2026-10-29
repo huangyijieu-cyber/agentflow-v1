@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import shutil
@@ -239,6 +240,87 @@ class GoalStoreTests(unittest.TestCase):
         rows[0]["initial_facts"].clear()
         self.assertTrue(rows[1]["initial_facts"])
         self.assertEqual(self.output.read_bytes(), original)
+
+    def test_progress_counts_include_skipped_files_and_complete_only_after_publish(self):
+        game = self.game()
+        sliced = self.games / "AppleSliced"
+        sliced.mkdir()
+        (sliced / "game.tw-pddl").write_text("officially excluded")
+        unsolvable = self.games / "unsolvable"
+        unsolvable.mkdir()
+        (unsolvable / "game.tw-pddl").write_text(json.dumps({"solvable": False}))
+        events = []
+
+        def observe(event):
+            events.append(event)
+            if event["phase"] == "complete":
+                self.assertTrue(self.output.is_file())
+                self.assertEqual(store.read_goal_spec(self.output, game)["task_type"],
+                                 "pick_clean_then_place_in_recep")
+            else:
+                self.assertFalse(self.output.exists())
+
+        summary = store.build_goal_store(self.games, self.output, progress=observe)
+        self.assertEqual(events[0]["phase"], "scanning")
+        self.assertIsNone(events[0]["total"])
+        rows = [row for row in events if row["phase"] == "progress"]
+        self.assertEqual([row["processed"] for row in rows], [1, 2, 3])
+        for row in rows:
+            self.assertEqual(row["total"], 3)
+            self.assertEqual(row["processed"], row["converted"] + row["skipped_unsupported"] + row["skipped_unsolvable"])
+            self.assertGreaterEqual(row["elapsed_seconds"], 0)
+        self.assertEqual([row["phase"] for row in events[-2:]], ["saving", "complete"])
+        self.assertEqual(summary["converted"], 1)
+        self.assertEqual(events[-1]["skipped_unsupported"], 1)
+        self.assertEqual(events[-1]["skipped_unsolvable"], 1)
+        with database(self.output) as connection:
+            keys = {row[0] for row in connection.execute("SELECT key FROM metadata")}
+        self.assertNotIn("elapsed_seconds", keys)
+
+    def test_failed_conversion_does_not_report_complete_or_replace_old_artifact(self):
+        self.game()
+        self.build()
+        before = self.output.read_bytes()
+        self.game(goal="(unsupported mug0)")
+        events = []
+        with self.assertRaisesRegex(store.GoalStoreError, "Offline conversion failed"):
+            store.build_goal_store(self.games, self.output, overwrite=True, progress=events.append)
+        self.assertNotIn("complete", [row["phase"] for row in events])
+        self.assertEqual(self.output.read_bytes(), before)
+
+    def test_cli_progress_uses_stderr_and_quiet_preserves_json_summary(self):
+        self.game()
+        self.game("pick_heat_then_place_in_recep")
+        command = [sys.executable, str(MODULE), "build", "--games-root", str(self.games),
+                   "--output", str(self.output), "--progress-every", "1"]
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["converted"], 2)
+        for text in ("[scan]", "1/2 (50.0%)", "2/2 (100.0%)", "ETA=", "[saving]", "[complete]"):
+            self.assertIn(text, result.stderr)
+        command[command.index(str(self.output))] = str(self.root / "quiet.sqlite")
+        quiet = subprocess.run(command + ["--quiet"], capture_output=True, text=True)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertEqual(quiet.stderr, "")
+        self.assertEqual(json.loads(quiet.stdout)["converted"], 2)
+
+    def test_progress_printer_throttles_but_always_reports_last_file(self):
+        stream = io.StringIO()
+        reporter = store._progress_printer(every=2, stream=stream)
+        for index in range(1, 6):
+            reporter({"phase": "progress", "processed": index, "total": 5,
+                      "converted": index, "skipped_unsupported": 0, "skipped_unsolvable": 0,
+                      "elapsed_seconds": index * .1, "current_game": f"{index}/game.tw-pddl"})
+        text = stream.getvalue()
+        for index in (1, 2, 4, 5):
+            self.assertIn(f"{index}/5", text)
+        self.assertNotIn("3/5", text)
+        invalid = subprocess.run([sys.executable, str(MODULE), "build", "--games-root", str(self.games),
+                                  "--output", str(self.output), "--progress-every", "0"],
+                                 capture_output=True, text=True)
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn("positive integer", invalid.stderr)
+        self.assertFalse(self.output.exists())
 
 
 if __name__ == "__main__":
