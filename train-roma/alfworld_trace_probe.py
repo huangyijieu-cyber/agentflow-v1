@@ -24,6 +24,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import threading
 import traceback
@@ -868,13 +869,27 @@ class SampleWorkspace:
         cached = self._snapshot_summary_cache.get(cache_key)
         if cached and cached[0] == version:
             return cached[1]
-        snapshot = read_json(file)
-        value = {
-            "dataset": (snapshot or {}).get("dataset") or {},
-            "created_at": (snapshot or {}).get("created_at"),
-            "complete": bool((snapshot or {}).get("complete")),
-            "trajectory_count": len((snapshot or {}).get("trajectories") or []),
-        }
+        try:
+            snapshot = read_json(file)
+        except json.JSONDecodeError as exc:
+            # A corrupted historical sample must never break the entire editor.
+            # Keep it listed so it can be inspected and explicitly recovered.
+            value = {
+                "dataset": {}, "created_at": None,
+                "complete": False, "trajectory_count": 0,
+                "corrupt_error": (
+                    f"Invalid JSON in {file}: {exc.msg} at "
+                    f"line {exc.lineno}, column {exc.colno} (char {exc.pos}). "
+                    "The saved file is preserved. Recover from checkpoints or select another sample."
+                ),
+            }
+        else:
+            value = {
+                "dataset": (snapshot or {}).get("dataset") or {},
+                "created_at": (snapshot or {}).get("created_at"),
+                "complete": bool((snapshot or {}).get("complete")),
+                "trajectory_count": len((snapshot or {}).get("trajectories") or []),
+            }
         self._snapshot_summary_cache[cache_key] = (version, value)
         return value
 
@@ -898,6 +913,7 @@ class SampleWorkspace:
             job = instance.job if instance else None
             trajectory_count = (snapshot or {}).get("trajectory_count", 0)
             status = (
+                "corrupt" if snapshot and snapshot.get("corrupt_error") else
                 "running" if job and job.get("status") == "running" else
                 "error" if job and job.get("status") == "error" else
                 "complete" if snapshot and snapshot.get("complete") else
@@ -910,6 +926,8 @@ class SampleWorkspace:
                 "trajectories": trajectory_count,
                 "expected_trajectories": sampling.get("trajectories"),
                 "status": status, "has_score": has_score,
+                "corrupt_error": (snapshot or {}).get("corrupt_error"),
+                "can_recover": bool(list((directory / "partial_trajectories").glob("traj_*.json"))),
                 "legacy": sample_id == "legacy",
             })
         return result
@@ -917,8 +935,13 @@ class SampleWorkspace:
     def state(self):
         with self.lock:
             value = self.current.state(lightweight=True)
-            value.update(active_sample_id=self.active_id, samples=self.list_samples(),
+            samples = self.list_samples()
+            active = next((sample for sample in samples if sample["id"] == self.active_id), None)
+            value.update(active_sample_id=self.active_id, samples=samples,
                          workspace_dir=str(self.root))
+            if active and active.get("corrupt_error"):
+                value["snapshot_error"] = active["corrupt_error"]
+                value["snapshot_version"] = None  # Avoid repeatedly fetching invalid JSON.
             return value
 
     def select_sample(self, sample_id):
@@ -971,6 +994,92 @@ class SampleWorkspace:
             instance.start("sample")
             return {"sample_id": sample_id}
 
+
+    def recover_snapshot(self):
+        """Explicit recovery from per-worker checkpoints, never silent overwrite."""
+        with self.lock:
+            self._ensure_idle()
+            instance = self.current
+            file = instance.directory / "trajectories.json"
+            if not file.is_file():
+                raise ValueError("No trajectories.json exists; use normal sampling instead.")
+            try:
+                read_json(file)
+            except json.JSONDecodeError:
+                pass
+            else:
+                raise ValueError("trajectories.json is already valid; no recovery required.")
+            checkpoints = sorted((instance.directory / "partial_trajectories").glob("traj_*.json"))
+            if not checkpoints:
+                raise ValueError(
+                    "No trajectory checkpoints were found for this sample. "
+                    "The damaged JSON has not been modified; inspect the latest.json "
+                    "and runs/ backups or create a new sample."
+                )
+            config = instance.config
+            sampling = copy.deepcopy(config["sampling"])
+            valid = {}
+            snapshot_ids = set()
+            for checkpoint in checkpoints:
+                try:
+                    data = read_json(checkpoint)
+                except json.JSONDecodeError:
+                    continue
+                if data.get("sampling") != {**sampling, "trajectories": 1}:
+                    continue
+                trajectory = (data.get("trajectories") or [None])[0]
+                if not trajectory or not re.fullmatch(r"traj_\d+", trajectory.get("trajectory_id", "")):
+                    continue
+                index = int(trajectory["trajectory_id"].split("_")[1]) - 1
+                if not 0 <= index < sampling["trajectories"]:
+                    continue
+                if not trajectory.get("states") or len(trajectory["states"]) != len(trajectory.get("turns", [])) + 1:
+                    continue
+                if not data.get("snapshot_id"):
+                    continue
+                snapshot_ids.add(data["snapshot_id"])
+                valid[index] = trajectory
+            if not valid:
+                raise ValueError(
+                    "No valid trajectory checkpoints matching the current sample were found. "
+                    "The damaged JSON has not been modified."
+                )
+            if len(snapshot_ids) != 1:
+                raise ValueError(
+                    "Checkpoints belong to different sample sessions. Nothing was modified."
+                )
+            trajectories = [valid[i] for i in sorted(valid)]
+            first = trajectories[0]
+            for trajectory in trajectories[1:]:
+                if (trajectory.get("initial_gamefile") != first.get("initial_gamefile")
+                        or trajectory["states"][0].get("state_context") != first["states"][0].get("state_context")):
+                    raise ValueError("Checkpoint initial states differ; nothing was modified.")
+            dataset = select_row(config["dataset"]["path"], config["dataset"]["row_index"])
+            complete = len(valid) == sampling["trajectories"] and all(
+                tr.get("status") in ("completed", "external_error") for tr in trajectories
+            )
+            restored = {
+                "schema_version": 1, "snapshot_id": next(iter(snapshot_ids)),
+                "created_at": utc_now(), "dataset": dataset,
+                "sampling": sampling, "complete": complete,
+                "trajectories": trajectories,
+            }
+            if complete:
+                restored["completed_at"] = utc_now()
+            # Never delete the corrupted original, even on successful recovery.
+            backup = file.with_name(
+                file.name + ".corrupt." +
+                datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") +
+                "." + uuid.uuid4().hex[:6] + ".bak"
+            )
+            shutil.copy2(file, backup)
+            atomic_json(file, restored)
+            self._snapshot_summary_cache.pop(str(file), None)
+            return {
+                "restored_trajectories": len(trajectories),
+                "complete": complete, "backup_file": str(backup),
+            }
+
     def save_probe(self, probe):
         with self.lock:
             return self.current.save_probe(probe)
@@ -1010,7 +1119,15 @@ def serve(experiment, host, port):
                 if parsed.path == "/api/state":
                     return self.send(workspace.state())
                 if parsed.path == "/api/snapshot":
-                    snapshot = read_json(workspace.directory / "trajectories.json")
+                    file = workspace.directory / "trajectories.json"
+                    try:
+                        snapshot = read_json(file)
+                    except json.JSONDecodeError as exc:
+                        return self.send({
+                            "error": f"Invalid JSON in {file}: {exc}. "
+                                     "The file is preserved; use checkpoint recovery.",
+                            "sample_id": workspace.active_id,
+                        }, status=422)
                     if snapshot is None:
                         raise FileNotFoundError("No saved trajectories yet.")
                     return self.send(snapshot)
@@ -1050,6 +1167,9 @@ def serve(experiment, host, port):
                 if not isinstance(payload, dict):
                     raise ValueError("Expected a JSON object")
                 with workspace.lock:
+                    if self.path == "/api/recover-snapshot":
+                        recovered = workspace.recover_snapshot()
+                        return self.send({"ok": True, **recovered})
                     if self.path == "/api/new-sample":
                         created = workspace.create_sample(payload)
                         return self.send({"ok": True, **created})
