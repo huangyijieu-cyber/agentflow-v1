@@ -363,8 +363,112 @@ def capture_trajectories(snapshot, sampling, save, *, env_factory=make_environme
     return snapshot
 
 
-def _capture_parallel_worker(trajectory_index, dataset, sampling, snapshot_id, directory, original):
-    """Each spawned process owns its ALFWorld instance and checkpoint file."""
+
+# The catalogue is immutable: it can be shared safely between processes and
+# saved samples. The actual game environment is mutable and MUST remain private
+# to each rollout worker.
+_CATALOG_TYPES = {
+    1: "pick_and_place_simple",
+    2: "look_at_obj_in_light",
+    3: "pick_clean_then_place_in_recep",
+    4: "pick_heat_then_place_in_recep",
+    5: "pick_cool_then_place_in_recep",
+    6: "pick_two_obj_and_place",
+}
+_PERSISTENT_POOL = None
+_PERSISTENT_POOL_WORKERS = None
+_POOL_LOCK = threading.Lock()
+_PROCESS_ENV = None
+_PROCESS_ENV_KEY = None
+
+
+def _catalogue_for_sample(dataset, sampling, directory, progress):
+    """Scan the ALL-task game list once per data split, cache it for future samples.
+
+    Filtering the ordered ALL list reproduces the order of each task-specific
+    AlfredTWEnv.collect_game_files() configuration without rescanning.
+    """
+    reset = dataset["reset"]
+    split = reset["data_type"]
+    if split not in ("train", "val_seen", "val_unseen"):
+        raise ValueError(f"Unsupported ALFWorld split: {split}")
+    root = (Path(sampling["alfworld_data"]).expanduser().resolve()
+            if sampling.get("alfworld_data")
+            else (REPO_ROOT / "data" / "alfworld-master" / "json_data").resolve())
+    workspace = Path(directory)
+    if workspace.parent.name == "samples":
+        workspace = workspace.parent.parent
+    key = {"root": str(root), "split": split}
+    digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
+    catalogue_file = workspace / "game_catalog" / f"{split}-{digest}.json"
+    stored = read_json(catalogue_file)
+    if stored is None or stored.get("key") != key:
+        progress(f"Indexing ALFWorld games once for {split}; future samples will reuse the catalogue.")
+        wrapper = make_environment(sampling)
+        base = wrapper._init_env(data_type=split, task_type="all")
+        records = []
+        for filename in base.game_files:
+            gamefile = str(Path(filename).resolve())
+            with Path(gamefile).with_name("traj_data.json").open(encoding="utf-8") as f:
+                details = json.load(f)
+            records.append({"gamefile": gamefile, "task_type": details["task_type"]})
+        stored = {"key": key, "records": records, "created_at": utc_now()}
+        atomic_json(catalogue_file, stored)
+        progress(f"Cached {len(records)} ALFWorld games at {catalogue_file}")
+    else:
+        progress(f"Reusing the cached ALFWorld game catalogue ({len(stored['records'])} games).")
+    config_path = (REPO_ROOT / "agentflow" / "agentflow" / "envs" /
+                   "alfworld" / "config" / f"config_tw_{reset['task_type']}.yaml")
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Unsupported ALFWorld task configuration: {config_path}")
+    import yaml
+    with config_path.open(encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    allowed_types = {_CATALOG_TYPES[i] for i in config["env"]["task_types"]}
+    candidates = [r["gamefile"] for r in stored["records"] if r["task_type"] in allowed_types]
+    data_config = config.get("dataset") or {}
+    limit = data_config.get("num_train_games" if split == "train" else "num_eval_games", -1)
+    if isinstance(limit, int) and limit > 0:
+        candidates = candidates[:limit]
+    selected_id = reset["question_id"]
+    if selected_id < 0 or selected_id >= len(candidates):
+        raise IndexError(
+            f"Task question_id {selected_id} exceeds catalogue size {len(candidates)} "
+            f"for {split}/{reset['task_type']}"
+        )
+    selected = candidates[selected_id]
+    if not Path(selected).is_file():
+        raise FileNotFoundError(f"Cached ALFWorld game has moved: {selected}")
+    progress(f"Selected game {selected_id}/{len(candidates)}: {Path(selected).parent.name}")
+    return selected
+
+
+def _persistent_pool(workers):
+    global _PERSISTENT_POOL, _PERSISTENT_POOL_WORKERS
+    with _POOL_LOCK:
+        if _PERSISTENT_POOL is None or _PERSISTENT_POOL_WORKERS != workers:
+            if _PERSISTENT_POOL is not None:
+                _PERSISTENT_POOL.shutdown(wait=True)
+            _PERSISTENT_POOL = ProcessPoolExecutor(
+                max_workers=workers, mp_context=multiprocessing.get_context("spawn")
+            )
+            _PERSISTENT_POOL_WORKERS = workers
+    return _PERSISTENT_POOL
+
+
+def _shutdown_persistent_pool():
+    global _PERSISTENT_POOL, _PERSISTENT_POOL_WORKERS
+    with _POOL_LOCK:
+        if _PERSISTENT_POOL is not None:
+            _PERSISTENT_POOL.shutdown(wait=True)
+        _PERSISTENT_POOL = None
+        _PERSISTENT_POOL_WORKERS = None
+
+
+def _capture_parallel_worker(trajectory_index, dataset, sampling, snapshot_id, directory, original,
+                             selected_gamefile):
+    """Reuse this process's environment, without rescanning the game directory."""
+    global _PROCESS_ENV, _PROCESS_ENV_KEY
     checkpoint = Path(directory) / "partial_trajectories" / f"traj_{trajectory_index + 1:02d}.json"
     worker_sampling = {**sampling, "trajectories": 1}
     saved = read_json(checkpoint)
@@ -377,24 +481,61 @@ def _capture_parallel_worker(trajectory_index, dataset, sampling, snapshot_id, d
         candidate = (saved.get("trajectories") or [None])[0]
         if candidate and (original is None or len(candidate.get("turns", [])) >= len(original.get("turns", []))):
             original = candidate
+
+    # Worker sees exactly one curated game, so its local question_id is zero.
+    # Keep the original parquet row and task identifier in the parent snapshot.
+    worker_dataset = copy.deepcopy(dataset)
+    worker_dataset["reset"]["question_id"] = 0
     worker_snapshot = {
         "schema_version": 1, "snapshot_id": snapshot_id,
-        "dataset": dataset, "sampling": worker_sampling,
+        "dataset": worker_dataset, "sampling": worker_sampling,
         "complete": False, "trajectories": [original] if original else [],
     }
-    capture_trajectories(
-        worker_snapshot, worker_sampling, lambda data: atomic_json(checkpoint, data),
-        progress=lambda message: print(f"[worker {trajectory_index + 1}] {message}", flush=True),
-        trajectory_offset=trajectory_index,
+
+    env_key = (
+        sampling.get("alfworld_root"), sampling.get("alfworld_data"),
+        sampling["history_length"], sampling["max_steps"],
     )
+    if _PROCESS_ENV is None or _PROCESS_ENV_KEY != env_key:
+        if _PROCESS_ENV is not None:
+            _PROCESS_ENV.close()
+        _PROCESS_ENV = make_environment(sampling)
+        _PROCESS_ENV_KEY = env_key
+    env = _PROCESS_ENV
+
+    from alfworld.agents.environment.alfred_tw_env import AlfredTWEnv
+    original_collect = AlfredTWEnv.collect_game_files
+
+    def collect_selected(self, verbose=False):
+        # Bypass the expensive recursive game-file scan in every worker.
+        self.game_files = [selected_gamefile]
+        self.num_games = 1
+
+    # The worker executes one submitted trajectory at a time. This temporary
+    # override cannot affect the parent or any other spawned process.
+    AlfredTWEnv.collect_game_files = collect_selected
+    try:
+        env_key = (worker_dataset["reset"]["data_type"], worker_dataset["reset"]["task_type"])
+        if env_key in env._env_instances:
+            env._env_gamefiles[env_key] = [selected_gamefile]
+        capture_trajectories(
+            worker_snapshot, worker_sampling, lambda value: atomic_json(checkpoint, value),
+            env_factory=lambda _: env,
+            progress=lambda message: print(f"[worker {trajectory_index + 1}] {message}", flush=True),
+            trajectory_offset=trajectory_index,
+        )
+    finally:
+        AlfredTWEnv.collect_game_files = original_collect
     result = worker_snapshot["trajectories"][0]
     if result.get("trajectory_id") != f"traj_{trajectory_index + 1:02d}":
         raise RuntimeError("Parallel worker returned a mismatched trajectory ID.")
+    if scalar(result.get("initial_gamefile")) != selected_gamefile:
+        raise RuntimeError("Worker loaded a different game than the shared catalogue selection.")
     return result
 
 
 def capture_parallel_trajectories(snapshot, sampling, save, directory, progress=None):
-    """Parallel rollouts with independent native environments and durable turn checkpoints."""
+    """Scan one immutable catalogue and reuse persistent isolated game workers."""
     progress = progress or (lambda message: None)
     if snapshot.get("complete"):
         return snapshot
@@ -406,29 +547,36 @@ def capture_parallel_trajectories(snapshot, sampling, save, directory, progress=
     expected_ids = {f"traj_{i + 1:02d}" for i in range(count)}
     if set(indexed) - expected_ids:
         raise RuntimeError("Saved snapshot contains unexpected trajectory IDs.")
+    selected_gamefile = _catalogue_for_sample(snapshot["dataset"], sampling, directory, progress)
     save(snapshot)
-    progress(f"Starting {workers} independent ALFWorld rollout processes for {count} trajectories.")
-    with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as executor:
-        futures = {
-            executor.submit(
-                _capture_parallel_worker, i, snapshot["dataset"], sampling,
-                snapshot["snapshot_id"], str(directory), indexed.get(f"traj_{i + 1:02d}"),
-            ): i for i in range(count)
-            if indexed.get(f"traj_{i + 1:02d}", {}).get("status") not in ("completed", "external_error")
-        }
-        for future in as_completed(futures):
-            i = futures[future]
-            trajectory = future.result()
-            indexed[trajectory["trajectory_id"]] = trajectory
-            snapshot["trajectories"] = [indexed[f"traj_{j + 1:02d}"]
-                                        for j in range(count) if f"traj_{j + 1:02d}" in indexed]
-            first = snapshot["trajectories"][0]
-            for other in snapshot["trajectories"][1:]:
-                if (other["initial_gamefile"] != first["initial_gamefile"]
-                        or other["states"][0]["state_context"] != first["states"][0]["state_context"]):
-                    raise RuntimeError("Parallel rollouts reset to different initial games/states.")
-            save(snapshot)
-            progress(f"Finished trajectory {i + 1}/{count}; {len(indexed)}/{count} collected.")
+    progress(
+        f"Using {workers} reusable independent ALFWorld workers for {count} trajectories; "
+        "no redundant directory scans."
+    )
+    executor = _persistent_pool(workers)
+    futures = {
+        executor.submit(
+            _capture_parallel_worker, i, snapshot["dataset"], sampling,
+            snapshot["snapshot_id"], str(directory), indexed.get(f"traj_{i + 1:02d}"),
+            selected_gamefile,
+        ): i for i in range(count)
+        if indexed.get(f"traj_{i + 1:02d}", {}).get("status") not in ("completed", "external_error")
+    }
+    for future in as_completed(futures):
+        i = futures[future]
+        trajectory = future.result()
+        indexed[trajectory["trajectory_id"]] = trajectory
+        snapshot["trajectories"] = [
+            indexed[f"traj_{j + 1:02d}"]
+            for j in range(count) if f"traj_{j + 1:02d}" in indexed
+        ]
+        first = snapshot["trajectories"][0]
+        for other in snapshot["trajectories"][1:]:
+            if (other["initial_gamefile"] != first["initial_gamefile"]
+                    or other["states"][0]["state_context"] != first["states"][0]["state_context"]):
+                raise RuntimeError("Parallel rollouts reset to different initial games/states.")
+        save(snapshot)
+        progress(f"Finished trajectory {i + 1}/{count}; {len(indexed)}/{count} collected.")
     if len(indexed) != count or any(
         indexed[f"traj_{i + 1:02d}"].get("status") not in ("completed", "external_error")
         for i in range(count)
@@ -439,7 +587,6 @@ def capture_parallel_trajectories(snapshot, sampling, save, directory, progress=
     snapshot["completed_at"] = utc_now()
     save(snapshot)
     return snapshot
-
 
 def export_csv(result):
     buffer = io.StringIO()
@@ -881,6 +1028,7 @@ def serve(experiment, host, port):
         pass
     finally:
         server.server_close()
+        _shutdown_persistent_pool()
 
 
 def main(argv=None):
