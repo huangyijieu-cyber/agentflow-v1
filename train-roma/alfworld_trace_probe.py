@@ -641,7 +641,156 @@ class Experiment:
         threading.Thread(target=run, daemon=True).start()
 
 
+
+class SampleWorkspace:
+    """Independent saved ALFWorld samples; legacy files remain in the root directory."""
+
+    _pattern = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$")
+
+    def __init__(self, experiment):
+        self.root = experiment.directory
+        self.lock = threading.RLock()
+        self.samples_dir = self.root / "samples"
+        self.samples_dir.mkdir(parents=True, exist_ok=True)
+        self.active_file = self.root / "active_sample.json"
+        self.instances = {"legacy": experiment}
+        stored = read_json(self.active_file, {})
+        selected = stored.get("sample_id", "legacy") if isinstance(stored, dict) else "legacy"
+        if selected != "legacy" and not self._sample_path(selected).is_dir():
+            selected = "legacy"
+        self.active_id = selected
+
+    def _sample_path(self, sample_id):
+        if not isinstance(sample_id, str) or not self._pattern.fullmatch(sample_id):
+            raise ValueError("Invalid saved sample ID")
+        return self.samples_dir / sample_id
+
+    def _load(self, sample_id):
+        if sample_id in self.instances:
+            return self.instances[sample_id]
+        path = self._sample_path(sample_id)
+        if not (path / "config.json").is_file():
+            raise ValueError("Saved sample does not have a config.json")
+        instance = Experiment(path)
+        self.instances[sample_id] = instance
+        return instance
+
+    @property
+    def current(self):
+        return self._load(self.active_id)
+
+    @property
+    def directory(self):
+        return self.current.directory
+
+    def _ensure_idle(self):
+        if self.current.job["status"] == "running":
+            raise RuntimeError("Finish the current sampling or scoring job before switching samples.")
+
+    def list_samples(self):
+        ids = ["legacy"] + sorted(
+            (p.name for p in self.samples_dir.iterdir()
+             if p.is_dir() and self._pattern.fullmatch(p.name) and (p / "config.json").is_file()),
+            reverse=True,
+        )
+        result = []
+        for sample_id in ids:
+            directory = self.root if sample_id == "legacy" else self._sample_path(sample_id)
+            config = read_json(directory / "config.json", {})
+            snapshot = read_json(directory / "trajectories.json")
+            latest = read_json(directory / "latest.json")
+            info = read_json(directory / "sample_info.json", {})
+            dataset = config.get("dataset") or {}
+            sampling = config.get("sampling") or {}
+            meta = (snapshot or {}).get("dataset") or {}
+            instance = self.instances.get(sample_id)
+            job = instance.job if instance else None
+            trajectories = (snapshot or {}).get("trajectories", [])
+            status = (
+                "running" if job and job.get("status") == "running" else
+                "error" if job and job.get("status") == "error" else
+                "complete" if snapshot and snapshot.get("complete") else
+                "partial" if snapshot else "not_started"
+            )
+            result.append({
+                "id": sample_id, "row_index": dataset.get("row_index"),
+                "question": meta.get("question"),
+                "created_at": (snapshot or {}).get("created_at") or info.get("created_at"),
+                "trajectories": len(trajectories),
+                "expected_trajectories": sampling.get("trajectories"),
+                "status": status, "has_score": latest is not None,
+                "legacy": sample_id == "legacy",
+            })
+        return result
+
+    def state(self):
+        with self.lock:
+            value = self.current.state()
+            value.update(active_sample_id=self.active_id, samples=self.list_samples(),
+                         workspace_dir=str(self.root))
+            return value
+
+    def select_sample(self, sample_id):
+        with self.lock:
+            self._ensure_idle()
+            if sample_id != "legacy":
+                self._sample_path(sample_id)
+            self._load(sample_id)
+            self.active_id = sample_id
+            atomic_json(self.active_file, {"sample_id": sample_id})
+            return {"sample_id": sample_id}
+
+    def create_sample(self, options):
+        """Create, select and start a new sample without changing saved samples."""
+        with self.lock:
+            self._ensure_idle()
+            if not isinstance(options, dict):
+                raise ValueError("Expected a sample configuration object")
+            allowed = {"row_index", "trajectories", "workers", "seed", "temperature"}
+            if set(options) - allowed:
+                raise ValueError("Unknown sample configuration field")
+            row_index = options.get("row_index")
+            if type(row_index) is not int or row_index < 0:
+                raise ValueError("row_index must be a nonnegative integer")
+            config = copy.deepcopy(self.current.config)
+            select_row(config["dataset"]["path"], row_index)
+            overrides = {"dataset": {"row_index": row_index}, "sampling": {}}
+            for key in ("trajectories", "workers", "seed", "temperature"):
+                if key not in options:
+                    continue
+                value = options[key]
+                if key in ("trajectories", "workers") and (type(value) is not int or value < 1):
+                    raise ValueError(f"{key} must be a positive integer")
+                if key == "seed" and (type(value) is not int or value < 0):
+                    raise ValueError("seed must be a nonnegative integer")
+                if key == "temperature" and (
+                    type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 2
+                ):
+                    raise ValueError("temperature must be a finite value from 0 to 2")
+                overrides["sampling"][key] = value
+            deep_update(config, overrides)
+            Experiment.validate_config(config)
+            sample_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
+            path = self._sample_path(sample_id)
+            instance = Experiment(path, overrides=config)
+            atomic_json(path / "sample_info.json", {"created_at": utc_now(), "sample_id": sample_id})
+            self.instances[sample_id] = instance
+            self.active_id = sample_id
+            atomic_json(self.active_file, {"sample_id": sample_id})
+            instance.start("sample")
+            return {"sample_id": sample_id}
+
+    def save_probe(self, probe):
+        with self.lock:
+            return self.current.save_probe(probe)
+
+    def start(self, phase, probe=None):
+        with self.lock:
+            return self.current.start(phase, probe)
+
 def serve(experiment, host, port):
+    workspace = SampleWorkspace(experiment)
+
     class Handler(BaseHTTPRequestHandler):
         def send(self, data, content_type="application/json; charset=utf-8", status=200, filename=None):
             if not isinstance(data, (bytes, str)):
@@ -662,12 +811,15 @@ def serve(experiment, host, port):
                 if parsed.path == "/":
                     return self.send((SCRIPT_DIR / "alfworld_trace_probe.html").read_bytes(), "text/html; charset=utf-8")
                 if parsed.path == "/api/state":
-                    return self.send(experiment.state())
+                    return self.send(workspace.state())
                 if parsed.path == "/api/run":
                     run_id = parse_qs(parsed.query).get("id", [""])[0]
                     if not re.fullmatch(r"\d{8}T\d{6}-[0-9a-f]{8}", run_id):
                         raise ValueError("Invalid run id")
-                    return self.send(read_json(experiment.directory / "runs" / f"{run_id}.json") or {})
+                    result = read_json(workspace.directory / "runs" / f"{run_id}.json")
+                    if result is None:
+                        raise FileNotFoundError(f"Saved scoring run not found: {run_id}")
+                    return self.send(result)
                 if parsed.path == "/api/export":
                     name = parse_qs(parsed.query).get("name", [""])[0]
                     files = {"trajectories": ("trajectories.json", "application/json"),
@@ -677,7 +829,7 @@ def serve(experiment, host, port):
                     if name not in files:
                         raise ValueError("Unknown export")
                     filename, content_type = files[name]
-                    return self.send((experiment.directory / filename).read_bytes(), content_type, filename=filename)
+                    return self.send((workspace.directory / filename).read_bytes(), content_type, filename=filename)
                 self.send({"error": "Not found"}, status=404)
             except (ValueError, FileNotFoundError) as error:
                 self.send({"error": str(error)}, status=400)
@@ -695,15 +847,21 @@ def serve(experiment, host, port):
                 payload = json.loads(self.rfile.read(length))
                 if not isinstance(payload, dict):
                     raise ValueError("Expected a JSON object")
-                with experiment.lock:
-                    if experiment.job["status"] == "running":
-                        raise RuntimeError("A job is running; wait before changing the probe.")
+                with workspace.lock:
+                    if self.path == "/api/new-sample":
+                        created = workspace.create_sample(payload)
+                        return self.send({"ok": True, **created})
+                    if self.path == "/api/select-sample":
+                        selected = workspace.select_sample(payload["sample_id"])
+                        return self.send({"ok": True, **selected})
+                    if workspace.current.job["status"] == "running":
+                        raise RuntimeError("A job is running; finish it before changing the probe.")
                     if self.path == "/api/config":
-                        experiment.save_probe(payload["probe"])
+                        workspace.save_probe(payload["probe"])
                     elif self.path == "/api/sample":
-                        experiment.start("sample")
+                        workspace.start("sample")
                     elif self.path == "/api/score":
-                        experiment.start("score", payload.get("probe"))
+                        workspace.start("score", payload.get("probe"))
                     else:
                         return self.send({"error": "Not found"}, status=404)
                 self.send({"ok": True})
