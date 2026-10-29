@@ -698,7 +698,7 @@ class SampleWorkspace:
             directory = self.root if sample_id == "legacy" else self._sample_path(sample_id)
             config = read_json(directory / "config.json", {})
             snapshot = read_json(directory / "trajectories.json")
-            latest = read_json(directory / "latest.json")
+            has_score = (directory / "latest.json").is_file()
             info = read_json(directory / "sample_info.json", {})
             dataset = config.get("dataset") or {}
             sampling = config.get("sampling") or {}
@@ -718,7 +718,7 @@ class SampleWorkspace:
                 "created_at": (snapshot or {}).get("created_at") or info.get("created_at"),
                 "trajectories": len(trajectories),
                 "expected_trajectories": sampling.get("trajectories"),
-                "status": status, "has_score": latest is not None,
+                "status": status, "has_score": has_score,
                 "legacy": sample_id == "legacy",
             })
         return result
@@ -865,7 +865,7 @@ def serve(experiment, host, port):
                     else:
                         return self.send({"error": "Not found"}, status=404)
                 self.send({"ok": True})
-            except (ValueError, KeyError, TypeError, RuntimeError) as error:
+            except (ValueError, KeyError, TypeError, RuntimeError, IndexError, FileNotFoundError) as error:
                 self.send({"error": str(error)}, status=400)
 
         def log_message(self, fmt, *args):
