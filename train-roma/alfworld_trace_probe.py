@@ -18,6 +18,7 @@ import hashlib
 import html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib
+import importlib.util
 import io
 import json
 import math
@@ -56,18 +57,19 @@ DEFAULT_CONFIG = {
     },
     "probe": {
         "prompt": (
-            "Forecast whether the agent will successfully complete its task within "
-            "the remaining action budget, starting from the state above. "
-            "Use the recorded observations and actions as evidence; unknown facts "
-            "remain unknown. The task goal is not evidence that it has already "
-            "been achieved. Consider known alternatives and recovery paths.\n"
-            "Remaining actions: {remaining_steps}.\n"
-            "Answer with exactly one of these sentences:\n"
-            "The episode will end in success.\n"
-            "The episode will end in failure."
+            "Based on the applicable environment rules, initial state, current "
+            "full state and recorded action history above, describe the current "
+            "state in relation to the task's success conditions. Desired goal "
+            "conditions are not evidence that they already hold."
         ),
-        "response": "The episode will end in success.",
+        "response": "{goal_response}", "state_view": "full_state",
         "epsilon": 0.1, "k": 3, "gamma": 0.8, "max_response_tokens": 256,
+        "terminal_fill_enabled": True, "terminal_fill_scale": 2.0,
+        "norm_adv_by_std_in_grpo": False, "outcome_success_threshold": 0.5,
+        "outcome_match_value": False, "match_epsilon": 0.05,
+        "positive_threshold": 0.01, "negative_threshold": 0.01,
+        "gap_epsilon": 0.02, "length_ratio_max": 1.8,
+        "k_pairs_per_group": 2, "max_pairs_per_step": 256,
     },
 }
 
@@ -182,7 +184,7 @@ def make_environment(sampling):
     if sampling.get("alfworld_data"):
         module.data_path = str(Path(sampling["alfworld_data"]).expanduser().resolve())
     return module.AlfWorldEnv(history_length=sampling["history_length"],
-                              max_step=sampling["max_steps"])
+                              max_step=sampling["max_steps"], trace_enabled=True)
 
 
 def request_action(prompt, sampling, trajectory_index, turn_index):
@@ -216,9 +218,45 @@ def request_action(prompt, sampling, trajectory_index, turn_index):
             "response_token_ids": choice.get("token_ids"), "usage": result.get("usage")}
 
 
+def _goal_module():
+    name = "_alfworld_probe_goal_conversion"
+    if name not in sys.modules:
+        path = REPO_ROOT / "agentflow/agentflow/trace/alfworld.py"
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+def goal_metadata(spec):
+    keys = ("gamefile", "goal_source", "goal_task_type", "task_type", "template_version",
+            "source_sha256", "goal_spec_hash", "goal_ast", "goal_validation_status")
+    return {key: jsonable(spec[key]) for key in keys if key in spec}
+
+
+def _save_goal_fields(trajectory, spec):
+    if not isinstance(spec, dict) or not isinstance(spec.get("goal_response"), str):
+        raise ValueError("Environment goal specification has no deterministic goal_response")
+    trajectory.update({"goal_response": spec["goal_response"], "goal_spec": jsonable(spec),
+                       "goal_metadata": goal_metadata(spec), "goal_source": spec.get("goal_source"),
+                       "goal_task_type": spec.get("goal_task_type", spec.get("task_type")),
+                       "goal_spec_hash": spec.get("goal_spec_hash"),
+                       "state_view": "full_state"})
+
+
+def _full_facts(env, info):
+    facts = info.get("trace_full_facts", getattr(env, "trace_facts", None))
+    if facts is None:
+        return None
+    return _goal_module().normalize_facts(facts)
+
+
 def state_snapshot(env, actor_prompt, info, index, sampling, *, prior_turns=(), done=False):
     """Snapshot before the next action; error branches cannot reuse stale context."""
-    info = jsonable(info or {})
+    raw_info = info or {}
+    facts = _full_facts(env, raw_info)
+    info = jsonable(raw_info)
     observation = scalar(info.get("anchor"))
     if not isinstance(observation, str) or observation.startswith("["):
         observation = scalar(info.get("observation_text"))
@@ -228,7 +266,11 @@ def state_snapshot(env, actor_prompt, info, index, sampling, *, prior_turns=(), 
     if isinstance(actions, list) and len(actions) == 1 and isinstance(actions[0], list):
         actions = actions[0]
     is_error = any(flag(info.get(k)) is True for k in ("env_error", "format_error", "invalid_action"))
-    context = None if is_error else getattr(env, "trace_state_context", None)
+    # Locally rejected actions leave verified simulator facts unchanged. Their
+    # full-state view is still usable; external crashes cannot reuse old facts.
+    context = (getattr(env, "trace_state_context", None)
+               if not is_error or (facts is not None and flag(info.get("env_error")) is not True)
+               else None)
     if not isinstance(context, str) or not context.strip():
         recent = list(prior_turns)[-sampling["history_length"]:] if sampling["history_length"] else []
         history = [{"action": t.get("action"), "observation": t.get("observation_before")}
@@ -240,7 +282,14 @@ def state_snapshot(env, actor_prompt, info, index, sampling, *, prior_turns=(), 
     return {"state_index": index, "state_context": context, "observation": observation,
             "available_actions": actions, "remaining_steps": max(0, sampling["max_steps"] - index),
             "is_post_state": index > 0, "is_terminal_state": bool(done),
-            "env_info": info, "scoring_valid": flag(info.get("env_error")) is not True}
+            "env_info": info, "facts": facts,
+            "state_view": "full_state" if facts is not None else "legacy_observed",
+            "goal_check": info.get("trace_goal_check"),
+            "goal_check_valid": info.get("trace_goal_check_valid"),
+            "scoring_valid": flag(info.get("env_error")) is not True
+            and info.get("trace_scoring_valid", True) is not False
+            and (info.get("trace_goal_check_valid") is True if facts is not None
+                 else info.get("trace_goal_check_valid", True) is not False)}
 
 
 def summarize_outcome(info, reward, done):
@@ -258,8 +307,9 @@ def summarize_outcome(info, reward, done):
     reason = ("environment_error" if external else "format_error" if flag(info.get("format_error"))
               else "invalid_action" if flag(info.get("invalid_action")) else "max_steps" if truncated
               else "success" if success else "task_failure" if done else "incomplete")
+    goal_check_valid = info.get("trace_goal_check_valid", True) is not False
     return {"reward": scalar(reward), "success": success,
-            "valid": bool(done and not external and success is not None),
+            "valid": bool(done and not external and success is not None and goal_check_valid),
             "terminated": terminated, "truncated": truncated, "reason": reason}
 
 
@@ -297,6 +347,9 @@ def capture_trajectories(snapshot, sampling, save, *, env_factory=make_environme
                               "initial_gamefile": jsonable(info.get("extra.gamefile")),
                               "status": "running", "outcome": None,
                               "states": [initial], "turns": []}
+                spec = getattr(env, "trace_goal_spec", None)
+                if spec is not None:
+                    _save_goal_fields(trajectory, spec)
                 trajectories.append(trajectory)
                 save(snapshot)
             elif trajectory["states"][0]["state_context"] != initial["state_context"]:
@@ -488,6 +541,7 @@ def _capture_parallel_worker(trajectory_index, dataset, sampling, snapshot_id, d
     # Keep the original parquet row and task identifier in the parent snapshot.
     worker_dataset = copy.deepcopy(dataset)
     worker_dataset["reset"]["question_id"] = 0
+    worker_dataset["reset"]["gamefile"] = selected_gamefile
     worker_snapshot = {
         "schema_version": 1, "snapshot_id": snapshot_id,
         "dataset": worker_dataset, "sampling": worker_sampling,
@@ -590,10 +644,127 @@ def capture_parallel_trajectories(snapshot, sampling, save, directory, progress=
     save(snapshot)
     return snapshot
 
+
+def enrich_snapshot(snapshot, *, replay=False, env_factory=make_environment, progress=None):
+    """Add official goal metadata/full states in memory; never generate actions."""
+    if not snapshot.get("complete"):
+        raise ValueError("Finish the initial sampling before enriching its cache")
+    progress = progress or (lambda message: None)
+    converted = copy.deepcopy(snapshot)
+    module = _goal_module()
+    specs = {}
+    for trajectory in converted.get("trajectories", []):
+        gamefile = module.normalize_gamefile(trajectory.get("initial_gamefile"))
+        key = str(gamefile)
+        if key not in specs:
+            specs[key] = module.load_goal_spec(gamefile)
+        spec = specs[key]
+        _save_goal_fields(trajectory, spec)
+        if replay:
+            progress(f"Enriching {trajectory['trajectory_id']} by replay only; no policy requests")
+            env = env_factory(converted["sampling"])
+            try:
+                reset = dict(converted["dataset"]["reset"])
+                actor_prompt, info = env.reset(**reset, gamefile=str(gamefile))
+                actual = module.normalize_gamefile(info.get("extra.gamefile"))
+                if actual != gamefile:
+                    raise ValueError("Replay loaded a different game file")
+                new_states = [state_snapshot(env, actor_prompt, info, 0, converted["sampling"])]
+                if new_states[0]["observation"] != trajectory["states"][0]["observation"]:
+                    raise ValueError("Replay initial observation differs from the saved trajectory")
+                for index, turn in enumerate(trajectory["turns"]):
+                    if turn.get("external_error"):
+                        failed = copy.deepcopy(trajectory["states"][index + 1])
+                        failed.update({"facts": None, "state_view": "full_state", "scoring_valid": False})
+                        new_states.append(failed)
+                        if index != len(trajectory["turns"]) - 1:
+                            raise ValueError("Cannot enrich states beyond an unresolved external failure")
+                        break
+                    next_prompt, reward, done, info = env.step(turn["action_response"])
+                    after = state_snapshot(env, next_prompt, info, index + 1, converted["sampling"],
+                                           prior_turns=trajectory["turns"][:index + 1], done=done)
+                    if after["observation"] != trajectory["states"][index + 1]["observation"]:
+                        raise ValueError(f"Replay observation diverged after saved turn {index}")
+                    if bool(done) != bool(turn.get("done")):
+                        raise ValueError(f"Replay termination diverged after saved turn {index}")
+                    new_states.append(after)
+                if len(new_states) != len(trajectory["states"]):
+                    raise ValueError("Replay did not recover every saved state")
+                trajectory["states"] = new_states
+            finally:
+                env.close()
+        for index, state in enumerate(trajectory["states"]):
+            facts = state.get("facts")
+            if facts is None:
+                facts = (state.get("env_info") or {}).get("trace_full_facts")
+            if facts is None and state.get("scoring_valid") is False:
+                state["state_view"] = "full_state"
+                continue
+            if facts is None:
+                raise ValueError(
+                    "Saved observations do not contain full environment facts. "
+                    "Run enrich --replay to replay the saved actions without sampling new ones.")
+            facts = module.normalize_facts(facts)
+            history = [{"action": turn.get("action"), "response": turn.get("action_response")}
+                       for turn in trajectory["turns"][:index]]
+            check = module.evaluate_goal(spec, facts)
+            won = flag((state.get("env_info") or {}).get("won"))
+            check_valid = won is not None and check is won
+            state.update({"facts": facts, "state_view": "full_state",
+                          "state_context": module.render_full_state(spec, facts,
+                              observation=state.get("observation"), action_history=history),
+                          "goal_check": check, "goal_check_valid": check_valid,
+                          "scoring_valid": check_valid and flag((state.get("env_info") or {}).get("env_error")) is not True})
+        if trajectory.get("outcome", {}).get("valid") and trajectory["states"]:
+            check = trajectory["states"][-1].get("goal_check")
+            if isinstance(check, bool) and check != trajectory["outcome"].get("success"):
+                raise ValueError("Replayed goal predicates disagree with the saved environment outcome")
+    hashes = {trajectory.get("goal_spec_hash") for trajectory in converted.get("trajectories", [])}
+    if len(hashes) != 1:
+        raise ValueError("The four saved rollouts do not share the same actual goal specification")
+    return converted
+
+
+def _enrichment_payload(original, converted, source_hash):
+    trajectories = []
+    fields = ("goal_response", "goal_spec", "goal_metadata", "goal_source", "goal_task_type",
+              "goal_spec_hash", "state_view")
+    state_fields = ("state_index", "state_context", "facts", "state_view", "scoring_valid",
+                    "goal_check", "goal_check_valid")
+    for trajectory in converted["trajectories"]:
+        trajectories.append({"trajectory_id": trajectory["trajectory_id"],
+                             **{key: trajectory.get(key) for key in fields},
+                             "states": [{key: state[key] for key in state_fields if key in state}
+                                        for state in trajectory["states"]]})
+    return {"schema_version": 1, "source_snapshot_sha256": source_hash,
+            "snapshot_id": original["snapshot_id"], "created_at": utc_now(),
+            "trajectories": trajectories}
+
+
+def _merge_enrichment(snapshot, metadata, source_hash):
+    if metadata.get("source_snapshot_sha256") != source_hash:
+        raise ValueError("goal_metadata.json belongs to a different trajectory cache")
+    converted = copy.deepcopy(snapshot)
+    records = {item["trajectory_id"]: item for item in metadata["trajectories"]}
+    for trajectory in converted["trajectories"]:
+        item = records.get(trajectory["trajectory_id"])
+        if item is None or len(item["states"]) != len(trajectory["states"]):
+            raise ValueError("Goal sidecar does not match saved trajectory/state IDs")
+        trajectory.update({key: value for key, value in item.items() if key not in ("trajectory_id", "states")})
+        for state, update in zip(trajectory["states"], item["states"]):
+            if state["state_index"] != update["state_index"]:
+                raise ValueError("Goal sidecar state indices differ from the raw cache")
+            state.update(update)
+    converted["enrichment_sha256"] = hashlib.sha256(
+        json.dumps(metadata, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    return converted
+
+
 def export_csv(result):
     buffer = io.StringIO()
     fields = ["trajectory_id", "turn_index", "mean_logp", "value", "next_value", "delta",
-              "credit", "credit_valid", "credit_error", "action", "action_prompt",
+              "credit", "local_credit", "terminal_fill", "label_source", "outcome_advantage",
+              "credit_valid", "credit_error", "action", "action_prompt",
               "action_response", "scoring_prompt", "response"]
     writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
     writer.writeheader()
@@ -614,10 +785,11 @@ def export_report(result):
               f"<pre>{esc(json.dumps(result.get('probe'), ensure_ascii=False, indent=2))}</pre>"]
     for trajectory in result.get("trajectories", []):
         blocks.append(f"<h2>{esc(trajectory['trajectory_id'])}</h2><pre>{esc(trajectory.get('outcome'))}</pre>")
-        blocks.append("<table><tr><th>Turn</th><th>Action</th><th>Mean LogP</th><th>V</th><th>Delta</th><th>Credit</th></tr>")
+        blocks.append(f"<pre>{esc(trajectory.get('goal_response'))}</pre><pre>{esc(trajectory.get('goal_metadata'))}</pre>")
+        blocks.append("<table><tr><th>Turn</th><th>Action</th><th>Route</th><th>Mean LogP</th><th>V</th><th>Delta</th><th>Local credit</th><th>Terminal fill</th><th>Effective credit</th></tr>")
         for turn in trajectory["turns"]:
             blocks.append("<tr>" + "".join(f"<td>{esc(turn.get(key))}</td>" for key in
-                           ("turn_index", "action", "mean_logp", "value", "delta", "credit")) + "</tr>")
+                           ("turn_index", "action", "label_source", "mean_logp", "value", "delta", "local_credit", "terminal_fill", "credit")) + "</tr>")
         blocks.append("</table>")
         for turn in trajectory["turns"]:
             blocks.append(f"<details><summary>Turn {esc(turn['turn_index'])}: full prompts and responses</summary>")
@@ -651,7 +823,13 @@ class Experiment:
             if not isinstance(probe[key], str) or not probe[key].strip():
                 raise ValueError(f"probe.{key} must be nonempty text")
         if re.search(r"\{(?:remaining_steps|turn_index)\}", probe["response"]):
-            raise ValueError("Response must remain fixed across turns; only {goal} is allowed.")
+            raise ValueError("Response must remain fixed across turns; only {goal} and {goal_response} are allowed.")
+        if probe.get("state_view", "saved") not in ("full_state", "saved"):
+            raise ValueError("state_view must be full_state or saved")
+        if not isinstance(probe.get("terminal_fill_enabled", True), bool):
+            raise ValueError("terminal_fill_enabled must be boolean")
+        if not math.isfinite(float(probe.get("terminal_fill_scale", 2.0))) or float(probe.get("terminal_fill_scale", 2.0)) < 0:
+            raise ValueError("terminal_fill_scale must be nonnegative and finite")
         if type(probe["k"]) is not int or probe["k"] < 1:
             raise ValueError("K must be a positive integer")
         if not math.isfinite(float(probe["epsilon"])) or float(probe["epsilon"]) <= 0:
@@ -715,7 +893,7 @@ class Experiment:
                     return snapshot
             if snapshot is None:
                 dataset = select_row(config["dataset"]["path"], config["dataset"]["row_index"])
-                snapshot = {"schema_version": 1, "snapshot_id": uuid.uuid4().hex,
+                snapshot = {"schema_version": 2, "snapshot_id": uuid.uuid4().hex,
                             "created_at": utc_now(), "dataset": dataset,
                             "sampling": config["sampling"], "complete": False, "trajectories": []}
             save = lambda data: atomic_json(self.directory / "trajectories.json", data)
@@ -728,12 +906,47 @@ class Experiment:
                 snapshot, config["sampling"], save,
                 env_factory=env_factory, policy=policy, progress=self.progress)
 
+    def enrich(self, *, replay=False, env_factory=make_environment):
+        with self.session_lock():
+            snapshot_path = self.directory / "trajectories.json"
+            snapshot = read_json(snapshot_path)
+            if not snapshot:
+                raise ValueError("No saved trajectories to enrich")
+            source_hash = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+            converted = enrich_snapshot(snapshot, replay=replay, env_factory=env_factory, progress=self.progress)
+            payload = _enrichment_payload(snapshot, converted, source_hash)
+            atomic_json(self.directory / "goal_metadata.json", payload)
+            self.progress("Saved goal_metadata.json; original trajectories and actions are unchanged.")
+            return _merge_enrichment(snapshot, payload, source_hash)
+
+    def _prepare_scoring_snapshot(self, snapshot, probe):
+        needs_metadata = "{goal_response}" in probe["response"] or probe.get("state_view") == "full_state"
+        if not needs_metadata:
+            return snapshot
+        source_hash = hashlib.sha256((self.directory / "trajectories.json").read_bytes()).hexdigest()
+        sidecar = read_json(self.directory / "goal_metadata.json")
+        if sidecar:
+            return _merge_enrichment(snapshot, sidecar, source_hash)
+        complete = all(trajectory.get("goal_response") and all(
+            state.get("state_view") == "full_state" for state in trajectory["states"])
+            for trajectory in snapshot.get("trajectories", []))
+        if complete:
+            hashes = {trajectory.get("goal_spec_hash") for trajectory in snapshot["trajectories"]}
+            if len(hashes) != 1:
+                raise ValueError("Saved goal specifications differ across rollouts")
+            return snapshot
+        converted = enrich_snapshot(snapshot, replay=False, progress=self.progress)
+        payload = _enrichment_payload(snapshot, converted, source_hash)
+        atomic_json(self.directory / "goal_metadata.json", payload)
+        return _merge_enrichment(snapshot, payload, source_hash)
+
     def score(self, *, scorer=None):
         with self.session_lock():
             snapshot = read_json(self.directory / "trajectories.json")
             if not snapshot or not snapshot.get("complete"):
                 raise RuntimeError("Complete the initial sampling first. Scoring never samples automatically.")
             config = copy.deepcopy(self.config)
+            snapshot = self._prepare_scoring_snapshot(snapshot, config["probe"])
             if scorer is None:
                 from alfworld_trace_probe_scoring import score_snapshots
                 scorer = score_snapshots
@@ -752,6 +965,17 @@ class Experiment:
             self.progress(f"Saved scoring run {run_id}; original trajectories unchanged.")
             return result
 
+    def snapshot(self):
+        """Load the immutable raw cache with its verified goal sidecar."""
+        with self.lock:
+            path = self.directory / "trajectories.json"
+            snapshot = read_json(path)
+            sidecar = read_json(self.directory / "goal_metadata.json")
+            if snapshot and sidecar:
+                source_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+                snapshot = _merge_enrichment(snapshot, sidecar, source_hash)
+            return snapshot
+
     def state(self, *, lightweight=False):
         with self.lock:
             if lightweight:
@@ -766,12 +990,18 @@ class Experiment:
                 ]
                 snap_path = self.directory / "trajectories.json"
                 stat = snap_path.stat() if snap_path.is_file() else None
+                sidecar_path = self.directory / "goal_metadata.json"
+                sidecar_stat = sidecar_path.stat() if sidecar_path.is_file() else None
+                version = f"{stat.st_mtime_ns}:{stat.st_size}" if stat else None
+                if version and sidecar_stat:
+                    version += f":goal:{sidecar_stat.st_mtime_ns}:{sidecar_stat.st_size}"
                 return {
                     "config": copy.deepcopy(self.config),
                     "config_path": str(self.config_path),
                     "work_dir": str(self.directory),
                     "snapshot": None,
-                    "snapshot_version": f"{stat.st_mtime_ns}:{stat.st_size}" if stat else None,
+                    "snapshot_version": version,
+                    "goal_enrichment": sidecar_stat is not None,
                     "latest": runs[0] if runs and (self.directory / "latest.json").is_file() else None,
                     "runs": runs,
                     "job": dict(self.job),
@@ -781,10 +1011,12 @@ class Experiment:
                 item = read_json(path)
                 runs.append({key: item.get(key) for key in ("id", "created_at", "probe", "summary")})
             runs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+            snapshot = self.snapshot()
             return {"config": copy.deepcopy(self.config), "config_path": str(self.config_path),
                     "work_dir": str(self.directory),
-                    "snapshot": read_json(self.directory / "trajectories.json"),
+                    "snapshot": snapshot,
                     "latest": read_json(self.directory / "latest.json"),
+                    "goal_enrichment": (self.directory / "goal_metadata.json").exists(),
                     "runs": runs, "job": dict(self.job)}
 
     def start(self, phase, probe=None):
@@ -801,7 +1033,12 @@ class Experiment:
 
         def run():
             try:
-                self.sample() if phase == "sample" else self.score()
+                if phase == "sample":
+                    self.sample()
+                elif phase == "enrich":
+                    self.enrich(replay=True)
+                else:
+                    self.score()
             except Exception as error:
                 traceback.print_exc()
                 with self.lock:
@@ -1088,6 +1325,10 @@ class SampleWorkspace:
         with self.lock:
             return self.current.start(phase, probe)
 
+    def snapshot(self):
+        with self.lock:
+            return self.current.snapshot()
+
 def serve(experiment, host, port):
     workspace = SampleWorkspace(experiment)
 
@@ -1121,7 +1362,7 @@ def serve(experiment, host, port):
                 if parsed.path == "/api/snapshot":
                     file = workspace.directory / "trajectories.json"
                     try:
-                        snapshot = read_json(file)
+                        snapshot = workspace.snapshot()
                     except json.JSONDecodeError as exc:
                         return self.send({
                             "error": f"Invalid JSON in {file}: {exc}. "
@@ -1184,6 +1425,8 @@ def serve(experiment, host, port):
                         workspace.start("sample")
                     elif self.path == "/api/score":
                         workspace.start("score", payload.get("probe"))
+                    elif self.path == "/api/enrich":
+                        workspace.start("enrich")
                     else:
                         return self.send({"error": "Not found"}, status=404)
                 self.send({"ok": True})
@@ -1208,9 +1451,10 @@ def serve(experiment, host, port):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", nargs="?", choices=("serve", "sample", "score", "run"), default="serve")
+    parser.add_argument("mode", nargs="?", choices=("serve", "sample", "enrich", "score", "run"), default="serve")
     parser.add_argument("--work-dir", default=str(REPO_ROOT / "outputs" / "alfworld_trace_probe"))
     parser.add_argument("--config", help="JSON configuration; defaults to WORK_DIR/config.json")
+    parser.add_argument("--replay", action="store_true", help="enrich only: replay saved actions without policy generation")
     parser.add_argument("--dataset")
     parser.add_argument("--row-index", type=int)
     parser.add_argument("--trajectories", type=int)
@@ -1251,6 +1495,8 @@ def main(argv=None):
         experiment.sample()
     elif args.mode == "score":
         experiment.score()
+    elif args.mode == "enrich":
+        experiment.enrich(replay=args.replay)
     else:
         experiment.sample()
         experiment.score()

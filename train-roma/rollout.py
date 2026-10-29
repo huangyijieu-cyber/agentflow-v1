@@ -63,11 +63,12 @@ def _compute_turn_flags(planner_logs: list, task: str) -> list:
         trace_valid = (valid and log.get("extraction_valid", True) is not False
                        and not log.get("trace_tool_failed", False)
                        and not log.get("trace_external_error", False))
-        trace_dup = bool(resp and resp in trace_seen_responses) or bool(action_key and action_key in seen_actions)
+        response_key = (log.get("trace_state_context"), resp) if task == "alfworld" else resp
+        trace_dup = bool(resp and response_key in trace_seen_responses) or bool(action_key and action_key in seen_actions)
         # Failed attempts must not make a recovered retry look like a loop.
         # Legacy duplicate flags above retain their original all-turn scope.
         if trace_valid:
-            trace_seen_responses.add(resp)
+            trace_seen_responses.add(response_key)
             if action_key:
                 seen_actions.add(action_key)
         flags.append({"valid": bool(valid), "dup": bool(dup),
@@ -449,6 +450,14 @@ class RolloutAgent(LitAgent):
                         metadata={
                             "finish_reason": finish_reason,
                             "trace_state_context": log.get("trace_state_context"),
+                            "trace_task": log.get("trace_task"),
+                            "trace_gt": log.get("trace_gt"),
+                            "trace_answer_instruction": log.get("trace_answer_instruction"),
+                            "trace_goal_metadata": log.get("trace_goal_metadata"),
+                            "trace_state_view": log.get("trace_state_view"),
+                            "trace_scoring_valid": log.get("trace_scoring_valid", True),
+                            "trace_goal_check": log.get("trace_goal_check"),
+                            "trace_goal_check_valid": log.get("trace_goal_check_valid"),
                             "trace_turn_type": log.get("trace_turn_type", "unknown"),
                             "trace_original_turn": log.get("trace_original_turn", turn_index),
                             "trace_action_key": log.get("trace_action_key"),

@@ -250,11 +250,44 @@ class AgentFlowTrainer(RayPPOTrainer):
         ground_truths = batch.non_tensor_batch.get("trace_gt")
         if contexts is None or ground_truths is None:
             raise RuntimeError("TRACE metadata is missing; use a TRACE-aware rollout worker")
+        non = batch.non_tensor_batch
+        size = len(contexts)
+        # A parquet row index is not a stable identity for an os.walk result.
+        # Never compare credit or compute terminal advantages across different
+        # actual games that happened to share the same original data uid.
+        tasks = non.get("trace_task", [None] * size)
+        provenance = non.get("trace_goal_metadata", [None] * size)
+        game_by_uid = {}
+        for row, task in enumerate(tasks):
+            if task != "alfworld":
+                continue
+            item = provenance[row]
+            fingerprint = (item.get("goal_spec_hash") or (item.get("source_sha256") or {}).get("gamefile")) if isinstance(item, dict) else None
+            if not fingerprint:
+                raise ValueError("ALFWorld TRACE is missing actual-game goal provenance")
+            key = str(non["uid"][row])
+            if key in game_by_uid and game_by_uid[key] != fingerprint:
+                raise ValueError("ALFWorld TRACE uid contains different actual games or goal templates")
+            game_by_uid[key] = fingerprint
+        # Full-state facts are diagnostic inputs to the reference only. Invalid
+        # simulator/verifier states must never become valid scoring requests,
+        # even if metadata reaches the trainer without the daemon adapter.
+        scoring_valid = np.asarray(non.get("trace_scoring_valid", np.ones(size)), dtype=bool)
+        goal_valid = non.get("trace_goal_check_valid", [None] * size)
+        views = non.get("trace_state_view", [None] * size)
+        contexts = list(contexts)
+        for row, task in enumerate(tasks):
+            if task == "alfworld":
+                if views[row] != "full_state":
+                    raise ValueError("ALFWorld TRACE requires the explicit full_state scoring view")
+                if not scoring_valid[row] or not bool(goal_valid[row]):
+                    contexts[row] = None
         requests, row_requests, counters = encode_state_requests(
             contexts, ground_truths, self.tokenizer,
             max_prompt_length=self.config.data.max_prompt_length,
             max_gt_tokens=cfg.max_gt_tokens,
             answer_instruction=cfg.answer_instruction,
+            answer_instructions=batch.non_tensor_batch.get("trace_answer_instruction"),
         )
         row_logps = np.full(len(contexts), np.nan, dtype=np.float64)
         scoring_seconds = 0.0
@@ -280,8 +313,6 @@ class AgentFlowTrainer(RayPPOTrainer):
                 if request_index is not None:
                     row_logps[row] = logps[request_index]
 
-        non = batch.non_tensor_batch
-        size = len(contexts)
         values = np.full(size, np.nan, dtype=np.float64)
         credits = np.full(size, np.nan, dtype=np.float64)
         local_credits = np.full(size, np.nan, dtype=np.float64)
@@ -323,6 +354,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                 prefix = [row for row in rows if within_prefix[row]]
                 reward = outcome_rewards[final]
                 trustworthy = (all(raw_valid[row] for row in prefix)
+                               and all(tasks[row] != "alfworld" or
+                                       (scoring_valid[row] and bool(goal_valid[row])) for row in prefix)
                                and np.isfinite(reward)
                                and np.isfinite(outcome_rewards[prefix]).all()
                                and np.allclose(outcome_rewards[prefix], reward, rtol=0, atol=1e-8))
@@ -494,6 +527,10 @@ class AgentFlowTrainer(RayPPOTrainer):
                 payload.update({key: non[key][chosen:chosen + 1] for key in common_keys})
                 payload.update({key + "_a": non[key][chosen:chosen + 1] for key in side_keys})
                 payload.update({key + "_b": non[key][rejected:rejected + 1] for key in side_keys})
+                for key in ("trace_task", "trace_gt", "trace_goal_metadata", "trace_state_view"):
+                    if key in non:
+                        payload[key + "_a"] = non[key][chosen:chosen + 1]
+                        payload[key + "_b"] = non[key][rejected:rejected + 1]
                 proto = DataProto.from_single_dict(payload)
                 proto.non_tensor_batch["group_baseline"] = np.array([baseline], dtype=np.float32)
                 proto.non_tensor_batch["group_size"] = np.array([len(peers)], dtype=np.int32)

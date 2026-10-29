@@ -37,7 +37,7 @@ class FakeTokenizer:
 
 
 class FakeScorer:
-    def __init__(self, means=(-4.0, -2.0, -1.0, -3.0)):
+    def __init__(self, means=(-4.0, -2.0, -1.0, -3.0, -2.5)):
         self.tokenizer = FakeTokenizer()
         self.calls = []
         self.means = means
@@ -53,11 +53,13 @@ def saved(count=3):
     return {
         "snapshot_id": "saved-first-sampling",
         "trajectories": [{
-            "trajectory_id": "traj_01", "goal": "clean a mug", "outcome": {"success": True},
+            "trajectory_id": "traj_01", "goal": "clean a mug",
+            "outcome": {"success": True, "reward": 1.0, "valid": True, "terminated": True, "truncated": False},
             "states": [{"state_index": i, "state_context": f"s{i}", "remaining_steps": 50 - i,
                         "is_post_state": i == count} for i in range(count + 1)],
             "turns": [{"turn_index": i, "action_prompt": f"action input {i}",
-                       "action_response": f"<action>action {i}</action>", "external_error": False}
+                       "action_response": f"<action>action {i}</action>", "external_error": False,
+                       "done": i == count - 1, "finish_reason": "stop"}
                       for i in range(count)],
         }],
     }
@@ -78,9 +80,12 @@ class ScoringTests(unittest.TestCase):
         trajectory = result["trajectories"][0]
         values = [math.log(4.1) - math.log(-mean + 0.1) for mean in (-4.0, -2.0, -1.0, -3.0)]
         deltas = [values[i + 1] - values[i] for i in range(3)]
-        expected = (deltas[0] + .8 * deltas[1] + .8 ** 2 * deltas[2]) / (1 + .8 + .8 ** 2)
+        # QA K=3 includes the final decision; final's post-state is diagnostic only.
+        expected = (deltas[0] + .8 * deltas[1]) / (1 + .8) + 2 * .8 ** 2
         self.assertAlmostEqual(trajectory["turns"][0]["credit"], expected)
-        self.assertAlmostEqual(trajectory["turns"][-1]["credit"], deltas[-1])
+        self.assertIsNone(trajectory["turns"][-1]["credit"])
+        self.assertEqual(trajectory["turns"][-1]["label_source"], "outcome")
+        self.assertAlmostEqual(trajectory["turns"][-1]["diagnostic_post_delta"], deltas[-1])
         self.assertEqual(len(trajectory["turns"]), 3)
         self.assertEqual(len(trajectory["states"]), 4)
         self.assertEqual(trajectory["states"][0]["scoring_prompt"], "s0\n\npredict outcome")
@@ -95,8 +100,9 @@ class ScoringTests(unittest.TestCase):
 
     def test_k_one_uses_immediate_transition(self):
         result, _ = self.run_score(probe={"k": 1})
-        for turn in result["trajectories"][0]["turns"]:
+        for turn in result["trajectories"][0]["turns"][:-1]:
             self.assertAlmostEqual(turn["credit"], turn["delta"])
+        self.assertIsNone(result["trajectories"][0]["turns"][-1]["credit"])
 
     def test_external_failure_blocks_every_window_containing_it(self):
         snapshot = saved()
@@ -106,11 +112,11 @@ class ScoringTests(unittest.TestCase):
         self.assertIsNone(turns[0]["credit"])
         self.assertIsNone(turns[1]["credit"])
         self.assertIsNone(turns[1]["delta"])
-        self.assertIsNotNone(turns[2]["credit"])
+        self.assertIsNone(turns[2]["credit"])
         self.assertEqual(result["summary"]["external_error_windows"], 2)
 
     def test_missing_state_does_not_bridge_gap(self):
-        snapshot = saved()
+        snapshot = saved(count=4)
         snapshot["trajectories"][0]["states"][1]["state_context"] = ""
         result, _ = self.run_score(snapshot, probe={"k": 1})
         turns = result["trajectories"][0]["turns"]
@@ -145,7 +151,7 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(result["summary"]["invalid_scored_states"], 1)
 
     def test_discontinuous_original_state_numbers_do_not_join(self):
-        snapshot = saved()
+        snapshot = saved(count=4)
         snapshot["trajectories"][0]["states"][1]["state_index"] = 9
         result, _ = self.run_score(snapshot, probe={"k": 1})
         turns = result["trajectories"][0]["turns"]
@@ -193,6 +199,78 @@ class ScoringTests(unittest.TestCase):
         for probe in ({"k": 0}, {"epsilon": 0}, {"gamma": 1.2}):
             with self.subTest(probe=probe), self.assertRaises(ValueError):
                 self.run_score(probe=probe)
+
+    def full_state_saved(self):
+        snapshot = saved()
+        trajectory = snapshot["trajectories"][0]
+        trajectory.update(goal_response="A cleaned mug is on a table.", goal_spec_hash="same-game")
+        for state in trajectory["states"]:
+            state.update(state_view="full_state", goal_check_valid=True, scoring_valid=True,
+                         goal_check=state["state_index"] == 3)
+        return snapshot
+
+    def test_deterministic_goal_fixed_at_every_turn_and_reused(self):
+        result, backend = self.run_score(self.full_state_saved(),
+                                       probe={"response": "{goal_response}", "state_view": "full_state"})
+        trajectory = result["trajectories"][0]
+        self.assertEqual({state["response"] for state in trajectory["states"]},
+                         {"A cleaned mug is on a table."})
+        self.assertEqual(trajectory["turns"][-1]["trace_turn_type"], "base")
+        self.assertTrue(trajectory["turns"][-1]["outcome_valid"])
+        self.assertEqual(trajectory["turns"][0]["terminal_fill"], 2 * .8 ** 2)
+
+    def test_invalid_goal_keeps_final_type_but_removes_outcome_and_fill(self):
+        snapshot = self.full_state_saved()
+        snapshot["trajectories"][0]["states"][-1].update(goal_check_valid=False, scoring_valid=False)
+        result, backend = self.run_score(snapshot, probe={"state_view": "full_state"})
+        trajectory = result["trajectories"][0]
+        self.assertEqual(len(backend.calls), 3)
+        final = trajectory["turns"][-1]
+        self.assertEqual(final["trace_turn_type"], "base")
+        self.assertTrue(final["is_final"])
+        self.assertFalse(final["outcome_valid"])
+        self.assertTrue(all(turn["terminal_fill"] is None for turn in trajectory["turns"]))
+        self.assertTrue(all(turn["credit"] is None for turn in trajectory["turns"]))
+
+    def test_truncated_environment_budget_is_terminal_failure_population(self):
+        snapshot = self.full_state_saved()
+        failed = json.loads(json.dumps(snapshot["trajectories"][0]))
+        failed["trajectory_id"] = "traj_failed"
+        failed["outcome"].update(success=False, reward=0.0, terminated=False, truncated=True)
+        failed["states"][-1]["goal_check"] = False
+        snapshot["trajectories"].append(failed)
+        result, _ = self.run_score(snapshot, probe={"state_view": "full_state"})
+        success, failed = [t["turns"] for t in result["trajectories"]]
+        self.assertEqual(success[-1]["outcome_advantage"], .5)
+        self.assertEqual(failed[-1]["outcome_advantage"], -.5)
+        self.assertAlmostEqual(success[0]["terminal_fill"], .8 ** 2)
+        self.assertAlmostEqual(failed[0]["terminal_fill"], -.8 ** 2)
+        self.assertEqual(failed[-1]["label_source"], "outcome")
+
+    def test_model_length_stop_has_base_boundary_but_no_final_label(self):
+        snapshot = self.full_state_saved()
+        snapshot["trajectories"][0]["turns"][-1]["finish_reason"] = "length"
+        result, _ = self.run_score(snapshot)
+        final = result["trajectories"][0]["turns"][-1]
+        self.assertEqual(final["trace_turn_type"], "base")
+        self.assertFalse(final["is_final"])
+        self.assertFalse(final["outcome_valid"])
+
+    def test_missing_or_mixed_goal_metadata_fails_before_requests(self):
+        snapshot = self.full_state_saved()
+        snapshot["trajectories"][0].pop("goal_spec_hash")
+        backend = FakeScorer()
+        with self.assertRaisesRegex(ValueError, "goal_spec_hash"):
+            self.run_score(snapshot, probe={"response": "{goal_response}"}, scorer=backend)
+        self.assertFalse(backend.calls)
+        with self.assertRaisesRegex(ValueError, "enrich"):
+            self.run_score(saved(), probe={"response": "{goal_response}"})
+
+    def test_observations_cannot_be_labeled_full_state(self):
+        backend = FakeScorer()
+        with self.assertRaisesRegex(ValueError, "enrich --replay"):
+            self.run_score(saved(), probe={"state_view": "full_state"}, scorer=backend)
+        self.assertFalse(backend.calls)
 
 
 class VLLMProtocolTests(unittest.TestCase):

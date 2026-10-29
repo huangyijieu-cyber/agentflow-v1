@@ -845,6 +845,8 @@ class AgentModeDaemon:
         turn_valid_list, turn_dup_list = [], []   # DPO pair chosen 端质量标记
         trace_state_contexts, trace_turn_types, trace_original_turns = [], [], []
         trace_ground_truths, trace_valid_list, trace_action_keys = [], [], []
+        trace_answer_instructions, trace_goal_metadata, trace_state_views, trace_tasks = [], [], [], []
+        trace_scoring_valids, trace_goal_checks, trace_goal_check_valids = [], [], []
         trace_dup_list = []
         trace_external_errors, trace_error_types, trace_error_sources = [], [], []
         trace_final_flags, trace_outcome_valids, trace_outcome_successes = [], [], []
@@ -920,12 +922,27 @@ class AgentModeDaemon:
                 turn_dup_list.append(bool(_f.get("dup", False)))
                 trace_dup_list.append(bool(_f.get("trace_dup", _f.get("dup", False))))
                 trace_metadata = trace["metadata"]
+                is_alfworld = trace_metadata.get("trace_task") == "alfworld"
+                task_gt = trace_metadata.get("trace_gt") if is_alfworld else sample_info["trace_gt"]
+                if is_alfworld and (not isinstance(task_gt, str) or not task_gt.strip()):
+                    raise ValueError("ALFWorld TRACE requires the actual game's deterministic goal response")
                 state_context = trace_metadata.get("trace_state_context")
+                scoring_valid = trace_metadata.get("trace_scoring_valid", not is_alfworld) is True
+                if is_alfworld and not scoring_valid:
+                    state_context = None
                 trace_state_contexts.append(state_context)
                 trace_turn_types.append(trace_metadata.get("trace_turn_type", "unknown"))
                 # Retain original numbering even when an empty turn is skipped.
                 trace_original_turns.append(trace_metadata.get("trace_original_turn", turn_index))
-                trace_ground_truths.append(sample_info["trace_gt"])
+                trace_ground_truths.append(task_gt)
+                trace_answer_instructions.append(trace_metadata.get("trace_answer_instruction"))
+                trace_goal_metadata.append(trace_metadata.get("trace_goal_metadata"))
+                trace_state_views.append(trace_metadata.get("trace_state_view"))
+                trace_tasks.append(trace_metadata.get("trace_task"))
+                trace_scoring_valids.append(scoring_valid)
+                goal_check = trace_metadata.get("trace_goal_check")
+                trace_goal_checks.append(goal_check if isinstance(goal_check, bool) else None)
+                trace_goal_check_valids.append(trace_metadata.get("trace_goal_check_valid") is True)
                 trace_action_keys.append(trace_metadata.get("trace_action_key"))
                 trace_external_errors.append(bool(trace_metadata.get("trace_external_error", False)))
                 trace_error_types.append(trace_metadata.get("trace_error_type") or "")
@@ -946,6 +963,7 @@ class AgentModeDaemon:
                     and not _f.get("trace_dup", _f.get("dup", False))
                     and not trace_metadata.get("trace_tool_failed", False)
                     and not trace_external_errors[-1]
+                    and scoring_valid
                     and trace_metadata.get("trace_extraction_valid", True) is not False
                     and trace_metadata.get("finish_reason") in ("stop", "eos", "end_turn")
                     and (outcome_role or (isinstance(state_context, str) and state_context.strip()))
@@ -1034,6 +1052,17 @@ class AgentModeDaemon:
         for index, ground_truth in enumerate(trace_ground_truths):
             trace_gt_array[index] = ground_truth
         data_proto.non_tensor_batch["trace_gt"] = trace_gt_array
+        data_proto.non_tensor_batch["trace_answer_instruction"] = np.array(trace_answer_instructions, dtype=object)
+        # Explicit object allocation prevents numpy from expanding nested provenance dictionaries.
+        goal_metadata_array = np.empty(len(trace_goal_metadata), dtype=object)
+        for index, provenance in enumerate(trace_goal_metadata):
+            goal_metadata_array[index] = provenance
+        data_proto.non_tensor_batch["trace_goal_metadata"] = goal_metadata_array
+        data_proto.non_tensor_batch["trace_state_view"] = np.array(trace_state_views, dtype=object)
+        data_proto.non_tensor_batch["trace_task"] = np.array(trace_tasks, dtype=object)
+        data_proto.non_tensor_batch["trace_scoring_valid"] = np.array(trace_scoring_valids, dtype=bool)
+        data_proto.non_tensor_batch["trace_goal_check"] = np.array(trace_goal_checks, dtype=object)
+        data_proto.non_tensor_batch["trace_goal_check_valid"] = np.array(trace_goal_check_valids, dtype=bool)
         data_proto.non_tensor_batch["trace_valid"] = np.array(trace_valid_list, dtype=bool)
         data_proto.non_tensor_batch["trace_dup"] = np.array(trace_dup_list, dtype=bool)
         data_proto.non_tensor_batch["trace_external_error"] = np.array(trace_external_errors, dtype=bool)

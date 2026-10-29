@@ -2,9 +2,11 @@
 
 入口：train-roma/alfworld_trace_probe.py。
 
+当前默认使用“实际 PDDL → 固定英文 GT → 完整环境状态评分”，并与 QA 共用终局路由和回填。转换来源、正式训练接入及配置见 [alfworld-trace-goals.md](alfworld-trace-goals.md)。
+
 默认选 data/train/alfworld/train_all_alfworld_3305.parquet 第 0 行，即 train_all_alfworld_0；从 question 解析环境编号 0，而不是使用该行的 id=1。同一题采样 4 条轨迹，每条最多 50 个动作，策略 temperature=0.7、history_length=4。
 
-首次采样保存真实动作、生成 Prompt/Response、可见状态、环境返回和最后动作后的状态。随后修改评分 Prompt/固定 Response 只重新评分这些状态；即使重启脚本，也不会重新生成已完成的轨迹。用新的 work-dir 才能建立另一组采样。
+首次采样保存真实动作、生成 Prompt/Response、可见状态、环境返回和最后动作后的状态。随后修改评分 Prompt/固定 Response 只重新评分这些状态；即使重启脚本，也不会重新生成已完成的轨迹。在窗口中可新建样本并切换历史样本；每个样本独立保存轨迹和评分，原有 work-dir 根目录的缓存也可继续使用。
 
 ## 启动窗口
 
@@ -21,9 +23,9 @@ python train-roma/alfworld_trace_probe.py \
 
 打开 http://127.0.0.1:8765。程序不会在打开页面时自动调用模型。
 
-1. 点击“首次采样 4 条轨迹”，完成后检查原始轨迹。
+1. 点击“首次采样 4 条轨迹”，完成后检查原始轨迹。也可在样本管理中指定数据行和采样参数，新建另一个样本。默认 4 个独立环境进程并行采样，`--workers 1` 可串行运行。
 2. 在两个文本框中修改 Prompt 和固定 Response，点击“保存并重新评分”。
-3. 逐轨迹检查每个 Turn 的 Mean LogP、V、delta、credit。
+3. 逐轨迹检查每个 Turn 的 Mean LogP、V、local credit、terminal fill 和 effective credit；最后动作查看 outcome 路由。
 4. 展开明细，查看原动作 Prompt/Response、完整评分 Prompt/Response、chat 模板实际输入和动作后状态。
 5. 选择历史评分作为对照，查看同一动作的 credit 变化；可导出 JSON、CSV 和离线 HTML 报告。
 
@@ -96,7 +98,7 @@ NPU 服务器优先复用当前已经能运行的 vLLM/vLLM-Ascend 服务，HTTP
 
 alfworld-root 内应包含 alfworld Python 包。alfworld-data 指向包含 json_2.1.1/ 与 logic/ 的目录，对应当前环境配置里的 ALFWORLD_DATA。其余环境依赖沿用原项目安装方式。
 
-默认数据路径依次从当前目录、仓库目录和仓库父目录查找；可以用 --dataset 指定绝对路径。用 --row-index 改选数据行；已有完成缓存时仍复用缓存，需要新的 --work-dir 才会采新题。
+默认数据路径依次从当前目录、仓库目录和仓库父目录查找；可以用 --dataset 指定绝对路径。用 --row-index 改选数据行；已有完成缓存时仍复用缓存；可在窗口中新建样本采其他题，或使用新的 --work-dir。
 
 ## 纯命令行使用
 
@@ -122,6 +124,27 @@ python train-roma/alfworld_trace_probe.py run --work-dir outputs/probe_case_01
 
 score 模式从不自动采样，也不导入 ALFWorld；缓存缺失或尚未完成时直接报错。采样中断后可再次使用 sample：重放并核对已保存动作来恢复环境，只为缺失后缀调用模型。若环境重放不一致，停止并保留缓存，不混入不同状态。
 
+## 旧轨迹补齐 GT 和完整状态（不重新采样）
+
+已有 trajectories.json 时继续使用同一 work-dir。窗口支持多个样本时，先切换到目标样本再补齐；命令行的 --work-dir 应指向实际包含该 trajectories.json 的目录（新样本通常是工作区下的 samples/<sample-id>/）。旧配置中的手写 Response 会保留；在窗口中将 Response 改为 `{goal_response}`，选择完整状态。
+
+若旧轨迹已保存完整 facts，可直接离线补齐：
+
+```bash
+python train-roma/alfworld_trace_probe.py enrich --work-dir /path/to/old_probe
+```
+
+只有可见观察的旧缓存，需要在原 ALFWorld 数据与环境中重放保存的动作：
+
+```bash
+python train-roma/alfworld_trace_probe.py enrich --replay \
+  --work-dir /path/to/old_probe \
+  --alfworld-root /path/to/alfworld-master \
+  --alfworld-data /path/to/alfworld-master/json_data
+```
+
+也可点击窗口中的旧缓存补齐按钮。该操作不调用策略模型，不生成新动作；原 trajectories.json 字节保持不变，补齐内容写入 goal_metadata.json。使用缓存中实际 gamefile，逐步核对环境观察/终局结果，重放不一致会报错。若路径已迁移，应在相同相对数据布局下恢复原路径（例如软链接），不能换成按编号重新扫描的另一个游戏。随后只运行 score 或点击重新评分。
+
 ## 可修改的评分文本
 
 评分输入与当前 TRACE 一样构造：
@@ -133,9 +156,9 @@ assistant target = 可编辑的固定 Response
 
 user content 使用评分模型 tokenizer 的 chat template；只计算 assistant target 的 token LogP，温度固定为 1，不将状态、Prompt、chat 前缀或 EOS 的 LogP 混进均值。不自由生成评分 Response。
 
-Prompt 支持 {goal}、{remaining_steps}、{turn_index} 占位符。Response 只支持 {goal}，确保同一题、不同 Turn 的评分目标一致；其他普通大括号保持原样，方便直接写 JSON 或自然语言。
+Prompt 支持 {goal}、{goal_response}、{remaining_steps}、{turn_index} 占位符。Response 支持 {goal}、{goal_response}，确保同一题、不同 Turn 的评分目标一致；其他普通大括号保持原样，方便直接写 JSON 或自然语言。
 
-默认 Prompt 允许预测 success/failure 两种句子，而默认固定评分 Response 是 The episode will end in success.。本测试按用户要求只评分这一固定目标，未自动添加双候选归一化或成功率校准；得到的是文本似然与其派生信用。
+默认 Response 为 {goal_response}，在每道题中替换为实际 PDDL 确定性转换得到的完整成功状态描述。Prompt 根据完整规则、初始状态、当前状态和动作历史，要求描述当前状态。Response 表达目标状态，不作为当前已成功的证据。也可切换到手写固定 Response（例如原来的 The episode will end in success.）作为对照；比较时应记录 state_view。文本似然未自动做双候选归一化或成功率校准。
 
 ## TRACE 计算口径
 
@@ -148,9 +171,9 @@ delta_t = V_(t+1) - V_t
 credit_t = sum(gamma**j * delta_(t+j)) / sum(gamma**j)
 ```
 
-默认 epsilon=0.1、K=3、gamma=0.8，窗口包含最多 K 个真实环境动作，尾部按实际权重归一化。T 个动作有 T+1 个状态，最后动作也使用真实执行后状态；末状态不是额外动作。这与 QA 把最终文字回答算作一个 Turn 的边界有所区别。
+默认 epsilon=0.1、K=3、gamma=0.8。真实终局环境动作与 QA 的最终回答一样走 base/outcome，前面的动作走 tool_plan/TRACE。T 个动作仍保存 T+1 个真实状态，最后动作后状态可评分以诊断，但不会额外参与信用转移。
 
-本诊断不加终局优势回填，不用实际成功奖励改写参考模型 LogP 或 V。环境结果仅独立展示，供检查信用是否符合行为。外部故障影响的窗口无效；缺状态、编号缺口或超长输入不截断、不填 0、不跨缺口拼接。无效数值在输出中为 null，并注明原因。
+终局优势按同题可靠终局轨迹的 GRPO 规则计算，默认开启 terminal fill，scale=2.0，与 QA 配置一致。K 包括终局动作，K=3 最多向前两个工具决策回填；局部信用、回填量、最终有效信用分别展示。只有一个可靠结果或同组奖励相同时优势可能为零。环境奖励不改写参考模型 LogP 或 V。外部故障、Goal 与 won 不一致、缺完整状态、编号缺口或超长输入会阻断相应窗口；不截断、不跨缺口拼接。无效数值在输出中为 null，并注明原因。
 
 ## 评分后端
 
@@ -169,7 +192,10 @@ API key 从配置指定的环境变量读取，默认 OPENAI_API_KEY；配置和
 | 文件 | 内容 |
 | --- | --- |
 | config.json | 可编辑的采样、评分服务及探针配置 |
+| samples/<sample-id>/ | 窗口中新建样本的独立配置、轨迹及评分；根目录原有样本保留 |
+| partial_trajectories/ | 并行采样断点；窗口可显式恢复损坏 JSON，原文件另存备份 |
 | trajectories.json | 首次固定轨迹与 T+1 个状态；后续评分不修改 |
+| goal_metadata.json | 旧缓存补齐的实际 GT、完整事实与来源校验；绑定原缓存 SHA-256 |
 | runs/<run-id>.json | 每次评分的完整文本、token LogP、V、delta、credit、无效原因及配置 |
 | latest.json | 最新完整结果 |
 | latest.csv | 每轨迹每动作的数值及两套 Prompt/Response |
@@ -179,10 +205,10 @@ API key 从配置指定的环境变量读取，默认 OPENAI_API_KEY；配置和
 
 ## 验证范围
 
-标准库 unittest 覆盖采样一次后永久复用、断点恢复、修改 Prompt 重评分且原缓存字节不变、评分请求去重、真实后状态的末动作信用、TRACE 公式、故障与编号缺口、Response-only LogP、导出文本和 HTML 转义；HF 另有 CPU 张量 causal-shift 检查。
+标准库 unittest 覆盖采样一次后永久复用、断点恢复、修改 Prompt 重评分且原缓存字节不变、评分请求去重、QA 一致的终局路由和回填、TRACE 公式、故障与编号缺口、Response-only LogP、导出文本和 HTML 转义；HF 另有 CPU 张量 causal-shift 检查。
 
 ```bash
 python -m unittest discover -s agentflow/tests -p 'test_alfworld_probe_*.py' -v
 ```
 
-开发机器缺 ALFWorld 依赖、环境数据和运行中的模型服务，因此真实环境采样及实际部署 vLLM 的端到端冒烟仍需在目标运行环境执行。测试夹具仅用于测试，没有写成真实采样缓存。
+本地自动测试覆盖确定性转换、环境接口、两条训练入口与 Probe 的集成；同时核验官方发布的游戏 PDDL。开发机器未安装完整 ALFWorld 运行时，也没有实际模型服务，因此真实环境采样、GPU/NPU 训练和 vLLM 的端到端冒烟仍需在目标运行环境执行。测试夹具仅用于测试，没有写成真实采样缓存。

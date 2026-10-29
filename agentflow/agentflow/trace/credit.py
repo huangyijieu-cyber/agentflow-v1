@@ -527,10 +527,13 @@ def encode_state_requests(
     max_prompt_length,
     max_gt_tokens,
     answer_instruction,
+    answer_instructions=None,
 ):
     """Return unique probes and their row mapping; never truncate a state or GT."""
     if len(contexts) != len(ground_truths):
         raise ValueError("TRACE contexts and ground truths must be aligned")
+    if answer_instructions is not None and len(answer_instructions) != len(contexts):
+        raise ValueError("TRACE answer instructions and contexts must be aligned")
     requests, row_requests, seen, target_cache = [], [], {}, {}
     counts = Counter(
         {
@@ -544,7 +547,7 @@ def encode_state_requests(
             )
         }
     )
-    for context, raw_gt in zip(contexts, ground_truths):
+    for row, (context, raw_gt) in enumerate(zip(contexts, ground_truths)):
         answer = first_ground_truth(raw_gt)
         if answer is None:
             counts["missing_gt"] += 1
@@ -561,7 +564,11 @@ def encode_state_requests(
             counts["invalid_gt_length"] += 1
             row_requests.append(None)
             continue
-        content = context.strip() + "\n\n" + answer_instruction
+        instruction = answer_instructions[row] if answer_instructions is not None else None
+        instruction = answer_instruction if instruction is None else instruction
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise ValueError("TRACE answer instruction must be a nonempty string")
+        content = context.strip() + "\n\n" + instruction
         prompt_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": content}],
             tokenize=True,

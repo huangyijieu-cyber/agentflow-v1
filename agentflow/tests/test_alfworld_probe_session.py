@@ -1,10 +1,13 @@
 """CPU tests for immutable capture, resume, rescore, and exported diagnostics."""
 import copy
 import importlib.util
+import io
 import json
+from email.message import Message
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -27,6 +30,8 @@ class FakeEnv:
 
     def reset(self, **kwargs):
         self.index = 0
+        self.trace_state_context = "stage=0"
+        self.prev_text_obs = "stage=0"
         return "action prompt 0", {"anchor": "stage=0", "admissible_commands": [["act"]],
                                    "extra.gamefile": ["same-game"], "won": [False]}
 
@@ -76,7 +81,7 @@ class SessionTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.experiment = probe.Experiment(self.temp.name, {
             "sampling": {"max_steps": 3},
-            "probe": {"prompt": "forecast {remaining_steps}", "response": "success", "k": 1},
+            "probe": {"prompt": "forecast {remaining_steps}", "response": "success", "k": 1, "state_view": "saved", "terminal_fill_enabled": False},
         })
         self.selection = {"path": "/dataset.parquet", "row_index": 0,
                           "question": "train_all_alfworld_0", "source_row": {"id": 1},
@@ -88,7 +93,8 @@ class SessionTests(unittest.TestCase):
     def sample(self, policy=None, env_factory=FakeEnv):
         if policy is None:
             policy = lambda *args: {"response": "<action>act</action>", "finish_reason": "stop"}
-        with mock.patch.object(probe, "select_row", return_value=self.selection):
+        with mock.patch.object(probe, "select_row", return_value=self.selection), mock.patch.object(
+                probe, "resolve_dataset", return_value=Path(self.selection["path"])):
             return self.experiment.sample(policy=policy, env_factory=env_factory)
 
     def test_first_capture_four_rollouts_and_reuse_without_policy_or_env(self):
@@ -175,6 +181,171 @@ class SessionTests(unittest.TestCase):
     def test_state_dependent_response_is_rejected_before_scoring(self):
         with self.assertRaisesRegex(ValueError, "fixed across turns"):
             self.experiment.save_probe({"response": "success at {turn_index}"})
+
+    def goal_tools(self):
+        spec = {"goal_response": "A clean cup is on the table.", "goal_spec_hash": "same-goal",
+                "goal_source": "traj_data.json", "goal_task_type": "pick_clean_then_place_in_recep"}
+        return SimpleNamespace(
+            normalize_gamefile=lambda value: Path(value[0] if isinstance(value, list) else value),
+            load_goal_spec=lambda path: spec,
+            normalize_facts=lambda facts: sorted(facts),
+            evaluate_goal=lambda spec, facts: "s2" in facts,
+            render_full_state=lambda spec, facts, **kwargs: "full facts " + " ".join(facts)), spec
+
+    def test_offline_goal_enrichment_preserves_raw_cache_and_checks_every_state(self):
+        self.sample()
+        path = Path(self.temp.name) / "trajectories.json"
+        snapshot = probe.read_json(path)
+        for trajectory in snapshot["trajectories"]:
+            for state in trajectory["states"]:
+                state["facts"] = [f"s{state['state_index']}"]
+        probe.atomic_json(path, snapshot)
+        original = path.read_bytes()
+        tools, _ = self.goal_tools()
+        with mock.patch.object(probe, "_goal_module", return_value=tools):
+            converted = self.experiment.enrich()
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(converted["trajectories"][0]["goal_response"], "A clean cup is on the table.")
+        self.assertTrue(all(state["goal_check_valid"] for t in converted["trajectories"] for state in t["states"]))
+        self.assertEqual(self.experiment.state()["snapshot"]["trajectories"][0]["state_view"], "full_state")
+        metadata = probe.read_json(Path(self.temp.name) / "goal_metadata.json")
+        self.assertEqual(metadata["source_snapshot_sha256"], __import__("hashlib").sha256(original).hexdigest())
+        bad = copy.deepcopy(snapshot)
+        bad["trajectories"][0]["states"][1]["env_info"]["won"] = [True]
+        with mock.patch.object(probe, "_goal_module", return_value=tools):
+            invalid = probe.enrich_snapshot(bad)
+        self.assertFalse(invalid["trajectories"][0]["states"][1]["goal_check_valid"])
+        self.assertFalse(invalid["trajectories"][0]["states"][1]["scoring_valid"])
+
+    def test_old_cache_replay_recovers_full_facts_without_sampling(self):
+        self.sample()
+        path = Path(self.temp.name) / "trajectories.json"
+        original = path.read_bytes()
+        tools, spec = self.goal_tools()
+        replayed = []
+        class ReplayEnv(FakeEnv):
+            def details(self, result):
+                prompt, info = result[0], result[-1]
+                self.trace_facts = [f"s{self.index}"]
+                self.trace_goal_spec = spec
+                self.trace_state_context = "full facts " + self.trace_facts[0]
+                info.update(trace_goal_check=self.index == 2, trace_goal_check_valid=True,
+                            trace_scoring_valid=True)
+                return result
+            def reset(self, **kwargs):
+                self.assert_game = kwargs.get("gamefile")
+                return self.details(super().reset(**kwargs))
+            def step(self, response):
+                replayed.append(response)
+                return self.details(super().step(response))
+        with mock.patch.object(probe, "_goal_module", return_value=tools):
+            with self.assertRaisesRegex(ValueError, "enrich --replay"):
+                self.experiment.enrich()
+            converted = self.experiment.enrich(replay=True, env_factory=ReplayEnv)
+        self.assertEqual(len(replayed), 8)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertTrue(all(state["state_view"] == "full_state" for t in converted["trajectories"] for state in t["states"]))
+        self.experiment.save_probe({"response": "{goal_response}", "state_view": "full_state"})
+        fake = FakeScorer()
+        with mock.patch.object(scoring, "_get_scorer", return_value=fake), mock.patch.object(
+                probe, "make_environment", side_effect=AssertionError("scoring must not load an environment")):
+            result = self.experiment.score(scorer=scoring.score_snapshots)
+        self.assertTrue(result["trajectories"][0]["turns"][-1]["outcome_valid"])
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_goal_sidecar_cannot_be_reused_for_a_changed_cache(self):
+        self.sample()
+        path = Path(self.temp.name) / "trajectories.json"
+        source = probe.read_json(path)
+        payload = {"source_snapshot_sha256": "wrong-cache", "trajectories": []}
+        with self.assertRaisesRegex(ValueError, "different trajectory cache"):
+            probe._merge_enrichment(source, payload, "actual-cache")
+
+    def test_ui_exposes_qa_fill_fixed_gt_and_replay(self):
+        ui = (SCRIPTS / "alfworld_trace_probe.html").read_text()
+        for text in ("{goal_response}", "/api/enrich", "terminalFill", "terminalScale", "Local credit", "Effective credit"):
+            self.assertIn(text, ui)
+        self.assertNotIn("不添加终局优势回填", ui)
+
+    def test_multisample_enrichment_isolated_and_lazy_snapshot_version_changes(self):
+        snapshot = self.sample()
+        raw_path = Path(self.temp.name) / "trajectories.json"
+        original = raw_path.read_bytes()
+        workspace = probe.SampleWorkspace(self.experiment)
+        with mock.patch.object(probe, "select_row", return_value=self.selection), mock.patch.object(
+                probe.Experiment, "start") as start:
+            created = workspace.create_sample({"row_index": 1, "trajectories": 4, "workers": 2})
+        start.assert_called_once_with("sample")
+        selected = workspace.current
+        copy_snapshot = copy.deepcopy(snapshot)
+        copy_snapshot["dataset"]["row_index"] = 1
+        for trajectory in copy_snapshot["trajectories"]:
+            for state in trajectory["states"]:
+                state["facts"] = [f"s{state['state_index']}"]
+        selected_path = selected.directory / "trajectories.json"
+        probe.atomic_json(selected_path, copy_snapshot)
+        selected_raw = selected_path.read_bytes()
+        before = workspace.state()
+        self.assertIsNone(before["snapshot"])
+        self.assertFalse(before["goal_enrichment"])
+        tools, _ = self.goal_tools()
+        with mock.patch.object(probe, "_goal_module", return_value=tools):
+            selected.enrich()
+        after = workspace.state()
+        self.assertNotEqual(before["snapshot_version"], after["snapshot_version"])
+        self.assertTrue(after["goal_enrichment"])
+        self.assertEqual(after["active_sample_id"], created["sample_id"])
+        self.assertEqual(workspace.snapshot()["trajectories"][0]["goal_spec_hash"], "same-goal")
+        self.assertEqual(selected_path.read_bytes(), selected_raw)
+        self.assertEqual(raw_path.read_bytes(), original)
+        workspace.select_sample("legacy")
+        self.assertNotIn("goal_response", workspace.snapshot()["trajectories"][0])
+        self.assertFalse(workspace.state()["goal_enrichment"])
+        workspace.select_sample(created["sample_id"])
+        self.assertEqual(workspace.snapshot()["trajectories"][0]["goal_response"], "A clean cup is on the table.")
+
+    def test_server_enrich_and_snapshot_routes_target_the_active_sample(self):
+        snapshot = self.sample()
+        workspace = probe.SampleWorkspace(self.experiment)
+        with mock.patch.object(probe, "select_row", return_value=self.selection), mock.patch.object(
+                probe.Experiment, "start"):
+            workspace.create_sample({"row_index": 1})
+        selected = workspace.current
+        selected_snapshot = copy.deepcopy(snapshot)
+        for trajectory in selected_snapshot["trajectories"]:
+            for state in trajectory["states"]:
+                state["facts"] = [f"s{state['state_index']}"]
+        probe.atomic_json(selected.directory / "trajectories.json", selected_snapshot)
+        tools, _ = self.goal_tools()
+        with mock.patch.object(probe, "_goal_module", return_value=tools):
+            selected.enrich()
+        server = mock.Mock(server_port=8765)
+        with mock.patch.object(probe, "SampleWorkspace", return_value=workspace), mock.patch.object(
+                probe, "ThreadingHTTPServer", return_value=server) as constructor:
+            probe.serve(self.experiment, "127.0.0.1", 8765)
+        handler_cls = constructor.call_args.args[1]
+        handler = object.__new__(handler_cls)
+        handler.send = mock.Mock()
+        handler.headers = Message()
+        handler.headers["Content-Type"] = "application/json"
+        handler.headers["Content-Length"] = "2"
+        handler.rfile = io.BytesIO(b"{}")
+        handler.path = "/api/enrich"
+        with mock.patch.object(selected, "start") as active_start, mock.patch.object(
+                self.experiment, "start") as legacy_start:
+            handler.do_POST()
+        active_start.assert_called_once_with("enrich", None)
+        legacy_start.assert_not_called()
+        handler.send.assert_called_with({"ok": True})
+        handler.path = "/api/snapshot"
+        handler.do_GET()
+        self.assertEqual(handler.send.call_args.args[0]["trajectories"][0]["goal_spec_hash"], "same-goal")
+
+    def test_ui_keeps_multisample_recovery_and_lazy_loading(self):
+        ui = (SCRIPTS / "alfworld_trace_probe.html").read_text()
+        for text in ("/api/new-sample", "/api/select-sample", "/api/recover-snapshot", "/api/snapshot",
+                     "snapshot_version", "snapshotCacheKey", "enrichButton", "repairButton"):
+            self.assertIn(text, ui)
 
     def test_error_post_state_does_not_reuse_stale_context(self):
         env = FakeEnv({})

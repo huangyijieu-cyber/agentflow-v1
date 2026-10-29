@@ -57,6 +57,73 @@ from agentflow.envs.memory import SimpleMemory
 from alfworld.agents.environment import get_environment
 
 
+ALFWORLD_TRACE_INSTRUCTION = (
+    "Based on the applicable environment rules, initial state, and verified "
+    "current state above, describe the current state in relation to the task "
+    "success conditions. A desired condition is not evidence that it is met."
+)
+
+
+def _environment_scalar(value):
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    while isinstance(value, (list, tuple)) and len(value) == 1:
+        value = value[0]
+    return value
+
+
+def _environment_flag(value):
+    value = _environment_scalar(value)
+    if isinstance(value, (bool, int, float)) and value in (0, 1):
+        return bool(value)
+    return None
+
+
+def _goal_tools():
+    # The deterministic parser is lightweight; importing the environment is not
+    # required when converting games or rescoring a previously saved Probe.
+    from agentflow.trace import alfworld
+    return alfworld
+
+
+def _create_trace_environment(base_env, batch_size=1):
+    """Mirror official TW registration, additionally requesting actual facts.
+
+    Do not patch textworld.EnvInfos globally or modify the installed ALFWorld.
+    The wrappers, expert, split randomization and budget match AlfredTWEnv.
+    """
+    import textworld
+    import textworld.gym
+    from alfworld.agents.environment.alfred_tw_env import (
+        AlfredDemangler, AlfredExpert, AlfredInfos,
+    )
+
+    config = base_env.config
+    if config["env"]["type"] != "AlfredTWEnv":
+        raise ValueError("Full-state ALFWorld TRACE requires AlfredTWEnv")
+    randomize = config["env"]["domain_randomization"] if base_env.train_eval == "train" else False
+    wrappers = [AlfredDemangler(shuffle=randomize), AlfredInfos]
+    request_infos = textworld.EnvInfos(
+        won=True, admissible_commands=True, facts=True, last_action=True,
+        extras=["gamefile"],
+    )
+    training_method = config["general"]["training_method"]
+    if training_method == "dqn":
+        budget = config["rl"]["training"]["max_nb_steps_per_episode"]
+    elif training_method == "dagger":
+        budget = config["dagger"]["training"]["max_nb_steps_per_episode"]
+        if base_env.train_eval == "train":
+            wrappers.append(AlfredExpert(expert_type=config["env"]["expert_type"]))
+            request_infos.extras.append("expert_plan")
+    else:
+        raise NotImplementedError(f"Unsupported ALFWorld training method: {training_method}")
+    env_id = textworld.gym.register_games(
+        base_env.game_files, request_infos, batch_size=batch_size,
+        asynchronous=True, max_episode_steps=budget, wrappers=wrappers,
+    )
+    return textworld.gym.make(env_id)
+
+
 def load_config_file(path):
     assert os.path.exists(path), "Invalid config file"
     with open(path) as reader:
@@ -93,7 +160,7 @@ def set_gamefile(info, gamefile):
 
 
 class AlfWorldEnv:
-    def __init__(self, history_length=4, max_step=50):
+    def __init__(self, history_length=4, max_step=50, trace_enabled=None):
         # ====== 延迟导入：确保 JVM 只在 worker 进程内启动 ======
         self.env = None
         self.seed = 44
@@ -112,10 +179,114 @@ class AlfWorldEnv:
         self.prev_admissible_command = [[]]
         self.task = None
         self.gamefile = None
+        if trace_enabled is None:
+            trace_enabled = (
+                "slic" in os.environ.get("ALGORITHM", "grpo+slic").split("+")
+                and os.environ.get("TRACE_ENABLED", "true").lower() not in ("0", "false", "no")
+            )
+        self.trace_enabled = bool(trace_enabled)
+        self.trace_goal_spec = None
+        self.trace_goal_metadata = None
+        self.trace_gt = None
+        self.trace_answer_instruction = ALFWORLD_TRACE_INSTRUCTION
+        self.trace_state_context = None
+        self.trace_state_view = "full_state" if self.trace_enabled else None
+        self.trace_facts = None
+        self.trace_goal_check = None
+        self.trace_goal_check_valid = False
+        self.trace_action_history = []
+        self.trace_scoring_valid = False
 
         # 对应集合
         self._env_instances = {}
         self._env_gamefiles = {}
+
+    def _load_trace_goal(self, info):
+        tools = _goal_tools()
+        self.trace_goal_spec = tools.load_goal_spec(info.get("extra.gamefile"))
+        self.trace_gt = self.trace_goal_spec["goal_response"]
+        self.trace_answer_instruction = self.trace_goal_spec.get(
+            "answer_instruction", ALFWORLD_TRACE_INSTRUCTION)
+        self.trace_goal_metadata = {
+            key: deepcopy(self.trace_goal_spec.get(key))
+            for key in ("gamefile", "goal_source", "goal_task_type", "template_version",
+                        "source_sha256", "goal_ast", "goal_validation_status", "goal_spec_hash")
+        }
+        self.trace_action_history = []
+
+    def _refresh_trace_state(self, info, observation, action=None):
+        """Use simulator facts, never infer execution success from model text."""
+        if not self.trace_enabled:
+            return
+        tools = _goal_tools()
+        raw_facts = info.get("facts")
+        if raw_facts is None:
+            raise RuntimeError("ALFWorld full-state TRACE requires facts=True in environment infos")
+        if isinstance(raw_facts, (list, tuple)) and len(raw_facts) == 1 and isinstance(raw_facts[0], list):
+            raw_facts = raw_facts[0]
+        self.trace_facts = tools.normalize_facts(raw_facts)
+        if not self.trace_facts:
+            raise RuntimeError("ALFWorld full-state TRACE received an empty fact set")
+        if action is not None:
+            last_action = _environment_scalar(info.get("last_action"))
+            self.trace_action_history.append({
+                "action": action, "observation": observation,
+                "environment_last_action": str(last_action) if last_action is not None else None,
+            })
+        self.trace_goal_check = bool(tools.evaluate_goal(self.trace_goal_spec, self.trace_facts))
+        won = _environment_flag(info.get("won"))
+        self.trace_goal_check_valid = won is not None and won == self.trace_goal_check
+        self.trace_scoring_valid = self.trace_goal_check_valid
+        self.trace_state_context = f"Task: {self.task}\n\n" + tools.render_full_state(
+            self.trace_goal_spec, self.trace_facts,
+            observation=observation, action_history=self.trace_action_history,
+        )
+        self._write_trace_info(info)
+        if not self.trace_goal_check_valid:
+            info["trace_goal_diagnostic"] = (
+                f"Goal evaluator={self.trace_goal_check!r}; environment won={won!r}. "
+                "The state is retained for inspection but is invalid for scoring/pairing."
+            )
+
+    def _write_trace_info(self, info):
+        info.update({
+            "trace_full_facts": deepcopy(self.trace_facts),
+            "trace_gt": self.trace_gt,
+            "trace_answer_instruction": self.trace_answer_instruction,
+            "trace_state_view": "full_state",
+            "trace_goal_metadata": deepcopy(self.trace_goal_metadata),
+            "trace_goal_check": self.trace_goal_check,
+            "trace_goal_check_valid": self.trace_goal_check_valid,
+            "trace_scoring_valid": self.trace_scoring_valid,
+        })
+
+    def _trace_failed_action(self, info, action, observation, *, external=False):
+        if not self.trace_enabled:
+            return info
+        info.update({"trace_env_action": action, "terminated": not external,
+                     "truncated": False, "env_error": bool(external)})
+        self.trace_action_history.append({
+            "action": action, "observation": observation,
+            "executed": False, "external_error": bool(external),
+        })
+        if external:
+            self.trace_facts = None
+            self.trace_goal_check = None
+            self.trace_goal_check_valid = False
+            self.trace_scoring_valid = False
+            self.trace_state_context = (
+                "Current full state is unavailable after an environment execution failure.\n"
+                f"Environment observation: {observation}"
+            )
+        else:
+            # Rejected format/illegal actions never reached the simulator, so
+            # its last verified facts remain the actual unchanged state.
+            self.trace_state_context = f"Task: {self.task}\n\n" + _goal_tools().render_full_state(
+                self.trace_goal_spec, self.trace_facts,
+                observation=observation, action_history=self.trace_action_history,
+            )
+        self._write_trace_info(info)
+        return info
 
     def _init_env(self, data_type:str, task_type:str):
         alf_config_path = os.path.join(os.path.dirname(__file__), f"config/config_tw_{task_type}.yaml")
@@ -263,7 +434,7 @@ class AlfWorldEnv:
 
         return action in valid_set
 
-    def reset(self, question_id=None, data_type:str="val_unseen", task_type:str="all"):
+    def reset(self, question_id=None, data_type:str="val_unseen", task_type:str="all", gamefile=None):
         ## 判断 data_type合理性
         if not data_type in ["val_unseen", "val_seen", "train"]:
             raise ValueError(f"Data type ({data_type}) is not exist.")
@@ -279,7 +450,9 @@ class AlfWorldEnv:
         org_gamefiles = self._env_gamefiles[env_key]
 
         # 选择场景
-        if question_id is not None:
+        if gamefile is not None:
+            select_gamefile = [str(_goal_tools().normalize_gamefile(gamefile))]
+        elif question_id is not None:
             if not (0 <= question_id < len(org_gamefiles)):
                 raise IndexError(f"question_id ({question_id}) out of range [0, {len(org_gamefiles)})")
             select_gamefile = [org_gamefiles[question_id]]
@@ -287,7 +460,10 @@ class AlfWorldEnv:
             select_gamefile = [self._rng.choice(org_gamefiles)]
         base_env.game_files = select_gamefile
 
-        self.env = base_env.init_env(batch_size=1)
+        if self.env is not None:
+            self.env.close()
+        self.env = (_create_trace_environment(base_env, batch_size=1) if self.trace_enabled
+                    else base_env.init_env(batch_size=1))
         obs, info = self.env.reset()
         info["observation_text"] = obs
         text_obs = obs[0]
@@ -299,9 +475,11 @@ class AlfWorldEnv:
         info["anchor"] = text_obs
 
         self.task = self._extract_task(text_obs)
-        full_text_obs = self._build_prompt(text_obs, self.prev_admissible_command, init=True)
-
         self.step_count = 0
+        full_text_obs = self._build_prompt(text_obs, self.prev_admissible_command, init=True)
+        if self.trace_enabled:
+            self._load_trace_goal(info)
+            self._refresh_trace_state(info, text_obs)
         return full_text_obs, info
 
     def step(self, response):
@@ -333,6 +511,7 @@ class AlfWorldEnv:
                 "invalid_action": False,
             }
             # return error_obs, -0.01, True, info
+            self._trace_failed_action(info, action, error_obs)
             return error_obs, 0.0, True, info
 
         # 3. 检查动作是否在 admissible_commands 中
@@ -383,13 +562,20 @@ class AlfWorldEnv:
                     "env_error_prev_obs": self.prev_text_obs, # 崩之前的状态
                 }
                 # return error_obs, -0.05, True, info
+                self._trace_failed_action(info, action, error_obs, external=True)
                 return error_obs, 0.0, True, info
 
             if len(result) == 5:
                 next_observation, reward, terminated, truncated, info = result
+                terminated = _environment_flag(terminated) is True
+                truncated = _environment_flag(truncated) is True
                 done = terminated or truncated
             else:
                 next_observation, reward, done, info = result
+                done = _environment_flag(done) is True
+                truncated = _environment_flag((info or {}).get(
+                    "truncated", (info or {}).get("TimeLimit.truncated", False))) is True
+                terminated = done and not truncated
 
             print("next_observation:", next_observation[0] if isinstance(next_observation, list) else next_observation)
 
@@ -411,10 +597,15 @@ class AlfWorldEnv:
             # max_step 截断
             if self.step_count >= self.max_step and not done:
                 done = True
+                truncated = True
                 info["truncated_by_max_step"] = True
 
             info["format_error"] = False
             info["invalid_action"] = False
+            if self.trace_enabled:
+                info.update({"trace_env_action": action, "terminated": terminated,
+                             "truncated": truncated, "env_error": False})
+                self._refresh_trace_state(info, next_text_obs, action)
             return full_next_text_obs, reward, done, info
 
         else:
@@ -436,6 +627,7 @@ class AlfWorldEnv:
                 "invalid_action": True,
             }
             # return error_obs, -0.001, True, info
+            self._trace_failed_action(info, action, error_obs)
             return error_obs, 0.0, True, info
 
     def close(self):

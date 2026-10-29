@@ -10,6 +10,7 @@
 @media(max-width:900px){.summary-grid{grid-template-columns:1fr 1fr}.summary-grid>div:first-child{grid-column:1/-1}.editor-grid{grid-template-columns:1fr}textarea{min-height:180px}.detail-grid,.service-grid{grid-template-columns:1fr}.detail-block.wide{grid-column:auto}.result-controls{width:100%}.card-head{align-items:flex-start;flex-wrap:wrap}}
 @media(max-width:560px){main{padding:20px 14px 50px}header{gap:10px}h1{font-size:22px}.card{padding:17px}.summary-grid{gap:14px}.summary-grid>div:first-child{grid-column:1/-1}.summary-grid>div:last-child{grid-column:1/-1}.parameter-row{align-items:stretch}.parameter-row>.row{width:100%}.parameter-row button{flex:1}.result-controls select{max-width:100%;min-width:0;width:100%}.result-controls>div{flex:1;min-width:150px}.trajectory-head{padding:13px}.detail-row td{padding:13px}th,td{padding:9px 10px}}
 .sample-manager{border:1px solid var(--line);border-radius:11px;padding:15px 17px;margin-bottom:20px;background:#fbfcfa}.sample-picker{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:15px}.sample-picker label,.sample-create label{display:block;color:var(--muted);font-size:11px;font-weight:600}.sample-picker select{min-width:300px;max-width:100%;flex:1}.sample-create{display:flex;flex-wrap:wrap;align-items:end;gap:10px}.sample-create>div{display:flex;flex-direction:column;gap:4px}.sample-create button{min-height:36px}.sample-manager p{margin-top:13px}
+.parameter input[type="checkbox"]{width:18px;height:18px;accent-color:var(--green)}.parameter select{max-width:210px;padding:6px;border:1px solid var(--line);border-radius:7px}
 </style>
 </head>
 <body>
@@ -46,6 +47,7 @@
       <h2 id="sampleHeading"><span class="step">01</span>固定轨迹</h2>
       <div class="row">
         <button id="repairButton" type="button" hidden disabled>从检查点恢复轨迹</button>
+        <button id="enrichButton" type="button" disabled>旧轨迹补全 GT / 完整状态</button>
         <button id="sampleButton" type="button" disabled>采样当前样本</button>
       </div>
     </div>
@@ -70,10 +72,13 @@
     <div class="card-head"><h2 id="probeHeading"><span class="step">02</span>修改评分探针</h2><span id="dirtyState" class="small-text muted">配置尚未加载</span></div>
     <div class="editor-grid">
       <label class="field" for="probePrompt"><span class="field-title"><span>Prompt</span><span>追加在每个 Turn 的状态之后</span></span><textarea id="probePrompt" spellcheck="false" placeholder="输入状态之后追加的评分指令…" disabled></textarea></label>
-      <label class="field" for="probeResponse"><span class="field-title"><span>Response</span><span>固定文本 · teacher forcing 目标</span></span><textarea id="probeResponse" spellcheck="false" placeholder="输入要计算平均 LogP 的固定回答…" disabled></textarea></label>
+      <label class="field" for="probeResponse"><span class="field-title"><span>Response</span><span>{goal_response} 自动填入实际 Goal</span></span><textarea id="probeResponse" spellcheck="false" placeholder="输入要计算平均 LogP 的固定回答…" disabled></textarea></label>
     </div>
     <div class="parameter-row">
       <div class="parameters">
+        <div class="parameter"><label for="stateView">评分视图</label><select id="stateView" disabled><option value="full_state">完整环境状态（含先验）</option><option value="saved">缓存视图 / 旧版对照</option></select></div>
+        <div class="parameter"><label for="terminalFill">QA 终局回填</label><input id="terminalFill" type="checkbox" checked disabled></div>
+        <div class="parameter"><label for="terminalScale">回填系数</label><input id="terminalScale" type="number" value="2" min="0" step="0.1" disabled></div>
         <div class="parameter"><label for="epsilon">ε · NLL offset</label><input id="epsilon" type="number" value="0.1" min="0.000001" step="0.01" disabled></div>
         <div class="parameter"><label for="k">K · 动作窗口</label><input id="k" type="number" value="3" min="1" step="1" disabled></div>
         <div class="parameter"><label for="gamma">γ · 折扣</label><input id="gamma" type="number" value="0.8" min="0" max="1" step="0.05" disabled></div>
@@ -81,7 +86,7 @@
       <div class="row"><button id="saveButton" type="button" disabled>保存探针</button><button id="scoreButton" class="primary" type="button" disabled>保存并重新评分</button></div>
     </div>
     <div class="formula">state + Prompt → 固定 Response 的平均 LogP ℓ → Vₜ = log[(-ℓ₀ + ε) / (-ℓₜ + ε)] → Δₜ = Vₜ₊₁ − Vₜ → K-step 折扣平均</div>
-    <p class="small-text muted" style="margin-top:9px">仅评分固定 Response 的 token。最后动作后的状态也会评分；不添加终局优势回填。每次结果保留当时的探针与分数，便于对照。</p>
+    <p class="small-text muted" style="margin-top:9px">默认 Response 使用 {goal_response}，由实际 PDDL Goal 确定性生成，同题所有状态保持固定。完整状态包含环境先验和隐藏事实，仅评分模型可见。复用 QA：真实终局动作走 outcome，K 包含该动作，末状态只作诊断；默认终局回填开启，系数为 2。旧缓存先点“补全”，只重放已有动作，不调用采样模型。</p>
   </section>
 
   <section class="card" aria-labelledby="resultHeading">
@@ -108,7 +113,7 @@ let state = null, connected = false, dirty = false, editorLoaded = false, pendin
 let selectedRunId = '', selectedCompareId = '', followLatest = true, renderKey = '', noticeTimer = null;
 let activeRun = null, comparisonRun = null, activeSampleId = null, sampleEditorReady = false;
 let snapshotCache = null, snapshotCacheKey = '';
-const editorIds = ['probePrompt', 'probeResponse', 'epsilon', 'k', 'gamma'];
+const editorIds = ['probePrompt', 'probeResponse', 'epsilon', 'k', 'gamma', 'stateView', 'terminalFill', 'terminalScale'];
 const toText = value => typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value, null, 2);
 const first = (...values) => values.find(value => value !== undefined && value !== null);
 const validNumber = value => typeof value === 'number' && Number.isFinite(value);
@@ -132,11 +137,12 @@ async function api(path, body) {
   return data;
 }
 function getProbe() {
-  const probe = {prompt:$('probePrompt').value, response:$('probeResponse').value, epsilon:Number($('epsilon').value), k:Number($('k').value), gamma:Number($('gamma').value)};
+  const probe = {prompt:$('probePrompt').value, response:$('probeResponse').value, epsilon:Number($('epsilon').value), k:Number($('k').value), gamma:Number($('gamma').value), state_view:$('stateView').value, terminal_fill_enabled:$('terminalFill').checked, terminal_fill_scale:Number($('terminalScale').value)};
   if (!probe.response.trim()) throw new Error('Response 不能为空；它是每个状态要评分的固定文本。');
   if (!Number.isFinite(probe.epsilon) || probe.epsilon <= 0) throw new Error('ε 必须大于 0。');
   if (!Number.isInteger(probe.k) || probe.k < 1) throw new Error('K 必须为正整数。');
   if (!Number.isFinite(probe.gamma) || probe.gamma < 0 || probe.gamma > 1) throw new Error('γ 必须在 0 到 1 之间。');
+  if (!Number.isFinite(probe.terminal_fill_scale) || probe.terminal_fill_scale < 0) throw new Error('回填系数必须是非负有限数。');
   return probe;
 }
 function updateControls() {
@@ -149,6 +155,7 @@ function updateControls() {
   $('sampleSelect').disabled = locked;
   $('newSampleButton').disabled = locked;
   ['newRowIndex','newTrajectories','newWorkers','newSeed','newTemperature'].forEach(id => { $(id).disabled = locked; });
+  $('enrichButton').disabled = locked || !(state && state.snapshot && state.snapshot.complete !== false) || !!(state && state.snapshot_error);
   $('saveButton').disabled = locked || !editorLoaded;
   $('scoreButton').disabled = locked || !editorLoaded || !(state && state.snapshot) || state.snapshot.complete === false;
   $('dirtyState').textContent = !editorLoaded ? '配置尚未加载' : dirty ? '有未保存修改' : '已保存';
@@ -159,7 +166,8 @@ function updateControls() {
 function applyEditor(probe) {
   if (!probe || dirty) return;
   $('probePrompt').value = toText(probe.prompt); $('probeResponse').value = toText(probe.response);
-  $('epsilon').value = first(probe.epsilon, 0.1); $('k').value = first(probe.k, 3); $('gamma').value = first(probe.gamma, 0.8); editorLoaded = true;
+  $('epsilon').value = first(probe.epsilon, 0.1); $('k').value = first(probe.k, 3); $('gamma').value = first(probe.gamma, 0.8);
+  $('stateView').value = first(probe.state_view, 'saved'); $('terminalFill').checked = first(probe.terminal_fill_enabled, true); $('terminalScale').value = first(probe.terminal_fill_scale, 2); editorLoaded = true;
 }
 const sampleStatuses = {running:'运行中',error:'出错',corrupt:'轨迹文件损坏',complete:'已完成',partial:'可继续',not_started:'尚未采样'};
 function updateSampleSelector() {
@@ -218,7 +226,7 @@ function renderMetadata() {
   $('sampleButton').textContent = snapshot ? snapshot.complete === false ? '继续采样当前样本' : '轨迹已保存' : '采样当前样本';
   $('sampleNote').textContent = state.snapshot_error ?
     '当前样本的轨迹 JSON 无法解析，旧文件未删除。若存在独立轨迹检查点，可点击“从检查点恢复轨迹”；没有检查点时可先切换其他样本。' :
-    snapshot ? snapshot.complete === false ? '采样尚未完成。继续时会重放并校验已保存的动作；只对未完成部分请求采样模型。' : '当前样本已保存。可切换历史样本，或在上方输入行号创建新样本并发采样；旧记录不会丢失。' :
+    snapshot ? snapshot.complete === false ? '采样尚未完成。继续时会重放并校验已保存的动作；只对未完成部分请求采样模型。' : '当前样本已保存。修改评分不再采样；旧缓存补全只重放已有动作以恢复 GT 和完整状态。可切换历史样本，或在上方输入行号创建新样本并发采样；旧记录不会丢失。' :
     '首次采样会保存原始动作、观测和全部逐步状态。建立缓存后，修改评分文本只会重算 LogP。';
   $('policyModel').textContent = toText(first(policy.model, sampling.model, config.policy_model, '未配置'));
   $('policyUrl').textContent = toText(first(policy.base_url, sampling.base_url, config.policy_base_url, '未配置'));
@@ -226,7 +234,7 @@ function renderMetadata() {
   $('scoreUrl').textContent = scorer.backend === 'hf' ? '本地 Hugging Face · ' + toText(first(scorer.device, 'auto')) : toText(first(scorer.base_url, '未配置'));
   const job = state.job || {}, running = job.status === 'running', isError = job.status === 'error';
   $('jobBox').className = 'job-box' + (running ? ' busy' : '');
-  $('jobTitle').textContent = running ? (job.phase === 'sample' || job.phase === 'sampling' ? '正在采样' : '正在评分固定轨迹') :
+  $('jobTitle').textContent = running ? (job.phase === 'sample' || job.phase === 'sampling' ? '正在采样' : job.phase === 'enrich' ? '正在重放已有动作并补全 GT' : '正在评分固定轨迹') :
     isError ? '本次操作失败' : state.snapshot_error ? '当前样本的轨迹文件损坏' :
     job.status === 'done' ? '操作已完成' : snapshot ? '轨迹已就绪' : '等待采样';
   $('jobTitle').style.color = isError ? 'var(--red)' : 'var(--ink)';
@@ -280,7 +288,7 @@ function findCompareTurn(trajectoryId, index) {
 }
 function renderResults(force) {
   const source = activeRun || state.snapshot;
-  const key = [selectedRunId, selectedCompareId, source && first(source.id, source.snapshot_id, source.created_at), trajectoryList(source).map(t => toText(first(t.trajectory_id,t.id)) + ':' + turnList(t).length + ':' + stateList(t).length).join('|'), !!activeRun, !!comparisonRun].join('::');
+  const key = [selectedRunId, selectedCompareId, source && first(source.id, source.snapshot_id, source.created_at), source && source.enrichment_sha256, trajectoryList(source).map(t => toText(first(t.trajectory_id,t.id)) + ':' + turnList(t).length + ':' + stateList(t).length).join('|'), !!activeRun, !!comparisonRun].join('::');
   if (!force && key === renderKey) return; renderKey = key;
   const trajectories = trajectoryList(source), scored = !!activeRun;
   $('results').replaceChildren();
@@ -302,22 +310,26 @@ function renderResults(force) {
     title.append(node('span', 'outcome ' + (trusted && success === true ? 'good' : trusted && success === false ? 'bad' : ''), !trusted ? '终局不可信' : success === true ? '成功' : success === false ? '失败' : '结果未确认'));
     head.append(title);
     const meta = node('div', 'trajectory-meta'); meta.append(node('span', '', turns.length + ' 个动作'), node('span', '', states.length + ' 个状态'), node('span', '', 'Reward ' + (validNumber(outcome.reward) ? String(outcome.reward) : '—'))); if (outcome.reason) meta.append(node('span', '', outcome.reason)); head.append(meta);
-    if (trajectory.goal) head.append(node('p', 'goal', trajectory.goal)); card.append(head);
+    if (trajectory.goal) head.append(node('p', 'goal', trajectory.goal));
+    const goalInfo = node('details', 'terminal'); goalInfo.append(node('summary', '', '目标与来源 · ' + first(trajectory.goal_task_type, '旧缓存 / 手动对照') + ' · ' + first(trajectory.state_view, '缓存视图')));
+    goalInfo.append(detailBlock('固定 Goal Response', first(trajectory.resolved_response, trajectory.goal_response, '尚未补全，可使用旧版手工 Response 对照')), detailBlock('确定性规则来源与校验', trajectory.goal_metadata || trajectory.goal_source || '无 Goal 元数据'));
+    head.append(goalInfo); card.append(head);
     const scroll = node('div', 'table-scroll'), table = node('table'), thead = node('thead'), header = node('tr');
-    ['Turn', '实际动作', 'Mean LogP', 'Vₜ', 'Δₜ', 'Credit'].concat(selectedCompareId ? ['对比 Credit', 'Δcredit'] : []).concat(['明细']).forEach((label, index) => header.append(node('th', index === 1 ? 'action-col' : '', label))); thead.append(header); table.append(thead); const tbody = node('tbody');
+    ['Turn', '实际动作', '路由', 'Mean LogP', 'Vₜ', 'Δₜ', 'Local credit', '终局回填', 'Effective credit'].concat(selectedCompareId ? ['对比 Credit', 'Δcredit'] : []).concat(['明细']).forEach((label, index) => header.append(node('th', index === 1 ? 'action-col' : '', label))); thead.append(header); table.append(thead); const tbody = node('tbody');
     turns.forEach((turn, position) => {
       const index = first(turn.turn_index, position), before = states.find((item, i) => first(item.state_index, i) === index) || states[position] || {}, after = states.find((item, i) => first(item.state_index, i) === index + 1) || states[position + 1] || {};
       const row = node('tr', 'turn-row'); row.append(node('td', '', 't=' + index)); row.append(node('td', 'action-col', first(turn.action, turn.action_response, '—')));
-      row.append(valueCell(first(turn.mean_logp, before.mean_logp), false), valueCell(first(turn.value, before.value), false), valueCell(turn.delta, true), valueCell(turn.credit, true));
+      row.append(node('td', '', first(turn.label_source, turn.trace_turn_type, '—')), valueCell(first(turn.mean_logp, before.mean_logp), false), valueCell(first(turn.value, before.value), false), valueCell(turn.delta, true), valueCell(turn.local_credit, true), valueCell(turn.terminal_fill, true), valueCell(turn.credit, true));
       if (selectedCompareId) { const other = findCompareTurn(id, index), compared = other && other.credit; row.append(valueCell(compared, true), valueCell(validNumber(turn.credit) && validNumber(compared) ? turn.credit - compared : null, true)); }
       const buttonCell = node('td'), button = node('button', 'small', '查看'); button.type = 'button'; button.setAttribute('aria-expanded', 'false'); buttonCell.append(button); row.append(buttonCell); tbody.append(row);
-      const detailsRow = node('tr', 'detail-row'); detailsRow.hidden = true; const detailsCell = node('td'); detailsCell.colSpan = selectedCompareId ? 9 : 7;
-      const errors = [errorMessage(turn), errorMessage(before)].filter(Boolean); if (turn.external_error) errors.unshift('外部执行故障：该动作及受影响信用窗口不可用。'); if (scored && !validNumber(turn.credit) && !errors.length) errors.push('此动作信用无效；检查状态评分、连续性和窗口边界。'); if (errors.length) detailsCell.append(node('p', 'error-text', Array.from(new Set(errors)).join('\n')));
+      const detailsRow = node('tr', 'detail-row'); detailsRow.hidden = true; const detailsCell = node('td'); detailsCell.colSpan = selectedCompareId ? 12 : 10;
+      const errors = [errorMessage(turn), errorMessage(before)].filter(Boolean); if (turn.external_error) errors.unshift('外部执行故障：该动作及受影响信用窗口不可用。'); if (scored && turn.label_source !== 'outcome' && !validNumber(turn.credit) && !errors.length) errors.push('此动作信用无效；检查状态评分、连续性和窗口边界。'); if (errors.length) detailsCell.append(node('p', 'error-text', Array.from(new Set(errors)).join('\n')));
       const grid = node('div', 'detail-grid');
+      if (turn.label_source === 'outcome') grid.append(detailBlock('终局路由', {outcome_valid:turn.outcome_valid, outcome_advantage:turn.outcome_advantage, is_final:turn.is_final}, true));
       grid.append(detailBlock('原动作 Prompt · 实际生成输入', turn.action_prompt), detailBlock('原动作 Response · 模型实际回答', turn.action_response));
       grid.append(detailBlock('完整评分 Prompt · 状态 + 可编辑 Prompt', first(turn.scoring_prompt, before.scoring_prompt)), detailBlock('固定评分 Response · 只对这段文本计 LogP', first(turn.response, before.response)));
       const renderedPrompt = first(turn.scoring_rendered_prompt, before.scoring_rendered_prompt); if (renderedPrompt) grid.append(foldedBlock('查看 chat template 后实际送入评分模型的 Prompt', renderedPrompt));
-      if (after.state_context || after.scoring_prompt) grid.append(detailBlock('动作后状态 · 用于下一状态价值', first(after.state_context, after.scoring_prompt), true));
+      if (after.state_context || after.scoring_prompt) grid.append(detailBlock('动作后状态 · 末状态仅作诊断', first(after.state_context, after.scoring_prompt), true));
       if (Array.isArray(before.token_logps)) grid.append(detailBlock('Response 逐 token LogP', before.token_logps, true));
       detailsCell.append(grid); detailsRow.append(detailsCell); tbody.append(detailsRow);
       button.addEventListener('click', () => { detailsRow.hidden = !detailsRow.hidden; button.textContent = detailsRow.hidden ? '查看' : '收起'; button.setAttribute('aria-expanded', String(!detailsRow.hidden)); row.classList.toggle('active', !detailsRow.hidden); });
@@ -368,6 +380,7 @@ async function mutate(path, getBody, successMessage) {
 editorIds.forEach(id => $(id).addEventListener('input', () => { dirty = true; updateControls(); }));
 $('saveButton').addEventListener('click', () => mutate('/api/config', () => ({probe:getProbe()}), '评分探针已保存。'));
 $('sampleButton').addEventListener('click', () => { if (state && state.snapshot && state.snapshot.complete !== false) return; mutate('/api/sample', () => ({}), state && state.snapshot ? '已提交继续采样；已保存的动作会重放校验，不重新请求。' : '首次采样任务已提交，完成后即可反复复用轨迹。'); });
+$('enrichButton').addEventListener('click', () => mutate('/api/enrich', () => ({}), '已提交补全：仅重放已有动作，原始轨迹文件保持不变。'));
 $('scoreButton').addEventListener('click', () => mutate('/api/score', () => ({probe:getProbe()}), '评分任务已提交；仅使用已保存的轨迹。'));
 $('repairButton').addEventListener('click', () => {
   if (!window.confirm('从保存的逐轨迹检查点恢复当前样本？恢复前会备份损坏的 trajectories.json。')) return;
