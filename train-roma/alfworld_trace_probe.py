@@ -93,12 +93,84 @@ def jsonable(value):
 
 
 def atomic_json(path, value):
+    """Durable replace with disk verification and a last-known-good trajectory backup.
+
+    A large full-state snapshot can exceed tens of MB. The old implementation
+    replaced it without syncing or verifying the temporary file. All writes
+    now go through a verified temporary file, with a backup of the last valid
+    merged trajectory snapshot. Checkpoints still remain independent.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Compact encoding significantly reduces repeated multi-MB checkpoint I/O.
+    payload = (json.dumps(jsonable(value), ensure_ascii=False, separators=(",", ":"),
+                          allow_nan=False) + "\n").encode("utf-8")
     temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-    temp.write_text(json.dumps(jsonable(value), ensure_ascii=False, indent=2,
-                               allow_nan=False) + "\n", encoding="utf-8")
-    os.replace(temp, path)
+    protect = path.name == "trajectories.json"
+    backup = path.with_name(path.name + ".lastgood.bak")
+    backup_temp = backup.with_name(backup.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        with temp.open("xb") as stream:
+            written = stream.write(payload)
+            if written != len(payload):
+                raise OSError(f"Short JSON write: {written}/{len(payload)} bytes to {temp}")
+            stream.flush()
+            os.fsync(stream.fileno())
+        if temp.stat().st_size != len(payload):
+            raise OSError(
+                f"Snapshot truncated during write: expected {len(payload)} bytes, "
+                f"got {temp.stat().st_size}, file={temp}"
+            )
+        # The expensive JSON readback is confined to merged snapshots, which
+        # are written only as rollouts finish; per-turn worker checkpoints use
+        # fsync + length verification to avoid an extra large read every turn.
+        if protect:
+            try:
+                with temp.open("r", encoding="utf-8") as reader:
+                    json.load(reader)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise OSError(f"Temporary snapshot failed JSON validation: {temp}: {exc}") from exc
+            if path.is_file():
+                try:
+                    with path.open("r", encoding="utf-8") as reader:
+                        json.load(reader)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    # Preserve the broken original, not overwrite a good backup.
+                    raise RuntimeError(
+                        f"Existing snapshot is invalid: {path}. Use the recovery "
+                        "button before sampling again; original file was not overwritten."
+                    )
+                # Copy/link the last complete version before promoting the new
+                # snapshot. The backup name is stable to avoid unbounded growth.
+                try:
+                    os.link(path, backup_temp)
+                except OSError:
+                    shutil.copyfile(path, backup_temp)
+                    with backup_temp.open("rb") as stream:
+                        os.fsync(stream.fileno())
+                os.replace(backup_temp, backup)
+        os.replace(temp, path)
+        # Durability of the rename itself requires syncing the directory.
+        try:
+            dirfd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dirfd)
+            finally:
+                os.close(dirfd)
+        except OSError:
+            # Some mounted storage cannot fsync directories. File-level fsync
+            # and the last-good backup still provide protection.
+            pass
+    except Exception as exc:
+        if isinstance(exc, OSError):
+            raise OSError(
+                f"Failed to save {path} ({len(payload):,} bytes): {exc}. "
+                "Check filesystem free space, inode/quota limits and mount type."
+            ) from exc
+        raise
+    finally:
+        temp.unlink(missing_ok=True)
+        backup_temp.unlink(missing_ok=True)
 
 
 def read_json(path, default=None):
