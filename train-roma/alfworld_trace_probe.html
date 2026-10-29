@@ -192,7 +192,7 @@ function resetForSampleChange() {
   selectedRunId = ''; selectedCompareId = ''; followLatest = true; renderKey = '';
   activeRun = null; comparisonRun = null; dirty = false; editorLoaded = false;
   sampleEditorReady = false;
-  $('runSelect').dataset.key = '';
+  $('runSelect').dataset.key = '__force_refresh__';
   $('notice').hidden = true;
 }
 function renderMetadata() {
