@@ -6,6 +6,16 @@ ROOT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 export ROOT_PATH
 cd "${ROOT_PATH}"
 
+# The active Python environment is normally inherited. Allow an optional
+# per-server Python bin directory without binding the script to one user.
+if [[ -n "${AGENTFLOW_PYTHON_BIN:-}" ]]; then
+    if [[ ! -d "${AGENTFLOW_PYTHON_BIN}" ]]; then
+        echo "[startup] Missing Python bin directory: ${AGENTFLOW_PYTHON_BIN}" >&2
+        exit 1
+    fi
+    export PATH="${AGENTFLOW_PYTHON_BIN}:${PATH}"
+fi
+
 # Select the actual task before proxy setup, dependency installation or Ray.
 # Explicit TASK wins over env.TASK in config.yaml. Invalid YAML/tasks fail closed.
 TASK_CONFIG="${ROOT_PATH}/train-roma/config.yaml"
@@ -103,23 +113,31 @@ export HCCL_DETERMINISTIC=false
 # ==========================================
 export TE_PARALLEL_COMPILER=8
 
-## 可调整
-export MOXING_PATH="${ROOT_PATH}/../../data/moxing"
-
-## MODEL_PATH
-if [ -z "$MODEL_PATH" ]; then
-    MODEL_PATH="/home/ma-user/work/Qwen3-4B-Instruct-2507"
-    echo "Set model path: ${MODEL_PATH}"
-fi
+## Repository-relative defaults; override them for external model/data mounts.
+export MOXING_PATH="${MOXING_PATH:-${ROOT_PATH}/../../data/moxing}"
+export MODEL_PATH="${MODEL_PATH:-${ROOT_PATH}/../Qwen3-4B-Instruct-2507}"
+echo "Model path: ${MODEL_PATH}"
 
 ## ======== 启动 ASCEND 环境 ==============
-source /usr/local/Ascend/driver/bin/setenv.bash
-export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64/common:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64/driver/:$LD_LIBRARY_PATH
-
-source /usr/local/Ascend/cann/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/cann/nnal/atb/set_env.sh
+# Ascend drivers/toolkits are system installations, not repository files.
+# Use ASCEND_ROOT when a different server installs them elsewhere.
+ASCEND_ROOT="${ASCEND_ROOT:-${ASCEND_INSTALL_ROOT:-/usr/local/Ascend}}"
+if [[ ! -f "${ASCEND_ROOT}/driver/bin/setenv.bash" ]]; then
+    echo "[startup] Missing Ascend driver environment: ${ASCEND_ROOT}/driver/bin/setenv.bash" >&2
+    exit 1
+fi
+source "${ASCEND_ROOT}/driver/bin/setenv.bash"
+export LD_LIBRARY_PATH="${ASCEND_ROOT}/driver/lib64/driver:${ASCEND_ROOT}/driver/lib64/common:${ASCEND_ROOT}/driver/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+for ascend_script in \
+    "${ASCEND_ROOT}/cann/ascend-toolkit/set_env.sh" \
+    "${ASCEND_ROOT}/cann/nnal/atb/set_env.sh"; do
+    if [[ ! -f "${ascend_script}" ]]; then
+        echo "[startup] Ascend environment script not found: ${ascend_script}" >&2
+        echo "[startup] Set ASCEND_ROOT to the Ascend installation directory." >&2
+        exit 1
+    fi
+    source "${ascend_script}"
+done
 
 export MY_IP=$(hostname -I | awk '{print $1}')
 echo "MyIP: ${MY_IP}"
@@ -127,22 +145,23 @@ export no_proxy="${MY_IP},${no_proxy}"
 echo "no_proxy=${no_proxy}"
 
 ## =======  执行资源 ==============
-export PATH=$PATH:/root/miniconda3/envs/agent_flow/bin
+# Use Python from the activated environment (or AGENTFLOW_PYTHON_BIN above).
 
-# ## 模型迁移（所有节点都需要访问模型）
-# if [ -e "/cache/model" ]; then
-#     echo "/cache/model文件已存在"
+# ## 模型迁移（所有节点都需要访问模型；默认保持禁用）
+# MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-${ROOT_PATH}/.cache/model}"
+# if [ -e "${MODEL_CACHE_DIR}" ]; then
+#     echo "${MODEL_CACHE_DIR} 文件已存在"
 # else
-#     echo "/cache/model文件不存在，需要迁移"
-#     cd ${MOXING_PATH}
-#     python mox_copy.py --src-dir ${MODEL_PATH} --target-dir /cache/model
+#     echo "${MODEL_CACHE_DIR} 文件不存在，需要迁移"
+#     cd "${MOXING_PATH}"
+#     python mox_copy.py --src-dir "${MODEL_PATH}" --target-dir "${MODEL_CACHE_DIR}"
 # fi
 
 # model_name=$(basename "${MODEL_PATH}")
 # model_path="${ROOT_PATH}/${model_name}"
-# echo "fetch ${model_path} from /cache/model" 
-# ln -sf /cache/model "${model_path}"
-# echo "ln -sf from [/cache/model] to [${model_path}]"
+# echo "fetch ${model_path} from ${MODEL_CACHE_DIR}"
+# ln -sf "${MODEL_CACHE_DIR}" "${model_path}"
+# echo "ln -sf from [${MODEL_CACHE_DIR}] to [${model_path}]"
 
 ## 安装agentflow（所有节点）
 echo "正在安装 agentflow..."
@@ -246,8 +265,10 @@ except Exception as e:
     # Head节点：启动所有服务
     # ==========================================
     export TIME_STR=$(date +"%y%m%d-%H%M%S")
-    export LOG_DIR_PREFIX="/home/ma-user/modelarts/log/${TIME_STR}_RL"
-    mkdir -p ${LOG_DIR_PREFIX}
+    # Default to repository-local logs; override LOG_BASE_DIR for persistent storage.
+    LOG_BASE_DIR="${LOG_BASE_DIR:-${ROOT_PATH}/logs}"
+    export LOG_DIR_PREFIX="${LOG_DIR_PREFIX:-${LOG_BASE_DIR}/${TIME_STR}_RL}"
+    mkdir -p -- "${LOG_DIR_PREFIX}"
     echo "Create: ${LOG_DIR_PREFIX}"
     
     # 导出Ray地址供子脚本使用
