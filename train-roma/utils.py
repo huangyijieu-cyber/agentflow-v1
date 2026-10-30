@@ -30,7 +30,23 @@ def load_and_set_env_from_yaml(config_file_path: str):
             # Convert non-string values to string.
             str_val = str(value)            
             start_prefix = "${env:"
-            if str_val.startswith(start_prefix) and "," in str_val:
+            if key == "TASK":
+                # Match the shell task resolver even for literal YAML TASKs.
+                # Import locally so this loader remains independently usable.
+                import re as task_re
+                task_value = os.environ["TASK"] if "TASK" in os.environ else value
+                if "TASK" not in os.environ and isinstance(task_value, str):
+                    match = task_re.fullmatch(r"\$\{env:([A-Za-z_][A-Za-z0-9_]*),(.*?)\}", task_value.strip())
+                    if match is not None:
+                        variable, default = match.groups()
+                        task_value = os.environ.get(variable, default)
+                if not isinstance(task_value, str):
+                    raise ValueError("TASK must be a nonempty task name")
+                str_val = task_value.strip().lower()
+                if task_re.fullmatch(r"[a-z][a-z0-9_-]*", str_val) is None:
+                    raise ValueError("TASK must be a nonempty task name containing letters, digits, '_' or '-'")
+                print(f"  Exported TASK={str_val}")
+            elif str_val.startswith(start_prefix) and "," in str_val:
                 env_variable = str_val.split(",")[0][len(start_prefix):]
                 env_default = str_val.split(",")[1][:-len("}")]
                 org_val = str_val

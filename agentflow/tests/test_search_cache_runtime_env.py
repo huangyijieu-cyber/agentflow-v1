@@ -17,7 +17,7 @@ class SearchCacheRuntimeEnvTests(unittest.TestCase):
         cls.select_env = staticmethod(scope[node.name])
         cls.ppo_node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_ppo")
 
-    def run_ppo_with_fake_ray(self, initialized):
+    def run_ppo_with_fake_ray(self, initialized, config=None):
         ray, task_runner = Mock(), Mock()
         ray.is_initialized.return_value = initialized
         # The cache branch also supports optional validation timing reports.
@@ -25,7 +25,7 @@ class SearchCacheRuntimeEnvTests(unittest.TestCase):
         ray.get.return_value = None
         scope = {"os": os, "ray": ray, "TaskRunner": task_runner, "_search_cache_env_vars": self.select_env}
         exec(compile(ast.Module(body=[self.ppo_node], type_ignores=[]), "entrypoint.py", "exec"), scope)
-        scope["run_ppo"](None)
+        scope["run_ppo"](config)
         return ray, task_runner
 
     def test_enabled_forwards_client_config_without_upstream_credentials(self):

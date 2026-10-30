@@ -647,10 +647,8 @@ class RolloutAgent(LitAgent):
 if __name__ == "__main__":
     from util.parse_config import get_values_from_yaml
     from util.port_cleanup import kill_process_on_port
-    from util.get_pub_ip import get_public_ip_with_fallback
     from pprint import pprint
 
-    # server_public_ip = get_public_ip_with_fallback()
     server_public_ip = "127.0.0.1"
 
     print(f"server_public_ip: {server_public_ip}")

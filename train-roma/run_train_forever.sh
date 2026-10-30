@@ -1,4 +1,18 @@
 #!/bin/bash
+# Resolve task routing before loading any search-only component.
+export ROOT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)" || exit 1
+cd "${ROOT_PATH}" || exit 1
+source "${ROOT_PATH}/train-roma/task_network.sh" || exit 1
+agentflow_resolve_task || exit 1
+if agentflow_task_needs_search; then
+    :
+else
+    _agentflow_network_status=$?
+    if [[ "${_agentflow_network_status}" -ne 1 ]]; then exit "${_agentflow_network_status}"; fi
+    agentflow_disable_search_components
+    echo "[network] TASK=${TASK}: search proxy, cache and SSH tunnel disabled."
+fi
+
 #set -x
 
 ## =============== 昇腾环境变量 ============================
@@ -165,7 +179,6 @@ export HCCL_DETERMINISTIC=false
 export TE_PARALLEL_COMPILER=8
 
 ## 可调整
-export ROOT_PATH=$(pwd)
 export MOXING_PATH="${ROOT_PATH}/../../data/moxing"
 
 ## MODEL_PATH
@@ -213,7 +226,7 @@ cd ..
 
 # =============== 启动服务并进入监控 ===============
 
-if [[ "${SEARCH_CACHE_ENABLED:-}" =~ ^(1|true|True|TRUE|yes|YES|on|ON)$ ]] || { [[ -z "${SEARCH_CACHE_ENABLED+x}" ]] && [[ -n "${SEARCH_CACHE_ENV_FILE:-}" || -f "${ROOT_PATH}/train-roma/search-cache.local.env" ]]; }; then
+if agentflow_task_needs_search && { [[ "${SEARCH_CACHE_ENABLED:-}" =~ ^(1|true|True|TRUE|yes|YES|on|ON)$ ]] || { [[ -z "${SEARCH_CACHE_ENABLED+x}" ]] && [[ -n "${SEARCH_CACHE_ENV_FILE:-}" || -f "${ROOT_PATH}/train-roma/search-cache.local.env" ]]; }; }; then
     source "${ROOT_PATH}/train-roma/enable_search_cache.sh" || exit 1
 fi
 

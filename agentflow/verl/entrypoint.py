@@ -15,8 +15,28 @@ def main(config):
     run_ppo(config)
 
 
-def _search_cache_env_vars():
+def _search_cache_env_vars(task=None):
     """Propagate explicitly configured search routing to Ray actors."""
+    selected_task = str(task if task is not None else os.environ.get("TASK", "")).strip().lower()
+    if selected_task in {"alfworld", "webshop", "rule"}:
+        disabled = {"SEARCH_CACHE_ENABLED": "0", "SEARCH_PROXY_ENABLED": "0",
+                    "SEARCH_CACHE_AUTO_START": "0", "SEARCH_CACHE_AUTO_TUNNEL": "0"}
+        # Runtime env overrides also cover inherited settings in an already
+        # running Ray cluster, but only for this checkout's managed proxy.
+        managed_url = os.environ.get("AGENTFLOW_SEARCH_PROXY_URL", "")
+        if managed_url:
+            for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                if os.environ.get(name) == managed_url:
+                    disabled[name] = ""
+        managed_path = os.environ.get("PROXY_PY_DIR", "")
+        python_paths = os.environ.get("PYTHONPATH", "").split(os.pathsep)
+        if managed_path and managed_path in python_paths:
+            disabled["PYTHONPATH"] = os.pathsep.join(path for path in python_paths if path != managed_path)
+        if any(name in os.environ for name in
+               ("AGENTFLOW_SEARCH_PROXY_ACTIVE", "AGENTFLOW_SEARCH_PROXY_URL", "PROXY_PY_DIR")):
+            disabled.update({"AGENTFLOW_SEARCH_PROXY_ACTIVE": "0",
+                             "AGENTFLOW_SEARCH_PROXY_URL": "", "PROXY_PY_DIR": ""})
+        return disabled
     names = (
         "SEARCH_CACHE_ENABLED", "SEARCH_CACHE_BASE_URL", "SEARCH_CACHE_TOKEN",
         "SEARCH_CACHE_CONNECT_TIMEOUT_SECONDS", "SEARCH_CACHE_READ_TIMEOUT_SECONDS",
@@ -29,7 +49,9 @@ def _search_cache_env_vars():
 
 
 def run_ppo(config) -> None:
-    worker_env = _search_cache_env_vars()
+    data_config = getattr(config, "data", None) if config is not None else None
+    configured_task = data_config.get("task") if data_config is not None else None
+    worker_env = _search_cache_env_vars(configured_task)
     # Explicit propagation also covers an already initialized/external Ray cluster.
     if "ALFWORLD_TRACE_GOALS" in os.environ:
         worker_env["ALFWORLD_TRACE_GOALS"] = os.environ["ALFWORLD_TRACE_GOALS"]

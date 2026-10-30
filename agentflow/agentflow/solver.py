@@ -552,6 +552,7 @@ def construct_solver(llm_engine_name : str = "gpt-4o",
                      task: str = "qa"
                      ):
 
+    task = str(task).strip().lower()
     # Parse model_engine configuration
     # Format: [planner_main, planner_fixed, verifier, executor]
     # "trainable" means use llm_engine_name (the trainable model)
@@ -563,14 +564,21 @@ def construct_solver(llm_engine_name : str = "gpt-4o",
     verifier_is_train = True if model_engine[2] == "trainable" else False
     executor_is_train = True if model_engine[3] == "trainable" else False
 
-    # Instantiate Initializer
-    initializer = Initializer(
-        enabled_tools=enabled_tools,
-        tool_engine=tool_engine,
-        model_string=llm_engine_name,
-        verbose=verbose,
-        vllm_config_path=vllm_config_path,
-    )
+    # Environment tasks act through their own env, not the QA search toolbox.
+    # Avoid importing/constructing search clients and their network settings.
+    if task in ("alfworld", "webshop", "rule"):
+        toolbox_metadata, available_tools, tool_instances_cache = {}, [], {}
+    else:
+        initializer = Initializer(
+            enabled_tools=enabled_tools,
+            tool_engine=tool_engine,
+            model_string=llm_engine_name,
+            verbose=verbose,
+            vllm_config_path=vllm_config_path,
+        )
+        toolbox_metadata = initializer.toolbox_metadata
+        available_tools = initializer.available_tools
+        tool_instances_cache = initializer.tool_instances_cache
     
     print("llm_engine_name:", llm_engine_name)
     print("planner_main_engine:", planner_main_engine)
@@ -582,8 +590,8 @@ def construct_solver(llm_engine_name : str = "gpt-4o",
     planner = Planner(
         llm_engine_name=planner_main_engine,
         llm_engine_fixed_name=planner_fixed_engine,
-        toolbox_metadata=initializer.toolbox_metadata,
-        available_tools=initializer.available_tools,
+        toolbox_metadata=toolbox_metadata,
+        available_tools=available_tools,
         verbose=verbose,
         base_url=base_url,
         temperature=temperature
@@ -594,8 +602,8 @@ def construct_solver(llm_engine_name : str = "gpt-4o",
     verifier = Verifier(
         llm_engine_name=verifier_engine,
         llm_engine_fixed_name=planner_fixed_engine,
-        toolbox_metadata=initializer.toolbox_metadata,
-        available_tools=initializer.available_tools,
+        toolbox_metadata=toolbox_metadata,
+        available_tools=available_tools,
         verbose=verbose,
         base_url=base_url if verifier_engine == llm_engine_name else None,
         temperature=temperature if verifier_is_train else 0.0
@@ -611,7 +619,7 @@ def construct_solver(llm_engine_name : str = "gpt-4o",
         verbose=verbose,
         base_url=base_url if executor_engine == llm_engine_name else None,  # Only use base_url for trainable model
         temperature=temperature if executor_is_train else 0.0,
-        tool_instances_cache=initializer.tool_instances_cache  # Pass the cached tool instances
+        tool_instances_cache=tool_instances_cache
     )
 
     # Instantiate Solver

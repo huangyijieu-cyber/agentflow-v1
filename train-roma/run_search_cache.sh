@@ -29,7 +29,7 @@ fi
 # Keep the current EC2 -> personal host egress chain. Set this to 0 if the
 # service environment already supplies HTTP_PROXY/HTTPS_PROXY itself.
 if [[ "${SEARCH_SERVICE_USE_PROXY:-1}" == "1" ]]; then
-    source "${_search_repo_dir}/train-roma/enable_search_proxy.sh"
+    source "${_search_repo_dir}/train-roma/enable_search_proxy.sh" --service
 fi
 
 export PYTHONPATH="${_search_repo_dir}/agentflow${PYTHONPATH:+:${PYTHONPATH}}"
