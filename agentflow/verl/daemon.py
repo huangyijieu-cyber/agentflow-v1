@@ -844,6 +844,7 @@ class AgentModeDaemon:
         anchor_list, traj_id_list, active_mask_list = [], [], []
         turn_valid_list, turn_dup_list = [], []   # DPO pair chosen 端质量标记
         trace_state_contexts, trace_turn_types, trace_original_turns = [], [], []
+        trace_next_contexts, trace_next_valids, trace_terminal_flags = [], [], []
         trace_ground_truths, trace_valid_list, trace_action_keys = [], [], []
         trace_answer_instructions, trace_goal_metadata, trace_state_views, trace_tasks = [], [], [], []
         trace_scoring_valids, trace_goal_checks, trace_goal_check_valids = [], [], []
@@ -933,6 +934,11 @@ class AgentModeDaemon:
                 if is_alfworld and not scoring_valid:
                     state_context = None
                 trace_state_contexts.append(state_context)
+                next_valid = trace_metadata.get("trace_next_scoring_valid") is True
+                next_context = trace_metadata.get("trace_next_state_context")
+                trace_next_contexts.append(next_context if next_valid else None)
+                trace_next_valids.append(next_valid)
+                trace_terminal_flags.append(bool(trace_metadata.get("trace_is_terminal", False)))
                 trace_turn_types.append(trace_metadata.get("trace_turn_type", "unknown"))
                 # Retain original numbering even when an empty turn is skipped.
                 trace_original_turns.append(trace_metadata.get("trace_original_turn", turn_index))
@@ -959,7 +965,8 @@ class AgentModeDaemon:
                 except (TypeError, ValueError, OverflowError):
                     outcome_reward = float("nan")
                 trace_outcome_rewards.append(outcome_reward)
-                outcome_role = (trace_turn_types[-1] == "analysis" or trace_final_flags[-1])
+                outcome_role = (not is_alfworld and
+                                (trace_turn_types[-1] == "analysis" or trace_final_flags[-1]))
                 trace_valid_list.append(bool(
                     _f.get("trace_valid", _f.get("valid", True))
                     and not _f.get("trace_dup", _f.get("dup", False))
@@ -1045,6 +1052,9 @@ class AgentModeDaemon:
         data_proto.non_tensor_batch["turn_valid_list"] = np.array(turn_valid_list)
         data_proto.non_tensor_batch["turn_dup_list"] = np.array(turn_dup_list)
         data_proto.non_tensor_batch["trace_state_context"] = np.array(trace_state_contexts, dtype=object)
+        data_proto.non_tensor_batch["trace_next_state_context"] = np.array(trace_next_contexts, dtype=object)
+        data_proto.non_tensor_batch["trace_next_scoring_valid"] = np.array(trace_next_valids, dtype=bool)
+        data_proto.non_tensor_batch["trace_is_terminal"] = np.array(trace_terminal_flags, dtype=bool)
         data_proto.non_tensor_batch["trace_turn_type"] = np.array(trace_turn_types, dtype=object)
         data_proto.non_tensor_batch["trace_action_key"] = np.array(trace_action_keys, dtype=object)
         data_proto.non_tensor_batch["trace_original_turn"] = np.array(trace_original_turns, dtype=np.int64)

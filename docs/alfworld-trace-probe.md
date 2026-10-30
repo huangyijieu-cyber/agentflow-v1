@@ -2,7 +2,7 @@
 
 入口：train-roma/alfworld_trace_probe.py。
 
-当前默认使用“离线实际 PDDL → 保存的固定英文 GT → 完整环境状态评分”，并与 QA 共用终局路由和回填。转换来源、正式训练接入及配置见 [alfworld-trace-goals.md](alfworld-trace-goals.md)。
+当前默认使用“离线实际 PDDL → 保存的固定英文 GT → 完整环境状态评分”，所有环境动作统一进行 TRACE 配对，并使用真实终局结果回填。转换来源、正式训练接入及配置见 [alfworld-trace-goals.md](alfworld-trace-goals.md)。
 
 默认选 data/train/alfworld/train_all_alfworld_3305.parquet 第 0 行，即 train_all_alfworld_0；从 question 解析环境编号 0，而不是使用该行的 id=1。同一题采样 4 条轨迹，每条最多 50 个动作，策略 temperature=0.7、history_length=4。
 
@@ -28,7 +28,7 @@ python train-roma/alfworld_trace_probe.py \
 
 1. 点击“首次采样 4 条轨迹”，完成后检查原始轨迹。也可在样本管理中指定数据行和采样参数，新建另一个样本。默认 4 个独立环境进程并行采样，`--workers 1` 可串行运行。
 2. 在两个文本框中修改 Prompt 和固定 Response，点击“保存并重新评分”。
-3. 逐轨迹检查每个 Turn 的 Mean LogP、V、local credit、terminal fill 和 effective credit；最后动作查看 outcome 路由。
+3. 逐轨迹检查每个 Turn 的 Mean LogP、V、local credit、terminal fill 和 effective credit；最后动作也查看其真实状态转移信用。
 4. 展开明细，查看原动作 Prompt/Response、完整评分 Prompt/Response、chat 模板实际输入和动作后状态。
 5. 选择历史评分作为对照，查看同一动作的 credit 变化；可导出 JSON、CSV 和离线 HTML 报告。
 
@@ -172,7 +172,7 @@ Prompt 支持 {goal}、{goal_response}、{remaining_steps}、{turn_index} 占位
 
 ## TRACE 计算口径
 
-调用现有 agentflow/agentflow/trace/credit.py 的 state_values 和 discounted_credits：
+调用 agentflow/agentflow/trace/credit.py 的 state_values 和 annotate_environment_credits：
 
 ```text
 ell_t   = 固定 Response 的平均 token LogP
@@ -181,9 +181,9 @@ delta_t = V_(t+1) - V_t
 credit_t = sum(gamma**j * delta_(t+j)) / sum(gamma**j)
 ```
 
-默认 epsilon=0.1、K=3、gamma=0.8。真实终局环境动作与 QA 的最终回答一样走 base/outcome，前面的动作走 tool_plan/TRACE。T 个动作仍保存 T+1 个真实状态，最后动作后状态可评分以诊断，但不会额外参与信用转移。
+默认 epsilon=0.1、K=3、gamma=0.8。所有真实环境动作统一为 tool_plan/TRACE，不单独隔离首轮或末轮，也不新增 final_answer turn。T 个动作保存 T+1 个真实状态，末状态用于计算最后一次动作的真实 `V_next - V`；它没有模型回答，不作为额外配对候选。
 
-终局优势按同题可靠终局轨迹的 GRPO 规则计算，默认开启 terminal fill，scale=2.0，与 QA 配置一致。K 包括终局动作，K=3 最多向前两个工具决策回填；局部信用、回填量、最终有效信用分别展示。只有一个可靠结果或同组奖励相同时优势可能为零。环境奖励不改写参考模型 LogP 或 V。外部故障、Goal 与 won 不一致、缺完整状态、编号缺口或超长输入会阻断相应窗口；不截断、不跨缺口拼接。无效数值在输出中为 null，并注明原因。
+终局优势按同题可靠终局轨迹的 GRPO 规则计算，默认开启 terminal fill，scale=2.0，与 QA 配置一致。K 按真实动作计数并包含末动作，K=3 最多向末三个动作回填（包含末动作自身）；回填折扣为 `gamma ** (terminal_action_turn - current_action_turn)`。局部信用、回填量、最终有效信用分别展示。只有一个可靠结果或同组奖励相同时优势可能为零。环境奖励不改写参考模型 LogP 或 V。外部故障、Goal 与 won 不一致、缺完整状态、编号缺口或超长输入会阻断相应窗口；不截断、不跨缺口拼接。无效数值在输出中为 null，并注明原因。
 
 ## 评分后端
 
@@ -215,7 +215,7 @@ API key 从配置指定的环境变量读取，默认 OPENAI_API_KEY；配置和
 
 ## 验证范围
 
-标准库 unittest 覆盖采样一次后永久复用、断点恢复、修改 Prompt 重评分且原缓存字节不变、评分请求去重、QA 一致的终局路由和回填、TRACE 公式、故障与编号缺口、Response-only LogP、导出文本和 HTML 转义；HF 另有 CPU 张量 causal-shift 检查。
+标准库 unittest 覆盖采样一次后永久复用、断点恢复、修改 Prompt 重评分且原缓存字节不变、评分请求去重、ALFWorld 统一动作信用、真实末状态转移和终局回填、TRACE 公式、故障与编号缺口、Response-only LogP、导出文本和 HTML 转义；HF 另有 CPU 张量 causal-shift 检查。
 
 ```bash
 python -m unittest discover -s agentflow/tests -p 'test_alfworld_probe_*.py' -v

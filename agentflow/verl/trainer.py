@@ -33,6 +33,7 @@ from agentflow.rollout_timing import PHASES, profiling_enabled, write_validation
 from agentflow.trace.credit import (
     TraceConfig,
     annotate_rollout_credits,
+    annotate_environment_credits,
     build_score_tensors,
     encode_state_requests,
     mean_gt_logps,
@@ -261,6 +262,9 @@ class AgentFlowTrainer(RayPPOTrainer):
         for row, task in enumerate(tasks):
             if task != "alfworld":
                 continue
+            if (str(non["trace_turn_type"][row]) != "tool_plan"
+                    or bool(non.get("trace_is_final", [False] * size)[row])):
+                raise ValueError("ALFWorld TRACE requires uniform environment-action metadata; refresh old rollout caches")
             item = provenance[row]
             fingerprint = (item.get("goal_spec_hash") or (item.get("source_sha256") or {}).get("gamefile")) if isinstance(item, dict) else None
             if not fingerprint:
@@ -276,20 +280,49 @@ class AgentFlowTrainer(RayPPOTrainer):
         goal_valid = non.get("trace_goal_check_valid", [None] * size)
         views = non.get("trace_state_view", [None] * size)
         contexts = list(contexts)
+        next_contexts = list(non.get("trace_next_state_context", [None] * size))
+        next_scoring_valid = np.asarray(non.get("trace_next_scoring_valid", np.zeros(size)), dtype=bool).copy()
+        alfworld_rows = [row for row, task in enumerate(tasks) if task == "alfworld"]
         for row, task in enumerate(tasks):
             if task == "alfworld":
                 if views[row] != "full_state":
                     raise ValueError("ALFWorld TRACE requires the explicit full_state scoring view")
                 if not scoring_valid[row] or not bool(goal_valid[row]):
                     contexts[row] = None
+                if (not next_scoring_valid[row] or not bool(goal_valid[row])
+                        or not isinstance(next_contexts[row], str) or not next_contexts[row].strip()):
+                    next_contexts[row] = None
+                    next_scoring_valid[row] = False
+        # Adjacent actions must describe the same observed boundary state.
+        # Turn numbering alone cannot certify that a real transition was kept.
+        environment_rows = defaultdict(list)
+        original_turns = non.get("trace_original_turn", non["turn_index_list"])
+        for row in alfworld_rows:
+            environment_rows[(str(non["uid"][row]), str(non["rollout_id_list"][row]))].append(row)
+        for rows in environment_rows.values():
+            rows.sort(key=lambda row: int(original_turns[row]))
+            for left, right in zip(rows, rows[1:]):
+                if (int(original_turns[right]) == int(original_turns[left]) + 1
+                        and next_scoring_valid[left] and contexts[right] is not None
+                        and next_contexts[left] != contexts[right]):
+                    raise ValueError("ALFWorld adjacent action post-state and next pre-state disagree")
+        # A post-state is a scoring request, never an additional actor row.
+        # Encoding all requests together deduplicates s_(t+1) against the next
+        # action's pre-state while preserving the native T-action batch.
+        score_contexts = contexts + [next_contexts[row] for row in alfworld_rows]
+        score_targets = list(ground_truths) + [ground_truths[row] for row in alfworld_rows]
+        instructions = non.get("trace_answer_instruction")
+        score_instructions = (None if instructions is None else
+                              list(instructions) + [instructions[row] for row in alfworld_rows])
         requests, row_requests, counters = encode_state_requests(
-            contexts, ground_truths, self.tokenizer,
+            score_contexts, score_targets, self.tokenizer,
             max_prompt_length=self.config.data.max_prompt_length,
             max_gt_tokens=cfg.max_gt_tokens,
             answer_instruction=cfg.answer_instruction,
-            answer_instructions=batch.non_tensor_batch.get("trace_answer_instruction"),
+            answer_instructions=score_instructions,
         )
-        row_logps = np.full(len(contexts), np.nan, dtype=np.float64)
+        row_logps = np.full(size, np.nan, dtype=np.float64)
+        next_logps = np.full(size, np.nan, dtype=np.float64)
         scoring_seconds = 0.0
         if requests:
             pad_id = self.tokenizer.pad_token_id
@@ -309,11 +342,15 @@ class AgentFlowTrainer(RayPPOTrainer):
             scored = unpad_dataproto(scored, pad_size=probe_padding)
             probes = unpad_dataproto(probes, pad_size=probe_padding)
             logps = mean_gt_logps(scored.batch["ref_log_prob"], probes.batch["response_mask"])
-            for row, request_index in enumerate(row_requests):
+            for row, request_index in enumerate(row_requests[:size]):
                 if request_index is not None:
                     row_logps[row] = logps[request_index]
+            for row, request_index in zip(alfworld_rows, row_requests[size:]):
+                if request_index is not None:
+                    next_logps[row] = logps[request_index]
 
         values = np.full(size, np.nan, dtype=np.float64)
+        next_values = np.full(size, np.nan, dtype=np.float64)
         credits = np.full(size, np.nan, dtype=np.float64)
         local_credits = np.full(size, np.nan, dtype=np.float64)
         terminal_fills = np.full(size, np.nan, dtype=np.float64)
@@ -328,6 +365,7 @@ class AgentFlowTrainer(RayPPOTrainer):
         types = non["trace_turn_type"]
         external = np.asarray(non.get("trace_external_error", np.zeros(size)), dtype=bool)
         final_flags = np.asarray(non.get("trace_is_final", np.zeros(size)), dtype=bool)
+        terminal_flags = np.asarray(non.get("trace_is_terminal", np.zeros(size)), dtype=bool)
         raw_valid = np.asarray(non.get("trace_outcome_valid", np.zeros(size)), dtype=bool)
         raw_success = non.get("trace_outcome_success", [None] * size)
         raw_rewards = non.get("trace_outcome_reward", non.get("reward_list"))
@@ -345,9 +383,13 @@ class AgentFlowTrainer(RayPPOTrainer):
         reliable = defaultdict(list)
         for key, rows in groups.items():
             rows.sort(key=lambda row: int(turns[row]))
-            finals = [row for row in rows if final_flags[row]
-                      and str(types[row]) in ("final_answer", "direct", "base")]
-            if len(finals) == 1 and int(final_flags[rows].sum()) == 1:
+            is_environment = all(tasks[row] == "alfworld" for row in rows)
+            if any(tasks[row] == "alfworld" for row in rows) and not is_environment:
+                raise ValueError("TRACE rollout mixes environment and answer-based decisions")
+            boundaries = terminal_flags if is_environment else final_flags
+            finals = [row for row in rows if boundaries[row]
+                      and (is_environment or str(types[row]) in ("final_answer", "direct", "base"))]
+            if len(finals) == 1 and int(boundaries[rows].sum()) == 1:
                 final = finals[0]
                 for row in rows:
                     within_prefix[row] = int(turns[row]) <= int(turns[final])
@@ -355,7 +397,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                 reward = outcome_rewards[final]
                 trustworthy = (all(raw_valid[row] for row in prefix)
                                and all(tasks[row] != "alfworld" or
-                                       (scoring_valid[row] and bool(goal_valid[row])) for row in prefix)
+                                       (scoring_valid[row] and bool(goal_valid[row])
+                                        and next_scoring_valid[row]) for row in prefix)
                                and np.isfinite(reward)
                                and np.isfinite(outcome_rewards[prefix]).all()
                                and np.allclose(outcome_rewards[prefix], reward, rtol=0, atol=1e-8))
@@ -374,7 +417,10 @@ class AgentFlowTrainer(RayPPOTrainer):
                     outcome_success[prefix] = success
                     reliable[key[0]].append((key, float(reward)))
             for offset, row in enumerate(rows):
-                if str(types[row]) == "analysis":
+                if is_environment:
+                    label_sources[row] = "trace"
+                    expected_credit[row] = within_prefix[row]
+                elif str(types[row]) == "analysis":
                     label_sources[row] = "outcome"
                 elif final_flags[row] and str(types[row]) in ("final_answer", "direct", "base"):
                     label_sources[row] = "outcome"
@@ -401,13 +447,28 @@ class AgentFlowTrainer(RayPPOTrainer):
             rollout_values = (state_values(row_logps[rows], epsilon=cfg.epsilon)
                               if int(turns[rows[0]]) == 0 else [float("nan")] * len(rows))
             trusted_rows = [row for row in rows if outcome_valid[row]]
-            annotated = annotate_rollout_credits(
-                rollout_values, [int(turns[row]) for row in rows],
-                [str(types[row]) for row in rows], external[rows].tolist(), final_flags[rows].tolist(),
+            outcome_options = dict(
                 outcome_valid=bool(trusted_rows),
                 outcome_advantage=float(outcome_advantages[trusted_rows[0]]) if trusted_rows else float("nan"),
                 config=cfg,
             )
+            if all(tasks[row] == "alfworld" for row in rows):
+                # The initial pre-state is the shared baseline for both ends
+                # of every real transition, including the terminal post-state.
+                rollout_next_values = (state_values([row_logps[rows[0]], *next_logps[rows]],
+                                                    epsilon=cfg.epsilon)[1:]
+                                       if int(turns[rows[0]]) == 0 else [float("nan")] * len(rows))
+                annotated = annotate_environment_credits(
+                    rollout_values, rollout_next_values, [int(turns[row]) for row in rows],
+                    external[rows].tolist(), terminal_flags[rows].tolist(), **outcome_options,
+                )
+                next_values[rows] = rollout_next_values
+            else:
+                annotated = annotate_rollout_credits(
+                    rollout_values, [int(turns[row]) for row in rows],
+                    [str(types[row]) for row in rows], external[rows].tolist(), final_flags[rows].tolist(),
+                    **outcome_options,
+                )
             values[rows] = rollout_values
             local_credits[rows] = annotated["local_credit"]
             terminal_fills[rows] = annotated["terminal_fill"]
@@ -417,6 +478,8 @@ class AgentFlowTrainer(RayPPOTrainer):
             reached[rows] = annotated["terminal_reached"]
         non.update({
             "trace_gt_logp": row_logps, "trace_value": values, "trace_credit": credits,
+            "trace_next_gt_logp": next_logps, "trace_next_value": next_values,
+            "trace_is_terminal": terminal_flags,
             "trace_local_credit": local_credits, "trace_terminal_fill": terminal_fills,
             "trace_credit_window_blocked": blocked, "trace_terminal_reached": reached,
             "trace_external_window_blocked": external_blocked,
@@ -439,7 +502,11 @@ class AgentFlowTrainer(RayPPOTrainer):
         metrics["trace/scoring_seconds"] = scoring_seconds
         metrics["trace/scoring_invalid_result_turns"] = sum(
             index is not None and not np.isfinite(row_logps[row])
-            for row, index in enumerate(row_requests)
+            for row, index in enumerate(row_requests[:size])
+        )
+        metrics["trace/scoring_invalid_next_result_turns"] = sum(
+            index is not None and not np.isfinite(next_logps[row])
+            for row, index in zip(alfworld_rows, row_requests[size:])
         )
         return metrics
 
@@ -527,7 +594,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                 payload.update({key: non[key][chosen:chosen + 1] for key in common_keys})
                 payload.update({key + "_a": non[key][chosen:chosen + 1] for key in side_keys})
                 payload.update({key + "_b": non[key][rejected:rejected + 1] for key in side_keys})
-                for key in ("trace_task", "trace_gt", "trace_goal_metadata", "trace_state_view"):
+                for key in ("trace_task", "trace_gt", "trace_goal_metadata", "trace_state_view",
+                            "trace_is_terminal", "trace_next_gt_logp", "trace_next_value"):
                     if key in non:
                         payload[key + "_a"] = non[key][chosen:chosen + 1]
                         payload[key + "_b"] = non[key][rejected:rejected + 1]

@@ -310,6 +310,100 @@ def annotate_rollout_credits(
     return result
 
 
+def annotate_environment_credits(
+    values: Sequence[Optional[float]],
+    next_values: Sequence[Optional[float]],
+    turn_indices: Sequence[int],
+    external_errors: Sequence[bool],
+    terminal_flags: Sequence[bool],
+    *,
+    outcome_valid: bool,
+    outcome_advantage: Optional[float],
+    config=None,
+):
+    """Credit every environment action, including its real final transition.
+
+    There are T action rows with T pre-action and T post-action values. The
+    terminal post-state is a scoring input, never an extra model decision.
+    K counts actual actions; a terminal action contributes its delta before
+    closing the window. Consequently K=3 can fill the last three actions,
+    and the terminal action itself has terminal-fill distance zero.
+
+    This separate adapter keeps QA's explicit final-answer semantics intact.
+    Missing states, discontinuous turns and external failures invalidate every
+    window that needs them. A verified terminal flag only closes a window;
+    the outcome must separately be trusted before reward fill is applied.
+    """
+    cfg = TraceConfig.from_mapping(config)
+    size = len(values)
+    if any(len(items) != size for items in
+           (next_values, turn_indices, external_errors, terminal_flags)):
+        raise ValueError("TRACE environment credit inputs must have the same length")
+    result = {key: [math.nan] * size
+              for key in ("local_credit", "terminal_fill", "effective_credit")}
+    result.update({key: [False] * size
+                   for key in ("window_blocked", "external_error_blocked", "terminal_reached")})
+    terminals = [index for index, flag in enumerate(terminal_flags) if bool(flag)]
+    terminal = terminals[0] if len(terminals) == 1 else None
+
+    def valid_turn(value):
+        return (not isinstance(value, bool) and _finite(value)
+                and float(value).is_integer() and float(value) >= 0)
+
+    for start in range(size):
+        if terminal is not None and start > terminal:
+            continue
+        if len(terminals) > 1 or not valid_turn(turn_indices[start]):
+            result["window_blocked"][start] = True
+            continue
+        first_turn = int(turn_indices[start])
+        weighted_sum = weight_sum = 0.0
+        blocked = reached = False
+        for position in range(start, min(start + cfg.k, size)):
+            if (not valid_turn(turn_indices[position])
+                    or int(turn_indices[position]) != first_turn + position - start):
+                blocked = True
+                break
+            if bool(external_errors[position]):
+                result["external_error_blocked"][start] = True
+                blocked = True
+                break
+            weight = cfg.gamma ** (position - start)
+            if weight:
+                if not (_finite(values[position]) and _finite(next_values[position])):
+                    blocked = True
+                    break
+                delta = float(next_values[position]) - float(values[position])
+                if not _finite(delta):
+                    blocked = True
+                    break
+                weighted_sum += weight * delta
+                weight_sum += weight
+            if position == terminal:
+                reached = True
+                break
+        result["terminal_reached"][start] = reached
+        if blocked or not weight_sum:
+            result["window_blocked"][start] = True
+            continue
+        local = weighted_sum / weight_sum
+        fill = 0.0
+        if (cfg.terminal_fill_enabled and cfg.terminal_fill_scale > 0
+                and reached and outcome_valid):
+            if not _finite(outcome_advantage):
+                result["window_blocked"][start] = True
+                continue
+            distance = int(turn_indices[terminal]) - first_turn
+            fill = cfg.terminal_fill_scale * cfg.gamma**distance * float(outcome_advantage)
+        if not (_finite(local) and _finite(fill) and _finite(local + fill)):
+            result["window_blocked"][start] = True
+            continue
+        result["local_credit"][start] = local
+        result["terminal_fill"][start] = fill
+        result["effective_credit"][start] = local + fill
+    return result
+
+
 def _pair_label_source(row):
     """Reward labels are explicit type routes, never a tool-credit fallback."""
     turn_type = str(row.get("turn_type", ""))

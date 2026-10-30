@@ -581,6 +581,7 @@ class SolverStateTests(unittest.TestCase):
                     "won": done, "terminated": done, "truncated": False,
                     "trace_goal_check": done, "trace_goal_check_valid": True,
                     "trace_scoring_valid": True,
+                    "trace_state_context": self.trace_state_context,
                 }
 
         class Planner:
@@ -606,7 +607,10 @@ class SolverStateTests(unittest.TestCase):
         logs = result["planner_logs"]
         self.assertEqual([item["trace_state_context"] for item in logs],
                          ["private full state 0", "private full state 1"])
-        self.assertEqual([item["trace_turn_type"] for item in logs], ["tool_plan", "base"])
+        self.assertEqual([item["trace_turn_type"] for item in logs], ["tool_plan", "tool_plan"])
+        self.assertEqual([item["trace_next_state_context"] for item in logs],
+                         ["private full state 1", "private full state 2"])
+        self.assertTrue(all(item["trace_next_scoring_valid"] for item in logs))
         self.assertEqual([item["trace_goal_check_before"] for item in logs], [False, False])
         self.assertEqual([item["trace_goal_check"] for item in logs], [False, True])
         self.assertEqual([item["prompt_token_ids"] for item in logs], [[100], [101]])

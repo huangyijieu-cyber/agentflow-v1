@@ -43,6 +43,7 @@ class AlfworldPipelineTests(unittest.TestCase):
             }
             final = index == 3
             EXECUTION.annotate_alfworld_step(log, name + str(index), final, {
+                "trace_state_context": name + str(index + 1),
                 "trace_env_action": f"act {index}", "terminated": final and success,
                 "truncated": final and not success, "won": final and success,
                 "trace_goal_check": final and success,
@@ -81,14 +82,14 @@ class AlfworldPipelineTests(unittest.TestCase):
         return batch
 
     def trainer(self):
-        scores = {"A0": -4., "A1": -3., "A2": -2., "A3": -1.,
-                  "B0": -4., "B1": -5., "B2": -6., "B3": -7.}
+        scores = {"A0": -4., "A1": -3., "A2": -2., "A3": -1., "A4": -.5,
+                  "B0": -4., "B1": -5., "B2": -6., "B3": -7., "B4": -8.}
         trainer = training.make_trainer(scores, {"k": 3, "gamma": .8, "epsilon": .1,
                                                "terminal_fill_enabled": True, "terminal_fill_scale": 2.})
         trainer.config.data.task = "alfworld"
         return trainer
 
-    def test_both_entrypoints_use_fixed_gt_full_state_and_qa_credit_routing(self):
+    def test_both_entrypoints_use_fixed_gt_full_state_and_uniform_action_credit(self):
         for path in ("train-roma/rollout.py", "train-roma/rollout_main_profiled.py"):
             with self.subTest(path=path):
                 history, trainer = self.batch(path), self.trainer()
@@ -100,17 +101,28 @@ class AlfworldPipelineTests(unittest.TestCase):
                 self.assertEqual(non["trace_state_view"].tolist(), ["full_state"] * 8)
                 self.assertEqual(non["trace_goal_check"].tolist(), [False, False, False, True] + [False] * 4)
                 self.assertTrue(non["trace_goal_check_valid"].all())
-                trainer._annotate_trace_credits(history)
-                self.assertEqual(non["trace_label_source"].tolist(), ["trace"] * 3 + ["outcome"] + ["trace"] * 3 + ["outcome"])
+                metrics = trainer._annotate_trace_credits(history)
+                self.assertEqual(metrics["trace/scoring_requests"], 10)  # Two rollouts, T+1 states each.
+                self.assertEqual(metrics["trace/credit_expected_turns"], 8)
+                self.assertEqual(non["trace_label_source"].tolist(), ["trace"] * 8)
+                self.assertEqual(non["trace_turn_type"].tolist(), ["tool_plan"] * 8)
+                self.assertFalse(non["trace_is_final"].any())
+                self.assertEqual(non["trace_is_terminal"].tolist(), [False, False, False, True] * 2)
+                self.assertTrue(np.isfinite(non["trace_credit"][[3, 7]]).all())
+                self.assertEqual(history.batch["responses"].shape[0], 8)  # Terminal post-states do not create actor samples.
                 np.testing.assert_allclose(non["trace_outcome_advantage"], [.5] * 4 + [-.5] * 4)
                 cfg = training.CREDIT.TraceConfig(k=3, gamma=.8, epsilon=.1)
                 for start in (0, 4):
-                    expected = training.CREDIT.annotate_rollout_credits(
-                        non["trace_value"][start:start + 4], [0, 1, 2, 3],
-                        ["tool_plan"] * 3 + ["base"], [False] * 4, [False] * 3 + [True],
+                    expected = training.CREDIT.annotate_environment_credits(
+                        non["trace_value"][start:start + 4], non["trace_next_value"][start:start + 4],
+                        [0, 1, 2, 3], [False] * 4, [False] * 3 + [True],
                         outcome_valid=True, outcome_advantage=.5 if start == 0 else -.5, config=cfg)
                     np.testing.assert_allclose(non["trace_credit"][start:start + 4], expected["effective_credit"], equal_nan=True)
-                self.assertEqual(non["trace_terminal_reached"].tolist(), [False, True, True, False] * 2)
+                self.assertEqual(non["trace_terminal_reached"].tolist(), [False, True, True, True] * 2)
+                np.testing.assert_allclose(non["trace_terminal_fill"][:4], [0., .64, .8, 1.])
+                np.testing.assert_allclose(non["trace_next_value"][:3], non["trace_value"][1:4])
+                expected_last = np.log(4.1 / .6) - np.log(4.1 / 1.1)
+                self.assertAlmostEqual(non["trace_local_credit"][3], expected_last)
                 for key, value in before.items():
                     self.assertTrue(torch.equal(history.batch[key], value), key)
                 for call in trainer.ref_policy_wg.calls:
@@ -120,7 +132,8 @@ class AlfworldPipelineTests(unittest.TestCase):
                         self.assertNotIn("actor visible", prompt)
                 pairs = trainer._trans_to_trace_batch([history])
                 self.assertTrue(pairs)
-                self.assertTrue(any(pair.non_tensor_batch["trace_label_source_a"][0] == "outcome" for pair in pairs))
+                self.assertTrue(all(pair.non_tensor_batch["trace_label_source_a"][0] == "trace" for pair in pairs))
+                self.assertTrue(all(pair.non_tensor_batch["trace_turn_type_a"][0] == "tool_plan" for pair in pairs))
                 for pair in pairs:
                     self.assertEqual(pair.non_tensor_batch["trace_gt_a"].tolist(), [GOAL])
                     self.assertEqual(pair.non_tensor_batch["trace_task_a"].tolist(), ["alfworld"])
@@ -135,9 +148,10 @@ class AlfworldPipelineTests(unittest.TestCase):
         self.assertTrue(np.isnan(non["trace_credit"][1]))
         self.assertFalse(non["trace_outcome_valid"].any())
         self.assertFalse(non["trace_valid"][1])
-        # Actual terminal identity remains base/outcome even when untrusted.
-        self.assertTrue(non["trace_is_final"][3])
-        self.assertEqual(non["trace_turn_type"][3], "base")
+        # Environment terminal identity only bounds the action window/fill.
+        self.assertFalse(non["trace_is_final"][3])
+        self.assertTrue(non["trace_is_terminal"][3])
+        self.assertEqual(non["trace_turn_type"][3], "tool_plan")
 
     def test_trainer_also_masks_invalid_state_without_daemon_cleanup(self):
         history, trainer = self.batch("train-roma/rollout.py"), self.trainer()
@@ -178,6 +192,78 @@ class AlfworldPipelineTests(unittest.TestCase):
         result = flags(logs, "alfworld")
         self.assertEqual([row["dup"] for row in result], [False, True, True])
         self.assertEqual([row["trace_dup"] for row in result], [False, False, True])
+
+    def test_terminal_action_can_pair_with_an_earlier_action(self):
+        history, trainer = self.batch("train-roma/rollout.py"), self.trainer()
+        trainer.ref_policy_wg.scores.update({"A1": -4., "A2": -4., "A3": -4., "A4": -1.})
+        trainer._annotate_trace_credits(history)
+        pairs = trainer._trans_to_trace_batch([history])
+        self.assertTrue(any(pair.non_tensor_batch["trace_is_terminal_a"][0]
+                            and pair.non_tensor_batch["turn_index_list_b"][0] == 0 for pair in pairs))
+        self.assertTrue(all(pair.non_tensor_batch["trace_label_source_a"][0] == "trace" for pair in pairs))
+
+    def test_single_action_episodes_score_terminal_post_state_without_extra_turn(self):
+        for path in ("train-roma/rollout.py", "train-roma/rollout_main_profiled.py"):
+            with self.subTest(path=path):
+                original, trainer = self.batch(path), self.trainer()
+                history = training.Proto(
+                    {key: value[[0, 4]].clone() for key, value in original.batch.items()},
+                    {key: value[[0, 4]].copy() for key, value in original.non_tensor_batch.items()},
+                    original.meta_info,
+                )
+                history.non_tensor_batch["trace_is_terminal"][:] = True
+                trainer._annotate_trace_credits(history)
+                non = history.non_tensor_batch
+                self.assertEqual(history.batch["responses"].shape[0], 2)
+                self.assertTrue(np.isfinite(non["trace_credit"]).all())
+                np.testing.assert_allclose(non["trace_value"], [0., 0.])
+                np.testing.assert_allclose(non["trace_local_credit"], [np.log(4.1 / 3.1), np.log(4.1 / 5.1)])
+                np.testing.assert_allclose(non["trace_terminal_fill"], [1., -1.])
+                self.assertEqual(non["trace_label_source"].tolist(), ["trace", "trace"])
+                pairs = trainer._trans_to_trace_batch([history])
+                self.assertTrue(pairs)
+                self.assertTrue(all(pair.non_tensor_batch["trace_is_terminal_a"][0] for pair in pairs))
+
+    def test_missing_terminal_post_state_blocks_last_credit_and_all_terminal_fill(self):
+        history, trainer = self.batch("train-roma/rollout.py"), self.trainer()
+        history.non_tensor_batch["trace_next_state_context"][3] = None
+        trainer._annotate_trace_credits(history)
+        non = history.non_tensor_batch
+        self.assertTrue(np.isnan(non["trace_next_gt_logp"][3]))
+        self.assertTrue(np.isnan(non["trace_credit"][3]))
+        self.assertFalse(non["trace_outcome_valid"][:4].any())
+        self.assertTrue(np.isnan(non["trace_credit"][[1, 2, 3]]).all())
+        self.assertTrue(np.isfinite(non["trace_credit"][0]))
+        np.testing.assert_allclose(non["trace_terminal_fill"][0], 0.)
+
+    def test_discontinuous_real_boundary_state_is_rejected_before_reference_scoring(self):
+        history, trainer = self.batch("train-roma/rollout.py"), self.trainer()
+        history.non_tensor_batch["trace_next_state_context"][0] = "different-game-or-state"
+        with self.assertRaisesRegex(ValueError, "post-state and next pre-state disagree"):
+            trainer._annotate_trace_credits(history)
+        self.assertEqual(trainer.ref_policy_wg.calls, [])
+
+    def test_missing_initial_turn_cannot_establish_a_new_environment_baseline(self):
+        original, trainer = self.batch("train-roma/rollout.py"), self.trainer()
+        kept = [1, 2, 3]
+        history = training.Proto(
+            {key: value[kept].clone() for key, value in original.batch.items()},
+            {key: value[kept].copy() for key, value in original.non_tensor_batch.items()},
+            original.meta_info,
+        )
+        trainer._annotate_trace_credits(history)
+        self.assertTrue(np.isnan(history.non_tensor_batch["trace_value"]).all())
+        self.assertTrue(np.isnan(history.non_tensor_batch["trace_next_value"]).all())
+        self.assertTrue(np.isnan(history.non_tensor_batch["trace_credit"]).all())
+        self.assertIsNone(trainer._trans_to_trace_batch([history]))
+
+    def test_old_outcome_routed_environment_cache_is_rejected(self):
+        history, trainer = self.batch("train-roma/rollout.py"), self.trainer()
+        history.non_tensor_batch["trace_turn_type"][3] = "base"
+        history.non_tensor_batch["trace_is_final"][3] = True
+        with self.assertRaisesRegex(ValueError, "uniform environment-action metadata"):
+            trainer._annotate_trace_credits(history)
+        self.assertEqual(trainer.ref_policy_wg.calls, [])
 
     def test_external_failure_never_creates_a_verified_failure_outcome(self):
         logs = self.logs("A", external=1)

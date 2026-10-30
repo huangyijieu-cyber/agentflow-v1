@@ -64,22 +64,23 @@ python agentflow/agentflow/trace/alfworld_goal_store.py build \
 
 ALFWorld 环境、solver、两个 rollout 入口、daemon 和 trainer 均传递实际 GT、完整状态、逐行评分指令、来源哈希和有效性。训练 rollout 将完整 Parquet 行绑定给 ALFWorld 环境；环境读取该行 `result` 和已保存规则，并核验实际游戏。daemon 从原始样本 `result` 设置 `trace_gt`，同时核对环境记录的 GT，拒绝空值或不一致，不调用转换器。运行时只更新当前事实、渲染评分上下文和检查目标谓词。同一 uid 若混入不同游戏/Goal 会报错，避免跨题配对。重复动作在不同前状态下可作为不同决策；QA 的重复过滤规则保持原样。
 
-沿用 QA 的算法配置与配对：
+沿用 QA 的数值配置；ALFWorld 的所有真实环境动作统一使用 TRACE 配对：
 
 | 项目 | 默认值/行为 |
 | --- | --- |
 | epsilon / K / gamma | 0.1 / 3 / 0.8 |
 | terminal fill | 开启，scale=2.0 |
-| outcome match value | false |
 | value match epsilon | 0.05 |
 | 正/负信用阈值、信用差阈值 | 0.01 / 0.01 / 0.02 |
 | length ratio / 每组 pair / 每步 pair | 1.8 / 2 / 256 |
 | GT token 上限 | 256，超长判无效，不截断 |
 | GRPO、SLIC loss、Replay | 沿用现有 QA 实现 |
 
-真实终局环境动作走 `base` / outcome 路由；之前动作走 `tool_plan` / TRACE 路由。K=3 包括终局动作，因此最多向前两个工具决策回填。最后动作后的状态可以保存/评分以诊断，但不新增一次信用转移。可信的步数预算耗尽属于终局失败；外部崩溃和无法核验的状态不作为失败奖励。
+首轮、中间轮和最后一轮都标为 `tool_plan`，按同题、动作前 V 接近及严格正/负有效信用配对；不再将末动作单独划入 `base` / outcome，也不按首尾或 turn 序号隔离。T 个动作对应 T+1 个真实状态，最后动作后的终止状态参与最后一步 `V_next - V`，但不新增模型回答或训练 turn。`trace_is_terminal` 只表示已完成的环境终止动作，用于截断信用窗口与终局回填；ALFWorld 的 `trace_is_final` 恒为 false。可信的步数预算耗尽属于终局失败；外部崩溃和无法核验的状态不作为失败奖励。
 
-固定 Response 的平均 token LogP 为 ell，`V_t = log((-ell_0 + epsilon) / (-ell_t + epsilon))`。局部信用和终局回填调用现有 QA 函数；不另建 ALFWorld 的信用公式。终局奖励不会改写参考模型的 LogP。
+固定 Response 的平均 token LogP 为 ell，`V_t = log((-ell_0 + epsilon) / (-ell_t + epsilon))`。pre-state 与 post-state 统一用该轨迹初始 ell_0 作基线。每个动作的真实转移为 `delta_t = V_(t+1) - V_t`，局部信用是最多 K 个连续真实动作 delta 的 gamma 加权平均，遇到环境终止动作则纳入该动作的 delta 后结束。缺失任何所需状态、编号缺口或外部故障均阻断窗口，不编造末状态或回退到 outcome 配对。
+
+窗口包含可信终止动作时，再加 `terminal_fill_scale * gamma ** (terminal_turn - start_turn) * outcome_advantage`。K=3 时最多给末三个真实动作回填，包含最后动作本身；末动作距离为 0，因此获得 `scale * outcome_advantage` 的回填。真实环境结果用于这项回填，不改变冻结参考模型的 LogP/V。QA 原来的最终答案路由及其信用函数保持不变。
 
 ## 服务器适配
 
@@ -119,3 +120,7 @@ export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305_with_gt.parquet
 这些是实际文件转换验证；动作执行与环境 won 的对照由运行时逐状态完成。本次离线文件还完成六类样例的实际 build、禁用转换器后的读取、独立新进程读取，以及文件字节不变检查。回归覆盖离线构建、Parquet 写入和读取、跨训练复用、来源变化拒绝、ALFWorld 环境/Probe 和既有 TRACE 行为。模型实际输出及部署环境性能仍需在服务器运行 Probe 检查。
 
 新增 Parquet 流程另用上述六类真实样例运行了完整 `prepare` 命令：原六列（除 result）保持一致，六行 GT 非空，四列规则/映射写入成功，中间 SQLite 已删除。目录收集采用官网构造器与收集方法的独立测试替身（本地未安装 TextWorld）；新进程禁用 Arrow 导入与转换器后仍能读取六行并核验源文件。该验证不代表已在本地转换服务器的全部 3305 个游戏，也未执行模型训练。
+
+统一动作配对改动不改变离线 GT/规则格式：已经准备好的 `..._with_gt.parquet` 可以直接复用，不需要重新转换。已有 Probe 缓存只要保留了全部 T+1 个真实状态，也可以直接重新评分，无需重新采样。
+
+本轮统一动作信用验证通过 183 项 ALFWorld 测试和 122 项 TRACE 回归，覆盖单动作终止、末动作真实 delta、末三动作回填、跨 turn 配对、缺失末状态、相邻状态不一致和 QA 既有路由。模型评分及模拟器在链路测试中使用 CPU 替身，未在服务器执行完整模型训练。更新代码后应重启训练及 rollout 进程；旧训练 rollout 的 base/outcome 元数据会被明确拒绝，离线 Parquet 不受影响。

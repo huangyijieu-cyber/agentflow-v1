@@ -78,7 +78,7 @@
     <div class="parameter-row">
       <div class="parameters">
         <div class="parameter"><label for="stateView">评分视图</label><select id="stateView" disabled><option value="full_state">完整环境状态（含先验）</option><option value="saved">缓存视图 / 旧版对照</option></select></div>
-        <div class="parameter"><label for="terminalFill">QA 终局回填</label><input id="terminalFill" type="checkbox" checked disabled></div>
+        <div class="parameter"><label for="terminalFill">终局回填</label><input id="terminalFill" type="checkbox" checked disabled></div>
         <div class="parameter"><label for="terminalScale">回填系数</label><input id="terminalScale" type="number" value="2" min="0" step="0.1" disabled></div>
         <div class="parameter"><label for="epsilon">ε · NLL offset</label><input id="epsilon" type="number" value="0.1" min="0.000001" step="0.01" disabled></div>
         <div class="parameter"><label for="k">K · 动作窗口</label><input id="k" type="number" value="3" min="1" step="1" disabled></div>
@@ -87,7 +87,7 @@
       <div class="row"><button id="saveButton" type="button" disabled>保存探针</button><button id="scoreButton" class="primary" type="button" disabled>保存并重新评分</button></div>
     </div>
     <div class="formula">state + Prompt → 固定 Response 的平均 LogP ℓ → Vₜ = log[(-ℓ₀ + ε) / (-ℓₜ + ε)] → Δₜ = Vₜ₊₁ − Vₜ → K-step 折扣平均</div>
-    <p class="small-text muted" style="margin-top:9px">默认 Response 使用 {goal_response}，从预先保存的 GT 文件读取，同题所有状态保持固定。完整状态包含环境先验和隐藏事实，仅评分模型可见。复用 QA：真实终局动作走 outcome，K 包含该动作，末状态只作诊断；默认终局回填开启，系数为 2。旧缓存补全读取保存的 GT 并重放已有动作，不调用采样模型；已完整保存的缓存可直接重新评分。</p>
+    <p class="small-text muted" style="margin-top:9px">默认 Response 使用 {goal_response}，从预先保存的 GT 文件读取，同题所有状态保持固定。完整状态包含环境先验和隐藏事实，仅评分模型可见。全部环境动作统一按 TRACE Credit 配对，包括最后动作；末状态参与最后一步 ΔV，但不增加回答 turn。K 表示真实动作数，K=3 时最多向最后三个动作回填；默认终局回填开启，系数为 2。旧缓存补全读取保存的 GT 并重放已有动作，不调用采样模型；已完整保存的缓存可直接重新评分。</p>
   </section>
 
   <section class="card" aria-labelledby="resultHeading">
@@ -298,12 +298,14 @@ function renderResults(force) {
   const totalTurns = trajectories.reduce((sum, t) => sum + turnList(t).length, 0);
   const validCredits = trajectories.reduce((sum, t) => sum + turnList(t).filter(turn => validNumber(turn.credit)).length, 0);
   const summary = activeRun && activeRun.summary || {};
-  $('resultSummary').textContent = trajectories.length ? trajectories.length + ' 条轨迹 · ' + totalTurns + ' 个动作' + (scored ? ' · ' + first(summary.valid_credit_turns, validCredits) + ' 个有效信用' : ' · 尚未评分，可先检查原始动作') : '采样后可查看原始轨迹，评分后显示数值。';
+  const modeLabel = !activeRun ? '待评分' : activeRun.credit_mode === 'alfworld-environment-transitions-v1' ? '统一环境动作信用' : '历史评分规则，可复用轨迹重新评分';
+  $('resultSummary').textContent = trajectories.length ? trajectories.length + ' 条轨迹 · ' + totalTurns + ' 个动作' + (scored ? ' · ' + first(summary.valid_credit_turns, validCredits) + ' 个有效信用 · ' + modeLabel : ' · 尚未评分，可先检查原始动作') : '采样后可查看原始轨迹，评分后显示数值。';
   $('viewedProbe').hidden = !(activeRun && activeRun.probe);
   $('viewedProbeBody').replaceChildren();
   if (activeRun && activeRun.probe) $('viewedProbeBody').append(detailBlock('此记录的 Prompt', activeRun.probe.prompt), detailBlock('此记录的固定 Response', activeRun.probe.response));
   $('comparisonNote').hidden = !selectedCompareId;
-  $('comparisonNote').textContent = selectedCompareId ? 'Δcredit = 当前记录信用 − 对比记录信用。无效值不参与相减；请结合实际 Prompt / Response 检查变化。' : '';
+  const differentRules = activeRun && comparisonRun && activeRun.credit_mode !== comparisonRun.credit_mode;
+  $('comparisonNote').textContent = selectedCompareId ? 'Δcredit = 当前记录信用 − 对比记录信用。无效值不参与相减；请结合实际 Prompt / Response 检查变化。' + (differentRules ? ' 两条记录使用不同信用规则；可复用原轨迹按当前规则重新评分后再比较。' : '') : '';
   trajectories.forEach((trajectory, trajectoryPosition) => {
     const id = toText(first(trajectory.trajectory_id, trajectory.id, String(trajectoryPosition))), turns = turnList(trajectory), states = stateList(trajectory), outcome = trajectory.outcome || {};
     const card = node('article', 'trajectory'), head = node('div', 'trajectory-head'), title = node('div', 'trajectory-title');
@@ -327,17 +329,17 @@ function renderResults(force) {
       const detailsRow = node('tr', 'detail-row'); detailsRow.hidden = true; const detailsCell = node('td'); detailsCell.colSpan = selectedCompareId ? 12 : 10;
       const errors = [errorMessage(turn), errorMessage(before)].filter(Boolean); if (turn.external_error) errors.unshift('外部执行故障：该动作及受影响信用窗口不可用。'); if (scored && turn.label_source !== 'outcome' && !validNumber(turn.credit) && !errors.length) errors.push('此动作信用无效；检查状态评分、连续性和窗口边界。'); if (errors.length) detailsCell.append(node('p', 'error-text', Array.from(new Set(errors)).join('\n')));
       const grid = node('div', 'detail-grid');
-      if (turn.label_source === 'outcome') grid.append(detailBlock('终局路由', {outcome_valid:turn.outcome_valid, outcome_advantage:turn.outcome_advantage, is_final:turn.is_final}, true));
+      if (turn.is_terminal || turn.label_source === 'outcome') grid.append(detailBlock(turn.label_source === 'outcome' ? '旧记录终局路由' : '环境终止边界与回填', {outcome_valid:turn.outcome_valid, outcome_advantage:turn.outcome_advantage, is_terminal:turn.is_terminal, is_final:turn.is_final}, true));
       grid.append(detailBlock('原动作 Prompt · 实际生成输入', turn.action_prompt), detailBlock('原动作 Response · 模型实际回答', turn.action_response));
       grid.append(detailBlock('完整评分 Prompt · 状态 + 可编辑 Prompt', first(turn.scoring_prompt, before.scoring_prompt)), detailBlock('固定评分 Response · 只对这段文本计 LogP', first(turn.response, before.response)));
       const renderedPrompt = first(turn.scoring_rendered_prompt, before.scoring_rendered_prompt); if (renderedPrompt) grid.append(foldedBlock('查看 chat template 后实际送入评分模型的 Prompt', renderedPrompt));
-      if (after.state_context || after.scoring_prompt) grid.append(detailBlock('动作后状态 · 末状态仅作诊断', first(after.state_context, after.scoring_prompt), true));
+      if (after.state_context || after.scoring_prompt) grid.append(detailBlock('动作后状态 · 用于该动作的 ΔV', first(after.state_context, after.scoring_prompt), true));
       if (Array.isArray(before.token_logps)) grid.append(detailBlock('Response 逐 token LogP', before.token_logps, true));
       detailsCell.append(grid); detailsRow.append(detailsCell); tbody.append(detailsRow);
       button.addEventListener('click', () => { detailsRow.hidden = !detailsRow.hidden; button.textContent = detailsRow.hidden ? '查看' : '收起'; button.setAttribute('aria-expanded', String(!detailsRow.hidden)); row.classList.toggle('active', !detailsRow.hidden); });
     });
     table.append(tbody); scroll.append(table); card.append(scroll);
-    if (states.length > turns.length) { const terminalState = states[states.length - 1], terminal = node('details', 'terminal'); terminal.append(node('summary', '', '最后动作后的评分状态（仅评分，不是额外动作） · Mean LogP ' + number(terminalState.mean_logp, false) + ' · V ' + number(terminalState.value, false))); const grid = node('div', 'detail-grid'); grid.append(detailBlock('末状态完整评分 Prompt', first(terminalState.scoring_prompt, terminalState.state_context)), detailBlock('固定评分 Response', terminalState.response)); if (terminalState.scoring_rendered_prompt) grid.append(foldedBlock('查看 chat template 后实际送入评分模型的末状态 Prompt', terminalState.scoring_rendered_prompt)); if (errorMessage(terminalState)) terminal.append(node('p', 'error-text', errorMessage(terminalState))); terminal.append(grid); card.append(terminal); }
+    if (states.length > turns.length) { const terminalState = states[states.length - 1], terminal = node('details', 'terminal'); const terminalLabel = !activeRun ? '最后动作后的状态（待评分，不是额外动作）' : activeRun.credit_mode === 'alfworld-environment-transitions-v1' ? '最后动作后的评分状态（参与最后一步信用，不是额外动作）' : '最后动作后的评分状态（旧记录仅作诊断，不是额外动作）'; terminal.append(node('summary', '', terminalLabel + ' · Mean LogP ' + number(terminalState.mean_logp, false) + ' · V ' + number(terminalState.value, false))); const grid = node('div', 'detail-grid'); grid.append(detailBlock('末状态完整评分 Prompt', first(terminalState.scoring_prompt, terminalState.state_context)), detailBlock('固定评分 Response', terminalState.response)); if (terminalState.scoring_rendered_prompt) grid.append(foldedBlock('查看 chat template 后实际送入评分模型的末状态 Prompt', terminalState.scoring_rendered_prompt)); if (errorMessage(terminalState)) terminal.append(node('p', 'error-text', errorMessage(terminalState))); terminal.append(grid); card.append(terminal); }
     $('results').append(card);
   });
 }

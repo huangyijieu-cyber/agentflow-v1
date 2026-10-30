@@ -376,6 +376,8 @@ class RolloutAgent(LitAgent):
                         metadata={
                             "finish_reason": finish_reason,
                             "trace_state_context": log.get("trace_state_context"),
+                            "trace_next_state_context": log.get("trace_next_state_context"),
+                            "trace_next_scoring_valid": log.get("trace_next_scoring_valid", False),
                             "trace_task": log.get("trace_task"),
                             "trace_gt": log.get("trace_gt"),
                             "trace_answer_instruction": log.get("trace_answer_instruction"),
@@ -393,6 +395,7 @@ class RolloutAgent(LitAgent):
                             "trace_error_type": log.get("trace_error_type", ""),
                             "trace_error_source": log.get("trace_error_source", ""),
                             "trace_is_final": bool(log.get("trace_is_final", False)),
+                            "trace_is_terminal": bool(log.get("trace_is_terminal", False)),
                             "trace_outcome_valid": bool(log.get("trace_outcome_valid", False)),
                             "trace_outcome_success": log.get("trace_outcome_success"),
                             "trace_outcome_reward": log.get("trace_outcome_reward"),

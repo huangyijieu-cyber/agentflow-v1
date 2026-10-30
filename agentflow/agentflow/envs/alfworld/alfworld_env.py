@@ -287,6 +287,7 @@ class AlfWorldEnv:
     def _write_trace_info(self, info):
         info.update({
             "trace_full_facts": deepcopy(self.trace_facts),
+            "trace_state_context": self.trace_state_context,
             "trace_gt": self.trace_gt,
             "trace_answer_instruction": self.trace_answer_instruction,
             "trace_state_view": "full_state",

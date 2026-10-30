@@ -26,6 +26,7 @@ class ProbeScoringError(RuntimeError):
 
 
 _SCORERS: dict[str, Any] = {}
+_CREDIT_MODE = "alfworld-environment-transitions-v1"
 
 
 def _trace_module():
@@ -214,15 +215,15 @@ def _invalid_state(state, response, reason, scoring_prompt=None):
 
 
 def _terminal_contract(trajectory):
-    """Keep environment type routing separate from completed/trusted labels."""
+    """Separate an environment boundary from its completed/trusted outcome."""
     turns = trajectory.get("turns") or []
     states = trajectory.get("states") or []
     outcome = trajectory.get("outcome") or {}
     if not turns:
         return None, None, False
     last = turns[-1]
-    # A real terminal environment decision remains base even if its label or
-    # full-state verification is unusable. This matches annotate_alfworld_step.
+    # A terminal flag bounds the credit window. Every decision, including
+    # this one, remains an environment action with a real post-state delta.
     boundary = len(turns) - 1 if (
         (outcome.get("terminated") is True or outcome.get("truncated") is True)
         and last.get("done") is True and not last.get("external_error", False)) else None
@@ -241,7 +242,7 @@ def _terminal_contract(trajectory):
     return boundary, completed, valid
 
 
-def _verified_final(trajectory):
+def _verified_terminal(trajectory):
     _, completed, valid = _terminal_contract(trajectory)
     return completed if valid else None
 
@@ -255,7 +256,7 @@ def _outcome_advantages(trajectories, norm_by_std):
         if not identity or identity in seen:
             raise ValueError("Saved trajectory IDs must be nonempty and unique")
         seen.add(identity)
-        if _verified_final(trajectory) is not None:
+        if _verified_terminal(trajectory) is not None:
             key = str(trajectory.get("uid", trajectory.get("goal_spec_hash", trajectory.get("goal", ""))))
             groups.setdefault(key, []).append((identity, float(trajectory["outcome"]["reward"])))
     advantages = {}
@@ -270,11 +271,11 @@ def _outcome_advantages(trajectories, norm_by_std):
 
 
 def score_snapshots(snapshot: dict, probe: dict, scorer_config: dict, *, progress=None) -> dict:
-    """Teacher-force fixed goals and reuse QA TRACE final routing and credits.
+    """Teacher-force fixed goals and credit every real environment transition.
 
-    T saved actions have T+1 recorded states. The real final action uses the QA
-    outcome route. The post-action state is scored for inspection only: it does
-    not become an additional decision, delta, or terminal position.
+    T saved actions have T+1 recorded states. The last post-state contributes
+    to the last action's delta without creating an extra decision. Verified
+    environment outcomes are used only for terminal credit fill.
     """
     started = time.monotonic()
     instruction, response_template = probe.get("prompt"), probe.get("response")
@@ -319,7 +320,7 @@ def score_snapshots(snapshot: dict, probe: dict, scorer_config: dict, *, progres
     counters = {"states": 0, "turns": 0, "valid_scored_states": 0,
                 "valid_credit_turns": 0, "invalid_scored_states": 0,
                 "external_error_windows": 0, "outcome_turns": 0,
-                "terminal_fill_turns": 0}
+                "terminal_fill_turns": 0, "terminal_actions": 0}
     for trajectory in trajectories:
         states, turns = trajectory.get("states", []), trajectory.get("turns", [])
         if not states or len(states) != len(turns) + 1:
@@ -375,39 +376,42 @@ def score_snapshots(snapshot: dict, probe: dict, scorer_config: dict, *, progres
                   if indices[0] == 0 else [math.nan] * len(states))
         for state, value in zip(scored_states, values):
             state["value"] = _number_or_none(value)
-        boundary, final, outcome_valid = _terminal_contract(trajectory)
-        types = ["base" if i == boundary else "tool_plan" for i in range(len(turns))]
-        finals = [i == final for i in range(len(turns))]
+        boundary, terminal, outcome_valid = _terminal_contract(trajectory)
+        terminals = [i == terminal for i in range(len(turns))]
         advantage = advantages.get(str(trajectory["trajectory_id"]))
         decision_values = values[:len(turns)]
+        next_values = values[1:]
+        turn_indices = [turn.get("turn_index", i) for i, turn in enumerate(turns)]
         # Production validates both sides of each actual environment step.
         # Keep the raw state score for inspection, but do not use a pre-state
         # as a credit anchor when its transition's full facts are unverified.
         for i in range(len(turns)):
             pair = states[i:i + 2]
-            if any(state.get("state_view") == "full_state" for state in pair) and not all(
+            continuous = (all(_finite(index) and float(index).is_integer()
+                              for index in (turn_indices[i], indices[i], indices[i + 1]))
+                          and indices[i] == turn_indices[i]
+                          and indices[i + 1] == turn_indices[i] + 1)
+            verified = not any(state.get("state_view") == "full_state" for state in pair) or all(
                     state.get("scoring_valid") is True and state.get("goal_check_valid") is True
-                    for state in pair):
+                    for state in pair)
+            if not continuous or not verified:
                 decision_values[i] = math.nan
-        annotated = trace.annotate_rollout_credits(
-            decision_values, indices[:len(turns)], types,
-            [bool(turn.get("external_error", False)) for turn in turns], finals,
+                next_values[i] = math.nan
+        annotated = trace.annotate_environment_credits(
+            decision_values, next_values, turn_indices,
+            [bool(turn.get("external_error", False)) for turn in turns], terminals,
             outcome_valid=outcome_valid, outcome_advantage=advantage, config=cfg)
         scored_turns = []
         for i, turn in enumerate(turns):
             current, following = scored_states[i:i + 2]
-            continuous = (all(_finite(index) and float(index).is_integer() for index in indices[i:i + 2])
-                          and indices[i + 1] == indices[i] + 1)
-            raw_delta = (values[i + 1] - values[i] if continuous and _finite(values[i])
-                         and _finite(values[i + 1]) and not turn.get("external_error", False) else None)
-            delta = raw_delta if types[i] == "tool_plan" and i + 1 < len(turns) else None
+            delta = (next_values[i] - decision_values[i]
+                     if _finite(decision_values[i]) and _finite(next_values[i])
+                     and not turn.get("external_error", False) else None)
             credit = _number_or_none(annotated["effective_credit"][i])
             local = _number_or_none(annotated["local_credit"][i])
             fill = _number_or_none(annotated["terminal_fill"][i])
             external_window = bool(annotated["external_error_blocked"][i])
-            if i == boundary:
-                reason = "outcome_route_final_action"
-            elif external_window:
+            if external_window:
                 reason = "external_error_in_credit_window"
                 counters["external_error_windows"] += 1
             elif credit is None:
@@ -415,19 +419,20 @@ def score_snapshots(snapshot: dict, probe: dict, scorer_config: dict, *, progres
                           else "missing_or_invalid_state_or_turn_gap")
             else:
                 reason = None
-            if i == boundary:
-                counters["outcome_turns"] += 1
+            if i == terminal:
+                counters["terminal_actions"] += 1
             if fill is not None and fill != 0:
                 counters["terminal_fill_turns"] += 1
             scored_turns.append({
                 **turn, "scoring_prompt": current["scoring_prompt"], "response": response,
                 "mean_logp": current["mean_logp"], "token_logps": current["token_logps"],
                 "value": current["value"], "next_value": following["value"],
-                "delta": _number_or_none(delta), "diagnostic_post_delta": _number_or_none(raw_delta),
+                "delta": _number_or_none(delta), "diagnostic_post_delta": _number_or_none(delta),
                 "credit": credit, "effective_credit": credit, "local_credit": local, "terminal_fill": fill,
                 "credit_valid": credit is not None, "credit_error": reason,
-                "trace_turn_type": types[i], "label_source": "outcome" if i == boundary else "trace",
-                "is_final": i == final, "outcome_valid": outcome_valid,
+                "trace_turn_type": "tool_plan", "label_source": "trace",
+                "is_final": False, "is_terminal": i == terminal,
+                "environment_terminal": i == boundary, "outcome_valid": outcome_valid,
                 "outcome_advantage": _number_or_none(advantage),
                 "terminal_reached": bool(annotated["terminal_reached"][i]),
             })
@@ -444,19 +449,21 @@ def score_snapshots(snapshot: dict, probe: dict, scorer_config: dict, *, progres
                           "goal_spec_hash": t.get("goal_spec_hash"), "goal_metadata": t.get("goal_metadata")}
                          for t in trajectories]
     fingerprint = hashlib.sha256(json.dumps({"snapshot_id": snapshot.get("snapshot_id"), "probe": probe,
+                                             "credit_mode": _CREDIT_MODE,
                                              "scorer": scorer_config, "goals": goal_fingerprints,
                                              "enrichment_sha256": snapshot.get("enrichment_sha256")},
                                             sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     return {"snapshot_id": snapshot.get("snapshot_id"), "scoring_fingerprint": fingerprint,
+            "credit_mode": _CREDIT_MODE,
             "trajectories": result_trajectories, "summary": counters,
             "formula": {"mean_logp": "mean fixed Response token LogP at temperature=1",
                         "value": "log((-mean_logp_initial + epsilon) / (-mean_logp_state + epsilon))",
-                        "delta": "Next real decision pre-state V minus current V; final has no TRACE delta",
-                        "credit": "QA annotate_rollout_credits: K includes actual final decision",
+                        "delta": "Real post-action V minus pre-action V, including the last action",
+                        "credit": "annotate_environment_credits: normalized K-action delta window plus terminal fill",
                         "epsilon": cfg.epsilon, "k": cfg.k, "gamma": cfg.gamma,
                         "terminal_fill_enabled": cfg.terminal_fill_enabled,
                         "terminal_fill_scale": cfg.terminal_fill_scale,
                         "norm_adv_by_std_in_grpo": norm_by_std,
-                        "terminal_state": "Real post-state is diagnostic only; real last completed action routes to outcome",
+                        "terminal_state": "Real terminal post-state scores the last action; it is not an extra turn",
                         "state_view": state_view,
                         "invalid": "null, never zero; no truncation or bridging missing/error transitions"}}

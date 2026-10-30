@@ -80,11 +80,12 @@ class ScoringTests(unittest.TestCase):
         trajectory = result["trajectories"][0]
         values = [math.log(4.1) - math.log(-mean + 0.1) for mean in (-4.0, -2.0, -1.0, -3.0)]
         deltas = [values[i + 1] - values[i] for i in range(3)]
-        # QA K=3 includes the final decision; final's post-state is diagnostic only.
-        expected = (deltas[0] + .8 * deltas[1]) / (1 + .8) + 2 * .8 ** 2
+        # K=3 includes all three real transitions, including the terminal post-state.
+        expected = (deltas[0] + .8 * deltas[1] + .8 ** 2 * deltas[2]) / (1 + .8 + .8 ** 2) + 2 * .8 ** 2
         self.assertAlmostEqual(trajectory["turns"][0]["credit"], expected)
-        self.assertIsNone(trajectory["turns"][-1]["credit"])
-        self.assertEqual(trajectory["turns"][-1]["label_source"], "outcome")
+        self.assertAlmostEqual(trajectory["turns"][-1]["credit"], deltas[-1] + 2)
+        self.assertEqual(trajectory["turns"][-1]["label_source"], "trace")
+        self.assertAlmostEqual(trajectory["turns"][-1]["delta"], deltas[-1])
         self.assertAlmostEqual(trajectory["turns"][-1]["diagnostic_post_delta"], deltas[-1])
         self.assertEqual(len(trajectory["turns"]), 3)
         self.assertEqual(len(trajectory["states"]), 4)
@@ -99,10 +100,10 @@ class ScoringTests(unittest.TestCase):
         json.dumps(result, allow_nan=False)
 
     def test_k_one_uses_immediate_transition(self):
-        result, _ = self.run_score(probe={"k": 1})
-        for turn in result["trajectories"][0]["turns"][:-1]:
+        result, _ = self.run_score(probe={"k": 1, "terminal_fill_enabled": False})
+        for turn in result["trajectories"][0]["turns"]:
             self.assertAlmostEqual(turn["credit"], turn["delta"])
-        self.assertIsNone(result["trajectories"][0]["turns"][-1]["credit"])
+            self.assertEqual(turn["terminal_fill"], 0)
 
     def test_external_failure_blocks_every_window_containing_it(self):
         snapshot = saved()
@@ -112,7 +113,8 @@ class ScoringTests(unittest.TestCase):
         self.assertIsNone(turns[0]["credit"])
         self.assertIsNone(turns[1]["credit"])
         self.assertIsNone(turns[1]["delta"])
-        self.assertIsNone(turns[2]["credit"])
+        self.assertAlmostEqual(turns[2]["credit"], turns[2]["delta"])
+        self.assertEqual(turns[2]["terminal_fill"], 0)
         self.assertEqual(result["summary"]["external_error_windows"], 2)
 
     def test_missing_state_does_not_bridge_gap(self):
@@ -215,19 +217,20 @@ class ScoringTests(unittest.TestCase):
         trajectory = result["trajectories"][0]
         self.assertEqual({state["response"] for state in trajectory["states"]},
                          {"A cleaned mug is on a table."})
-        self.assertEqual(trajectory["turns"][-1]["trace_turn_type"], "base")
+        self.assertEqual(trajectory["turns"][-1]["trace_turn_type"], "tool_plan")
         self.assertTrue(trajectory["turns"][-1]["outcome_valid"])
         self.assertEqual(trajectory["turns"][0]["terminal_fill"], 2 * .8 ** 2)
 
-    def test_invalid_goal_keeps_final_type_but_removes_outcome_and_fill(self):
+    def test_invalid_terminal_poststate_keeps_action_type_and_blocks_credit_and_fill(self):
         snapshot = self.full_state_saved()
         snapshot["trajectories"][0]["states"][-1].update(goal_check_valid=False, scoring_valid=False)
         result, backend = self.run_score(snapshot, probe={"state_view": "full_state"})
         trajectory = result["trajectories"][0]
         self.assertEqual(len(backend.calls), 3)
         final = trajectory["turns"][-1]
-        self.assertEqual(final["trace_turn_type"], "base")
-        self.assertTrue(final["is_final"])
+        self.assertEqual(final["trace_turn_type"], "tool_plan")
+        self.assertFalse(final["is_final"])
+        self.assertTrue(final["is_terminal"])
         self.assertFalse(final["outcome_valid"])
         self.assertTrue(all(turn["terminal_fill"] is None for turn in trajectory["turns"]))
         self.assertTrue(all(turn["credit"] is None for turn in trajectory["turns"]))
@@ -245,16 +248,80 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(failed[-1]["outcome_advantage"], -.5)
         self.assertAlmostEqual(success[0]["terminal_fill"], .8 ** 2)
         self.assertAlmostEqual(failed[0]["terminal_fill"], -.8 ** 2)
-        self.assertEqual(failed[-1]["label_source"], "outcome")
+        self.assertEqual(failed[-1]["label_source"], "trace")
+        self.assertAlmostEqual(success[-1]["terminal_fill"], 1)
+        self.assertAlmostEqual(failed[-1]["terminal_fill"], -1)
 
-    def test_model_length_stop_has_base_boundary_but_no_final_label(self):
+    def test_model_length_stop_has_environment_boundary_without_trusted_terminal_fill(self):
         snapshot = self.full_state_saved()
         snapshot["trajectories"][0]["turns"][-1]["finish_reason"] = "length"
         result, _ = self.run_score(snapshot)
         final = result["trajectories"][0]["turns"][-1]
-        self.assertEqual(final["trace_turn_type"], "base")
+        self.assertEqual(final["trace_turn_type"], "tool_plan")
         self.assertFalse(final["is_final"])
+        self.assertFalse(final["is_terminal"])
+        self.assertTrue(final["environment_terminal"])
         self.assertFalse(final["outcome_valid"])
+        self.assertEqual(final["terminal_fill"], 0)
+
+    def test_single_action_uses_real_terminal_state_without_creating_a_final_turn(self):
+        snapshot = saved(count=1)
+        result, _ = self.run_score(snapshot)
+        trajectory = result["trajectories"][0]
+        self.assertEqual(len(trajectory["turns"]), 1)
+        self.assertEqual(len(trajectory["states"]), 2)
+        turn = trajectory["turns"][0]
+        delta = math.log(4.1) - math.log(2.1)
+        self.assertAlmostEqual(turn["delta"], delta)
+        self.assertAlmostEqual(turn["local_credit"], delta)
+        self.assertAlmostEqual(turn["terminal_fill"], 2)
+        self.assertAlmostEqual(turn["credit"], delta + 2)
+        self.assertTrue(turn["is_terminal"])
+        self.assertFalse(turn["is_final"])
+        self.assertEqual(turn["trace_turn_type"], "tool_plan")
+        self.assertEqual(turn["label_source"], "trace")
+        self.assertEqual(result["summary"]["outcome_turns"], 0)
+        self.assertEqual(result["summary"]["terminal_actions"], 1)
+
+    def test_k_three_fills_last_three_actual_actions_including_terminal_action(self):
+        result, _ = self.run_score(saved(count=4))
+        turns = result["trajectories"][0]["turns"]
+        self.assertEqual([t["terminal_reached"] for t in turns], [False, True, True, True])
+        for turn, expected in zip(turns, (0, 2 * .8 ** 2, 2 * .8, 2)):
+            self.assertAlmostEqual(turn["terminal_fill"], expected)
+        self.assertTrue(all(t["label_source"] == "trace" for t in turns))
+
+    def test_missing_terminal_poststate_never_fabricates_delta_or_credit(self):
+        snapshot = saved()
+        snapshot["trajectories"][0]["states"][-1]["state_context"] = ""
+        result, backend = self.run_score(snapshot)
+        turns = result["trajectories"][0]["turns"]
+        self.assertEqual(len(backend.calls), 3)
+        self.assertTrue(all(t["credit"] is None for t in turns))
+        self.assertTrue(all(t["terminal_fill"] is None for t in turns))
+        self.assertIsNone(turns[-1]["delta"])
+        self.assertEqual(turns[-1]["label_source"], "trace")
+
+    def test_terminal_actions_form_the_same_credit_pairs_as_other_actions(self):
+        snapshot = saved(count=1)
+        success = snapshot["trajectories"][0]
+        failed = json.loads(json.dumps(success))
+        failed["trajectory_id"] = "traj_failed"
+        failed["outcome"].update(success=False, reward=0.0)
+        failed["states"][-1]["state_context"] = "s2"
+        failed["turns"][0]["action_response"] = "<action>wrong action</action>"
+        snapshot["trajectories"].append(failed)
+        result, _ = self.run_score(snapshot, scorer=FakeScorer(means=(-4., -2., -6.)))
+        rows = []
+        for index, trajectory in enumerate(result["trajectories"]):
+            turn = trajectory["turns"][0]
+            rows.append({"index": index, "uid": "same-question", "turn_type": turn["trace_turn_type"],
+                         "value": turn["value"], "credit": turn["credit"], "label_source": turn["label_source"],
+                         "length": 1, "old_per_token": -1., "valid": True,
+                         "action_key": turn["action_response"], "is_final": turn["is_final"]})
+        self.assertGreater(rows[0]["credit"], 0)
+        self.assertLess(rows[1]["credit"], 0)
+        self.assertEqual(scoring._trace_module().select_pairs(rows), [(0, 1)])
 
     def test_missing_or_mixed_goal_metadata_fails_before_requests(self):
         snapshot = self.full_state_saved()

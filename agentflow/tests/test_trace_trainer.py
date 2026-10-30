@@ -85,7 +85,8 @@ def load_trainer_methods():
     scope = dict(
         torch=torch, np=np, random=random, defaultdict=defaultdict, DataProto=Proto, time=time,
         TraceConfig=CREDIT.TraceConfig, state_values=CREDIT.state_values,
-        annotate_rollout_credits=CREDIT.annotate_rollout_credits, select_pairs=CREDIT.select_pairs,
+        annotate_rollout_credits=CREDIT.annotate_rollout_credits,
+        annotate_environment_credits=CREDIT.annotate_environment_credits, select_pairs=CREDIT.select_pairs,
         summarize_states=METRICS.summarize_states,
         summarize_selected_pairs=METRICS.summarize_selected_pairs,
         encode_state_requests=SCORING.encode_state_requests,

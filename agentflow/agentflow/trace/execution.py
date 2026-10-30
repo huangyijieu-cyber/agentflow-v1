@@ -206,7 +206,7 @@ def environment_flag(value):
 
 
 def annotate_alfworld_step(log, state_context, done, info):
-    """Adapt a real environment decision to the unchanged QA type routes.
+    """Record one environment action and its actual successor scoring state.
 
     A verified environment budget failure is a terminal decision; a model
     response cut short by token limits or an external crash is not a trusted
@@ -226,14 +226,20 @@ def annotate_alfworld_step(log, state_context, done, info):
     state_valid = (log.get("trace_scoring_valid", before_valid) is True
                    and info.get("trace_scoring_valid", goal_valid) is True
                    and before_valid and goal_valid)
+    next_context = info.get("trace_state_context")
+    next_valid = (info.get("trace_scoring_valid", goal_valid) is True and goal_valid
+                  and isinstance(next_context, str) and bool(next_context.strip())
+                  and not external)
     action = info.get("trace_env_action")
     log.update({
         "trace_task": "alfworld", "trace_environment_step": True,
         "trace_state_context": state_context,
+        "trace_next_state_context": next_context,
+        "trace_next_scoring_valid": next_valid,
         "trace_env_done": ended, "trace_env_terminated": terminated,
         "trace_env_truncated": truncated, "trace_env_won": environment_flag(info.get("won")),
         "trace_env_error": external, "trace_env_terminal": terminal,
-        "trace_turn_type": "base" if terminal else "tool_plan",
+        "trace_turn_type": "tool_plan",
         "trace_action_key": json.dumps([state_context, action], ensure_ascii=False, sort_keys=True),
         "trace_scoring_valid": state_valid,
         "extraction_valid": log.get("extraction_valid", True) is not False and not invalid and state_valid,
@@ -248,7 +254,7 @@ def annotate_alfworld_step(log, state_context, done, info):
 
 
 def _annotate_alfworld_outcome(planner_logs, result, reward_value):
-    """Use the environment verifier, then reuse QA's base/final pair route."""
+    """Verify the environment boundary for fill, keeping every action TRACE."""
     candidates = [index for index, item in enumerate(planner_logs)
                   if item.get("trace_task") == "alfworld" and item.get("trace_env_terminal") is True]
     terminal = candidates[0] if len(candidates) == 1 else None
@@ -274,18 +280,21 @@ def _annotate_alfworld_outcome(planner_logs, result, reward_value):
         and prefix and all(item.get("trace_task") == "alfworld"
                            and item.get("trace_goal_check_valid") is True
                            and item.get("trace_scoring_valid") is True
+                           and item.get("trace_next_scoring_valid") is True
                            and not item.get("trace_external_error", False)
                            for item in prefix)
         and selected.get("trace_goal_check") is success
     )
     for index, item in enumerate(planner_logs):
-        item["trace_is_final"] = bool(completed and index == terminal)
+        item["trace_is_final"] = False
+        item["trace_is_terminal"] = bool(completed and index == terminal)
         item["trace_outcome_valid"] = bool(trustworthy and index <= terminal)
         item["trace_outcome_success"] = success if item["trace_outcome_valid"] else None
         item["trace_outcome_reward"] = float(reward_value) if finite_reward else None
     return {"trace_outcome_valid": trustworthy,
             "trace_outcome_success": success if trustworthy else None,
-            "trace_final_turn": terminal if completed else None}
+            "trace_final_turn": None,
+            "trace_terminal_turn": terminal if completed else None}
 
 
 def annotate_trace_outcome(planner_logs, result, reward_value, verifier, task="qa"):
