@@ -108,6 +108,7 @@ def _create_trace_environment(base_env, batch_size=1):
     from alfworld.agents.environment.alfred_tw_env import (
         AlfredDemangler, AlfredExpert, AlfredInfos,
     )
+    from agentflow.envs.alfworld.trace_wrapper import AlfWorldTraceFacts
 
     config = base_env.config
     if config["env"]["type"] != "AlfredTWEnv":
@@ -118,6 +119,7 @@ def _create_trace_environment(base_env, batch_size=1):
         won=True, admissible_commands=True, facts=True, last_action=True,
         extras=["gamefile"],
     )
+    request_infos.extras.append("trace_raw_facts")
     training_method = config["general"]["training_method"]
     if training_method == "dqn":
         budget = config["rl"]["training"]["max_nb_steps_per_episode"]
@@ -128,6 +130,7 @@ def _create_trace_environment(base_env, batch_size=1):
             request_infos.extras.append("expert_plan")
     else:
         raise NotImplementedError(f"Unsupported ALFWorld training method: {training_method}")
+    wrappers.append(AlfWorldTraceFacts)
     env_id = textworld.gym.register_games(
         base_env.game_files, request_infos, batch_size=batch_size,
         asynchronous=True, max_episode_steps=budget, wrappers=wrappers,
@@ -255,9 +258,12 @@ class AlfWorldEnv:
         if not self.trace_enabled:
             return
         tools = _goal_tools()
-        raw_facts = info.get("facts")
+        raw_facts = info.get("extra.trace_raw_facts")
         if raw_facts is None:
-            raise RuntimeError("ALFWorld full-state TRACE requires facts=True in environment infos")
+            raise RuntimeError(
+                "ALFWorld full-state TRACE requires extra.trace_raw_facts from "
+                "AlfWorldTraceFacts; public facts use renamed display identities"
+            )
         if isinstance(raw_facts, (list, tuple)) and len(raw_facts) == 1 and isinstance(raw_facts[0], list):
             raw_facts = raw_facts[0]
         self.trace_facts = tools.normalize_facts(raw_facts)

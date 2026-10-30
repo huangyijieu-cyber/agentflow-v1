@@ -3,6 +3,7 @@ import ast
 import copy
 import io
 import os
+import pickle
 from pathlib import Path
 import re
 import sys
@@ -96,6 +97,7 @@ class Simulator:
         return ["Visible room. Your task is to: put a clean mug in a cabinet."], {
             "extra.gamefile": ["actual/game.tw-pddl"], "admissible_commands": [["place mug"]],
             "won": [False], "facts": [["(isclean mug0)", "(holds agent0 mug0)", "(secret location0)"]],
+            "extra.trace_raw_facts": [["(isclean mug0)", "(holds agent0 mug0)", "(secret location0)"]],
         }
 
     def step(self, action):
@@ -107,6 +109,7 @@ class Simulator:
         return ["The mug was placed."], [float(not self.endless)], [not self.endless], {
             "extra.gamefile": ["actual/game.tw-pddl"], "admissible_commands": [["place mug"]],
             "won": [not self.endless and not self.mismatch], "facts": [facts], "last_action": ["MoveObject"],
+            "extra.trace_raw_facts": [facts],
         }
 
     def close(self):
@@ -197,6 +200,7 @@ class EnvironmentTests(unittest.TestCase):
                     observation, info = super().reset()
                     info["extra.gamefile"] = [str(gamefile)]
                     info["facts"] = [fixtures.INITIAL]
+                    info["extra.trace_raw_facts"] = [fixtures.INITIAL]
                     return observation, info
 
             with mock.patch.object(store, "_converter", side_effect=AssertionError("runtime conversion forbidden")) as convert:
@@ -298,6 +302,7 @@ class EnvironmentTests(unittest.TestCase):
                     observation, info = super().reset()
                     info["extra.gamefile"] = [str(game)]
                     info["facts"] = [fixtures.INITIAL]
+                    info["extra.trace_raw_facts"] = [fixtures.INITIAL]
                     return observation, info
 
             with mock.patch.dict(os.environ, {}, clear=True), \
@@ -433,6 +438,7 @@ class EnvironmentTests(unittest.TestCase):
                     observation, info = super().reset()
                     info["extra.gamefile"] = [str(gamefile)]
                     info["facts"] = [fixtures.INITIAL]
+                    info["extra.trace_raw_facts"] = [fixtures.INITIAL]
                     return observation, info
 
             env, base = self.env(SavedSimulator())
@@ -498,10 +504,32 @@ class EnvironmentTests(unittest.TestCase):
     def test_missing_requested_facts_fail_closed(self):
         env, _ = self.env()
         self.reset(env, question_id=0)
-        with self.assertRaisesRegex(RuntimeError, "facts=True"):
-            env._refresh_trace_state({"won": False}, "visible observation")
+        # Public facts must never be used as a fallback, even if requested.
+        with self.assertRaisesRegex(RuntimeError, "extra.trace_raw_facts"):
+            env._refresh_trace_state({"facts": [["(isclean mug0)"]], "won": False}, "visible observation")
         with self.assertRaisesRegex(RuntimeError, "empty fact set"):
-            env._refresh_trace_state({"facts": [[]], "won": False}, "visible observation")
+            env._refresh_trace_state({"extra.trace_raw_facts": [[]], "won": False}, "visible observation")
+
+    def test_public_display_names_are_ignored_on_reset_and_step(self):
+        class DemangledSimulator(Simulator):
+            def reset(self):
+                observations, info = super().reset()
+                info["facts"] = [[NS(name="atlocation", arguments=[NS(name="agent1"), NS(name="loc 7")])]]
+                return observations, info
+
+            def step(self, action):
+                observations, reward, done, info = super().step(action)
+                info["facts"] = [[NS(name="inreceptacle", arguments=[NS(name="mug 2"), NS(name="cabinet 1")])]]
+                return observations, reward, done, info
+
+        env, _ = self.env(DemangledSimulator())
+        self.reset(env, question_id=0)
+        self.assertTrue(env.trace_goal_check_valid)
+        self.assertNotIn("loc 7", str(env.trace_facts))
+        _, _, done, info = self.step(env, "<action>place mug</action>")
+        self.assertTrue(done)
+        self.assertTrue(info["trace_goal_check"])
+        self.assertTrue(info["trace_scoring_valid"])
 
     def test_legacy_mode_does_not_parse_rules_or_register_extra_state(self):
         env, base = self.env(trace=False)
@@ -524,23 +552,85 @@ class RegistrationTests(unittest.TestCase):
         official.AlfredDemangler = mock.Mock(return_value="demangler")
         official.AlfredInfos = "infos-wrapper"
         official.AlfredExpert = mock.Mock(return_value="expert")
+        trace_wrapper = ModuleType("agentflow.envs.alfworld.trace_wrapper")
+        trace_wrapper.AlfWorldTraceFacts = "raw-facts-wrapper"
         function = extract(ENV_PATH, "_create_trace_environment", {})
         base = NS(config={"env": {"type": "AlfredTWEnv", "domain_randomization": True, "expert_type": "handcoded"},
                           "general": {"training_method": "dagger"},
                           "dagger": {"training": {"max_nb_steps_per_episode": 50}}},
                   train_eval="train", game_files=["actual/game.tw-pddl"])
         with mock.patch.dict(sys.modules, {"textworld": textworld, "textworld.gym": gym,
+                                          "agentflow.envs.alfworld.trace_wrapper": trace_wrapper,
                                           "alfworld.agents.environment.alfred_tw_env": official}):
             self.assertEqual(function(base), "simulator")
         requested = infos.call_args.kwargs
         self.assertTrue(requested["facts"])
         self.assertTrue(requested["last_action"])
         self.assertTrue(requested["won"])
+        self.assertIn("trace_raw_facts", requested["extras"])
         args = gym.register_games.call_args
         self.assertEqual(args.kwargs["max_episode_steps"], 50)
-        self.assertEqual(args.kwargs["wrappers"], ["demangler", "infos-wrapper", "expert"])
+        self.assertEqual(args.kwargs["wrappers"], ["demangler", "infos-wrapper", "expert", "raw-facts-wrapper"])
         self.assertTrue(args.kwargs["asynchronous"])
         official.AlfredExpert.assert_called_once_with(expert_type="handcoded")
+
+
+class TraceFactsWrapperTests(unittest.TestCase):
+    def wrapper(self, simulator):
+        class Wrapper:
+            def __init__(self, env):
+                self.env = env
+
+            def reset(self):
+                return self.env.reset()
+
+            def step(self, command):
+                return self.env.step(command)
+
+        cls = extract(ENV_PATH.with_name("trace_wrapper.py"), "AlfWorldTraceFacts", {"Wrapper": Wrapper})
+        return cls(simulator)
+
+    def test_raw_identity_survives_display_randomization_batch_and_serialization(self):
+        import test_alfworld_goal_conversion as fixtures
+        with tempfile.TemporaryDirectory() as directory:
+            builder = fixtures.GoalTests()
+            builder.root = Path(directory)
+            spec = fixtures.converter.load_goal_spec(builder.create())
+
+        def state(facts):
+            raw = [NS(name=parts[0], arguments=[NS(name=arg) for arg in parts[1:]])
+                   for parts in map(fixtures.converter.parse_pddl, facts)]
+            return {"_facts": raw,
+                    # A display label may identify different original objects
+                    # across episodes. It is never the saved PDDL identity.
+                    "facts": [NS(name="atlocation", arguments=[NS(name="agent1"), NS(name="loc 7")])],
+                    "feedback": "You see mug 2 in cabinet 1."}
+
+        initial = state(fixtures.INITIAL)
+        success = state(fixtures.INITIAL + ["(isclean mug0)"])
+        wrong_object = state(fixtures.INITIAL + ["(isclean mug1)"])
+        simulator = NS(reset=lambda: initial,
+                       step=mock.Mock(side_effect=[(success, 1, True), (wrong_object, 0, False)]))
+        wrapper = self.wrapper(simulator)
+        for result, expected in ((wrapper.reset(), False), (wrapper.step("clean mug 2")[0], True),
+                                 (wrapper.step("clean mug 2")[0], False)):
+            # Gym Filter keeps requested extras, batching wraps each in a list,
+            # and an async process serializes that payload.
+            filtered = {"extra.trace_raw_facts": [result["extra.trace_raw_facts"]]}
+            batched = pickle.loads(pickle.dumps(filtered))["extra.trace_raw_facts"]
+            normalized = fixtures.converter.normalize_facts(batched)
+            self.assertEqual(fixtures.converter.normalize_facts(normalized), normalized)
+            self.assertEqual(fixtures.converter.evaluate_goal(spec, normalized), expected)
+            rendered = fixtures.converter.render_full_state(spec, normalized)
+            self.assertIn("Current full environment state", rendered)
+            self.assertEqual(result["facts"][0].arguments[1].name, "loc 7")
+            self.assertEqual(result["feedback"], "You see mug 2 in cabinet 1.")
+        self.assertIs(wrapper.reset()["_facts"], initial["_facts"])
+
+    def test_missing_raw_facts_does_not_guess_from_display_names(self):
+        wrapper = self.wrapper(NS(reset=lambda: {"facts": []}))
+        with self.assertRaisesRegex(RuntimeError, "raw PddlEnv _facts"):
+            wrapper.reset()
 
 
 class SolverStateTests(unittest.TestCase):

@@ -226,6 +226,18 @@ class GoalTests(unittest.TestCase):
         with self.assertRaises(converter.GoalConversionError):
             converter.normalize_facts(None)
 
+    def test_display_entity_names_fail_before_lossy_pddl_serialization(self):
+        for value in (
+            NS(name="atlocation", arguments=[NS(name="agent1"), NS(name="loc 7")]),
+            {"name": "atlocation", "arguments": ["agent1", "loc 7"]},
+            ("atlocation", "agent1", "loc 7"),
+            "atlocation(agent1: agent, loc 7: location)",
+        ):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                converter.GoalConversionError, "raw PDDL identities"
+            ):
+                converter.normalize_facts([value])
+
     def test_goal_and_template_hash_change_when_actual_rules_change(self):
         path = self.create("look_at_obj_in_light")
         old = converter.load_goal_spec(path)

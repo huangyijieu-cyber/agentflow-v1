@@ -409,6 +409,11 @@ def normalize_facts(facts) -> list[str]:
         if normalized[0].startswith("new-axiom@"):
             # Internal compiler propositions are not user-domain state facts.
             continue
+        if any(not symbol or re.search(r"[\s();]", symbol) for symbol in normalized):
+            raise GoalConversionError(
+                f"Non-canonical environment fact: {normalized}. "
+                "Use raw PDDL identities, not human-readable TextWorld facts."
+            )
         arity = PREDICATE_ARITIES.get(normalized[0])
         if arity is None or len(normalized) != arity + 1:
             raise GoalConversionError(f"Unsupported environment predicate: {normalized}")
