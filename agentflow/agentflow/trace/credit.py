@@ -6,10 +6,20 @@ additionally invalidate every tool-credit window that includes the failure.
 """
 
 import math
+import warnings
 from numbers import Real
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, fields
 from typing import Any, Mapping, Optional, Sequence
+
+
+# Fields carried by the trace-2b base config, not used by this TRACE implementation.
+_LEGACY_IGPO_FIELDS = {
+    "pair_score_mode", "igpo_gamma", "igpo_ig_weight", "igpo_outcome_weight",
+    "igpo_norm_epsilon", "igpo_ig_std_min", "igpo_min_rollouts",
+    "igpo_positive_threshold", "igpo_negative_threshold", "igpo_gap_epsilon",
+    "igpo_absolute_ig_guard",
+}
 
 
 @dataclass(frozen=True)
@@ -87,10 +97,22 @@ class TraceConfig:
         if config is None:
             return cls()
         known_fields = {field.name for field in fields(cls)}
-        unknown = set(config) - known_fields
+        legacy_fields = set(config) & _LEGACY_IGPO_FIELDS
+        unknown = set(config) - known_fields - legacy_fields
         if unknown:
             raise ValueError(f"Unknown TRACE configuration fields: {sorted(unknown)}")
-        return cls(**dict(config))
+        if "pair_score_mode" in config and config["pair_score_mode"] not in ("igpo", "trace_fill"):
+            raise ValueError("Unrecognized legacy trace.pair_score_mode; expected 'igpo' or 'trace_fill'")
+        result = cls(**{key: value for key, value in config.items() if key in known_fields})
+        if legacy_fields:
+            warnings.warn(
+                f"Ignoring trace-2b-only configuration fields: {sorted(legacy_fields)}. "
+                "This trace implementation uses TRACE credit with the configured terminal fill; "
+                "pair_score_mode='igpo' does not enable IGPO. Remove these fields from data.trace.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return result
 
 
 def _finite(value):

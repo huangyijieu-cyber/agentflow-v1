@@ -66,7 +66,7 @@ class PlannerStateTests(unittest.TestCase):
         planner.temperature = 0.7
         return planner
 
-    def test_all_planner_turns_capture_original_context_without_current_instructions(self):
+    def test_all_planner_turns_capture_evidence_without_current_instructions(self):
         # Words used by template delimiters are deliberately in the user body.
         question = "Question body\n\nInstructions:\nkeep this user text\nTask: keep this too"
         for multimodal in (False, True):
@@ -86,26 +86,65 @@ class PlannerStateTests(unittest.TestCase):
                 for log, prompt in zip(planner.logs, planner.llm_engine.prompts):
                     self.assertEqual(log["prompt"], prompt)
                     self.assertIn(question, log["trace_state_context"])
-                    self.assertIn(log["trace_state_context"], prompt)
                     self.assertNotIn("Select ONE tool best suited", log["trace_state_context"])
                     self.assertNotIn("Select the **single best tool**", log["trace_state_context"])
                     self.assertEqual(log["response_token_ids"], [202, 303])
+                self.assertEqual(planner.logs[0]["trace_state_context"], planner.logs[1]["trace_state_context"])
                 self.assertIn("evidence before action", planner.logs[2]["trace_state_context"])
                 self.assertNotIn("evidence after action", planner.logs[2]["trace_state_context"])
                 self.assertIn("evidence after action", planner.logs[3]["trace_state_context"])
                 self.assertNotIn("generated response", planner.logs[1]["trace_state_context"])
 
+    def test_unchanged_evidence_has_identical_tool_and_final_score_contexts(self):
+        for multimodal in (False, True):
+            with self.subTest(multimodal=multimodal), contextlib.redirect_stdout(io.StringIO()):
+                planner = self.make_planner(multimodal)
+                planner.query_analysis = "model-only reasoning"
+                memory = NS(get_actions=lambda: {"Action Step 1": {"result": "retrieved evidence"}})
+                planner.generate_next_step("question", None, planner.query_analysis, memory, 2, 5)
+                planner.generate_next_step("question", None, "different reasoning", memory, 3, 5)
+                planner.generate_final_output("question", None, memory)
+                planner.generate_direct_output("question", None, memory)
+                contexts = [log["trace_state_context"] for log in planner.logs]
+                self.assertEqual(len(set(contexts)), 1)
+                self.assertIn("retrieved evidence", contexts[0])
+                self.assertNotIn("reasoning", contexts[0])
+                # Generation still sees its original stage-specific inputs.
+                self.assertIn("model-only reasoning", planner.logs[0]["prompt"])
+                self.assertIn("different reasoning", planner.logs[1]["prompt"])
+                self.assertNotIn("model-only reasoning", planner.logs[2]["prompt"])
+                self.assertIn("model-only reasoning", planner.logs[3]["prompt"])
+
+    def test_initial_score_context_is_shared_before_any_tool_observation(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            planner = self.make_planner()
+            planner.generate_base_response("question", None)
+            planner.analyze_query("question", None)
+            planner.generate_next_step("question", None, planner.query_analysis,
+                                       NS(get_actions=lambda: {}), 1, 3)
+        self.assertEqual(len({log["trace_state_context"] for log in planner.logs}), 1)
+
     def test_snapshot_does_not_read_memory_twice_or_add_response(self):
-        planner = self.make_planner()
-        reads = []
-        def get_actions():
-            reads.append(1)
-            return f"state snapshot {len(reads)}"
-        planner.generate_next_step("question", None, "analysis", NS(get_actions=get_actions), 1, 3)
-        log = planner.logs[0]
-        self.assertEqual(len(reads), 1)
-        self.assertIn("state snapshot 1", log["trace_state_context"])
-        self.assertNotIn(log["response"], log["trace_state_context"])
+        for turn in ("tool_plan", "final_answer", "direct"):
+            with self.subTest(turn=turn):
+                planner = self.make_planner()
+                planner.query_analysis = "analysis"
+                reads = []
+                def get_actions():
+                    reads.append(1)
+                    return f"state snapshot {len(reads)}"
+                memory = NS(get_actions=get_actions)
+                if turn == "tool_plan":
+                    planner.generate_next_step("question", None, "analysis", memory, 1, 3)
+                elif turn == "final_answer":
+                    planner.generate_final_output("question", None, memory)
+                else:
+                    planner.generate_direct_output("question", None, memory)
+                log = planner.logs[0]
+                self.assertEqual(len(reads), 1)
+                self.assertIn("state snapshot 1", log["trace_state_context"])
+                self.assertIn("state snapshot 1", log["prompt"])
+                self.assertNotIn(log["response"], log["trace_state_context"])
 
 
 class RolloutMetadataTests(unittest.TestCase):

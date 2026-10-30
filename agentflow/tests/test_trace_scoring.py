@@ -1,12 +1,14 @@
 """Exercise GT teacher forcing preparation without loading Ray or VERL."""
 import ast
 from contextlib import contextmanager, nullcontext
+from dataclasses import asdict
 import importlib.util
 import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace, MethodType
 import unittest
+from unittest.mock import Mock
 
 import torch
 
@@ -162,6 +164,59 @@ class ScorePreparationTests(unittest.TestCase):
                      "mapping": {}, "global_pool_id": "pool"}
             exec(code, scope)
             self.assertEqual("ref" in scope["role_worker_mapping"], expected)
+
+
+class TraceStartupTests(unittest.TestCase):
+    def make_runner(self, algorithm, trace_config):
+        # Execute the real startup body up to model loading, without Ray/GPU
+        # dependencies. The OmegaConf shim only supplies container operations.
+        path = ROOT / "agentflow/verl/entrypoint.py"
+        cls = next(n for n in ast.parse(path.read_text()).body
+                   if isinstance(n, ast.ClassDef) and n.name == "TaskRunner")
+        run = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "run")
+        run.body = [n for n in run.body if not isinstance(n, (ast.Import, ast.ImportFrom))]
+        class ConfigDict(dict):
+            __getattr__ = dict.__getitem__
+            __setattr__ = dict.__setitem__
+        config = SimpleNamespace(data=ConfigDict(algorithm=algorithm, trace=dict(trace_config)),
+                                 actor_rollout_ref=SimpleNamespace(model=SimpleNamespace(path="model")))
+        copy_model = Mock(side_effect=RuntimeError("model loading reached"))
+        scope = {"TraceConfig": scoring.TraceConfig, "asdict": asdict,
+                 "copy_to_local": copy_model, "pprint": Mock(),
+                 "OmegaConf": SimpleNamespace(resolve=lambda c: None, create=dict,
+                     to_container=lambda c, resolve: c)}
+        exec(compile(ast.Module(body=[run], type_ignores=[]), str(path), "exec"), scope)
+        return lambda: scope["run"](None, config), config, copy_model
+
+    def test_legacy_settings_are_normalized_before_model_loading(self):
+        run, config, copy_model = self.make_runner("grpo+slic", {
+            "enabled": True, "pair_score_mode": "igpo", "igpo_gamma": 1.0,
+            "k": 3, "gamma": 0.8, "terminal_fill_scale": 2.0,
+        })
+        with self.assertWarnsRegex(UserWarning, "does not enable IGPO"):
+            with self.assertRaisesRegex(RuntimeError, "model loading reached"):
+                run()
+        copy_model.assert_called_once_with("model")
+        self.assertNotIn("pair_score_mode", config.data.trace)
+        self.assertNotIn("igpo_gamma", config.data.trace)
+        self.assertEqual(scoring.TraceConfig.from_mapping(config.data.trace), scoring.TraceConfig())
+
+    def test_bad_trace_config_fails_before_loading_models(self):
+        for bad in ({"k": 0}, {"match_epslion": 0.05}, {"pair_score_mode": "igop"}):
+            with self.subTest(bad=bad):
+                run, _, copy_model = self.make_runner("grpo+slic", {"enabled": True, **bad})
+                with self.assertRaises(ValueError):
+                    run()
+                copy_model.assert_not_called()
+
+    def test_inactive_trace_settings_remain_untouched(self):
+        for algorithm, enabled in (("grpo", True), ("grpo+slic", False)):
+            settings = {"enabled": enabled, "unknown": 1}
+            with self.subTest(algorithm=algorithm, enabled=enabled):
+                run, config, _ = self.make_runner(algorithm, settings)
+                with self.assertRaisesRegex(RuntimeError, "model loading reached"):
+                    run()
+                self.assertEqual(config.data.trace, settings)
 
 
 if __name__ == "__main__":

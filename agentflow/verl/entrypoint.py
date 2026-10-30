@@ -2,8 +2,10 @@ import hydra
 import ray
 import os
 import traceback
+from dataclasses import asdict
 from pathlib import Path
 
+from agentflow.trace.credit import TraceConfig
 from .dataset import AgentDataset
 from .trainer import AgentFlowTrainer
 from verl.trainer.ppo.reward import load_reward_manager
@@ -100,8 +102,13 @@ class TaskRunner:
 
         from verl.utils.fs import copy_to_local
 
-        pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
         OmegaConf.resolve(config)
+        # Validate before loading models or collecting the first rollout, and
+        # pass only effective TRACE settings to all downstream consumers.
+        trace_config = config.data.get("trace", {})
+        if "slic" in str(config.data.get("algorithm", "")).split("+") and trace_config.get("enabled", False):
+            config.data.trace = OmegaConf.create(asdict(TraceConfig.from_mapping(trace_config)))
+        pprint(OmegaConf.to_container(config, resolve=True))
 
         # download the checkpoint from hdfs
         local_path = copy_to_local(config.actor_rollout_ref.model.path)

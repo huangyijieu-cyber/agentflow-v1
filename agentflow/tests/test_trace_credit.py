@@ -430,6 +430,28 @@ class TraceConfigTests(unittest.TestCase):
         self.assertEqual(TraceConfig.from_mapping().match_epsilon, 0.05)
         self.assertEqual(TraceConfig.from_mapping({"match_epsilon": 0.2}).match_epsilon, 0.2)
 
+    def test_mixed_trace_2b_config_warns_and_preserves_trace_settings(self):
+        trace_settings = {"k": 2, "gamma": 0.6, "match_epsilon": 0.03,
+                          "terminal_fill_enabled": False, "terminal_fill_scale": 1.3,
+                          "positive_threshold": 0.02, "negative_threshold": 0.03,
+                          "gap_epsilon": 0.07}
+        mixed = dict(trace_settings, pair_score_mode="igpo", igpo_gamma=1.0,
+                     igpo_ig_weight=1.0, igpo_outcome_weight=1.0,
+                     igpo_norm_epsilon=1e-6, igpo_ig_std_min=1e-3,
+                     igpo_min_rollouts=2, igpo_positive_threshold=0.1,
+                     igpo_negative_threshold=0.1, igpo_gap_epsilon=0.5,
+                     igpo_absolute_ig_guard="none")
+        original = dict(mixed)
+        with self.assertWarnsRegex(UserWarning, "does not enable IGPO"):
+            actual = TraceConfig.from_mapping(mixed)
+        self.assertEqual(actual, TraceConfig.from_mapping(trace_settings))
+        self.assertEqual(mixed, original)
+
+    def test_legacy_trace_fill_and_orphaned_igpo_fields_are_explicitly_ignored(self):
+        for extra in ({"pair_score_mode": "trace_fill"}, {"igpo_gamma": 1.0}):
+            with self.subTest(extra=extra), self.assertWarnsRegex(UserWarning, "Ignoring trace-2b-only"):
+                self.assertEqual(TraceConfig.from_mapping(extra), TraceConfig())
+
     def test_reject_invalid_configuration(self):
         for config in ({"k": 0}, {"k": 1.5}, {"gamma": 1.1}, {"epsilon": 0},
                        {"match_epsilon": -1}, {"positive_threshold": -1},
@@ -439,7 +461,10 @@ class TraceConfigTests(unittest.TestCase):
                        {"enabled": "true"}, {"terminal_fill_enabled": "true"},
                        {"outcome_match_value": 1}, {"terminal_fill_scale": -1},
                        {"terminal_fill_scale": math.inf},
-                       {"outcome_success_threshold": math.nan}, {"unknown": 1}):
+                       {"outcome_success_threshold": math.nan}, {"unknown": 1},
+                       {"pair_score_mode": "igop"},
+                       {"pair_score_mode": "igpo", "igpo_gama": 1.0},
+                       {"igpo_gamma": 1.0, "match_epslion": 0.05}):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 TraceConfig.from_mapping(config)
 

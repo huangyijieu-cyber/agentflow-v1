@@ -58,6 +58,15 @@ class Planner:
                 log["extraction_valid"] = False
         self.logs.append(log)
 
+    def _trace_state_context(self, question: str, actions=None, image: str = None) -> str:
+        """Use the same pre-action evidence view for every QA decision type."""
+        context = f"Context:\n- **Query:** {question}"
+        if self.is_multimodal and image:
+            context += f"\n- **Image:** {image}"
+        # Analysis and decision instructions are not new environment evidence.
+        # Reuse the prompt's bounded snapshot; do not reread or expand memory.
+        return context + f"\n- **Actions Taken:** {actions if actions is not None else {}}"
+
     def get_image_info(self, image_path: str) -> Dict[str, Any]:
         image_info = {}
         if image_path and os.path.isfile(image_path):
@@ -75,6 +84,7 @@ class Planner:
 
     def generate_base_response(self, question: str, image: str, max_tokens: int = 2048) -> str:
         image_info = self.get_image_info(image)
+        trace_state_context = self._trace_state_context(question, image=image)
 
         input_data = [question]
         if image_info and "image_path" in image_info:
@@ -94,14 +104,15 @@ class Planner:
         # [原代码保留]
         # self.logs.append({"prompt": input_data[0], "response": self.base_response})
         # [修改目的] 在不改变 prompt/response 文本的前提下，同时记录本次真实 token ids / finish_reason。
-        self._append_log(input_data[0], self.base_response, trace_state_context=input_data[0], trace_turn_type="base")
+        self._append_log(input_data[0], self.base_response, trace_state_context=trace_state_context, trace_turn_type="base")
         return self.base_response
 
     def analyze_query(self, question: str, image: str, max_tokens: int = 2048) -> str:
         image_info = self.get_image_info(image)
+        trace_state_context = self._trace_state_context(question, image=image)
 
         if self.is_multimodal:
-            trace_state_context = f"""Available tools: {self.available_tools}
+            generation_context = f"""Available tools: {self.available_tools}
 
 Metadata for the tools: {self.toolbox_metadata}
 
@@ -111,7 +122,7 @@ Query: {question}"""
             query_prompt = f"""
 Task: Analyze the given query with accompanying inputs and determine the skills and tools needed to address it effectively.
 
-{trace_state_context}
+{generation_context}
 
 Instructions:
 1. Carefully read and understand the query and any accompanying inputs.
@@ -129,14 +140,14 @@ Your response should include:
 Please present your analysis in a clear, structured format.
                         """
         else:
-            trace_state_context = f"""Inputs:
+            generation_context = f"""Inputs:
 - Query: {question}
 - Available tools: {self.available_tools}
 - Metadata for tools: {self.toolbox_metadata}"""
             query_prompt = f"""
 Task: Analyze the given query to determine necessary skills and tools.
 
-{trace_state_context}
+{generation_context}
 
 Instructions:
 1. Identify the main objectives in the query.
@@ -241,8 +252,10 @@ Be biref and precise with insight.
         return context, sub_goal, tool_name
 
     def generate_next_step(self, question: str, image: str, query_analysis: str, memory: Memory, step_count: int, max_step_count: int, json_data: Any = None, max_tokens: int = 2048) -> Any:
+        actions = memory.get_actions()
+        trace_state_context = self._trace_state_context(question, actions, image)
         if self.is_multimodal:
-            trace_state_context = f"""Context:
+            generation_context = f"""Context:
 Query: {question}
 Image: {image}
 Query Analysis: {query_analysis}
@@ -254,14 +267,14 @@ Tool Metadata:
 {self.toolbox_metadata}
 
 Previous Steps and Their Results:
-{memory.get_actions()}
+{actions}
 
 Current Step: {step_count} in {max_step_count} steps
 Remaining Steps: {max_step_count - step_count}"""
             prompt_generate_next_step = f"""
 Task: Determine the optimal next step to address the given query based on the provided analysis, available tools, and previous steps taken.
 
-{trace_state_context}
+{generation_context}
 
 Instructions:
 1. Analyze the context thoroughly, including the query, its analysis, any image, available tools and their metadata, and previous steps taken.
@@ -314,16 +327,16 @@ Tool Name: Object_Detector_Tool
 Remember: Your response MUST end with the Context, Sub-Goal, and Tool Name sections, with NO additional content afterwards.
                         """
         else:
-            trace_state_context = f"""Context:
+            generation_context = f"""Context:
 - **Query:** {question}
 - **Query Analysis:** {query_analysis}
 - **Available Tools:** {self.available_tools}
 - **Toolbox Metadata:** {self.toolbox_metadata}
-- **Previous Steps:** {memory.get_actions()}"""
+- **Previous Steps:** {actions}"""
             prompt_generate_next_step = f"""
 Task: Determine the optimal next step to address the query using available tools and previous steps.
 
-{trace_state_context}
+{generation_context}
 
 Instructions:
 1. Analyze the query, previous steps, and available tools.
@@ -360,17 +373,19 @@ Rules:
 
 
     def generate_final_output(self, question: str, image: str, memory: Memory, max_tokens: int = 2048) -> str:
+        actions = memory.get_actions()
+        trace_state_context = self._trace_state_context(question, actions, image)
         image_info = self.get_image_info(image)
         if self.is_multimodal:
-            trace_state_context = f"""Context:
+            generation_context = f"""Context:
 Query: {question}
 Image: {image_info}
 Actions Taken:
-{memory.get_actions()}"""
+{actions}"""
             prompt_generate_final_output = f"""
 Task: Generate the final output based on the query, image, and tools used in the process.
 
-{trace_state_context}
+{generation_context}
 
 Instructions:
 1. Review the query, image, and all actions taken during the process.
@@ -406,13 +421,13 @@ Your response should be well-organized and include the following sections:
    - If appropriate, suggest potential next steps or areas for further investigation.
 """
         else:
-                trace_state_context = f"""Context:
+                generation_context = f"""Context:
 - **Query:** {question}
-- **Actions Taken:** {memory.get_actions()}"""
+- **Actions Taken:** {actions}"""
                 prompt_generate_final_output = f"""
 Task: Generate the final output based on the query and the results from all tools used.
 
-{trace_state_context}
+{generation_context}
 
 Instructions:
 1. Review the query and the results from all tool executions.
@@ -440,31 +455,33 @@ Instructions:
 
 
     def generate_direct_output(self, question: str, image: str, memory: Memory, max_tokens: int = 2048) -> str:
+        actions = memory.get_actions()
+        trace_state_context = self._trace_state_context(question, actions, image)
         image_info = self.get_image_info(image)
         if self.is_multimodal:
-            trace_state_context = f"""Context:
+            generation_context = f"""Context:
 Query: {question}
 Image: {image_info}
 Initial Analysis:
 {self.query_analysis}
 Actions Taken:
-{memory.get_actions()}"""
+{actions}"""
             prompt_generate_direct_output = f"""
-{trace_state_context}
+{generation_context}
 
 Please generate the concise output based on the query, image information, initial analysis, and actions taken. Break down the process into clear, logical, and conherent steps. Conclude with a precise and direct answer to the query.
 
 Answer:
 """
         else:
-            trace_state_context = f"""Context:
+            generation_context = f"""Context:
 - **Query:** {question}
 - **Initial Analysis:** {self.query_analysis}
-- **Actions Taken:** {memory.get_actions()}"""
+- **Actions Taken:** {actions}"""
             prompt_generate_direct_output = f"""
 Task: Generate a concise final answer to the query based on all provided context.
 
-{trace_state_context}
+{generation_context}
 
 Instructions:
 1. Review the query and the results from all actions.
