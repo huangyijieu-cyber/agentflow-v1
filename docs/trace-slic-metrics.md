@@ -62,7 +62,7 @@
 
 | 指标 | 定义 |
 | --- | --- |
-| `candidates_sign` | 同题、同类型、同来源组内具备正负两侧的候选组合数 |
+| `candidates_sign` | 同题、同类型、同来源组内具备正负两侧的候选组合数；工具/环境动作还按原始 Turn id 分组 |
 | `groups_no_positive`、`groups_no_negative` | 缺少合格正侧／负侧的组数；中性组可能同时计入两者 |
 | `both_sign_group_rate` | 同时具备正负两侧的合格组数 / 有合格行的组数；无合格组时为 0 |
 | `tool_value_match_rate` | 工具候选通过价值匹配的比例；无工具候选时为 0 |
@@ -74,7 +74,7 @@
 | `selected_unique` | 补齐前最终选中的 Pair 数 |
 | `trace_selected_unique`、`outcome_selected_unique` | 工具／奖励来源最终选中的 Pair 数 |
 | `question_coverage` | 最终 Pair 覆盖问题数 / 当前批次已有 Turn 的不同问题数；未返回任何 Turn 的问题不在分母 |
-| `cross_turn_rate` | 最终 Pair 两侧原始 Turn 编号不同的比例，不以越高越好为目标 |
+| `cross_turn_rate` | 最终 Pair 两侧原始 Turn 编号不同的比例；工具/环境动作应为 0，QA outcome 路由保留原行为，因此所有来源合计值可能非零 |
 | `value_gap_{p50,p90,max}` | 最终工具 Pair 两侧动作前状态价值差，仅统计工具来源 |
 | `credit_gap_{min,p50,p90}` | 最终工具 Pair 两侧有效信用差，仅统计工具来源 |
 | `{type}/selected_unique` | 各决策类型最终选中的 Pair 数 |

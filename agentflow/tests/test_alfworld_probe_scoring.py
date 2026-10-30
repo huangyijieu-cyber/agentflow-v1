@@ -315,7 +315,8 @@ class ScoringTests(unittest.TestCase):
         rows = []
         for index, trajectory in enumerate(result["trajectories"]):
             turn = trajectory["turns"][0]
-            rows.append({"index": index, "uid": "same-question", "turn_type": turn["trace_turn_type"],
+            rows.append({"index": index, "uid": "same-question", "turn_index": turn["turn_index"],
+                         "turn_type": turn["trace_turn_type"],
                          "value": turn["value"], "credit": turn["credit"], "label_source": turn["label_source"],
                          "length": 1, "old_per_token": -1., "valid": True,
                          "action_key": turn["action_response"], "is_final": turn["is_final"]})

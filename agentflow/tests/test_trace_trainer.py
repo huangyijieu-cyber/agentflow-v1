@@ -86,7 +86,8 @@ def load_trainer_methods():
         torch=torch, np=np, random=random, defaultdict=defaultdict, DataProto=Proto, time=time,
         TraceConfig=CREDIT.TraceConfig, state_values=CREDIT.state_values,
         annotate_rollout_credits=CREDIT.annotate_rollout_credits,
-        annotate_environment_credits=CREDIT.annotate_environment_credits, select_pairs=CREDIT.select_pairs,
+        annotate_environment_credits=CREDIT.annotate_environment_credits,
+        pair_group_key=CREDIT.pair_group_key, select_pairs=CREDIT.select_pairs,
         summarize_states=METRICS.summarize_states,
         summarize_selected_pairs=METRICS.summarize_selected_pairs,
         encode_state_requests=SCORING.encode_state_requests,
@@ -211,19 +212,70 @@ def make_trainer(scores, trace=None):
 
 
 def standard_rows(chosen_reward=1.0, rejected_reward=1.0):
-    # Positive action A1 and negative action B0 have the same value but
-    # different original turn numbers and different decision prompts.
+    # Positive action A1 and negative action B1 share their original turn,
+    # while retaining each rollout's own decision prompt and state baseline.
     rows = [
         make_row("A0", "a", 0, turn_type="analysis", reward=chosen_reward),
         make_row("A1", "a", 1, old=-1, reward=chosen_reward),
         make_row("A2", "a", 2, turn_type="final_answer", reward=chosen_reward),
-        make_row("B0", "b", 0, old=-3, reward=rejected_reward),
-        make_row("B1", "b", 1, turn_type="final_answer", reward=rejected_reward),
+        make_row("B0", "b", 0, turn_type="analysis", reward=rejected_reward),
+        make_row("B1", "b", 1, old=-3, reward=rejected_reward),
+        make_row("B2", "b", 2, turn_type="final_answer", reward=rejected_reward),
     ]
-    return rows, {"A0": -4., "A1": -4., "A2": -2., "B0": -4., "B1": -8.}
+    return rows, {"A0": -4., "A1": -4., "A2": -2., "B0": -4., "B1": -4., "B2": -8.}
 
 
 class TraceTrainerIntegrationTests(unittest.TestCase):
+    def test_trace_pairing_uses_original_turn_ids_and_preserves_native_batch(self):
+        rows, scores = standard_rows()
+        history, trainer = make_batch(rows), make_trainer(scores)
+        history.non_tensor_batch["trace_original_turn"] = history.non_tensor_batch["turn_index_list"].copy()
+        history.non_tensor_batch["turn_index_list"][4] = 0  # Compacted worker numbering differs.
+        native_turns = history.non_tensor_batch["turn_index_list"].copy()
+        trainer._annotate_trace_credits(history)
+        pair = trainer._trans_to_dpo_batch([history])[0]
+        self.assertEqual(pair.non_tensor_batch["turn_index_list_a"].tolist(), [1])
+        self.assertEqual(pair.non_tensor_batch["turn_index_list_b"].tolist(), [1])
+        self.assertEqual(pair.non_tensor_batch["pair_turn"].tolist(), [1])
+        np.testing.assert_array_equal(history.non_tensor_batch["turn_index_list"], native_turns)
+        history.non_tensor_batch["trace_original_turn"][4] = 7
+        self.assertIsNone(trainer._trans_to_dpo_batch([history]))
+
+    def test_trace_baseline_excludes_valid_actions_from_other_turns(self):
+        rows, scores = standard_rows()
+        rows.extend([make_row("C0", "c", 0, old=-100.),
+                     make_row("C1", "c", 1, turn_type="final_answer")])
+        scores.update(C0=-4., C1=-4.)
+        history, trainer = make_batch(rows), make_trainer(scores)
+        trainer._annotate_trace_credits(history)
+        pair = trainer._trans_to_dpo_batch([history])[0]
+        self.assertEqual(pair.non_tensor_batch["group_baseline"].tolist(), [-2.])
+        self.assertEqual(pair.non_tensor_batch["group_size"].tolist(), [2])
+
+    def test_trace_turn_quotas_are_independent_and_shared_across_history_batches(self):
+        rows, scores = [], {}
+        for rollout, positive in (("a", True), ("b", True), ("c", False), ("d", False)):
+            for turn in range(3):
+                context = rollout + str(turn)
+                rows.append(make_row(context, rollout, turn,
+                                     turn_type="tool_plan" if turn < 2 else "final_answer"))
+                scores[context] = -4.
+        history, trainer = make_batch(rows), make_trainer(scores)
+        trainer._annotate_trace_credits(history)
+        non = history.non_tensor_batch
+        non["trace_credit"][:] = [.2, .2, np.nan, .3, .3, np.nan,
+                                  -.2, -.2, np.nan, -.3, -.3, np.nan]
+        pairs = trainer._trans_to_trace_batch([history])
+        counts = defaultdict(int)
+        for pair in pairs:
+            left, right = pair.non_tensor_batch["turn_index_list_a"][0], pair.non_tensor_batch["turn_index_list_b"][0]
+            self.assertEqual(left, right)
+            counts[int(left)] += 1
+        self.assertEqual(dict(counts), {0: 2, 1: 2})
+        repeated = trainer._trans_to_trace_batch([history, history])
+        self.assertEqual(len(repeated), 4)
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/selected_unique"], 4)
+
     def test_metric_coverage_funnel_and_outcome_disagreement_are_actual(self):
         rows, scores = standard_rows(chosen_reward=0., rejected_reward=1.)
         trainer, history = make_trainer(scores), make_batch(rows)
@@ -238,7 +290,7 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
         self.assertEqual(metrics["trace/pair/candidates_sign"], 1)
         self.assertEqual(metrics["trace/pair/tool_value_match_rate"], 1.)
         self.assertEqual(metrics["trace/pair/selected_unique"], 1)
-        self.assertEqual(metrics["trace/pair/cross_turn_rate"], 1.)
+        self.assertEqual(metrics["trace/pair/cross_turn_rate"], 0.)
         self.assertEqual(metrics["trace/pair/question_coverage"], 1.)
         self.assertEqual(metrics["trace/pair/trace/outcome_pairs_count"], 0)
         self.assertNotIn("trace/pair/chosen_failed_rollout_rate", metrics)
@@ -246,10 +298,11 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
     def test_analysis_and_final_use_verified_outcomes_without_gt_scores(self):
         rows = []
         for rollout, reward, success in (("a", 1., True), ("b", 0.1, False)):
+            offset = 0 if rollout == "a" else 5
             rows.extend([
-                make_row(rollout + "0", rollout, 0, turn_type="analysis", gt="",
+                make_row(rollout + "0", rollout, offset, turn_type="analysis", gt="",
                          reward=reward, outcome_valid=True, outcome_success=success),
-                make_row(rollout + "1", rollout, 1, turn_type="final_answer", gt="",
+                make_row(rollout + "1", rollout, offset + 1, turn_type="final_answer", gt="",
                          reward=reward, is_final=True, outcome_valid=True, outcome_success=success),
             ])
         trainer, history = make_trainer({}), make_batch(rows)
@@ -419,7 +472,7 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
         self.assertEqual(metrics["trace/pair/rejected_global_cap"], 1)
         self.assertEqual(metrics["trace/pair/selected_unique"], 1)
 
-    def test_cross_turn_pair_keeps_each_prompt_and_ignores_final_reward(self):
+    def test_same_turn_pair_keeps_each_prompt_and_ignores_final_reward(self):
         for chosen_reward, rejected_reward in ((1., 1.), (0., 1.), (1., 0.)):
             with self.subTest(chosen_reward=chosen_reward, rejected_reward=rejected_reward):
                 rows, scores = standard_rows(chosen_reward, rejected_reward)
@@ -432,9 +485,9 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
                 self.assertEqual(pair.non_tensor_batch["rollout_id_list_a"].tolist(), ["a"])
                 self.assertEqual(pair.non_tensor_batch["rollout_id_list_b"].tolist(), ["b"])
                 self.assertEqual(pair.non_tensor_batch["turn_index_list_a"].tolist(), [1])
-                self.assertEqual(pair.non_tensor_batch["turn_index_list_b"].tolist(), [0])
+                self.assertEqual(pair.non_tensor_batch["turn_index_list_b"].tolist(), [1])
                 self.assertTrue(torch.equal(pair.batch["prompts_a"], history.batch["prompts"][1:2]))
-                self.assertTrue(torch.equal(pair.batch["prompts_b"], history.batch["prompts"][3:4]))
+                self.assertTrue(torch.equal(pair.batch["prompts_b"], history.batch["prompts"][4:5]))
                 self.assertFalse(torch.equal(pair.batch["prompts_a"], pair.batch["prompts_b"]))
                 self.assertGreater(pair.non_tensor_batch["trace_credit_a"][0], 0)
                 self.assertLess(pair.non_tensor_batch["trace_credit_b"][0], 0)
@@ -455,7 +508,7 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
         self.assertEqual(pair.non_tensor_batch["group_baseline"].tolist(), [-2.])
         self.assertEqual(pair.non_tensor_batch["group_size"].tolist(), [2])
         # Action filtering must not delete its state observation before credit.
-        self.assertEqual(history.non_tensor_batch["trace_credit"][5], 0.)
+        self.assertEqual(history.non_tensor_batch["trace_credit"][6], 0.)
 
     def test_invalid_next_action_still_supplies_current_actions_next_state(self):
         rows = [make_row("A0", "a", 0), make_row("A1", "a", 1, valid=False),
@@ -473,7 +526,7 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
 
     def test_no_negative_credit_skips_even_when_rewards_differ(self):
         rows, scores = standard_rows(chosen_reward=1., rejected_reward=0.)
-        scores["B1"] = -2.
+        scores["B2"] = -2.
         trainer = make_trainer(scores)
         history = make_batch(rows)
         trainer._annotate_trace_credits(history)
@@ -553,6 +606,98 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
         self.assertEqual(pairs[0].non_tensor_batch["rollout_id_list_a"].tolist(), ["a"])
         self.assertEqual(pairs[0].non_tensor_batch["rollout_id_list_b"].tolist(), ["b"])
         self.assertEqual(pairs[0].non_tensor_batch["group_baseline"].tolist(), [-2.])
+
+
+class LegacySlicTurnTests(unittest.TestCase):
+    def trainer(self, task, algorithm="grpo+slic"):
+        trainer = make_trainer({}, trace={"enabled": False})
+        trainer.algorithm = algorithm
+        trainer.config.data["algorithm"] = algorithm
+        trainer.config.data["task"] = task
+        return trainer
+
+    def pairs(self, trainer, histories):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return trainer._trans_to_dpo_batch(histories)
+
+    def history(self, task, positive=3, negative=3):
+        rows = []
+        for index in range(positive + negative):
+            success = index < positive
+            for turn in (0, 1):
+                rows.append(make_row(f"state-{index}-{turn}", f"traj-{index}", turn,
+                                     reward=float(success), old=-1. - index))
+        history = make_batch(rows)
+        history.non_tensor_batch["anchor_list"][:] = "tool\nsame state" if task == "qa" else "same state"
+        return history
+
+    def test_slic_without_trace_limits_each_task_turn_independently(self):
+        for task in ("qa", "alfworld"):
+            with self.subTest(task=task):
+                trainer, history = self.trainer(task), self.history(task)
+                pairs = self.pairs(trainer, [history])
+                counts = defaultdict(int)
+                for pair in pairs:
+                    left, right = pair.non_tensor_batch["turn_index_list_a"][0], pair.non_tensor_batch["turn_index_list_b"][0]
+                    self.assertEqual(left, right)
+                    counts[int(left)] += 1
+                self.assertEqual(dict(counts), {0: 2, 1: 2})
+                self.assertEqual(len(self.pairs(trainer, [history, history])), 4)
+
+    def test_slic_without_trace_rejects_cross_turn_positive_negative_actions(self):
+        for task in ("qa", "alfworld"):
+            with self.subTest(task=task):
+                history = make_batch([make_row("positive", "a", 0, reward=1.),
+                                      make_row("negative", "b", 1, reward=0.)])
+                history.non_tensor_batch["anchor_list"][:] = "tool\nsame state" if task == "qa" else "same state"
+                self.assertIsNone(self.pairs(self.trainer(task), [history]))
+
+    def test_legacy_slic_uses_original_turn_ids_not_compacted_ids(self):
+        for task in ("qa", "alfworld"):
+            with self.subTest(task=task):
+                history = make_batch([make_row("positive", "a", 0, reward=1.),
+                                      make_row("negative", "b", 0, reward=0.)])
+                history.non_tensor_batch["anchor_list"][:] = "tool\nsame state" if task == "qa" else "same state"
+                history.non_tensor_batch["trace_original_turn"] = np.array([3, 4])
+                self.assertIsNone(self.pairs(self.trainer(task), [history]))
+                history.non_tensor_batch["trace_original_turn"][:] = 3
+                pair = self.pairs(self.trainer(task), [history])[0]
+                self.assertEqual(pair.non_tensor_batch["turn_index_list_a"].tolist(), [3])
+                self.assertEqual(pair.non_tensor_batch["turn_index_list_b"].tolist(), [3])
+                np.testing.assert_array_equal(history.non_tensor_batch["turn_index_list"], [0, 0])
+
+    def test_qa_analysis_final_legacy_grouping_and_no_cap_default_are_preserved(self):
+        rows, anchors = [], []
+        for index in range(6):
+            success = index < 3
+            for stage, turn in (("analysis", index), ("final", index + 10)):
+                rows.append(make_row(f"{stage}-{index}", f"traj-{index}", turn,
+                                     reward=float(success), old=-1. - index))
+                anchors.append(stage + "\nsame state")
+        history = make_batch(rows)
+        history.non_tensor_batch["anchor_list"] = np.array(anchors)
+        pairs = self.pairs(self.trainer("qa"), [history])
+        self.assertEqual(len(pairs), 6)  # The original default None cap remains for outcomes.
+        self.assertTrue(any(pair.non_tensor_batch["turn_index_list_a"][0]
+                            != pair.non_tensor_batch["turn_index_list_b"][0] for pair in pairs))
+
+    def test_other_preference_algorithms_keep_their_original_cross_turn_path(self):
+        for task in ("qa", "alfworld"):
+            with self.subTest(task=task):
+                history = make_batch([make_row("positive", "a", 0, reward=1.),
+                                      make_row("negative", "b", 1, reward=0.)])
+                history.non_tensor_batch["anchor_list"][:] = "tool\nsame state" if task == "qa" else "same state"
+                history.non_tensor_batch["trace_original_turn"] = np.array([50, 90])
+                pairs = self.pairs(self.trainer(task, "grpo+abpo"), [history])
+                self.assertEqual(len(pairs), 1)
+                self.assertEqual(pairs[0].non_tensor_batch["turn_index_list_a"].tolist(), [0])
+                self.assertEqual(pairs[0].non_tensor_batch["turn_index_list_b"].tolist(), [1])
+
+    def test_other_slic_tasks_keep_the_original_explicit_none_cap(self):
+        trainer = self.trainer("webshop")
+        trainer.config.data["replay_filter"] = {"k_pairs_per_group": None}
+        pairs = self.pairs(trainer, [self.history("webshop")])
+        self.assertEqual(len(pairs), 6)
 
 
 if __name__ == "__main__":

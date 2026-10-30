@@ -1,5 +1,7 @@
 # TRACE 状态信用与分类型 SLIC 配对
 
+QA 的状态、终局和回填语义见下文；ALFWorld 的真实后状态与统一环境动作信用见 [ALFWorld 接入说明](alfworld-trace-goals.md)。两个任务的 SLIC 工具/环境动作均仅允许同题同原始 Turn id 配对。
+
 本实现按决策类型选择偏好标签：analysis 和实际最终回答使用可验证的最终任务结果，工具 Turn 使用 K-step GT 信用及可选的终局优势回填。配对质量优先；没有合格正负两侧时跳过，不为凑数量放宽条件。SLIC Loss、原 GRPO 训练公式和 Replay 更新剂量保持原样。
 
 算法待办已完成实现与 CPU 集成回归，对应提交 `6eb6215` 已推送到 `trace` 分支。其后的指标精简也纳入 `trace` 分支，具体版本见 Git 提交记录；GPU/NPU 端训练效果尚未验证。修改状态见 [修改记录](trace-slic-change-log.md)。
@@ -82,7 +84,7 @@ $$
 
 ## 配对、排序与 Loss
 
-候选必须同 `uid`、同决策类型和同标签来源，允许不同 Rollout、不同 Turn 序号。两侧均过滤无效响应、执行故障、重复动作、被丢弃的 Prompt 和异常数值。
+候选必须同 `uid`、同决策类型和同标签来源。QA 工具和 ALFWorld 环境动作还必须具有相同原始 Turn id，允许来自不同 Rollout，不允许跨 Turn 配对；每题每 Turn 默认最多 2 对，多个 Turn 各有独立额度。QA analysis 和实际最终回答保留原 outcome 分组及规则，不新增 Turn id 限制。两侧均过滤无效响应、执行故障、重复动作、被丢弃的 Prompt 和异常数值。SLIC baseline 与配对分组使用同一原始 Turn id，避免跳过空日志后按压缩编号误配。
 
 工具候选要求：
 
@@ -122,7 +124,7 @@ Pair 两侧保留各自原始生成 Prompt、响应及原生 token IDs。仍使�
 | `negative_threshold` | `0.01` | 工具有效信用严格负阈值的绝对值 |
 | `gap_epsilon` | `0.02` | 工具正负信用差下限 |
 | `length_ratio_max` | `1.8` | 两侧响应最大长度比 |
-| `k_pairs_per_group` | `2` | 每题、类型及来源组的 Pair 上限 |
+| `k_pairs_per_group` | `2` | 工具/环境动作按每题、每原始 Turn 限额；QA analysis/final 保留每题、类型、来源组限额 |
 | `max_pairs_per_step` | `256` | 每步原始 Pair 上限 |
 | `max_gt_tokens` | `256` | GT token 上限，超长跳过 |
 | `gt_alias_strategy` | `first` | 固定第一个非空 GT 别名 |

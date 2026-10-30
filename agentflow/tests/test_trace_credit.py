@@ -22,7 +22,7 @@ select_pairs = trace_credit.select_pairs
 
 def row(index, credit=0.1, **kwargs):
     result = dict(index=index, uid="q", turn_type="tool", rollout_id="r",
-                  turn_index=index, value=0.2, credit=credit, valid=True,
+                  turn_index=0, value=0.2, credit=credit, valid=True,
                   length=10, old_per_token=-1.0)
     result.update(kwargs)
     return result
@@ -170,12 +170,42 @@ class RoutedCreditTests(unittest.TestCase):
 
 
 class TracePairTests(unittest.TestCase):
-    def test_same_question_type_pairs_across_turns_and_rollouts(self):
+    def test_same_question_type_pairs_across_rollouts_only_at_same_turn(self):
         rows = [row(0, rollout_id="a", turn_index=1),
                 row(1, -0.1, rollout_id="b", turn_index=7)]
+        self.assertEqual(select_pairs(rows), [])
+        rows[1]["turn_index"] = 1
         self.assertEqual(select_pairs(rows), [(0, 1)])
         rows[1]["rollout_id"] = "a"
         self.assertEqual(select_pairs(rows), [(0, 1)])
+
+    def test_missing_or_malformed_action_turn_cannot_pair(self):
+        for turn in (None, -1, True, False, 1.5, math.nan, math.inf, "0", 10**400):
+            with self.subTest(turn=turn):
+                self.assertEqual(select_pairs([row(0), row(1, -0.1, turn_index=turn)]), [])
+        missing = row(1, -0.1)
+        missing.pop("turn_index")
+        self.assertEqual(select_pairs([row(0), missing]), [])
+
+    def test_same_question_has_an_independent_two_pair_budget_at_each_turn(self):
+        rows = [row(0, .4, turn_index=1), row(1, -.1, turn_index=1),
+                row(2, -.2, turn_index=1), row(3, -.3, turn_index=1),
+                row(4, .4, turn_index=2), row(5, -.1, turn_index=2),
+                row(6, -.2, turn_index=2), row(7, -.3, turn_index=2)]
+        selected = select_pairs(rows)
+        self.assertEqual(selected, [(0, 3), (4, 7), (0, 2), (4, 6)])
+        self.assertEqual(len(selected), 4)
+        self.assertTrue(all(rows[a]["turn_index"] == rows[b]["turn_index"] for a, b in selected))
+
+    def test_global_cap_still_applies_across_same_question_turn_groups(self):
+        rows = []
+        for turn in range(140):
+            start = len(rows)
+            rows.extend([row(start, .4, turn_index=turn), row(start + 1, -.1, turn_index=turn),
+                         row(start + 2, -.2, turn_index=turn)])
+        selected = select_pairs(rows)
+        self.assertEqual(len(selected), 256)
+        self.assertTrue(all(rows[a]["turn_index"] == rows[b]["turn_index"] for a, b in selected))
 
     def test_different_question_or_type_cannot_pair(self):
         self.assertEqual(select_pairs([row(0), row(1, -0.1, uid="other")]), [])
@@ -242,6 +272,15 @@ class TracePairTests(unittest.TestCase):
         self.assertEqual(select_pairs(rows, {"outcome_match_value": True}), [])
         rows[0]["value"], rows[1]["value"] = 0, 0.01
         self.assertEqual(select_pairs(rows, {"outcome_match_value": True}), [(0, 1)])
+
+    def test_qa_analysis_and_final_outcome_turn_grouping_is_unchanged(self):
+        for kind in ("analysis", "final_answer", "direct", "base"):
+            rows = [self.outcome_row(0, 1, turn_type=kind, turn_index=1, is_final=True),
+                    self.outcome_row(1, 0, turn_type=kind, turn_index=9, is_final=True)]
+            with self.subTest(kind=kind):
+                self.assertEqual(select_pairs(rows), [(0, 1)])
+                self.assertEqual(trace_credit.pair_group_key(rows[0]),
+                                 trace_credit.pair_group_key(rows[1]))
 
     def test_only_actual_terminal_answers_use_outcome_labels(self):
         for turn_type in ("final_answer", "direct", "base"):

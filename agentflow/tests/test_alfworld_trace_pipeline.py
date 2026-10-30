@@ -86,7 +86,7 @@ class AlfworldPipelineTests(unittest.TestCase):
                   "B0": -4., "B1": -5., "B2": -6., "B3": -7., "B4": -8.}
         trainer = training.make_trainer(scores, {"k": 3, "gamma": .8, "epsilon": .1,
                                                "terminal_fill_enabled": True, "terminal_fill_scale": 2.})
-        trainer.config.data.task = "alfworld"
+        trainer.config.data["task"] = "alfworld"
         return trainer
 
     def test_both_entrypoints_use_fixed_gt_full_state_and_uniform_action_credit(self):
@@ -193,13 +193,23 @@ class AlfworldPipelineTests(unittest.TestCase):
         self.assertEqual([row["dup"] for row in result], [False, True, True])
         self.assertEqual([row["trace_dup"] for row in result], [False, False, True])
 
-    def test_terminal_action_can_pair_with_an_earlier_action(self):
+    def test_terminal_action_cannot_pair_with_an_earlier_turn(self):
         history, trainer = self.batch("train-roma/rollout.py"), self.trainer()
         trainer.ref_policy_wg.scores.update({"A1": -4., "A2": -4., "A3": -4., "A4": -1.})
         trainer._annotate_trace_credits(history)
         pairs = trainer._trans_to_trace_batch([history])
+        self.assertIsNone(pairs)  # The only value-matched sign pair would cross turn IDs.
+
+    def test_terminal_actions_can_pair_at_the_same_turn(self):
+        history, trainer = self.batch("train-roma/rollout.py"), self.trainer()
+        trainer.ref_policy_wg.scores.update({"A1": -4., "A2": -4., "A3": -4., "A4": -1.,
+                                             "B1": -4., "B2": -4., "B3": -4.})
+        trainer._annotate_trace_credits(history)
+        pairs = trainer._trans_to_trace_batch([history])
         self.assertTrue(any(pair.non_tensor_batch["trace_is_terminal_a"][0]
-                            and pair.non_tensor_batch["turn_index_list_b"][0] == 0 for pair in pairs))
+                            and pair.non_tensor_batch["trace_is_terminal_b"][0] for pair in pairs))
+        self.assertTrue(all(pair.non_tensor_batch["turn_index_list_a"][0]
+                            == pair.non_tensor_batch["turn_index_list_b"][0] for pair in pairs))
         self.assertTrue(all(pair.non_tensor_batch["trace_label_source_a"][0] == "trace" for pair in pairs))
 
     def test_single_action_episodes_score_terminal_post_state_without_extra_turn(self):

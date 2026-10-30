@@ -6,6 +6,7 @@ additionally invalidate every tool-credit window that includes the failure.
 """
 
 import math
+from numbers import Real
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, fields
 from typing import Any, Mapping, Optional, Sequence
@@ -429,15 +430,41 @@ def _outcome_success(row, config):
     return float(reward) > config.outcome_success_threshold if _finite(reward) else None
 
 
-def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
-    """Select type-routed pairs within question, decision type and label source.
+def pair_group_key(row):
+    """Keep action credit pairs within one original task/turn.
 
-    Each row supplies ``index``, ``uid``, ``turn_type``, ``value``, ``credit``,
-    ``valid``, ``length``, and ``old_per_token``.  The returned indices are those
-    supplied in each row, not positions in a filtered list.  Rollout and turn
-    numbers do not restrict pairing.  Analysis and actual final answers use
-    trusted verifier outcomes; tools always require strict signed credit.
-    Outcome labels never require GT credit and, by default, do not match GT V.
+    QA analysis and actual final answers retain their existing outcome groups.
+    A missing or malformed action turn cannot be assigned to a synthetic turn.
+    """
+    source = _pair_label_source(row)
+    if source is None:
+        return None
+    turn = None
+    if source == "trace":
+        turn = row.get("turn_index")
+        if isinstance(turn, bool) or not isinstance(turn, Real):
+            return None
+        try:
+            numeric_turn = float(turn)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(numeric_turn) or numeric_turn < 0 or not numeric_turn.is_integer():
+            return None
+        turn = int(turn)
+    return row.get("uid"), row.get("turn_type"), source, turn
+
+
+def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
+    """Select action pairs within one question, original turn and type route.
+
+    Each row supplies ``index``, ``uid``, ``turn_type``, ``turn_index``, ``value``,
+    ``credit``, ``valid``, ``length``, and ``old_per_token``. Returned indices are
+    those supplied in each row, not positions in a filtered list. Actions may
+    pair across rollouts only at the same original turn; the per-group cap is
+    consequently per question/turn. QA analysis and actual final answers retain
+    their trusted-outcome groups without a new turn restriction. Tools always
+    require strict signed credit. Outcome labels never require GT credit and,
+    by default, do not match GT V.
 
     ``metrics`` optionally collects counts for this call, resetting these keys
     while preserving unrelated keys.  Candidate filters form an ordered,
@@ -475,17 +502,16 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
     groups = defaultdict(list)
     scores, success_flags = {}, {}
     for row in rows:
-        source = _pair_label_source(row)
-        turn_type = row.get("turn_type")
-        key = (row.get("uid"), turn_type, source)
+        key = pair_group_key(row)
         if (
-            source is None
+            key is None
             or not row.get("valid", True)
             or row.get("external_error", False)
             or not all(_finite(row.get(key)) for key in ("old_per_token", "length"))
             or float(row["length"]) <= 0
         ):
             continue
+        source = key[2]
         if source == "outcome":
             success = _outcome_success(row, cfg)
             if (

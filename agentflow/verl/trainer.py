@@ -37,6 +37,7 @@ from agentflow.trace.credit import (
     build_score_tensors,
     encode_state_requests,
     mean_gt_logps,
+    pair_group_key,
     select_pairs,
     state_values,
 )
@@ -526,6 +527,7 @@ class AgentFlowTrainer(RayPPOTrainer):
         proto_list = []
         pair_metrics = defaultdict(int)
         diagnostic_rows, diagnostic_pairs = [], []
+        selected_per_group = defaultdict(int)
         for history in history_batch_list:
             non = history.non_tensor_batch
             missing = set(side_keys) - set(non)
@@ -543,6 +545,7 @@ class AgentFlowTrainer(RayPPOTrainer):
             dup = non.get("trace_dup", np.zeros(len(lengths), dtype=bool))
             action_keys = non.get("trace_action_key")
             rows = []
+            original_turns = non.get("trace_original_turn", non["turn_index_list"])
             for i, length in enumerate(lengths):
                 # The native response IDs supply a stable fallback action identity.
                 response = history.batch["responses"][i][masks[i].bool()].cpu().tolist()
@@ -550,7 +553,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                     "index": i, "uid": str(non["uid"][i]),
                     "turn_type": str(non["trace_turn_type"][i]),
                     "rollout_id": str(non["rollout_id_list"][i]),
-                    "turn_index": int(non["turn_index_list"][i]),
+                    "turn_index": (original_turns[i] if non["trace_label_source"][i] == "trace"
+                                   else non["turn_index_list"][i]),
                     "value": float(non["trace_value"][i]),
                     "credit": float(non["trace_credit"][i]),
                     "valid": bool(valid[i]) and not bool(dup[i])
@@ -573,16 +577,27 @@ class AgentFlowTrainer(RayPPOTrainer):
             diagnostic_rows.extend(dict(row, index=row["index"] + offset) for row in rows)
             selection_metrics = {}
             selected_pairs = select_pairs(rows, cfg, metrics=selection_metrics)
+            # A task/turn quota applies across all history batches in this step.
+            accepted_pairs = []
+            for chosen, rejected in selected_pairs:
+                group = pair_group_key(rows[chosen])
+                if group[2] == "trace":
+                    if selected_per_group[group] >= cfg.k_pairs_per_group:
+                        selection_metrics["rejected_group_cap"] += 1
+                        selection_metrics["selected_unique"] -= 1
+                        continue
+                    selected_per_group[group] += 1
+                accepted_pairs.append((chosen, rejected))
+            selected_pairs = accepted_pairs
             for key, value in selection_metrics.items():
                 pair_metrics["trace/pair/" + key] += value
             diagnostic_pairs.extend((chosen + offset, rejected + offset) for chosen, rejected in selected_pairs)
             for chosen, rejected in selected_pairs:
                 # Preserve the old group-mean per-token baseline convention in
-                # the new same-question/type progress neighborhood.
+                # the same original task/turn/type progress neighborhood.
+                chosen_group = pair_group_key(rows[chosen])
                 peers = [r for r in rows if r["valid"] and r["length"] > 0
-                         and r["uid"] == rows[chosen]["uid"]
-                         and r["turn_type"] == rows[chosen]["turn_type"]
-                         and r["label_source"] == rows[chosen]["label_source"]
+                         and pair_group_key(r) == chosen_group
                          and np.isfinite(r["old_per_token"])
                          and (r["label_source"] == "trace" or r["outcome_valid"])
                          and ((r["label_source"] == "outcome" and not cfg.outcome_match_value)
@@ -594,6 +609,10 @@ class AgentFlowTrainer(RayPPOTrainer):
                 payload.update({key: non[key][chosen:chosen + 1] for key in common_keys})
                 payload.update({key + "_a": non[key][chosen:chosen + 1] for key in side_keys})
                 payload.update({key + "_b": non[key][rejected:rejected + 1] for key in side_keys})
+                # Pair identities use original turn IDs, not compacted trace rows.
+                if rows[chosen]["label_source"] == "trace":
+                    payload["turn_index_list_a"] = np.array([rows[chosen]["turn_index"]], dtype=np.int64)
+                    payload["turn_index_list_b"] = np.array([rows[rejected]["turn_index"]], dtype=np.int64)
                 for key in ("trace_task", "trace_gt", "trace_goal_metadata", "trace_state_view",
                             "trace_is_terminal", "trace_next_gt_logp", "trace_next_value"):
                     if key in non:
@@ -674,6 +693,14 @@ class AgentFlowTrainer(RayPPOTrainer):
 
         cfg = self.config.data.get("replay_filter", {})
         K_PAIRS_PER_GROUP   = cfg.get("k_pairs_per_group", None)
+        is_slic = "slic" in str(getattr(self, "algorithm", self.config.data.get("algorithm", ""))).split("+")
+        slic_turn_cap = cfg.get("k_pairs_per_group", 2)
+        if slic_turn_cap is None:
+            slic_turn_cap = 2
+        if (is_slic and str(self.config.data.get("task", "")).lower() in ("qa", "alfworld")
+                and (type(slic_turn_cap) is not int or slic_turn_cap < 1)):
+            raise ValueError("SLIC k_pairs_per_group must be a positive integer")
+        slic_turn_counts = defaultdict(int)
         LENGTH_RATIO_MAX    = cfg.get("length_ratio_max", 1.8)
         ANCHOR_SIM_THRESH   = cfg.get("anchor_sim_thresh", 0.95)
         REQUIRE_REWARD_GAP  = cfg.get("require_reward_gap", True)
@@ -686,7 +713,10 @@ class AgentFlowTrainer(RayPPOTrainer):
         for history_batch in history_batch_list:
             uids           = history_batch.non_tensor_batch["uid"]
             traj_uids      = history_batch.non_tensor_batch["traj_uid"]
-            turn_indices   = history_batch.non_tensor_batch["turn_index_list"]
+            native_turn_indices = history_batch.non_tensor_batch["turn_index_list"]
+            turn_indices = native_turn_indices
+            if is_slic and str(self.config.data.get("task", "")).lower() in ("qa", "alfworld"):
+                turn_indices = history_batch.non_tensor_batch.get("trace_original_turn", turn_indices)
             anchors        = history_batch.non_tensor_batch["anchor_list"]
             responses      = history_batch.batch["responses"]
             response_mask  = history_batch.batch["response_mask"]
@@ -702,12 +732,13 @@ class AgentFlowTrainer(RayPPOTrainer):
             bsz = scores.shape[0]
 
             task = str(self.config.data.get("task", "")).lower()
+            restrict_action_turns = is_slic and task in ("qa", "alfworld")
             rollout_last_turn = {}
             if task == "qa":
                 rollout_ids = history_batch.non_tensor_batch["rollout_id_list"]
                 for i in range(bsz):
                     rollout_id = str(rollout_ids[i])
-                    turn = int(turn_indices[i])
+                    turn = int(native_turn_indices[i])
                     rollout_last_turn[rollout_id] = max(
                         rollout_last_turn.get(rollout_id, -1), turn
                     )
@@ -718,19 +749,26 @@ class AgentFlowTrainer(RayPPOTrainer):
                 for i in range(bsz):
                     rlen = int(lengths[i].item())
                     resp_ids = responses[i, :rlen].detach().cpu().tolist() if rlen > 0 else []
+                    anchor = anchors[i] if isinstance(anchors[i], str) else str(anchors[i])
+                    action_turn = restrict_action_turns and not (
+                        task == "qa" and anchor.partition("\n")[0] in ("analysis", "final"))
+                    original_turn = turn_indices[i] if action_turn else native_turn_indices[i]
+                    if action_turn and pair_group_key({"uid": str(uids[i]), "turn_type": "tool_plan",
+                                                       "turn_index": original_turn}) is None:
+                        continue
                     rows.append({
                         "row":    i,
                         "uid":    str(uids[i]),
                         "traj":   str(traj_uids[i]),
-                        "turn":   int(turn_indices[i]),
-                        "anchor": anchors[i] if isinstance(anchors[i], str) else str(anchors[i]),
+                        "turn":   int(original_turn),
+                        "anchor": anchor,
                         "score":  float(scores[i].item()),
                         "length": max(rlen, 1),
                         "logP":   float(seq_logP[i].item()),
                         "resp":   tuple(resp_ids),
                         "valid":  bool(valid_flags[i]) if valid_flags is not None else True,
                         "dup":    bool(dup_flags[i])   if dup_flags   is not None else False,
-                        "is_last": int(turn_indices[i]) == rollout_last_turn[str(rollout_ids[i])] if task == "qa" else None,
+                        "is_last": int(native_turn_indices[i]) == rollout_last_turn[str(rollout_ids[i])] if task == "qa" else None,
                     })
 
             uid2trajs = defaultdict(lambda: defaultdict(list))
@@ -757,7 +795,14 @@ class AgentFlowTrainer(RayPPOTrainer):
                             turn_type = r["anchor"].partition("\n")[0]
                             if turn_type not in ("analysis", "tool", "final"):
                                 turn_type = ""
-                            turn2rows[(r["is_last"], turn_type)].append(r)
+                            # Preserve QA analysis/final outcome groups. Tools
+                            # additionally require the same original action turn.
+                            if restrict_action_turns and turn_type not in ("analysis", "final"):
+                                turn2rows[(r["is_last"], turn_type, r["turn"])].append(r)
+                            else:
+                                turn2rows[(r["is_last"], turn_type)].append(r)
+                        elif restrict_action_turns:
+                            turn2rows[r["turn"]].append(r)
                         else:
                             turn2rows["cross_turn"].append(r)
 
@@ -825,7 +870,25 @@ class AgentFlowTrainer(RayPPOTrainer):
                             candidates.append((hardness, chosen, rejected, len(uniq), baseline, turn))
 
                 candidates.sort(key=lambda x: x[0])
-                for hardness, chosen, rejected, cluster_size, baseline, turn in candidates[:K_PAIRS_PER_GROUP]:
+                if restrict_action_turns:
+                    selected = []
+                    outcome_candidates = []
+                    for candidate in candidates:
+                        chosen = candidate[1]
+                        qa_outcome = task == "qa" and chosen["anchor"].partition("\n")[0] in ("analysis", "final")
+                        if qa_outcome:
+                            outcome_candidates.append(candidate)
+                            continue
+                        quota_key = uid, chosen["turn"]
+                        if slic_turn_counts[quota_key] < slic_turn_cap:
+                            slic_turn_counts[quota_key] += 1
+                            selected.append(candidate)
+                    # Keep QA's existing outcome cap, including its no-cap default.
+                    selected.extend(outcome_candidates[:K_PAIRS_PER_GROUP])
+                    selected.sort(key=lambda x: x[0])
+                else:
+                    selected = candidates[:K_PAIRS_PER_GROUP]
+                for hardness, chosen, rejected, cluster_size, baseline, turn in selected:
                     p_idx, n_idx = chosen["row"], rejected["row"]
                     proto = DataProto.from_single_dict(
                         {key + "_a": history_batch.batch[key][p_idx: p_idx + 1, :] for key in split_select_keys}
@@ -834,6 +897,9 @@ class AgentFlowTrainer(RayPPOTrainer):
                         | {key + "_a": history_batch.non_tensor_batch[key][p_idx: p_idx + 1] for key in non_tensor_split_select_keys}
                         | {key + "_b": history_batch.non_tensor_batch[key][n_idx: n_idx + 1] for key in non_tensor_split_select_keys}
                     )
+                    if restrict_action_turns:
+                        proto.non_tensor_batch["turn_index_list_a"] = np.array([chosen["turn"]], dtype=np.int64)
+                        proto.non_tensor_batch["turn_index_list_b"] = np.array([rejected["turn"]], dtype=np.int64)
                     proto.non_tensor_batch["group_baseline"] = np.array([baseline], dtype=np.float32)
                     proto.non_tensor_batch["group_size"]     = np.array([cluster_size], dtype=np.int32)
                     proto.non_tensor_batch["born_step"]      = np.array([self.global_steps], dtype=np.int64)

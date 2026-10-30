@@ -72,11 +72,11 @@ ALFWorld 环境、solver、两个 rollout 入口、daemon 和 trainer 均传递�
 | terminal fill | 开启，scale=2.0 |
 | value match epsilon | 0.05 |
 | 正/负信用阈值、信用差阈值 | 0.01 / 0.01 / 0.02 |
-| length ratio / 每组 pair / 每步 pair | 1.8 / 2 / 256 |
+| length ratio / 每题每原始 turn 的 pair / 每步 pair | 1.8 / 2 / 256 |
 | GT token 上限 | 256，超长判无效，不截断 |
 | GRPO、SLIC loss、Replay | 沿用现有 QA 实现 |
 
-首轮、中间轮和最后一轮都标为 `tool_plan`，按同题、动作前 V 接近及严格正/负有效信用配对；不再将末动作单独划入 `base` / outcome，也不按首尾或 turn 序号隔离。T 个动作对应 T+1 个真实状态，最后动作后的终止状态参与最后一步 `V_next - V`，但不新增模型回答或训练 turn。`trace_is_terminal` 只表示已完成的环境终止动作，用于截断信用窗口与终局回填；ALFWorld 的 `trace_is_final` 恒为 false。可信的步数预算耗尽属于终局失败；外部崩溃和无法核验的状态不作为失败奖励。
+首轮、中间轮和最后一轮都标为 `tool_plan`，仅在同题、同原始 turn id 内，按动作前 V 接近及严格正/负有效信用配对；每题每个 turn 默认独立最多 2 对。末动作不单独划入 `base` / outcome，它只能与其他轨迹中相同 turn id 的合格环境动作配对，不允许跨 turn。T 个动作对应 T+1 个真实状态，最后动作后的终止状态参与最后一步 `V_next - V`，但不新增模型回答或训练 turn。`trace_is_terminal` 只表示已完成的环境终止动作，用于截断信用窗口与终局回填；ALFWorld 的 `trace_is_final` 恒为 false。可信的步数预算耗尽属于终局失败；外部崩溃和无法核验的状态不作为失败奖励。
 
 固定 Response 的平均 token LogP 为 ell，`V_t = log((-ell_0 + epsilon) / (-ell_t + epsilon))`。pre-state 与 post-state 统一用该轨迹初始 ell_0 作基线。每个动作的真实转移为 `delta_t = V_(t+1) - V_t`，局部信用是最多 K 个连续真实动作 delta 的 gamma 加权平均，遇到环境终止动作则纳入该动作的 delta 后结束。缺失任何所需状态、编号缺口或外部故障均阻断窗口，不编造末状态或回退到 outcome 配对。
 
@@ -123,4 +123,6 @@ export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305_with_gt.parquet
 
 统一动作配对改动不改变离线 GT/规则格式：已经准备好的 `..._with_gt.parquet` 可以直接复用，不需要重新转换。已有 Probe 缓存只要保留了全部 T+1 个真实状态，也可以直接重新评分，无需重新采样。
 
-本轮统一动作信用验证通过 183 项 ALFWorld 测试和 122 项 TRACE 回归，覆盖单动作终止、末动作真实 delta、末三动作回填、跨 turn 配对、缺失末状态、相邻状态不一致和 QA 既有路由。模型评分及模拟器在链路测试中使用 CPU 替身，未在服务器执行完整模型训练。更新代码后应重启训练及 rollout 进程；旧训练 rollout 的 base/outcome 元数据会被明确拒绝，离线 Parquet 不受影响。
+当前回归通过 184 项 ALFWorld 测试和 135 项 TRACE 回归，覆盖单动作终止、末动作真实 delta、末三动作回填、缺失末状态、相邻状态不一致和 QA 既有路由。模型评分及模拟器在链路测试中使用 CPU 替身，未在服务器执行完整模型训练。更新代码后应重启训练及 rollout 进程；旧训练 rollout 的 base/outcome 元数据会被明确拒绝，离线 Parquet 不受影响。
+
+SLIC 工具/环境动作的配对现已恢复为同题、同原始 turn id：ALFWorld 所有动作及 QA 工具动作均按各 turn 独立扣取默认 2 对额度；baseline 也仅使用相同分组，空响应日志造成的压缩编号不能用作配对身份。QA analysis/final 的 outcome 分组、标签及配对规则保留；关闭 TRACE 后的这两个任务的 SLIC 动作配对也遵循同 turn 限制。K-step 信用仍沿真实轨迹计算，此限制只约束偏好对的两端，不改变信用窗口。

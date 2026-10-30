@@ -105,11 +105,15 @@ class EnvironmentCreditTests(unittest.TestCase):
             self.annotate(next_values=[1.])
         self.assertEqual(self.annotate(values=[], next_values=[], terminals=[])["effective_credit"], [])
 
-    def test_first_and_terminal_action_can_pair_under_same_trace_rules(self):
+    def test_first_and_terminal_action_share_type_but_cannot_cross_turn_ids(self):
         first = shared.row(0, credit=.2, turn_type="tool_plan", turn_index=0,
                            label_source="trace", is_final=False, is_terminal=False)
         terminal = shared.row(1, credit=-.2, turn_type="tool_plan", turn_index=7,
                               label_source="trace", is_final=False, is_terminal=True)
+        self.assertEqual(CREDIT.select_pairs([first, terminal]), [])
+        # Terminal status does not create a separate route: actions from
+        # different rollouts can still pair when their original turns agree.
+        first["turn_index"] = terminal["turn_index"]
         self.assertEqual(CREDIT.select_pairs([first, terminal]), [(0, 1)])
 
 
