@@ -38,6 +38,7 @@ from agentflow.trace.credit import (
     encode_state_requests,
     mean_gt_logps,
     pair_group_key,
+    scale_outcome_advantages,
     select_pairs,
     state_values,
 )
@@ -355,6 +356,8 @@ class AgentFlowTrainer(RayPPOTrainer):
         credits = np.full(size, np.nan, dtype=np.float64)
         local_credits = np.full(size, np.nan, dtype=np.float64)
         terminal_fills = np.full(size, np.nan, dtype=np.float64)
+        terminal_discounts = np.full(size, np.nan, dtype=np.float64)
+        scaled_outcome_advantages = np.full(size, np.nan, dtype=np.float64)
         blocked = np.zeros(size, dtype=bool)
         external_blocked = np.zeros(size, dtype=bool)
         reached = np.zeros(size, dtype=bool)
@@ -443,7 +446,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                     if outcome_valid[row]:
                         outcome_advantages[row] = advantage
 
-        for rows in groups.values():
+        qa_groups = defaultdict(list)
+        for key, rows in groups.items():
             # An absent initial turn cannot be silently replaced by a later baseline.
             rollout_values = (state_values(row_logps[rows], epsilon=cfg.epsilon)
                               if int(turns[rows[0]]) == 0 else [float("nan")] * len(rows))
@@ -465,11 +469,18 @@ class AgentFlowTrainer(RayPPOTrainer):
                 )
                 next_values[rows] = rollout_next_values
             else:
+                is_qa = (self.config.data.get("task", "qa") == "qa"
+                         and all(tasks[row] in (None, "qa") for row in rows))
+                # QA filling needs all local tool credits for this question.
+                # First collect the unchanged K-step credit and eligible discount.
                 annotated = annotate_rollout_credits(
                     rollout_values, [int(turns[row]) for row in rows],
                     [str(types[row]) for row in rows], external[rows].tolist(), final_flags[rows].tolist(),
-                    **outcome_options,
+                    defer_terminal_fill=is_qa, **outcome_options,
                 )
+                if is_qa:
+                    qa_groups[key[0]].append(key)
+                    terminal_discounts[rows] = annotated["terminal_discount"]
             values[rows] = rollout_values
             local_credits[rows] = annotated["local_credit"]
             terminal_fills[rows] = annotated["terminal_fill"]
@@ -477,6 +488,42 @@ class AgentFlowTrainer(RayPPOTrainer):
             blocked[rows] = annotated["window_blocked"]
             external_blocked[rows] = annotated["external_error_blocked"]
             reached[rows] = annotated["terminal_reached"]
+
+        # Range population uses all valid QA tools, before sign/matching/pair
+        # filters, including windows that do not reach a trusted terminal answer.
+        # Never filter the state sequence before computing its K-step windows.
+        range_valid = (
+            np.asarray(non.get("trace_valid", np.zeros(size)), dtype=bool)
+            & ~np.asarray(non.get("trace_dup", np.zeros(size)), dtype=bool)
+            & ~external & within_prefix & ~blocked & np.isfinite(local_credits)
+            & (np.asarray(types) == "tool_plan")
+            & (batch.batch["response_mask"].sum(dim=-1).cpu().numpy() > 0)
+        )
+        drop = batch.batch.get("is_drop_mask")
+        if drop is not None:
+            range_valid &= ~drop.bool().cpu().numpy()
+        for uid, keys in qa_groups.items():
+            question_rows = [row for key in keys for row in groups[key]]
+            local_population = [local_credits[row] for row in question_rows if range_valid[row]]
+            # reliable already contains exactly one trusted outcome per rollout.
+            trusted_keys = [key for key, _ in reliable[uid] if key in keys]
+            advantages = [outcome_advantages[next(row for row in groups[key] if outcome_valid[row])]
+                          for key in trusted_keys]
+            scaled = scale_outcome_advantages(local_population, advantages)
+            for key, advantage in zip(trusted_keys, scaled):
+                for row in groups[key]:
+                    if not outcome_valid[row]:
+                        continue
+                    scaled_outcome_advantages[row] = advantage
+                    if terminal_discounts[row] > 0:
+                        fill = terminal_discounts[row] * advantage
+                        effective = local_credits[row] + fill
+                        if not (np.isfinite(fill) and np.isfinite(effective)):
+                            terminal_fills[row] = credits[row] = np.nan
+                            blocked[row] = True
+                            continue
+                        terminal_fills[row] = fill
+                        credits[row] = effective
         non.update({
             "trace_gt_logp": row_logps, "trace_value": values, "trace_credit": credits,
             "trace_next_gt_logp": next_logps, "trace_next_value": next_values,
@@ -487,6 +534,7 @@ class AgentFlowTrainer(RayPPOTrainer):
             "trace_external_error": external, "trace_is_final": final_flags,
             "trace_outcome_valid": outcome_valid, "trace_outcome_success": outcome_success,
             "trace_outcome_reward": outcome_rewards, "trace_outcome_advantage": outcome_advantages,
+            "trace_scaled_outcome_advantage": scaled_outcome_advantages,
             "trace_within_final_prefix": within_prefix, "trace_label_source": label_sources,
         })
         metrics = {"trace/" + key: value for key, value in counters.items()}

@@ -17,6 +17,7 @@ TraceConfig = trace_credit.TraceConfig
 state_values = trace_credit.state_values
 discounted_credits = trace_credit.discounted_credits
 annotate_rollout_credits = trace_credit.annotate_rollout_credits
+scale_outcome_advantages = trace_credit.scale_outcome_advantages
 select_pairs = trace_credit.select_pairs
 
 
@@ -87,9 +88,42 @@ class TraceValueTests(unittest.TestCase):
         self.assertTrue(math.isnan(discounted_credits([0])[0]))
 
 
+class OutcomeScalingTests(unittest.TestCase):
+    def test_asymmetric_signed_ranges_preserve_zero_and_relative_advantages(self):
+        scaled = scale_outcome_advantages([0.20, 0.05, -0.08, -0.02, 0.0],
+                                         [0.25, 0.125, 0.0, -0.375, -0.75])
+        for actual, expected in zip(scaled, [0.20, 0.10, 0.0, -0.04, -0.08]):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_missing_tool_sign_maps_only_that_outcome_direction_to_zero(self):
+        self.assertEqual(scale_outcome_advantages([0.2], [-1., 0., 1.]), [0., 0., 0.2])
+        self.assertEqual(scale_outcome_advantages([-0.1], [-1., 0., 1.]), [-0.1, 0., 0.])
+        self.assertEqual(scale_outcome_advantages([0.2, -0.1], [1., 0.5]), [0.2, 0.1])
+
+    def test_zero_and_empty_ranges_do_not_create_terminal_credit(self):
+        for credits in ([], [0., 0.], [None, math.nan, math.inf, -math.inf]):
+            with self.subTest(credits=credits):
+                self.assertEqual(scale_outcome_advantages(credits, [-1., 0., 1.]), [0., 0., 0.])
+        self.assertEqual(scale_outcome_advantages([0.2, -0.1], [0., 0.]), [0., 0.])
+        self.assertEqual(scale_outcome_advantages([0.2, -0.1], []), [])
+
+    def test_nonfinite_credit_is_ignored_and_invalid_advantage_keeps_its_position(self):
+        result = scale_outcome_advantages([None, math.inf, -math.inf, math.nan, 0.2, -0.1],
+                                         [None, math.nan, math.inf, -math.inf, 1., -1., 0.])
+        self.assertTrue(all(math.isnan(value) for value in result[:4]))
+        self.assertEqual(result[4:], [0.2, -0.1, 0.])
+
+    def test_tiny_advantages_and_large_ranges_do_not_overflow_or_use_an_offset(self):
+        tiny = float.fromhex('0x0.0000000000001p-1022')
+        result = scale_outcome_advantages([1e308, -1e308], [tiny, -tiny])
+        self.assertEqual(result, [1e308, -1e308])
+        self.assertEqual(scale_outcome_advantages([0.2, -0.1], [1e308, -1e308]), [0.2, -0.1])
+        self.assertEqual(scale_outcome_advantages([0.2, -0.1], [1e-300, -1e-300]), [0.2, -0.1])
+
+
 class RoutedCreditTests(unittest.TestCase):
     def annotate(self, *, values=None, indices=None, types=None, errors=None,
-                 finals=None, outcome_valid=True, advantage=0.5, config=None):
+                 finals=None, outcome_valid=True, config=None):
         values = [0, 0.1, 0.2, 0.3, 0.4, 0.5] if values is None else values
         size = len(values)
         return annotate_rollout_credits(
@@ -98,53 +132,63 @@ class RoutedCreditTests(unittest.TestCase):
             if types is None else types,
             [False] * size if errors is None else errors,
             [False] * (size - 1) + [True] if finals is None else finals,
-            outcome_valid=outcome_valid, outcome_advantage=advantage, config=config)
+            outcome_valid=outcome_valid, defer_terminal_fill=True, config=config)
 
-    def test_k_three_contains_final_and_only_last_two_tools_receive_fill(self):
+    def test_k_three_contains_final_and_only_last_two_tools_receive_terminal_discount(self):
         result = self.annotate()
         self.assertTrue(math.isnan(result["effective_credit"][0]))
         self.assertTrue(math.isnan(result["effective_credit"][-1]))
         for position in range(1, 5):
             self.assertAlmostEqual(result["local_credit"][position], 0.1)
-        self.assertEqual(result["terminal_fill"][1:3], [0, 0])
-        self.assertAlmostEqual(result["terminal_fill"][3], 2 * 0.8 ** 2 * 0.5)
-        self.assertAlmostEqual(result["terminal_fill"][4], 2 * 0.8 * 0.5)
+        self.assertEqual(result["terminal_fill"][1:5], [0, 0, 0, 0])
+        self.assertEqual(result["terminal_discount"][1:3], [0, 0])
+        self.assertAlmostEqual(result["terminal_discount"][3], 0.8 ** 2)
+        self.assertAlmostEqual(result["terminal_discount"][4], 0.8)
+        self.assertTrue(math.isnan(result["terminal_discount"][0]))
+        self.assertTrue(math.isnan(result["terminal_discount"][-1]))
         self.assertEqual(result["terminal_reached"], [False, False, False, True, True, False])
 
-    def test_fill_uses_signed_advantage_and_can_reverse_effective_credit(self):
-        result = self.annotate(advantage=-0.5)
-        self.assertAlmostEqual(result["effective_credit"][4], 0.1 - 0.8)
-        self.assertLess(result["effective_credit"][4], 0)
-        self.assertTrue(math.isnan(result["effective_credit"][0]))
+    def test_qa_discount_and_local_credit_ignore_fixed_terminal_fill_scale(self):
+        for scale in (0., 2., 100.):
+            with self.subTest(scale=scale):
+                result = self.annotate(config={"terminal_fill_scale": scale})
+                self.assertAlmostEqual(result["effective_credit"][4], 0.1)
+                self.assertEqual(result["terminal_fill"][4], 0.)
+                self.assertAlmostEqual(result["terminal_discount"][4], 0.8)
+                self.assertTrue(math.isnan(result["effective_credit"][0]))
 
     def test_external_failure_invalidates_all_windows_containing_transition(self):
         result = self.annotate(errors=[False, False, False, True, False, False])
         for position in (1, 2, 3):
             self.assertTrue(math.isnan(result["effective_credit"][position]))
             self.assertTrue(result["external_error_blocked"][position])
-        self.assertAlmostEqual(result["effective_credit"][4], 0.9)
+            self.assertTrue(math.isnan(result["terminal_discount"][position]))
+        self.assertAlmostEqual(result["effective_credit"][4], 0.1)
+        self.assertAlmostEqual(result["terminal_discount"][4], 0.8)
 
     def test_one_step_does_not_include_next_actions_failure_or_final_decision(self):
         result = self.annotate(errors=[False, False, True, False, False, False], config={"k": 1})
         self.assertAlmostEqual(result["effective_credit"][1], 0.1)
         self.assertTrue(math.isnan(result["effective_credit"][2]))
         self.assertEqual(result["terminal_fill"][4], 0)
+        self.assertEqual(result["terminal_discount"][4], 0)
 
     def test_no_final_marker_means_no_terminal_fill(self):
         result = self.annotate(values=[0, 0.1, 0.2],
                                types=["analysis", "tool_plan", "tool_plan"], finals=[False] * 3)
         self.assertAlmostEqual(result["effective_credit"][1], 0.1)
         self.assertEqual(result["terminal_fill"][1], 0)
+        self.assertEqual(result["terminal_discount"][1], 0)
         self.assertTrue(math.isnan(result["effective_credit"][2]))
 
     def test_untrusted_outcome_or_disabled_fill_preserves_only_local_credit(self):
-        for kwargs in ({"outcome_valid": False, "advantage": None},
-                       {"config": {"terminal_fill_enabled": False}, "advantage": None},
-                       {"config": {"terminal_fill_scale": 0}, "advantage": None}):
+        for kwargs in ({"outcome_valid": False},
+                       {"config": {"terminal_fill_enabled": False}}):
             with self.subTest(kwargs=kwargs):
                 result = self.annotate(**kwargs)
                 self.assertAlmostEqual(result["effective_credit"][4], 0.1)
                 self.assertEqual(result["terminal_fill"][4], 0)
+                self.assertEqual(result["terminal_discount"][4], 0)
 
     def test_missing_gt_cannot_be_replaced_with_terminal_advantage(self):
         result = self.annotate(values=[0, 0.1, 0.2, 0.3, 0.4, math.nan])
@@ -155,13 +199,15 @@ class RoutedCreditTests(unittest.TestCase):
         result = self.annotate(values=[0, 0.1, 0.3, 0.4], indices=[0, 1, 3, 4],
                                types=["analysis", "tool_plan", "tool_plan", "final_answer"])
         self.assertTrue(math.isnan(result["effective_credit"][1]))
-        self.assertAlmostEqual(result["effective_credit"][2], 0.9)
+        self.assertAlmostEqual(result["effective_credit"][2], 0.1)
+        self.assertAlmostEqual(result["terminal_discount"][2], 0.8)
 
     def test_decisions_after_actual_final_do_not_receive_credit(self):
         result = self.annotate(values=[0, 0.1, 0.2, 0.3],
                                types=["analysis", "tool_plan", "direct", "tool_plan"],
                                finals=[False, False, True, False])
-        self.assertAlmostEqual(result["effective_credit"][1], 0.9)
+        self.assertAlmostEqual(result["effective_credit"][1], 0.1)
+        self.assertAlmostEqual(result["terminal_discount"][1], 0.8)
         self.assertTrue(math.isnan(result["effective_credit"][3]))
 
     def test_multiple_terminal_markers_fail_closed(self):

@@ -87,6 +87,7 @@ def load_trainer_methods():
         TraceConfig=CREDIT.TraceConfig, state_values=CREDIT.state_values,
         annotate_rollout_credits=CREDIT.annotate_rollout_credits,
         annotate_environment_credits=CREDIT.annotate_environment_credits,
+        scale_outcome_advantages=CREDIT.scale_outcome_advantages,
         pair_group_key=CREDIT.pair_group_key, select_pairs=CREDIT.select_pairs,
         summarize_states=METRICS.summarize_states,
         summarize_selected_pairs=METRICS.summarize_selected_pairs,
@@ -225,6 +226,20 @@ def standard_rows(chosen_reward=1.0, rejected_reward=1.0):
     return rows, {"A0": -4., "A1": -4., "A2": -2., "B0": -4., "B1": -4., "B2": -8.}
 
 
+def value_rollout(rollout, values, reward, *, uid="q", trusted=True, final=True):
+    """Generate GT scores with prescribed V_t for end-to-end credit checks."""
+    rows, scores = [], {}
+    for turn, value in enumerate(values):
+        terminal = final and turn == len(values) - 1
+        kind = "analysis" if turn == 0 else ("final_answer" if terminal else "tool_plan")
+        context = f"{uid}/{rollout}/{turn}"
+        rows.append(make_row(context, rollout, turn, uid=uid, turn_type=kind,
+                             reward=reward, is_final=terminal,
+                             outcome_valid=trusted, outcome_success=reward > 0.5))
+        scores[context] = 0.1 - 4.1 * np.exp(-value)
+    return rows, scores
+
+
 class TraceTrainerIntegrationTests(unittest.TestCase):
     def test_trace_pairing_uses_original_turn_ids_and_preserves_native_batch(self):
         rows, scores = standard_rows()
@@ -341,7 +356,7 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
                     "deduplicated_states", "effective_credit_mean", "outcome_invalid_turns"):
             self.assertNotIn("trace/" + key, state_metrics)
 
-    def test_k3_fill_uses_final_decision_and_unique_rollout_outcomes(self):
+    def test_zero_local_range_does_not_create_tool_credit_from_outcomes(self):
         rows, scores = [], {}
         for rollout, reward, success in (("a", 1., True), ("b", 0., False)):
             for turn, turn_type in enumerate(("analysis", "tool_plan", "tool_plan", "tool_plan", "final_answer")):
@@ -355,13 +370,136 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
         trainer._annotate_trace_credits(history)
         credit = history.non_tensor_batch["trace_credit"]
         self.assertTrue(np.isnan(credit[[0, 4, 5, 9]]).all())
-        np.testing.assert_allclose(credit[[1, 2, 3]], [0., 0.64, 0.8])
-        np.testing.assert_allclose(credit[[6, 7, 8]], [0., -0.64, -0.8])
+        np.testing.assert_allclose(credit[[1, 2, 3, 6, 7, 8]], 0.)
         np.testing.assert_allclose(history.non_tensor_batch["trace_outcome_advantage"][:5], 0.5)
         np.testing.assert_allclose(history.non_tensor_batch["trace_local_credit"][[1, 2, 3]], 0.)
         self.assertEqual(history.non_tensor_batch["trace_terminal_reached"].tolist(),
                          [False, False, True, True, False] * 2)
-        self.assertEqual(len(trainer._trans_to_dpo_batch([history])), 4)
+        self.assertEqual(len(trainer._trans_to_dpo_batch([history])), 2)
+
+    def test_k3_dynamic_fill_keeps_final_discount_and_deduplicated_outcomes(self):
+        rows, scores = [], {}
+        for rollout, values, reward in (("a", [0, 0, .1, .2, .3], 1.),
+                                        ("b", [0, 0, -.05, -.1], 0.)):
+            new_rows, new_scores = value_rollout(rollout, values, reward)
+            rows.extend(new_rows)
+            scores.update(new_scores)
+        history = make_batch(rows)
+        trainer = make_trainer(scores, {"k": 3, "terminal_fill_enabled": True})
+        trainer._annotate_trace_credits(history)
+        non = history.non_tensor_batch
+        np.testing.assert_allclose(non["trace_outcome_advantage"], [.5] * 5 + [-.5] * 4)
+        np.testing.assert_allclose(non["trace_scaled_outcome_advantage"], [.1] * 5 + [-.05] * 4,
+                                   atol=1e-7)
+        np.testing.assert_allclose(non["trace_terminal_fill"][[1, 2, 3, 6, 7]],
+                                   [0, .064, .08, -.032, -.04], atol=1e-7)
+        self.assertTrue(np.isnan(non["trace_credit"][[0, 4, 5, 8]]).all())
+
+    def test_ranges_include_nonterminal_untrusted_tools_but_do_not_cross_uid(self):
+        rows, scores = [], {}
+        fixtures = [("q", "a", [0, 0, .1], 1., True, True),
+                    ("q", "b", [0, 0, -.08], 0., True, True),
+                    ("q", "prefix", [0, 0, .8], 100., False, False),
+                    ("other", "a", [0, 0, 2.], 1., True, True),
+                    ("other", "b", [0, 0, -1.], 0., True, True)]
+        for uid, rollout, values, reward, trusted, final in fixtures:
+            new_rows, new_scores = value_rollout(rollout, values, reward, uid=uid,
+                                                trusted=trusted, final=final)
+            rows.extend(new_rows)
+            scores.update(new_scores)
+        trainer = make_trainer(scores, {"k": 3, "terminal_fill_enabled": True})
+        history = make_batch(rows)
+        trainer._annotate_trace_credits(history)
+        non = history.non_tensor_batch
+        np.testing.assert_allclose(non["trace_scaled_outcome_advantage"][[1, 4, 10, 13]],
+                                   [.8, -.08, 2., -1.], atol=1e-6)
+        np.testing.assert_allclose(non["trace_terminal_fill"][[1, 4, 7]], [.64, -.064, 0], atol=1e-6)
+        np.testing.assert_allclose(non["trace_outcome_advantage"][[1, 4]], [.5, -.5])
+
+    def test_dynamic_fill_matches_asymmetric_ranges_and_ignores_fixed_scale(self):
+        rows, scores = [], {}
+        for rollout, credit, reward in (("a", .2, 1.), ("b", .1, 1.),
+                                        ("c", .05, 1.), ("d", -.08, 0.)):
+            new_rows, new_scores = value_rollout(rollout, [0, 0, credit], reward)
+            rows.extend(new_rows)
+            scores.update(new_scores)
+        for scale in (0., 2., 100.):
+            for norm_by_std in (False, True):
+                with self.subTest(scale=scale, norm_by_std=norm_by_std):
+                    trainer = make_trainer(scores, {"k": 3, "terminal_fill_enabled": True,
+                                                    "terminal_fill_scale": scale})
+                    trainer.config.algorithm["norm_adv_by_std_in_grpo"] = norm_by_std
+                    history = make_batch(rows)
+                    original_rewards = history.batch["token_level_scores"].clone()
+                    trainer._annotate_trace_credits(history)
+                    non = history.non_tensor_batch
+                    np.testing.assert_allclose(non["trace_scaled_outcome_advantage"][[1, 4, 7, 10]],
+                                               [.2, .2, .2, -.08], atol=1e-7)
+                    np.testing.assert_allclose(non["trace_terminal_fill"][[1, 4, 7, 10]],
+                                               [.16, .16, .16, -.064], atol=1e-7)
+                    torch.testing.assert_close(history.batch["token_level_scores"], original_rewards)
+
+    def test_invalid_tool_extrema_do_not_set_the_question_range(self):
+        for excluded in ("invalid", "duplicate", "drop", "empty", "external", "missing_gt"):
+            with self.subTest(excluded=excluded):
+                rows, scores = [], {}
+                for rollout, credit, reward in (("a", .2, 1.), ("b", -.08, 0.), ("bad", 1.5, 1.)):
+                    new_rows, new_scores = value_rollout(rollout, [0, 0, credit], reward)
+                    rows.extend(new_rows)
+                    scores.update(new_scores)
+                history = make_batch(rows)
+                non = history.non_tensor_batch
+                if excluded == "invalid":
+                    non["trace_valid"][7] = False
+                elif excluded == "duplicate":
+                    non["trace_dup"] = np.zeros(len(rows), dtype=bool)
+                    non["trace_dup"][7] = True
+                elif excluded == "drop":
+                    history.batch["is_drop_mask"][7] = True
+                elif excluded == "empty":
+                    history.batch["response_mask"][7] = 0
+                elif excluded == "external":
+                    non["trace_external_error"][7] = True
+                else:
+                    non["trace_gt"][7] = ""
+                trainer = make_trainer(scores, {"k": 3, "terminal_fill_enabled": True})
+                trainer._annotate_trace_credits(history)
+                np.testing.assert_allclose(non["trace_scaled_outcome_advantage"][[1, 4]],
+                                           [.2, -.08], atol=1e-7)
+
+    def test_missing_tool_sign_or_disabled_fill_adds_no_terminal_credit(self):
+        for enabled in (False, True):
+            rows, scores = [], {}
+            for rollout, credit, reward in (("a", .2, 1.), ("b", .1, 0.)):
+                new_rows, new_scores = value_rollout(rollout, [0, 0, credit], reward)
+                rows.extend(new_rows)
+                scores.update(new_scores)
+            trainer = make_trainer(scores, {"k": 3, "terminal_fill_enabled": enabled})
+            history = make_batch(rows)
+            trainer._annotate_trace_credits(history)
+            non = history.non_tensor_batch
+            np.testing.assert_allclose(non["trace_terminal_fill"][[1, 4]],
+                                       [.16 if enabled else 0, 0], atol=1e-7)
+
+    def test_non_qa_tasks_keep_fixed_scale_terminal_fill(self):
+        rows, scores = [], {}
+        for rollout, credit, reward in (("a", .2, 1.), ("b", -.08, 0.)):
+            new_rows, new_scores = value_rollout(rollout, [0, 0, credit], reward)
+            rows.extend(new_rows)
+            scores.update(new_scores)
+        for task, metadata_task in (("webshop", None), ("rule", None), ("qa", "webshop")):
+            for scale in (0., 2., 3.):
+                with self.subTest(task=task, metadata_task=metadata_task, scale=scale):
+                    trainer = make_trainer(scores, {"k": 3, "terminal_fill_enabled": True,
+                                                    "terminal_fill_scale": scale})
+                    trainer.config.data["task"] = task
+                    history = make_batch(rows)
+                    history.non_tensor_batch["trace_task"] = np.full(len(rows), metadata_task, dtype=object)
+                    trainer._annotate_trace_credits(history)
+                    non = history.non_tensor_batch
+                    np.testing.assert_allclose(non["trace_terminal_fill"][[1, 4]],
+                                               [.4 * scale, -.4 * scale], atol=1e-7)
+                    self.assertTrue(np.isnan(non["trace_scaled_outcome_advantage"]).all())
 
     def test_external_failure_blocks_tool_windows_and_untrusted_outcome_pairs(self):
         rows, scores = [], {}
@@ -439,7 +577,7 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
                                      outcome_valid=log["trace_outcome_valid"],
                                      outcome_success=log["trace_outcome_success"],
                                      external_error=log["trace_external_error"]))
-                scores[context] = -4.
+                scores[context] = (-2. if success else -8.) if turn == 2 else -4.
         trainer = make_trainer(scores, {"k": 3, "terminal_fill_enabled": True})
         history = make_batch(rows)
         trainer._annotate_trace_credits(history)
@@ -447,7 +585,8 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
         self.assertEqual(len(pairs), 3)
         self.assertEqual(trainer._trace_pair_metrics["trace/pair/trace_selected_unique"], 1)
         self.assertEqual(trainer._trace_pair_metrics["trace/pair/outcome_selected_unique"], 2)
-        np.testing.assert_allclose(history.non_tensor_batch["trace_credit"][[1, 4]], [0.8, -0.8])
+        non = history.non_tensor_batch
+        np.testing.assert_allclose(non["trace_credit"][[1, 4]], 1.8 * non["trace_local_credit"][[1, 4]])
 
     def test_distributed_padding_does_not_inflate_pair_statistics(self):
         rows, scores = standard_rows()

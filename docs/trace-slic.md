@@ -54,12 +54,34 @@ c_t^{(K)}=\frac{\sum_{u\in\mathcal W_t^{\mathrm{tool}}}\gamma^{u-t}\delta_u}
 \mathcal W_t=[t,\min(t+K-1,\text{末可见 Turn})].
 $$
 
-final 的执行结果单独用于终局项，不作为 GT delta 混入局部平均。窗口触及实际已完成且验证可信的 final 时，对工具 Turn 回填：
+final 的执行结果单独用于终局项，不作为 GT delta 混入局部平均。QA 按当前 batch 同题（同 `uid`）所有有效工具 Turn 的回填前局部信用，以及所有可信 Rollout 的终局优势，分别统计正负范围：
+
+$$
+C_x^+=\max_{g,t}\max(c_{g,t}^{(K)},0),\quad
+C_x^-=\max_{g,t}\max(-c_{g,t}^{(K)},0),\qquad
+A_x^+=\max_g\max(A_g^{\mathrm{out}},0),\quad
+A_x^-=\max_g\max(-A_g^{\mathrm{out}},0).
+$$
+
+保持零点和正负号，动态映射终局优势，不再乘固定回填系数：
+
+$$
+\widehat A_g=
+\begin{cases}
+(A_g^{\mathrm{out}}/A_x^+)C_x^+,& A_g^{\mathrm{out}}>0,\\
+(A_g^{\mathrm{out}}/A_x^-)C_x^-,& A_g^{\mathrm{out}}<0,\\
+0,& A_g^{\mathrm{out}}=0.
+\end{cases}
+$$
+
+没有某个方向的有效工具信用时，该方向映射为零；空工具范围或全零范围不产生回填。工具范围在信用阈值、价值匹配和 Pair 数量筛选前统计，包括未触及 final 或终局不可信 Rollout 中的有效工具窗口；排除外部故障、阻断窗口、无效／重复／被丢弃／无 Response 的动作及 final 后输出。分母仅在对应优势非零时使用，无新增 epsilon 或幅度超参数。范围对齐不保证每个弱局部信用的正负号保持不变。
+
+窗口触及实际已完成且验证可信的 final 时，对工具 Turn 回填：
 
 $$
 \widetilde c_t=c_t^{(K)}+
 \mathbf1[\mathcal W_t\text{触及可信 final}]
-\lambda_{\mathrm{term}}\gamma^{f-t}A_g^{\mathrm{out}},
+\gamma^{f-t}\widehat A_g,
 $$
 
 其中 f 为真实 final 的原始 Turn 编号，折扣距离与总窗口的计数一致。用于 TRACE 回填的终局优势仅在有可信终局结果的同题 Rollout 中计算，并按 Rollout 去重。复用的是原 GRPO 的中心化、是否除以标准差及单例组特例等计算口径；可信 Rollout 的统计人口可能与实际 GRPO batch 不同，因此两条路径的优势数值不保证相同。它不是直接把原始奖励 R 加到信用上，也不会回写或修改原 GRPO 优势。局部信用、回填项及回填后信用分别保留。
@@ -69,8 +91,8 @@ $$
 | 工具 Turn | 窗口 | 是否回填 |
 | --- | --- | --- |
 | A | A、B、C | 否 |
-| B | B、C、final | 是，系数 `lambda * gamma**2` |
-| C | C、final | 是，系数 `lambda * gamma` |
+| B | B、C、final | 是，`gamma**2 * A_hat` |
+| C | C、final | 是，`gamma * A_hat` |
 
 因此本项目的 K=3 最多向 final 前两个工具 Turn 回填。这是明确包含 final 的总 Turn 窗口约定；与 TRACE 论文按工具转移计 K 的约定不同，不能同时声称回填最后三个工具 Turn。
 
@@ -116,7 +138,7 @@ Pair 两侧保留各自原始生成 Prompt、响应及原生 token IDs。仍使�
 | `k` | `3` | 包含当前 Turn 和可能的 final 的总窗口大小 |
 | `gamma` | `0.8` | 窗口和终局回填折扣 |
 | `terminal_fill_enabled` | `true` | 启用可信终局优势回填 |
-| `terminal_fill_scale` | `2.0` | 回填系数，可独立消融 |
+| `terminal_fill_scale` | `2.0` | 仅保留非 QA 任务原回填系数；QA 忽略此值，使用同题动态范围 |
 | `outcome_match_value` | `false` | analysis／final 是否额外要求 GT 价值匹配 |
 | `outcome_success_threshold` | `0.5` | 兼容数值奖励时的成功阈值；明确 verifier 布尔值优先 |
 | `match_epsilon` | `0.05` | 工具执行前价值差上限；同初态时平滑 NLL 比不超过 `exp(0.05)≈1.051` |
@@ -130,7 +152,7 @@ Pair 两侧保留各自原始生成 Prompt、响应及原生 token IDs。仍使�
 | `gt_alias_strategy` | `first` | 固定第一个非空 GT 别名 |
 | `answer_instruction` | 上文统一指令 | 独立 GT 评分提示 |
 
-TRACE 论文提供 epsilon=0.1、gamma=0.8、K-step 归一化、终局回填 scale=2 的参考设置，但本项目按类型配对、包含 final 的窗口计数和阈值均是项目设计，不能称为精确复现。[TRACE §3 与附录 A.1](https://arxiv.org/html/2607.13988v1)
+TRACE 论文提供 epsilon=0.1、gamma=0.8、K-step 归一化、终局回填 scale=2 的参考设置；当前 QA 使用同题动态范围缩放，按类型配对、包含 final 的窗口计数和阈值也是项目设计，不能称为精确复现。[TRACE §3 与附录 A.1](https://arxiv.org/html/2607.13988v1)
 
 ```bash
 TRACE_MATCH_EPSILON=0.05 python train-roma/train_agent.py

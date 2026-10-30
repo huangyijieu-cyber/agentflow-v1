@@ -18,7 +18,7 @@ data:
     k: 3  # Total turn window, including the current turn and a final turn if reached.
     gamma: 0.8
     terminal_fill_enabled: true
-    terminal_fill_scale: 2.0
+    terminal_fill_scale: 2.0  # Non-QA only; QA dynamically matches per-question credit ranges.
     outcome_match_value: false
     outcome_success_threshold: 0.5
     match_epsilon: 0.05

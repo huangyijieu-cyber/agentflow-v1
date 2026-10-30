@@ -30,6 +30,7 @@ class TraceConfig:
     k: int = 3
     gamma: float = 0.8
     terminal_fill_enabled: bool = True
+    # Retained for non-QA tasks; QA uses per-question ranges.
     terminal_fill_scale: float = 2.0
     outcome_match_value: bool = False
     outcome_success_threshold: float = 0.5
@@ -200,6 +201,38 @@ def discounted_credits(
     return result
 
 
+def scale_outcome_advantages(
+    local_credits: Sequence[Optional[float]],
+    outcome_advantages: Sequence[Optional[float]],
+):
+    """Map one question's outcome advantages into its signed tool-credit ranges.
+
+    Callers supply every valid pre-fill tool credit, before pair filtering, and
+    one advantage per trusted rollout. Positive and negative ranges are scaled
+    separately to preserve zero and signs. A missing tool-credit direction maps
+    to zero; invalid advantages retain their positions as NaN.
+    """
+    credits = [float(value) for value in local_credits if _finite(value)]
+    advantages = [float(value) if _finite(value) else math.nan for value in outcome_advantages]
+    positive_credit = max((value for value in credits if value > 0), default=0.0)
+    negative_credit = max((-value for value in credits if value < 0), default=0.0)
+    positive_advantage = max((value for value in advantages if value > 0), default=0.0)
+    negative_advantage = max((-value for value in advantages if value < 0), default=0.0)
+    result = []
+    for advantage in advantages:
+        if not _finite(advantage):
+            result.append(math.nan)
+        elif advantage > 0 and positive_advantage > 0:
+            # Divide first: the ratio is bounded, even for tiny advantages or
+            # very large local-credit ranges. No numerical scale offset is used.
+            result.append((advantage / positive_advantage) * positive_credit)
+        elif advantage < 0 and negative_advantage > 0:
+            result.append((advantage / negative_advantage) * negative_credit)
+        else:
+            result.append(0.0)
+    return result
+
+
 def annotate_rollout_credits(
     values: Sequence[Optional[float]],
     turn_indices: Sequence[int],
@@ -208,10 +241,11 @@ def annotate_rollout_credits(
     final_flags: Sequence[bool],
     *,
     outcome_valid: bool,
-    outcome_advantage: Optional[float],
+    outcome_advantage: Optional[float] = None,
+    defer_terminal_fill: bool = False,
     config=None,
 ):
-    """Assign tool credit without crossing missing turns or external failures.
+    """Compute answer-based credit, optionally deferring QA's terminal fill.
 
     K counts original decision positions, including the current decision and
     the actual final answer.  Final has no fabricated GT delta: local credit
@@ -222,6 +256,11 @@ def annotate_rollout_credits(
     ``final_flags`` marks an actual terminal answer, never a last-visible tool
     decision.  ``outcome_valid`` additionally certifies its verifier outcome.
     Invalid scoring windows are kept as NaN, not truncated across a failure.
+
+    QA requests deferred filling so its trainer can first collect every rollout's
+    local range. Other tasks retain the existing fixed-scale filling behavior.
+    Terminal fill is deferred until all rollouts' local credits are available.
+    Thus effective credit initially equals local credit and valid fills are zero.
     """
     cfg = TraceConfig.from_mapping(config)
     size = len(values)
@@ -232,7 +271,7 @@ def annotate_rollout_credits(
         raise ValueError("TRACE rollout credit inputs must have the same length")
     result = {
         key: [math.nan] * size
-        for key in ("local_credit", "terminal_fill", "effective_credit")
+        for key in ("local_credit", "terminal_fill", "effective_credit", "terminal_discount")
     }
     result.update(
         {
@@ -311,20 +350,18 @@ def annotate_rollout_credits(
             result["window_blocked"][start] = True
             continue
         result["local_credit"][start] = local
+        discount = 0.0
+        if cfg.terminal_fill_enabled and reached and outcome_valid:
+            distance = int(turn_indices[final_position]) - int(turn_indices[start])
+            discount = cfg.gamma**distance
+        result["terminal_discount"][start] = discount
         fill = 0.0
-        if (
-            cfg.terminal_fill_enabled
-            and cfg.terminal_fill_scale > 0
-            and reached
-            and outcome_valid
-        ):
+        if (not defer_terminal_fill and cfg.terminal_fill_enabled
+                and cfg.terminal_fill_scale > 0 and reached and outcome_valid):
             if not _finite(outcome_advantage):
                 result["window_blocked"][start] = True
                 continue
-            distance = int(turn_indices[final_position]) - int(turn_indices[start])
-            fill = (
-                cfg.terminal_fill_scale * cfg.gamma**distance * float(outcome_advantage)
-            )
+            fill = cfg.terminal_fill_scale * discount * float(outcome_advantage)
         if not _finite(fill) or not _finite(local + fill):
             result["window_blocked"][start] = True
             continue
