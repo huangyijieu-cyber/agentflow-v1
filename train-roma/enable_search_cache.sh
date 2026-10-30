@@ -4,17 +4,6 @@ _agentflow_enable_search_cache() {
     local repo_dir env_file name index original_flags
     local -a supplied_names supplied_values
     repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-    source "${repo_dir}/train-roma/task_network.sh" || return $?
-    agentflow_resolve_task || return $?
-    if agentflow_task_needs_search; then
-        :
-    else
-        local network_status=$?
-        if [[ "${network_status}" -ne 1 ]]; then return "${network_status}"; fi
-        # Do not even source a stale search env file for local tasks.
-        agentflow_disable_search_components
-        return 0
-    fi
     env_file="${SEARCH_CACHE_ENV_FILE:-${repo_dir}/train-roma/search-cache.local.env}"
     supplied_names=()
     supplied_values=()

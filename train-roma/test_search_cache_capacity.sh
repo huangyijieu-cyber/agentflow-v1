@@ -10,7 +10,7 @@ if [[ -f "${_capacity_env}" ]]; then
     set +a
 fi
 if [[ "${SEARCH_SERVICE_USE_PROXY:-1}" == "1" ]]; then
-    source "${_capacity_repo}/train-roma/enable_search_proxy.sh" --service
+    source "${_capacity_repo}/train-roma/enable_search_proxy.sh"
 fi
 export PYTHONPATH="${_capacity_repo}/agentflow${PYTHONPATH:+:${PYTHONPATH}}"
 exec "${SEARCH_SERVICE_PYTHON:-python3}" "${_capacity_repo}/train-roma/test_search_cache_capacity.py" "$@"

@@ -86,8 +86,6 @@ ALFWorld 环境、solver、两个 rollout 入口、daemon 和 trainer 均传递�
 
 使用服务器原有的 ALFWorld/TextWorld/fast_downward 环境和数据即可，不修改官网安装包。正式训练默认源码/数据布局仍为仓库根目录下的 `data/alfworld-master` 与其中的 `json_data`；若已有自定义路径，继续使用自己的环境路径配置。
 
-启动器会按 `TASK=alfworld` 自动跳过外网搜索代理、共享搜索缓存和 SSH 隧道，solver 也不加载 QA 搜索工具。无需为 ALFWorld 配置搜索私钥或令牌；模型服务及环境访问保留原配置。可使用 `TASK=alfworld bash train-roma/start.sh`，具体任务分流见 [搜索组件说明](search_cache.md#按任务选择搜索组件)。
-
 在仓库根目录，使用原有训练启动方式，并确保：
 
 ```bash

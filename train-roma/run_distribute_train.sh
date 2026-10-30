@@ -1,22 +1,73 @@
 #!/bin/bash
-# Resolve task routing before loading any search-only component.
-export ROOT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)" || exit 1
-cd "${ROOT_PATH}" || exit 1
-source "${ROOT_PATH}/train-roma/task_network.sh" || exit 1
-agentflow_resolve_task || exit 1
-if agentflow_task_needs_search; then
-    :
-else
-    _agentflow_network_status=$?
-    if [[ "${_agentflow_network_status}" -ne 1 ]]; then exit "${_agentflow_network_status}"; fi
-    agentflow_disable_search_components
-    echo "[network] TASK=${TASK}: search proxy, cache and SSH tunnel disabled."
-fi
-
-
 set -e
 
-source "${ROOT_PATH}/train-roma/enable_search_proxy.sh"
+# Resolve the repository from this file, independently of the caller's cwd.
+ROOT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+export ROOT_PATH
+cd "${ROOT_PATH}"
+
+# Select the actual task before proxy setup, dependency installation or Ray.
+# Explicit TASK wins over env.TASK in config.yaml. Invalid YAML/tasks fail closed.
+TASK_CONFIG="${ROOT_PATH}/train-roma/config.yaml"
+if ! RESOLVED_TASK="$("${AGENTFLOW_TASK_PYTHON:-python3}" - "${TASK_CONFIG}" <<'PY'
+import os
+import re
+import sys
+from pathlib import Path
+
+config_file = Path(sys.argv[1])
+try:
+    import yaml
+    config = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+except Exception:
+    # Deliberately do not print YAML contents or parser errors (may leak keys).
+    print(f"[network] Cannot read task configuration: {config_file}", file=sys.stderr)
+    sys.exit(2)
+
+if not isinstance(config, dict) or not isinstance(config.get("env", {}), dict):
+    print("[network] Invalid config: env must be a mapping", file=sys.stderr)
+    sys.exit(2)
+
+value = os.environ["TASK"] if "TASK" in os.environ else config.get("env", {}).get("TASK", "qa")
+if "TASK" not in os.environ and isinstance(value, str):
+    expression = re.fullmatch(r"\$\{env:([A-Za-z_][A-Za-z0-9_]*),(.*?)\}", value.strip())
+    if expression:
+        name, fallback = expression.groups()
+        value = os.environ.get(name, fallback)
+
+if not isinstance(value, str):
+    print("[network] Invalid TASK: expected a nonempty string", file=sys.stderr)
+    sys.exit(2)
+value = value.strip().lower()
+if not re.fullmatch(r"[a-z][a-z0-9_-]*", value):
+    print("[network] Invalid TASK: expected letters, digits, '_' or '-'", file=sys.stderr)
+    sys.exit(2)
+print(value)
+PY
+)"; then
+    exit 2
+fi
+export TASK="${RESOLVED_TASK}"
+unset RESOLVED_TASK TASK_CONFIG
+
+case "${TASK}" in
+    alfworld|webshop|rule)
+        NEED_SEARCH_NETWORK=0
+        ;;
+    *)
+        NEED_SEARCH_NETWORK=1
+        ;;
+esac
+
+if [[ "${NEED_SEARCH_NETWORK}" == 1 ]]; then
+    source "${ROOT_PATH}/train-roma/enable_search_proxy.sh"
+else
+    export SEARCH_CACHE_ENABLED=0
+    export SEARCH_PROXY_ENABLED=0
+    export SEARCH_CACHE_AUTO_START=0
+    export SEARCH_CACHE_AUTO_TUNNEL=0
+    echo "[network] TASK=${TASK}: 跳过搜索代理、缓存和 SSH 隧道"
+fi
 
 #source train-roma/con_to_web.sh
 
@@ -99,9 +150,15 @@ cd "${ROOT_PATH}/agentflow"
 python -m pip install --user --no-deps -e . --no-build-isolation
 cd ..
 
-# Enable before Ray starts on each node so tools inherit the shared service.
-if agentflow_task_needs_search && { [[ "${SEARCH_CACHE_ENABLED:-}" =~ ^(1|true|True|TRUE|yes|YES|on|ON)$ ]] || { [[ -z "${SEARCH_CACHE_ENABLED+x}" ]] && [[ -n "${SEARCH_CACHE_ENV_FILE:-}" || -f "${ROOT_PATH}/train-roma/search-cache.local.env" ]]; }; }; then
-    source "${ROOT_PATH}/train-roma/enable_search_cache.sh" || exit 1
+# Enable the shared search service only for tasks that need external search.
+# Every node reaches this gate before starting Ray.
+if [[ "${NEED_SEARCH_NETWORK}" == 1 ]]; then
+    if [[ "${SEARCH_CACHE_ENABLED:-}" =~ ^(1|true|True|TRUE|yes|YES|on|ON)$ ]] ||
+       { [[ -z "${SEARCH_CACHE_ENABLED+x}" ]] &&
+         [[ -n "${SEARCH_CACHE_ENV_FILE:-}" ||
+            -f "${ROOT_PATH}/train-roma/search-cache.local.env" ]]; }; then
+        source "${ROOT_PATH}/train-roma/enable_search_cache.sh"
+    fi
 fi
 
 # ==========================================

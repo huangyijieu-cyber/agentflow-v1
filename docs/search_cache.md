@@ -1,45 +1,5 @@
 # 统一搜索与共享缓存
 
-## 按任务选择搜索组件
-
-训练先确定 `TASK`，再加载搜索组件。环境变量 `TASK` 优先；未设置时读取
-`train-roma/config.yaml` 的 `env.TASK`，同时支持字面任务名和 `${env:TASK,qa}` 默认值。
-这一步不探测外网，也不读取搜索令牌或 SSH 私钥。
-
-| 任务 | 搜索代理、共享缓存、SSH 隧道 | QA 搜索工具 |
-| --- | --- | --- |
-| `alfworld`、`webshop`、`rule` | 自动跳过，旧缓存配置中即使启用也不加载 | 不初始化 |
-| `qa` | 保留现有配置及显式开关 | 按原工具配置初始化 |
-| 其他任务 | 保留原联网行为 | 按原工具配置初始化 |
-
-统一入口会从脚本位置定位仓库，不再写死服务器路径，也不依赖调用时的工作目录：
-
-```bash
-TASK=alfworld bash train-roma/start.sh
-# 或 TASK=webshop / TASK=qa；也可以只在 config.yaml 中配置 TASK。
-```
-
-`start.sh` 对联网任务按 `SEARCH_PROXY_ENABLED` 选择代理：`1` 显式加载，`0` 跳过；
-未设置时，有 `PROXY_HOST` 和 `PROXY_TOKEN` 才加载已有出口代理。
-缓存仍按 `SEARCH_CACHE_ENABLED` 及本地缓存配置决定是否启动。ALFWorld/WebShop 无需手动
-设置关闭缓存，也不要求搜索令牌、SSH 私钥或代理凭据。
-
-三个 `run_train*.sh` 入口及直接 source 的代理/缓存脚本也会按任务分流。
-本地任务在读取 `search-cache.local.env`、检查密钥、创建代理兼容钩子之前返回，
-并将缓存自举/隧道开关置为关闭；本地或外部 Ray 集群的任务运行时同样禁用搜索组件。
-solver 不为这些环境任务加载 Brave/Web/Wikipedia；两个 rollout 入口也不再通过无用导入探测公网 IP。
-
-这些规则只控制外网搜索组件，不禁用模型 RPC、WebShop 本地 HTTP/Lucene、模型或数据文件的
-原有加载方式。清理旧代理时只移除本搜索组件记录的 URL 和 PYTHONPATH 钩子，保留其他用户配置。
-更新后重启启动器、rollout 与训练进程，已转换的 ALFWorld GT Parquet 可以继续使用。
-
-手动运行搜索服务和容量测试属于显式联网操作，使用 `enable_search_proxy.sh --service`，
-不受当前训练任务的本地模式影响。下文描述的是需要搜索组件时的配置。
-
-本次验证通过 30 项任务/启动/工具路由测试、154 项搜索缓存测试、184 项 ALFWorld 和
-135 项 TRACE 回归。启动、模型、SSH 使用替身，搜索缓存 HTTP 用本机回环服务验证；
-没有连接外部搜索服务或在服务器执行完整 GPU/NPU 训练。
-
 `cache` 分支基于 `main`，集成共享搜索、缓存和一键启动功能，保留 `main` 的训练与奖励逻辑。
 统一服务运行在开发服务器，配置、日志和 PID 默认放在
 `/home/ma-user/work/code-rl/cache`；SQLite 数据库默认放在本地临时目录
