@@ -10,7 +10,7 @@
 
 ## 启动窗口
 
-先按 [离线构建步骤](alfworld-trace-goals.md#规则来源与转换) 生成 `alfworld_trace_goals.sqlite`。新采样和旧缓存补 GT 都只读取这个文件，不在窗口中执行转换。已经保存完整 GT/状态的轨迹可以直接评分，无需再次读取转换文件。
+正式训练使用填好 `result` 的 Parquet，见 [离线准备步骤](alfworld-trace-goals.md#规则来源与转换)。本 Probe 继续使用兼容的独立 SQLite；按该文的 `build --dataset ...` 命令生成 `alfworld_trace_goals.sqlite`。新采样和旧缓存补 GT 都只读取这个文件，不在窗口中执行转换。已经保存完整 GT/状态的轨迹可以直接评分，无需再次读取转换文件。
 
 在平时能运行 ALFWorld 的 Python 环境、仓库根目录中执行。下面的模型名、服务地址和 tokenizer 路径须对应实际部署；采样与评分可使用不同服务。
 

@@ -227,6 +227,12 @@ class RolloutAgent(LitAgent):
 
     async def _solve_and_evaluate(self, rollout_id: str, rollout: AgentFlowRollout, task: Any, step_n: int, val: bool = False, is_train: bool = True):
         """A helper function to run the agent, parse the result, and evaluate it."""
+        # Keep validation independent of a goal artifact restricted to training.
+        if self.task == "alfworld":
+            if is_train:
+                rollout.solver.env.set_trace_task(task)
+            else:
+                rollout.solver.env.trace_enabled = False
         profile_val = val and profiling_enabled()
         rollout_started = time.perf_counter() if profile_val else 0.0
         result = {}

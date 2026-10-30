@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 import hashlib
+import errno
 import importlib.util
 import io
 import json
@@ -291,7 +292,7 @@ class GoalStoreTests(unittest.TestCase):
     def test_cli_progress_uses_stderr_and_quiet_preserves_json_summary(self):
         self.game()
         self.game("pick_heat_then_place_in_recep")
-        command = [sys.executable, str(MODULE), "build", "--games-root", str(self.games),
+        command = [sys.executable, str(MODULE), "build", "--all-games", "--games-root", str(self.games),
                    "--output", str(self.output), "--progress-every", "1"]
         result = subprocess.run(command, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -315,12 +316,114 @@ class GoalStoreTests(unittest.TestCase):
         for index in (1, 2, 4, 5):
             self.assertIn(f"{index}/5", text)
         self.assertNotIn("3/5", text)
-        invalid = subprocess.run([sys.executable, str(MODULE), "build", "--games-root", str(self.games),
+        invalid = subprocess.run([sys.executable, str(MODULE), "build", "--all-games", "--games-root", str(self.games),
                                   "--output", str(self.output), "--progress-every", "0"],
                                  capture_output=True, text=True)
         self.assertNotEqual(invalid.returncode, 0)
         self.assertIn("positive integer", invalid.stderr)
         self.assertFalse(self.output.exists())
+
+    def dataset(self, questions):
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            self.skipTest("pyarrow is required for dataset selection tests")
+        path = self.root / "train.parquet"
+        pq.write_table(pa.table({"question": questions, "id": list(range(1, len(questions) + 1))}), path)
+        return path
+
+    def test_dataset_build_only_converts_selected_rows_and_freezes_actual_game(self):
+        first = self.game()
+        second = self.game("pick_heat_then_place_in_recep")
+        third = self.game("pick_cool_then_place_in_recep")
+        dataset = self.dataset(["train_all_alfworld_2", "train_all_alfworld_0"])
+        catalogue = [third, first, second]  # actual collector order, deliberately nonlexical
+        summary = store.build_goal_store(self.games, self.output, dataset=dataset, expected_rows=2,
+                                         catalogue_loader=lambda *args: catalogue)
+        self.assertEqual(summary["count"], 2)
+        self.assertEqual(summary["dataset_rows"], 2)
+        self.assertEqual(summary["selected_games"], 2)
+        self.assertEqual(summary["selection_mode"], "dataset")
+        self.assertEqual(store.read_dataset_gamefile(self.output, "train", "all", 2, self.games), second.resolve())
+        self.assertEqual(store.read_dataset_gamefile(self.output, "train", "all", 0, self.games), third.resolve())
+        with self.assertRaisesRegex(store.GoalStoreError, "no selected question"):
+            store.read_dataset_gamefile(self.output, "train", "all", 1, self.games)
+        with self.assertRaisesRegex(store.GoalStoreError, "not converted"):
+            store.read_goal_spec(self.output, first)
+        with database(self.output) as connection:
+            rows = connection.execute("SELECT question,game_key FROM dataset_rows ORDER BY row_index").fetchall()
+        self.assertEqual(rows, [("train_all_alfworld_2", "1/game.tw-pddl"),
+                                ("train_all_alfworld_0", "2/game.tw-pddl")])
+
+    def test_dataset_subset_can_reuse_completed_store_without_converter(self):
+        first = self.game()
+        second = self.game("pick_heat_then_place_in_recep")
+        self.build()
+        before = self.output.read_bytes()
+        subset = self.root / "selected.sqlite"
+        dataset = self.dataset(["train_all_alfworld_1"])
+        with mock.patch.object(store, "_converter", side_effect=AssertionError("reconversion forbidden")):
+            summary = store.build_goal_store(self.games, subset, dataset=dataset, expected_rows=1,
+                                             catalogue_loader=lambda *args: [first, second], reuse_store=self.output)
+        self.assertEqual(summary["reused"], 1)
+        self.assertEqual(summary["dataset_rows"], 1)
+        self.assertEqual(self.output.read_bytes(), before)
+        self.assertEqual(store.read_goal_spec(subset, second)["goal_response"],
+                         store.read_goal_spec(self.output, second)["goal_response"])
+        moved = self.root / "moved_data"
+        shutil.copytree(self.games, moved)
+        self.assertEqual(store.read_dataset_gamefile(subset, "train", "all", 1, moved), (moved / "1/game.tw-pddl").resolve())
+
+    def test_dataset_scope_rejects_wrong_count_and_tampered_row(self):
+        game = self.game()
+        dataset = self.dataset(["train_all_alfworld_0"])
+        with self.assertRaisesRegex(store.GoalStoreError, "expected exactly 3305"):
+            store.build_goal_store(self.games, self.output, dataset=dataset, expected_rows=3305,
+                                   catalogue_loader=lambda *args: [game])
+        self.assertFalse(self.output.exists())
+        store.build_goal_store(self.games, self.output, dataset=dataset,
+                               catalogue_loader=lambda *args: [game])
+        with database(self.output) as connection:
+            connection.execute("UPDATE dataset_rows SET question='train_all_alfworld_999'")
+        with self.assertRaisesRegex(store.GoalStoreError, "row failed integrity"):
+            store.read_dataset_gamefile(self.output, "train", "all", 0, self.games)
+
+    def test_legacy_store_keeps_environment_catalogue_selection(self):
+        self.game()
+        self.build()
+        self.assertIsNone(store.read_dataset_gamefile(self.output, "train", "all", 0, self.games))
+
+    def test_hardlink_unsupported_mount_publishes_without_reconverting(self):
+        game = self.game()
+        with mock.patch.object(store.os, "link", side_effect=OSError(errno.EOPNOTSUPP, "Operation not supported")):
+            summary = self.build()
+        self.assertEqual(summary["count"], 1)
+        self.assertEqual(store.read_goal_spec(self.output, game)["goal_store_id"], summary["goal_store_id"])
+        self.assertFalse(self.output.with_name(self.output.name + ".publish.lock").exists())
+        self.assertEqual(list(self.root.glob("*.building-*")), [])
+
+    def test_publish_failure_keeps_complete_temporary_sqlite_for_recovery(self):
+        game = self.game()
+        with mock.patch.object(store.os, "link", side_effect=OSError(errno.EOPNOTSUPP, "Operation not supported")), \
+             mock.patch.object(store.os, "replace", side_effect=OSError(errno.EIO, "rename unavailable")):
+            with self.assertRaisesRegex(store.GoalStoreError, "Completed SQLite retained"):
+                self.build()
+        self.assertFalse(self.output.exists())
+        temporary = list(self.root.glob("*.building-*.sqlite"))
+        self.assertEqual(len(temporary), 1)
+        self.assertTrue(store.read_goal_spec(temporary[0], game)["goal_response"])
+        self.assertFalse(self.output.with_name(self.output.name + ".publish.lock").exists())
+
+    def test_fallback_publish_never_replaces_racing_existing_target(self):
+        temporary = self.root / "ready.sqlite"
+        temporary.write_bytes(b"new")
+        self.output.write_bytes(b"existing")
+        with mock.patch.object(store.os, "link", side_effect=OSError(errno.EOPNOTSUPP, "Operation not supported")):
+            with self.assertRaises(FileExistsError):
+                store._publish_goal_store(temporary, self.output, False)
+        self.assertEqual(self.output.read_bytes(), b"existing")
+        self.assertEqual(temporary.read_bytes(), b"new")
 
 
 if __name__ == "__main__":

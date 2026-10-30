@@ -1,39 +1,58 @@
 # ALFWorld：实际 PDDL → 固定英文 GT → TRACE
 
-转换与训练已分开：先离线批量转换，保存成一个 SQLite 文件；训练只读该文件，不在 reset 或 turn 中重新生成 GT。
+转换与训练已分开：只转换训练 Parquet 选中的题，将固定英文 GT 写入 `result`，同时在该 Parquet 中保存规则和游戏映射。训练直接读取该行 `result`，不在 reset 或 turn 中转换，也不依赖单独的 SQLite 文件。
 
 此实现使用完整环境状态进行参考模型评分（privileged/full-state）。策略模型继续接收原来的可见观察和有限历史。完整状态只进入评分上下文；固定 Response 描述成功条件，每道题的所有状态复用同一文本。
 
 ## 规则来源与转换
 
-离线入口是 `agentflow/agentflow/trace/alfworld_goal_store.py`，只使用 Python 标准库，不启动 ALFWorld、模型或训练器：
+离线入口是 `agentflow/agentflow/trace/alfworld_goal_store.py prepare`。在服务器仓库根目录运行一次：
+
+```bash
+python agentflow/agentflow/trace/alfworld_goal_store.py prepare \
+  --dataset /home/ma-user/work/code-rl/AgentFlow-distributed-GRPO/data/train/alfworld/train_all_alfworld_3305.parquet \
+  --games-root /home/ma-user/work/code-rl/AgentFlow-distributed-GRPO/data/alfworld-master/json_data/json_2.1.1 \
+  --alfworld-root /home/ma-user/work/code-rl/AgentFlow-distributed-GRPO/data/alfworld-master \
+  --output /home/ma-user/work/code-rl/AgentFlow-distributed-GRPO/data/train/alfworld/train_all_alfworld_3305_with_gt.parquet \
+  --expected-rows 3305 \
+  --progress-every 1
+```
+
+激活原有 ALFWorld Python 环境，确保有 `pyarrow` 和 `PyYAML`。`--alfworld-root` 是包含 `alfworld` Python 包的官网源码目录，`--games-root` 是含 train 等 split 的 `json_2.1.1` 目录。选择阶段调用官方 `AlfredTWEnv` 的目录收集逻辑，不启动模拟器或模型；转换读取选中游戏内的 `pddl_domain`、`pddl_problem` 和同目录 `traj_data.json`。
+
+**只处理输入 Parquet 的 3305 行。** 按 `question`（如 `train_all_alfworld_0`）中的零起始编号，匹配服务器官方环境的原始游戏目录顺序，不能用一开始为 1 的 `id`，也不能按路径排序后取前 3305 个。选定的游戏相对路径、原文件哈希和题号会一起保存，后续训练不重新按目录遍历顺序选题。缺失或超出目录范围、重复映射、不可解或不支持的选中游戏均明确报错。
+
+输出保留原六列及行顺序，仅填充 `result`；追加四个字符串列：
+
+| 列 | 内容 |
+| --- | --- |
+| `alfworld_goal_spec` | 预转换的完整 Goal、初始事实和动作规则 JSON |
+| `alfworld_goal_spec_sha256` | 保存规则的完整性校验 |
+| `alfworld_game_key` | 选中游戏在 games-root 下的相对路径 |
+| `alfworld_goal_row` | 原始行号、question、题号和数据集/选择哈希 JSON |
+
+完整规则较长，因此不放进 `result`；`result` 只保存用于 teacher-forcing 的固定英文 Response。`extra_info_ground_truth` 等其余原始列保持原值。可以继续用 `data/parquet_viewer.py` 查看新文件中的 `result`。
+
+原始 Parquet 默认保留，输出已存在时拒绝覆盖；明确重建才使用 `--overwrite`。进度实时显示已处理/总题数、百分比、耗时及 ETA。只有最终出现 `[complete] ... Training Parquet saved successfully.` 才表示新训练文件发布成功；100% 后仍有保存和校验阶段。
+
+内部先构建仅含所选题的临时 SQLite，成功发布 Parquet 后删除它，训练无需该中间文件。若已有完整 SQLite，可增加 `--reuse-store /path/to/complete.sqlite` 复用已转换规则，不再次调用 PDDL 转换器。若最终发布失败，新版本会保留完整中间文件并报告路径，供 `--reuse-store` 重试。旧版本此前报错时清理的临时文件不能据此恢复。
+
+文件系统不支持硬链接（`Errno 95`）时，会自动使用加锁后的重命名发布，仍拒绝覆盖已存在的目标。输出目录需要支持创建文件和重命名。
+
+运行时先按保存的相对路径选中游戏，再以实际 reset 返回的 `extra.gamefile` 核验游戏和 `traj_data.json` 的 SHA-256，并检查 `result` 与保存规则的固定 GT 完全一致。路径整体迁移后，内容一致仍可使用；缺失、陈旧或损坏明确报错，不回退实时转换。不要单独手改 `result`：需要同步完整规则及其哈希，通常应重新执行离线准备。
+
+Probe 仍兼容独立 SQLite。需要时单独构建；这不是正式训练的必需步骤：
 
 ```bash
 python agentflow/agentflow/trace/alfworld_goal_store.py build \
-  --games-root /absolute/path/to/alfworld-master/json_data/json_2.1.1 \
-  --output /absolute/path/to/artifacts/alfworld_trace_goals.sqlite
+  --dataset /path/to/train_all_alfworld_3305.parquet \
+  --games-root /path/to/alfworld-master/json_data/json_2.1.1 \
+  --alfworld-root /path/to/alfworld-master \
+  --expected-rows 3305 \
+  --output /path/to/alfworld_trace_goals.sqlite
 ```
 
-`--games-root` 指向实际游戏目录树，不是训练 Parquet。建议包含 train、valid_seen、valid_unseen 三个 split，覆盖训练和验证可能加载的所有游戏。脚本扫描 `game.tw-pddl`，读取内含的 `pddl_domain`、`pddl_problem` 及同目录 `traj_data.json`，将固定 `goal_response`、Goal AST、初始事实、动作规则、对象别名、来源哈希和转换版本一起保存。遵循官方 TextWorld 过滤条件，排除 movable、Sliced 及明确不可解游戏；其余不支持的谓词、结构或损坏来源会使构建报错，不静默遗漏。
-
-输出是单个 SQLite 文件，供多个进程只读、按游戏索引取数据。转换成功后才发布完整文件；构建失败不会替换旧文件。目标已存在时默认拒绝覆盖；确实需要重建时显式增加 `--overwrite`。第二次及以后训练复用同一文件，不需要再次运行 build。
-
-构建默认实时输出进度到终端，包括已处理/总文件数、百分比、已转换数、跳过数、耗时和预计剩余时间。默认每 25 个文件报告一次；首个、末个和间隔约 5 秒的更新也会显示。希望每个游戏都显示时增加 `--progress-every 1`；`--quiet` 仅保留最终 JSON 汇总。进度写入 stderr 并立即刷新，stdout 的 JSON 格式保持不变。
-
-百分比按扫描到的全部游戏文件计算，包含官方规则排除的文件；`converted` 才是实际保存条目数。处理到 100% 后还有 `[saving]` 阶段，只有出现 `[complete] ... Goal store saved successfully.` 才表示目标文件已成功发布。预计剩余时间是按当前平均处理速度估算的。已启动的旧进程不会自动获得进度输出，新版本下次启动时生效。
-
-可以导出某个游戏已经保存的英文 GT 和规则，不会重新转换：
-
-```bash
-python agentflow/agentflow/trace/alfworld_goal_store.py show \
-  --store /absolute/path/to/artifacts/alfworld_trace_goals.sqlite \
-  --gamefile /absolute/path/to/trial/game.tw-pddl \
-  --output outputs/goal.json
-```
-
-原 `alfworld.py convert --gamefile ... --output ...` 仍可单独调试一个游戏的转换；它输出的单题 JSON 不是正式训练读取的批量存储文件。
-
-运行时以实际 reset 返回的 `extra.gamefile` 为准，校验该游戏和 `traj_data.json` 的 SHA-256，再从保存文件查找已经转换好的结果，不根据 Parquet 的 id 或目录遍历序号查 GT。原始数据移动路径后，只要文件内容一致仍可匹配。缺失文件、条目、来源内容变化、版本或完整性校验失败均直接报错，不退回实时转换。
+`build --all-games` 才表示显式转换整个游戏目录。`show --store ... --gamefile ...` 只导出保存内容；`alfworld.py convert` 仅用于单题转换调试。
 
 转换保留 and/or/not、存在/全称量词、对象不同及共享容器/位置等绑定。英文使用显式变量（例如 O1、R1），避免将“存在一个目标物体”错误绑定到某个编号。`isToggled` 翻译为 toggle flag；当前 `isOn` 才表示开启。冷热标记按当前事实描述，不将被覆盖的热/冷状态当成永久历史。动作前提放在规则上下文，不添加到成功条件中。
 
@@ -43,7 +62,7 @@ python agentflow/agentflow/trace/alfworld_goal_store.py show \
 
 ## 正式训练接入
 
-ALFWorld 环境、solver、两个 rollout 入口、daemon 和 trainer 均传递实际 GT、完整状态、逐行评分指令、来源哈希和有效性。ALFWorld 环境读取离线文件中的固定 GT，不读取数据表中空的答案字段，也不调用转换器。运行时只更新当前事实、渲染评分上下文和检查目标谓词。同一 uid 若混入不同游戏/Goal 会报错，避免跨题配对。重复动作在不同前状态下可作为不同决策；QA 的重复过滤规则保持原样。
+ALFWorld 环境、solver、两个 rollout 入口、daemon 和 trainer 均传递实际 GT、完整状态、逐行评分指令、来源哈希和有效性。训练 rollout 将完整 Parquet 行绑定给 ALFWorld 环境；环境读取该行 `result` 和已保存规则，并核验实际游戏。daemon 从原始样本 `result` 设置 `trace_gt`，同时核对环境记录的 GT，拒绝空值或不一致，不调用转换器。运行时只更新当前事实、渲染评分上下文和检查目标谓词。同一 uid 若混入不同游戏/Goal 会报错，避免跨题配对。重复动作在不同前状态下可作为不同决策；QA 的重复过滤规则保持原样。
 
 沿用 QA 的算法配置与配对：
 
@@ -72,12 +91,11 @@ ALFWorld 环境、solver、两个 rollout 入口、daemon 和 trainer 均传递�
 export TASK=alfworld
 export ALGORITHM=grpo+slic
 export TRACE_ENABLED=true
-export ALFWORLD_TRACE_GOALS=/absolute/path/to/artifacts/alfworld_trace_goals.sqlite
-export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305.parquet
+export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305_with_gt.parquet
 # TEST_DATA_PATH 设为自己实际存在的 ALFWorld 验证 Parquet。
 ```
 
-`ALFWORLD_TRACE_GOALS` 也可在 `train-roma/config.yaml` 的同名环境变量项配置，默认留空，启用 ALFWorld TRACE 时必须指定。每个 rollout worker 所在机器都需能只读访问该路径（共享磁盘或各节点同路径的相同文件）；复制保存文件与原始游戏数据即可，不需要安装 SQLite 服务或额外 Python 包。
+训练只需要准备好的 Parquet，不需要设置 `ALFWORLD_TRACE_GOALS`。该配置保留用于旧 SQLite/Probe 兼容。每个 worker 需能访问相同内容的训练文件和原始游戏数据。第二次及后续训练继续使用 `..._with_gt.parquet`，无需重新转换。验证环境关闭 ALFWorld TRACE 的完整状态评分，继续按环境奖励验证，不要求为验证集额外转换 GT。
 
 数据路径与 `BASE_DATA_DIR` 组合，由现有 `train-roma/config.yaml` 解析；使用自定义启动配置时，将 TASK、数据路径和 TRACE 配置传入两个 rollout 入口及训练进程。无需为 ALFWorld 改 QA 的 epsilon、K、gamma、配对阈值或 loss。参考模型保持冻结，且 tokenizer 必须与参考模型一致。
 
@@ -98,4 +116,6 @@ export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305.parquet
 | pick_heat_then_place_in_recep | pick_heat_then_place_in_recep-Mug-None-CoffeeMachine-10 | 473 | 15809 |
 | pick_two_obj_and_place | pick_two_obj_and_place-KeyChain-None-Safe-219 | 224 | 10965 |
 
-这些是实际文件转换验证；动作执行与环境 won 的对照由运行时逐状态完成。本次离线文件还完成六类样例的实际 build、禁用转换器后的读取、独立新进程读取，以及文件字节不变检查。自动回归通过 113 项 ALFWorld 测试和 122 项既有 TRACE 测试，覆盖离线构建/只读加载、跨训练复用、来源变化拒绝、ALFWorld 环境/Probe 和既有 TRACE 行为。模型实际输出及部署环境性能仍需在服务器运行 Probe 检查。
+这些是实际文件转换验证；动作执行与环境 won 的对照由运行时逐状态完成。本次离线文件还完成六类样例的实际 build、禁用转换器后的读取、独立新进程读取，以及文件字节不变检查。回归覆盖离线构建、Parquet 写入和读取、跨训练复用、来源变化拒绝、ALFWorld 环境/Probe 和既有 TRACE 行为。模型实际输出及部署环境性能仍需在服务器运行 Probe 检查。
+
+新增 Parquet 流程另用上述六类真实样例运行了完整 `prepare` 命令：原六列（除 result）保持一致，六行 GT 非空，四列规则/映射写入成功，中间 SQLite 已删除。目录收集采用官网构造器与收集方法的独立测试替身（本地未安装 TextWorld）；新进程禁用 Arrow 导入与转换器后仍能读取六行并核验源文件。该验证不代表已在本地转换服务器的全部 3305 个游戏，也未执行模型训练。

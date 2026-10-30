@@ -4,6 +4,8 @@ The simulator/frozen reference are CPU stubs; the production adapter methods
 are extracted without importing distributed or ALFWorld runtime dependencies.
 """
 import copy
+import ast
+import asyncio
 import re
 from types import SimpleNamespace as NS
 import unittest
@@ -64,7 +66,7 @@ class AlfworldPipelineTests(unittest.TestCase):
             logs = self.logs(name, success=success, invalid=invalid, external=external)
             completed[name] = NS(triplets=self.encode(logs, path), metadata={"turn_flags": flags(logs, "alfworld")},
                                  reward=float(success))
-            originals[name] = {"data_id": "same-question", "result": ""}  # ALFWorld parquet has no GT.
+            originals[name] = {"data_id": "same-question", "result": GOAL}  # Prepared Parquet is authoritative.
         daemon = NS(is_train=True, _completed_rollouts=completed, _total_tasks_queued=2,
                     pad_token_id=0, _task_id_to_original_sample=originals,
                     _fillna_reward=lambda rollout: rollout.reward,
@@ -154,8 +156,17 @@ class AlfworldPipelineTests(unittest.TestCase):
     def test_missing_actual_gt_cannot_fall_back_to_parquet(self):
         logs = self.logs("A")
         logs[0]["trace_gt"] = None
-        with self.assertRaisesRegex(ValueError, "deterministic goal response"):
-            self.daemon_builder.build_batch(self.encode(logs, "train-roma/rollout.py"), ground_truth="guessed answer")
+        with self.assertRaisesRegex(ValueError, "differs from the verified"):
+            self.daemon_builder.build_batch(self.encode(logs, "train-roma/rollout.py"), ground_truth=GOAL)
+
+    def test_empty_original_result_cannot_fall_back_to_environment_gt(self):
+        with self.assertRaisesRegex(ValueError, "nonempty prepared Parquet result"):
+            self.daemon_builder.build_batch(self.encode(self.logs("A"), "train-roma/rollout.py"), ground_truth="")
+
+    def test_original_result_mismatch_is_rejected_in_both_entrypoints(self):
+        for path in ("train-roma/rollout.py", "train-roma/rollout_main_profiled.py"):
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "differs from the verified"):
+                self.daemon_builder.build_batch(self.encode(self.logs("A"), path), ground_truth="Another task is complete.")
 
     def test_repeated_action_at_different_states_remains_trace_eligible(self):
         flags = states.extract("train-roma/rollout.py", "_compute_turn_flags", {"re": re})
@@ -172,6 +183,61 @@ class AlfworldPipelineTests(unittest.TestCase):
         logs = self.logs("A", external=1)
         self.assertFalse(any(log["trace_outcome_valid"] for log in logs))
         self.assertTrue(logs[1]["trace_external_error"])
+
+
+class ValidationScopeTests(unittest.TestCase):
+    def run_until_solve(self, path, *, task_name="alfworld", is_train=False):
+        """Execute the real runner up to model solve, without distributed imports."""
+        tree = ast.parse((states.ROOT / path).read_text())
+        method = next(node for node in ast.walk(tree)
+                      if isinstance(node, ast.AsyncFunctionDef) and node.name == "_solve_and_evaluate")
+        validation_env = NS(trace_enabled=True)
+        training_env = NS(trace_enabled=True)
+        bound_tasks = []
+        validation_env.set_trace_task = bound_tasks.append
+        rollout = NS(solver=NS(env=validation_env, executor=NS(tool_instances_cache={})),
+                     solve=lambda **kwargs: None)
+        snapshots = []
+
+        class ReachedSolve(Exception):
+            pass
+
+        async def to_thread(function, **kwargs):
+            snapshots.append((validation_env.trace_enabled, dict(kwargs)))
+            raise ReachedSolve
+
+        scope = {"Any": object, "AgentFlowRollout": object,
+                 "asyncio": NS(to_thread=to_thread), "profiling_enabled": lambda: False,
+                 "time": NS(perf_counter=lambda: 0)}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), path, "exec"), scope)
+        owner = NS(task=task_name, training_agent=NS(solver=NS(env=training_env)))
+        with self.assertRaises(ReachedSolve):
+            asyncio.run(scope["_solve_and_evaluate"](
+                owner, "rollout", rollout, {"question": "val_unseen_all_alfworld_0", "result": ""},
+                0, val=not is_train, is_train=is_train))
+        self.assertTrue(training_env.trace_enabled)
+        self.assertEqual(len(snapshots), 1)
+        return snapshots[0], bound_tasks
+
+    def test_both_entrypoints_disable_only_alfworld_validation_trace_before_solve(self):
+        for path in ("train-roma/rollout.py", "train-roma/rollout_main_profiled.py"):
+            with self.subTest(path=path):
+                (enabled, arguments), bound_tasks = self.run_until_solve(path)
+                self.assertFalse(enabled)
+                self.assertEqual(bound_tasks, [])
+                self.assertEqual(arguments["question"], "val_unseen_all_alfworld_0")
+                self.assertEqual(arguments["ground_truth"], "")
+
+    def test_both_entrypoints_leave_training_trace_and_other_tasks_unchanged(self):
+        for path in ("train-roma/rollout.py", "train-roma/rollout_main_profiled.py"):
+            with self.subTest(path=path):
+                (enabled, _), bound_tasks = self.run_until_solve(path, is_train=True)
+                self.assertTrue(enabled)
+                self.assertEqual(len(bound_tasks), 1)
+                self.assertEqual(bound_tasks[0]["question"], "val_unseen_all_alfworld_0")
+                (enabled, _), bound_tasks = self.run_until_solve(path, task_name="webshop")
+                self.assertTrue(enabled)
+                self.assertEqual(bound_tasks, [])
 
 
 if __name__ == "__main__":

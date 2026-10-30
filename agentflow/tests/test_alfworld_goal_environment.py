@@ -49,6 +49,10 @@ class Memory:
 
 class Tools:
     @staticmethod
+    def read_dataset_gamefile(store_path, data_type, task_type, question_id, games_root):
+        return None
+
+    @staticmethod
     def normalize_gamefile(path):
         if isinstance(path, list):
             if len(path) != 1:
@@ -112,6 +116,7 @@ class Simulator:
 class EnvironmentTests(unittest.TestCase):
     def setUp(self):
         self.scope = {"os": os, "np": np, "deepcopy": copy.deepcopy, "re": re,
+                      "data_path": "/saved/alfworld-data",
                       "SimpleMemory": Memory, "ALFWORLD_TRACE_INSTRUCTION": "fallback instruction",
                       "_goal_tools": lambda: Tools, "_saved_goal_tools": lambda: Tools,
                       "ALFWORLD_TEMPLATE_NO_HIS": "ACTOR {current_observation} {admissible_actions}",
@@ -208,12 +213,126 @@ class EnvironmentTests(unittest.TestCase):
             self.assertTrue(second.trace_goal_check_valid)
             self.assertEqual(output.read_bytes(), original)
 
-    def test_missing_store_configuration_fails_before_environment_registration(self):
-        with mock.patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(ValueError, "Build it offline"):
-            self.cls(trace_enabled=True)
-        with mock.patch.dict(os.environ, {"ALFWORLD_TRACE_GOALS": "   "}, clear=True), \
-             self.assertRaisesRegex(ValueError, "prebuilt goal store"):
-            self.cls(trace_enabled=True)
+    def test_unbound_row_and_missing_store_fail_before_environment_registration(self):
+        for goal_setting in (None, "   "):
+            settings = {} if goal_setting is None else {"ALFWORLD_TRACE_GOALS": goal_setting}
+            with mock.patch.dict(os.environ, settings, clear=True):
+                env = self.cls(trace_enabled=True)
+            env._init_env = mock.Mock(side_effect=AssertionError("must fail before environment initialization"))
+            with self.assertRaisesRegex(ValueError, "prepared Parquet row"):
+                self.reset(env, question_id=0)
+            env._init_env.assert_not_called()
+
+    def test_prepared_row_result_loads_without_sqlite_or_actor_gt_injection(self):
+        selected = Path("/saved/alfworld-data/json_2.1.1/train/row-game/game.tw-pddl")
+        row = {"question": "train_all_alfworld_0", "result": "A clean mug is in a cabinet.",
+               "alfworld_goal_spec": "saved-spec", "alfworld_goal_spec_sha256": "saved-hash",
+               "alfworld_game_key": "train/row-game/game.tw-pddl", "alfworld_goal_row": "saved-row"}
+
+        class RowSimulator(Simulator):
+            def reset(self):
+                observations, info = super().reset()
+                info["extra.gamefile"] = [str(selected)]
+                return observations, info
+
+        path_reader = mock.Mock(return_value=selected)
+        spec_reader = mock.Mock(side_effect=lambda task, path: Tools.read_goal_spec("parquet.result", path))
+        self.scope["_parquet_goal_tools"] = lambda: NS(
+            parquet_task_gamefile=path_reader, read_parquet_task_goal=spec_reader)
+        env, base = self.env(RowSimulator())
+        env.trace_goals_path = ""
+        env.set_trace_task(row)
+        row["result"] = "mutated by caller"
+        with mock.patch.object(Tools, "read_goal_spec", side_effect=AssertionError("SQLite forbidden")), \
+             mock.patch.object(Tools, "read_dataset_gamefile", side_effect=AssertionError("SQLite mapping forbidden")):
+            # Freeze the expected spec before forbidding the legacy reader.
+            spec_reader.side_effect = None
+            spec_reader.return_value = {"goal_response": "A clean mug is in a cabinet.",
+                                       "answer_instruction": "Judge the recorded state.", "goal_spec_hash": "row-spec"}
+            actor, _ = self.reset(env, question_id=0)
+        self.assertEqual(base.game_files, [str(selected)])
+        self.assertEqual(env.trace_gt, "A clean mug is in a cabinet.")
+        self.assertEqual(env.trace_goal_metadata["goal_source"], "parquet.result")
+        self.assertEqual(env.trace_goal_metadata["parquet_goal_spec_sha256"], "saved-hash")
+        self.assertNotIn(env.trace_gt, actor)
+        path_reader.assert_called_once_with(env.trace_task, "/saved/alfworld-data/json_2.1.1")
+        spec_reader.assert_called_once_with(env.trace_task, [str(selected)])
+
+    def test_bound_parquet_question_must_match_all_reset_parameters(self):
+        row = {"question": "train_all_alfworld_0", "result": "A clean mug is in a cabinet."}
+        for changed in ({"question_id": 1}, {"data_type": "val_seen"}, {"task_type": "look"}):
+            env, _ = self.env()
+            env.trace_goals_path = ""
+            env.set_trace_task(row)
+            env._init_env = mock.Mock(side_effect=AssertionError("must reject stale row before init"))
+            arguments = {"data_type": "train", "task_type": "all", "question_id": 0, **changed}
+            with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, "reset parameters differ"):
+                env.reset(**arguments)
+            env._init_env.assert_not_called()
+
+    def test_prepared_parquet_survives_new_environment_sessions_without_a_store(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        import test_alfworld_goal_conversion as fixtures
+        module_spec = importlib.util.spec_from_file_location(
+            "prepared_parquet_environment_integration", ROOT / "agentflow/agentflow/trace/alfworld_parquet.py")
+        parquet = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(parquet)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            builder = fixtures.GoalTests()
+            builder.root = root / "json_2.1.1"
+            builder.root.mkdir()
+            game = builder.create()
+            source, output = root / "source.parquet", root / "prepared.parquet"
+            pq.write_table(pa.table({"id": [1], "question": ["train_all_alfworld_0"], "result": [""]}), source)
+            parquet.prepare_dataset_parquet(source, builder.root, output, expected_rows=1,
+                                             catalogue_loader=lambda *args: [game])
+            row = pq.read_table(output).to_pylist()[0]
+            original = output.read_bytes()
+            self.scope.update({"_parquet_goal_tools": lambda: parquet, "_goal_tools": lambda: fixtures.converter,
+                               "data_path": str(root)})
+
+            class RowSimulator(Simulator):
+                def reset(self):
+                    observation, info = super().reset()
+                    info["extra.gamefile"] = [str(game)]
+                    info["facts"] = [fixtures.INITIAL]
+                    return observation, info
+
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(parquet._store_tools(), "_converter", side_effect=AssertionError("conversion forbidden")), \
+                 mock.patch.object(parquet._store_tools(), "read_goal_spec", side_effect=AssertionError("SQLite forbidden")):
+                sessions = []
+                for _ in range(2):
+                    env, base = self.env(RowSimulator())
+                    env.trace_goals_path = ""
+                    env.set_trace_task(row)
+                    env._env_gamefiles[("train", "all")] = ["reordered-machine/wrong/game.tw-pddl"]
+                    actor, _ = self.reset(env, question_id=0)
+                    self.assertEqual(base.game_files, [str(game)])
+                    self.assertEqual(env.trace_gt, row["result"])
+                    self.assertEqual(env.trace_goal_metadata["goal_source"], "parquet.result")
+                    self.assertNotIn(row["result"], actor)
+                    sessions.append(env.trace_goal_spec)
+            self.assertEqual(sessions[0], sessions[1])
+            self.assertEqual(output.read_bytes(), original)
+            self.assertEqual(list(root.rglob("*.sqlite")), [])
+
+    def test_prepared_row_with_empty_result_is_rejected_before_environment_init(self):
+        module_spec = importlib.util.spec_from_file_location(
+            "invalid_parquet_environment_integration", ROOT / "agentflow/agentflow/trace/alfworld_parquet.py")
+        parquet = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(parquet)
+        self.scope["_parquet_goal_tools"] = lambda: parquet
+        env, _ = self.env()
+        env.trace_goals_path = ""
+        env.set_trace_task({"question": "train_all_alfworld_0", "result": ""})
+        env._env_instances.clear()
+        env._init_env = mock.Mock(side_effect=AssertionError("must reject before init"))
+        with self.assertRaisesRegex(ValueError, "result is empty"):
+            self.reset(env, question_id=0)
+        env._init_env.assert_not_called()
 
     def test_configured_store_and_explicit_probe_path_are_supported(self):
         with mock.patch.dict(os.environ, {"ALFWORLD_TRACE_GOALS": "/shared/train-goals.sqlite"}, clear=True):
@@ -248,6 +367,83 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(base.game_files, ["saved/game.tw-pddl"])
         # The simulator's reported loaded path remains authoritative for GT.
         self.assertEqual(env.trace_goal_metadata["gamefile"], "actual/game.tw-pddl")
+
+    def test_saved_dataset_mapping_takes_priority_over_changed_catalogue(self):
+        selected = Path("/saved/alfworld-data/json_2.1.1/train/frozen/game.tw-pddl")
+
+        class MappedSimulator(Simulator):
+            def reset(self):
+                observations, info = super().reset()
+                info["extra.gamefile"] = [str(selected)]
+                return observations, info
+
+        env, base = self.env(MappedSimulator())
+        env._env_gamefiles[("train", "all")] = ["wrong/new-order/game.tw-pddl"]
+        with mock.patch.object(Tools, "read_dataset_gamefile", return_value=selected) as read:
+            self.reset(env, question_id=3304)
+        self.assertEqual(base.game_files, [str(selected)])
+        read.assert_called_once_with("/saved/goals.sqlite", "train", "all", 3304,
+                                     "/saved/alfworld-data/json_2.1.1")
+        self.assertEqual(env.trace_goal_metadata["gamefile"], str(selected))
+
+    def test_missing_dataset_question_does_not_fall_back_to_catalogue(self):
+        env, _ = self.env()
+        with mock.patch.object(Tools, "read_dataset_gamefile", side_effect=ValueError("question is not selected")):
+            with self.assertRaisesRegex(ValueError, "not selected"):
+                self.reset(env, question_id=0)
+        self.scope["_create_trace_environment"].assert_not_called()
+
+    def test_explicit_gamefile_does_not_reinterpret_worker_local_index(self):
+        env, base = self.env()
+        with mock.patch.object(Tools, "read_dataset_gamefile", side_effect=AssertionError("must not look up local index")) as read:
+            self.reset(env, question_id=0, gamefile="saved/actual-selection/game.tw-pddl")
+        read.assert_not_called()
+        self.assertEqual(base.game_files, ["saved/actual-selection/game.tw-pddl"])
+
+    def test_dataset_mapping_requires_actual_loaded_game_to_match(self):
+        env, _ = self.env()
+        with mock.patch.object(Tools, "read_dataset_gamefile", return_value=Path("/saved/expected/game.tw-pddl")):
+            with self.assertRaisesRegex(ValueError, "different game"):
+                self.reset(env, question_id=0)
+
+    def test_dataset_scoped_sqlite_freezes_game_across_a_reordered_runtime_catalogue(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        import test_alfworld_goal_conversion as fixtures
+        module_spec = importlib.util.spec_from_file_location(
+            "dataset_goal_environment_integration", ROOT / "agentflow/agentflow/trace/alfworld_goal_store.py")
+        store = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(store)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            builder = fixtures.GoalTests()
+            builder.root = root / "json_2.1.1"
+            builder.root.mkdir()
+            gamefile = builder.create()
+            dataset = root / "train.parquet"
+            pq.write_table(pa.table({"id": [999], "question": ["train_all_alfworld_0"]}), dataset)
+            output = root / "train-goals.sqlite"
+            store.build_goal_store(builder.root, output, dataset=dataset, expected_rows=1,
+                                   catalogue_loader=lambda *args: [gamefile])
+            self.scope.update({"_saved_goal_tools": lambda: store, "_goal_tools": lambda: fixtures.converter,
+                               "data_path": str(root)})
+
+            class SavedSimulator(Simulator):
+                def reset(self):
+                    observation, info = super().reset()
+                    info["extra.gamefile"] = [str(gamefile)]
+                    info["facts"] = [fixtures.INITIAL]
+                    return observation, info
+
+            env, base = self.env(SavedSimulator())
+            env.trace_goals_path = str(output)
+            env._env_gamefiles[("train", "all")] = ["other-machine/reordered/game.tw-pddl"]
+            with mock.patch.object(store, "_converter", side_effect=AssertionError("conversion forbidden")):
+                self.reset(env, question_id=0)
+            self.assertEqual(base.game_files, [str(gamefile.resolve())])
+            self.assertEqual(env.trace_goal_metadata["goal_store_selection_mode"], "dataset")
+            self.assertEqual(env.trace_goal_metadata["goal_store_dataset_rows"], 1)
+            self.assertTrue(env.trace_goal_check_valid)
 
     def test_rejected_action_keeps_real_facts_and_records_no_execution(self):
         env, _ = self.env()

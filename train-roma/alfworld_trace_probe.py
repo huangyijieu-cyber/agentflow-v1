@@ -256,7 +256,8 @@ def _configured_goal_store(sampling, *, required=True):
         raise ValueError(
             "A prebuilt ALFWorld goal store is required. First run "
             "python agentflow/agentflow/trace/alfworld_goal_store.py build "
-            "--games-root /path/to/json_2.1.1 --output /path/to/alfworld_trace_goals.sqlite, "
+            "--games-root /path/to/json_2.1.1 --dataset /path/to/train.parquet "
+            "--output /path/to/alfworld_trace_goals.sqlite, "
             "then pass --trace-goals /path/to/alfworld_trace_goals.sqlite "
             "or set ALFWORLD_TRACE_GOALS. Runtime conversion is disabled."
         )

@@ -20,7 +20,7 @@ env:
 
   # ----- TRACE 状态价值与 SLIC 配对（仅算法包含 slic 时生效） -----
   TRACE_ENABLED: ${env:TRACE_ENABLED,true}
-  # Prebuilt offline ALFWorld goals; required only for ALFWorld TRACE.
+  # Optional legacy SQLite/Probe goals; prepared training Parquet embeds GT in result.
   ALFWORLD_TRACE_GOALS: ${env:ALFWORLD_TRACE_GOALS,}
   TRACE_EPSILON: ${env:TRACE_EPSILON,0.1}
   TRACE_K: ${env:TRACE_K,3}

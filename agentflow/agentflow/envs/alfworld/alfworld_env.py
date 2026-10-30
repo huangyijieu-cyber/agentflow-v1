@@ -92,6 +92,11 @@ def _saved_goal_tools():
     return alfworld_goal_store
 
 
+def _parquet_goal_tools():
+    from agentflow.trace import alfworld_parquet
+    return alfworld_parquet
+
+
 def _create_trace_environment(base_env, batch_size=1):
     """Mirror official TW registration, additionally requesting actual facts.
 
@@ -193,13 +198,7 @@ class AlfWorldEnv:
         self.trace_enabled = bool(trace_enabled)
         configured_goals = os.environ.get("ALFWORLD_TRACE_GOALS", "") if trace_goals_path is None else trace_goals_path
         self.trace_goals_path = os.fspath(configured_goals) if configured_goals else ""
-        if self.trace_enabled and not self.trace_goals_path.strip():
-            raise ValueError(
-                "ALFWorld TRACE requires a prebuilt goal store. Build it offline with "
-                "alfworld_goal_store.py build --games-root DATA_ROOT --output GOALS.sqlite, "
-                "then set ALFWORLD_TRACE_GOALS=/absolute/path/GOALS.sqlite. "
-                "Training never converts missing goals automatically."
-            )
+        self.trace_task = None
         self.trace_goal_spec = None
         self.trace_goal_metadata = None
         self.trace_gt = None
@@ -216,18 +215,39 @@ class AlfWorldEnv:
         self._env_instances = {}
         self._env_gamefiles = {}
 
+    def set_trace_task(self, task):
+        """Bind a prepared dataset row without exposing its GT to actor prompts."""
+        if not isinstance(task, dict):
+            raise ValueError("ALFWorld TRACE requires a prepared Parquet task row")
+        self.trace_task = deepcopy(task)
+
     def _load_trace_goal(self, info):
-        self.trace_goal_spec = _saved_goal_tools().read_goal_spec(
-            self.trace_goals_path, info.get("extra.gamefile"))
-        self.trace_gt = self.trace_goal_spec["goal_response"]
+        if self.trace_task is not None:
+            self.trace_goal_spec = _parquet_goal_tools().read_parquet_task_goal(
+                self.trace_task, info.get("extra.gamefile"))
+            # The filled dataset result is the authoritative scoring target.
+            self.trace_gt = self.trace_task["result"]
+        else:
+            self.trace_goal_spec = _saved_goal_tools().read_goal_spec(
+                self.trace_goals_path, info.get("extra.gamefile"))
+            self.trace_gt = self.trace_goal_spec["goal_response"]
         self.trace_answer_instruction = self.trace_goal_spec.get(
             "answer_instruction", ALFWORLD_TRACE_INSTRUCTION)
         self.trace_goal_metadata = {
             key: deepcopy(self.trace_goal_spec.get(key))
             for key in ("gamefile", "goal_source", "goal_task_type", "template_version",
                         "source_sha256", "goal_ast", "goal_validation_status", "goal_spec_hash",
-                        "goal_store_path", "goal_store_id", "goal_store_entry", "goal_store_spec_sha256")
+                        "goal_store_path", "goal_store_id", "goal_store_entry", "goal_store_spec_sha256",
+                        "goal_store_selection_mode", "goal_store_selection_sha256",
+                        "goal_store_dataset_sha256", "goal_store_dataset_rows")
         }
+        if self.trace_task is not None:
+            self.trace_goal_metadata.update({
+                "goal_source": "parquet.result",
+                "parquet_goal_spec_sha256": self.trace_task.get("alfworld_goal_spec_sha256"),
+                "parquet_goal_row": self.trace_task.get("alfworld_goal_row"),
+                "parquet_game_key": self.trace_task.get("alfworld_game_key"),
+            })
         self.trace_action_history = []
 
     def _refresh_trace_state(self, info, observation, action=None):
@@ -455,6 +475,28 @@ class AlfWorldEnv:
         if not data_type in ["val_unseen", "val_seen", "train"]:
             raise ValueError(f"Data type ({data_type}) is not exist.")
 
+        mapped_gamefile = None
+        if self.trace_enabled:
+            if self.trace_task is not None:
+                requested_question = f"{data_type}_{task_type}_alfworld_{question_id}"
+                if self.trace_task.get("question") != requested_question:
+                    raise ValueError("ALFWorld reset parameters differ from the bound prepared Parquet question")
+                mapped_gamefile = _parquet_goal_tools().parquet_task_gamefile(
+                    self.trace_task, os.path.join(data_path, "json_2.1.1"))
+                if gamefile is not None and str(_goal_tools().normalize_gamefile(gamefile)) != str(mapped_gamefile):
+                    raise ValueError("Explicit gamefile differs from the prepared Parquet row")
+            elif self.trace_goals_path.strip():
+                if gamefile is None and question_id is not None:
+                    mapped_gamefile = _saved_goal_tools().read_dataset_gamefile(
+                        self.trace_goals_path, data_type, task_type, question_id,
+                        os.path.join(data_path, "json_2.1.1"))
+            else:
+                raise ValueError(
+                    "ALFWorld TRACE requires a prepared Parquet row with result and saved goal metadata. "
+                    "Bind it with set_trace_task(task) before reset. Legacy Probe sessions may instead "
+                    "set ALFWORLD_TRACE_GOALS to an existing offline SQLite file. "
+                    "Training never converts missing goals automatically."
+                )
 
         ## 修改，令data_type只init_env一次
         env_key = (data_type, task_type)
@@ -468,6 +510,8 @@ class AlfWorldEnv:
         # 选择场景
         if gamefile is not None:
             select_gamefile = [str(_goal_tools().normalize_gamefile(gamefile))]
+        elif mapped_gamefile is not None:
+            select_gamefile = [str(mapped_gamefile)]
         elif question_id is not None:
             if not (0 <= question_id < len(org_gamefiles)):
                 raise IndexError(f"question_id ({question_id}) out of range [0, {len(org_gamefiles)})")
@@ -481,6 +525,10 @@ class AlfWorldEnv:
         self.env = (_create_trace_environment(base_env, batch_size=1) if self.trace_enabled
                     else base_env.init_env(batch_size=1))
         obs, info = self.env.reset()
+        if mapped_gamefile is not None:
+            actual_gamefile = _goal_tools().normalize_gamefile(info.get("extra.gamefile"))
+            if str(actual_gamefile) != str(mapped_gamefile):
+                raise ValueError("ALFWorld loaded a different game than the saved dataset row mapping")
         info["observation_text"] = obs
         text_obs = obs[0]
         self.prev_admissible_command = info['admissible_commands']

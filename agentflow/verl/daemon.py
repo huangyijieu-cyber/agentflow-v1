@@ -923,9 +923,11 @@ class AgentModeDaemon:
                 trace_dup_list.append(bool(_f.get("trace_dup", _f.get("dup", False))))
                 trace_metadata = trace["metadata"]
                 is_alfworld = trace_metadata.get("trace_task") == "alfworld"
-                task_gt = trace_metadata.get("trace_gt") if is_alfworld else sample_info["trace_gt"]
+                task_gt = sample_info["trace_gt"]
                 if is_alfworld and (not isinstance(task_gt, str) or not task_gt.strip()):
-                    raise ValueError("ALFWorld TRACE requires the actual game's deterministic goal response")
+                    raise ValueError("ALFWorld TRACE requires a nonempty prepared Parquet result")
+                if is_alfworld and trace_metadata.get("trace_gt") != task_gt:
+                    raise ValueError("ALFWorld Parquet result differs from the verified environment goal")
                 state_context = trace_metadata.get("trace_state_context")
                 scoring_valid = trace_metadata.get("trace_scoring_valid", not is_alfworld) is True
                 if is_alfworld and not scoring_valid:
