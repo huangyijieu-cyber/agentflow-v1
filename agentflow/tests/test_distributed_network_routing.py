@@ -106,6 +106,38 @@ class DistributedNetworkRoutingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.record.read_text().splitlines(), ['proxy'])
 
+    def test_launch_without_pyyaml_or_pre_activated_conda(self):
+        # -S disables site-packages: PyYAML is deliberately unavailable here.
+        # This mimics a ModelArts launcher before pip install or conda activation.
+        wrapper = self.scripts / 'python-stdlib-only'
+        wrapper.write_text(
+            '#!/bin/sh\nexec "' + sys.executable + '" -S "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        self.config.write_text('env:\n  TASK: "  ALFWorld  " # comment\n')
+        result = self.run_header(full=True, AGENTFLOW_TASK_PYTHON=str(wrapper))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('result:alfworld|', result.stdout)
+        self.assertFalse(self.record.exists())
+
+    def test_one_click_yaml_resolution_and_override_without_pyyaml(self):
+        wrapper = self.scripts / 'python-stdlib-only'
+        wrapper.write_text('#!/bin/sh\nexec "' + sys.executable + '" -S "$@"\n')
+        wrapper.chmod(0o755)
+        self.config.write_text('env:\n  TASK: ${env:TRAINING_TASK,qa} # inline comment\n')
+        cases = (
+            ({}, 'qa', ['proxy']),
+            ({'TRAINING_TASK': ' webshop '}, 'webshop', []),
+            ({'TASK': ' ALFWORLD '}, 'alfworld', []),
+        )
+        for env, task, calls in cases:
+            with self.subTest(env=env):
+                self.record.unlink(missing_ok=True)
+                result = self.run_header(full=True, AGENTFLOW_TASK_PYTHON=str(wrapper), **env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'result:{task}|', result.stdout)
+                self.assertEqual(self.record.read_text().splitlines() if self.record.exists() else [], calls)
+
     def test_yaml_default_env_fallback(self):
         self.config.write_text('env:\n  TASK: ${env:TRAINING_TASK,qa}\n')
         result = self.run_header(full=True, TRAINING_TASK=' rule ')

@@ -16,44 +16,95 @@ if [[ -n "${AGENTFLOW_PYTHON_BIN:-}" ]]; then
     export PATH="${AGENTFLOW_PYTHON_BIN}:${PATH}"
 fi
 
-# Select the actual task before proxy setup, dependency installation or Ray.
-# Explicit TASK wins over env.TASK in config.yaml. Invalid YAML/tasks fail closed.
+# Select the task before proxy setup, dependency installation or Ray.
+# ModelArts starts this script before the training dependencies are installed,
+# so this small YAML env.TASK reader uses ONLY Python's standard library.
+# The full YAML configuration is loaded by the training code later.
 TASK_CONFIG="${ROOT_PATH}/train-roma/config.yaml"
-if ! RESOLVED_TASK="$("${AGENTFLOW_TASK_PYTHON:-python3}" - "${TASK_CONFIG}" <<'PY'
+if ! RESOLVED_TASK="$("${AGENTFLOW_TASK_PYTHON:-python3}" - "${TASK_CONFIG}" <<'PYTASK'
 import os
 import re
 import sys
 from pathlib import Path
 
 config_file = Path(sys.argv[1])
+
+
+def fail(reason):
+    # Do not echo YAML lines, parser internals or any other config values.
+    print(f"[network] {reason}: {config_file}", file=sys.stderr)
+    sys.exit(2)
+
+
 try:
-    import yaml
-    config = yaml.safe_load(config_file.read_text(encoding="utf-8"))
-except Exception:
-    # Deliberately do not print YAML contents or parser errors (may leak keys).
-    print(f"[network] Cannot read task configuration: {config_file}", file=sys.stderr)
-    sys.exit(2)
+    lines = config_file.read_text(encoding="utf-8-sig").splitlines()
+except OSError:
+    fail("Cannot read task configuration")
 
-if not isinstance(config, dict) or not isinstance(config.get("env", {}), dict):
-    print("[network] Invalid config: env must be a mapping", file=sys.stderr)
-    sys.exit(2)
 
-value = os.environ["TASK"] if "TASK" in os.environ else config.get("env", {}).get("TASK", "qa")
-if "TASK" not in os.environ and isinstance(value, str):
+def scalar(raw):
+    """Read the simple YAML scalar used by env.TASK, not the whole YAML file."""
+    raw = raw.strip()
+    if raw.startswith(("'", '"')):
+        quote = raw[0]
+        # A task name/default expression has no YAML escape sequences.
+        # Reject complex scalars rather than guessing a task value.
+        match = re.fullmatch(r"'([^']*)'\s*(?:#.*)?" if quote == "'"
+                             else r'"([^"\\]*)"\s*(?:#.*)?', raw)
+        if match is None:
+            fail("Invalid env.TASK scalar")
+        return match.group(1)
+    raw = re.split(r"\s+#", raw, maxsplit=1)[0].strip()
+    # Unquoted YAML booleans/null are not string task names.
+    if raw.lower() in {"true", "false", "null", "~", "yes", "no", "on", "off"}:
+        fail("Invalid env.TASK scalar")
+    return raw
+
+
+found_env = False
+in_env = False
+configured_task = "qa"
+found_task = False
+for line in lines:
+    if not line.strip() or line.lstrip().startswith("#"):
+        continue
+    if not line[0].isspace():
+        in_env = False
+        if re.match(r"^env\s*:", line):
+            if found_env:
+                fail("Duplicate env configuration")
+            found_env = True
+            rest = line.split(":", 1)[1].strip()
+            if rest and not rest.startswith("#"):
+                fail("Invalid env configuration; expected a mapping")
+            in_env = True
+    elif in_env:
+        if line[0] == "\t":
+            fail("Invalid env indentation")
+        match = re.match(r"^ +TASK\s*:\s*(.*)$", line)
+        if match:
+            if found_task:
+                fail("Duplicate env.TASK")
+            found_task = True
+            configured_task = scalar(match.group(1))
+
+if not found_env:
+    fail("Missing env configuration")
+
+# Explicit TASK takes precedence, including when YAML uses a literal task.
+value = os.environ["TASK"] if "TASK" in os.environ else configured_task
+if "TASK" not in os.environ:
     expression = re.fullmatch(r"\$\{env:([A-Za-z_][A-Za-z0-9_]*),(.*?)\}", value.strip())
     if expression:
         name, fallback = expression.groups()
         value = os.environ.get(name, fallback)
 
-if not isinstance(value, str):
-    print("[network] Invalid TASK: expected a nonempty string", file=sys.stderr)
-    sys.exit(2)
 value = value.strip().lower()
 if not re.fullmatch(r"[a-z][a-z0-9_-]*", value):
-    print("[network] Invalid TASK: expected letters, digits, '_' or '-'", file=sys.stderr)
+    print("[network] Invalid TASK: expected a nonempty name with letters, digits, '_' or '-'", file=sys.stderr)
     sys.exit(2)
 print(value)
-PY
+PYTASK
 )"; then
     exit 2
 fi
