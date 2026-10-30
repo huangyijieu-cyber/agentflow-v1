@@ -339,6 +339,85 @@ class EnvironmentTests(unittest.TestCase):
             self.reset(env, question_id=0)
         env._init_env.assert_not_called()
 
+    def test_fresh_worker_switches_prepared_games_without_catalogue_collection(self):
+        created = []
+
+        class OfficialBase:
+            def __init__(self, config, train_eval="train"):
+                self.config, self.train_eval = config, train_eval
+                created.append(self)
+                self.collect_game_files()
+
+            def collect_game_files(self, verbose=False):
+                raise AssertionError("full-split catalogue collection must not run")
+
+        selected = extract(ENV_PATH.with_name("selected_game_env.py"), "SelectedGameAlfredTWEnv",
+                           {"AlfredTWEnv": OfficialBase, "os": os})
+        module = ModuleType("agentflow.envs.alfworld.selected_game_env")
+        module.SelectedGameAlfredTWEnv = selected
+        config = {"env": {"type": "AlfredTWEnv", "domain_randomization": True}}
+        self.scope.update({"__file__": str(ENV_PATH), "load_config_file": lambda path: config,
+                           "update_config_with_data": lambda value: None,
+                           "get_environment": mock.Mock(side_effect=AssertionError("catalogue constructor forbidden"))})
+        env, _ = self.env()
+        env._env_instances.clear()
+        env._env_gamefiles.clear()
+        self.scope["_parquet_goal_tools"] = lambda: NS(
+            parquet_task_gamefile=lambda task, root: Path(root) / task["alfworld_game_key"],
+            read_parquet_task_goal=lambda task, path: Tools.read_goal_spec("parquet.result", path))
+
+        class BoundSimulator(Simulator):
+            def reset(self):
+                observations, info = super().reset()
+                info["extra.gamefile"] = list(env._env_instances[("train", "all")].game_files)
+                return observations, info
+
+        self.scope["_create_trace_environment"] = mock.Mock(side_effect=lambda *args, **kwargs: BoundSimulator())
+        with mock.patch.dict(sys.modules, {module.__name__: module}), \
+             mock.patch("os.walk", side_effect=AssertionError("directory traversal forbidden")):
+            for number in (3304, 123):
+                env.set_trace_task({"question": f"train_all_alfworld_{number}",
+                                    "result": "A clean mug is in a cabinet.",
+                                    "alfworld_game_key": f"train/task-{number}/game.tw-pddl"})
+                actor, info = self.reset(env, question_id=number)
+                self.assertEqual(info["extra.gamefile"],
+                                 [f"/saved/alfworld-data/json_2.1.1/train/task-{number}/game.tw-pddl"])
+                self.assertTrue(env.trace_goal_check_valid)
+                self.assertNotIn(env.trace_gt, actor)
+        self.assertEqual(len(created), 1)
+        self.assertIs(created[0].config, config)
+        self.assertEqual(created[0].train_eval, "train")
+        self.assertEqual(created[0].num_games, 1)
+        self.scope["get_environment"].assert_not_called()
+
+    def test_index_reset_rebuilds_catalogue_after_selected_only_base(self):
+        simulator = Simulator()
+        env, _ = self.env(simulator, trace=False)
+        env._env_instances[("train", "all")] = NS(
+            _trace_selected_game=True, game_files=["previous-selected/game.tw-pddl"])
+        env._env_gamefiles[("train", "all")] = ["previous-selected/game.tw-pddl"]
+        official = NS(game_files=["catalogue/first/game.tw-pddl", "catalogue/second/game.tw-pddl"],
+                      init_env=mock.Mock(return_value=simulator))
+        env._init_env = mock.Mock(return_value=official)
+        self.reset(env, question_id=1)
+        env._init_env.assert_called_once_with(data_type="train", task_type="all")
+        self.assertEqual(official.game_files, ["catalogue/second/game.tw-pddl"])
+        official.init_env.assert_called_once_with(batch_size=1)
+
+    def test_unmapped_initialization_still_uses_official_constructor(self):
+        expected = object()
+        constructor = mock.Mock(return_value=expected)
+        getter = mock.Mock(return_value=constructor)
+        config = {"env": {"type": "AlfredTWEnv"}}
+        self.scope.update({"__file__": str(ENV_PATH), "load_config_file": lambda path: config,
+                           "update_config_with_data": lambda value: None, "get_environment": getter})
+        for trace_enabled in (False, True):
+            env = self.cls(trace_enabled=trace_enabled)
+            self.assertIs(env._init_env(data_type="val_seen", task_type="all"), expected)
+        self.assertEqual(getter.call_args_list, [mock.call("AlfredTWEnv")] * 2)
+        self.assertEqual(constructor.call_args_list,
+                         [mock.call(config, train_eval="eval_in_distribution")] * 2)
+
     def test_configured_store_and_explicit_probe_path_are_supported(self):
         with mock.patch.dict(os.environ, {"ALFWORLD_TRACE_GOALS": "/shared/train-goals.sqlite"}, clear=True):
             from_env = self.cls(trace_enabled=True)

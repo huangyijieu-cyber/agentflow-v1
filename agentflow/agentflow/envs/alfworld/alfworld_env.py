@@ -331,7 +331,7 @@ class AlfWorldEnv:
         self._write_trace_info(info)
         return info
 
-    def _init_env(self, data_type:str, task_type:str):
+    def _init_env(self, data_type:str, task_type:str, gamefile=None):
         alf_config_path = os.path.join(os.path.dirname(__file__), f"config/config_tw_{task_type}.yaml")
         config = load_config_file(alf_config_path)
         update_config_with_data(config)
@@ -345,6 +345,12 @@ class AlfWorldEnv:
             data_type = "eval_out_of_distribution"
         else:
             raise ValueError(f"Invalid data_type: {data_type}")
+
+        if self.trace_enabled and gamefile is not None:
+            if env_type != "AlfredTWEnv":
+                raise ValueError("Saved-game ALFWorld TRACE requires AlfredTWEnv")
+            from agentflow.envs.alfworld.selected_game_env import SelectedGameAlfredTWEnv
+            return SelectedGameAlfredTWEnv(config, train_eval=data_type, gamefile=gamefile)
 
         base_env = get_environment(env_type)(config, train_eval=data_type)
         return base_env
@@ -507,8 +513,15 @@ class AlfWorldEnv:
 
         ## 修改，令data_type只init_env一次
         env_key = (data_type, task_type)
-        if not env_key in self._env_instances:
-            self._env_instances[env_key] = self._init_env(data_type=data_type, task_type=task_type)
+        # A selected-only base has no catalogue for a later index-based reset.
+        # Restore the normal official path if a caller stops supplying a mapping.
+        needs_catalogue = mapped_gamefile is None and gamefile is None
+        cached_selected = getattr(self._env_instances.get(env_key), "_trace_selected_game", False)
+        if env_key not in self._env_instances or (needs_catalogue and cached_selected):
+            init_kwargs = {"data_type": data_type, "task_type": task_type}
+            if self.trace_enabled and self.trace_task is not None and mapped_gamefile is not None:
+                init_kwargs["gamefile"] = mapped_gamefile
+            self._env_instances[env_key] = self._init_env(**init_kwargs)
             self._env_gamefiles[env_key] = deepcopy(self._env_instances[env_key].game_files)
         
         base_env = self._env_instances[env_key]

@@ -41,6 +41,8 @@ python agentflow/agentflow/trace/alfworld_goal_store.py prepare \
 
 运行时先按保存的相对路径选中游戏，再以实际 reset 返回的 `extra.gamefile` 核验游戏和 `traj_data.json` 的 SHA-256，并检查 `result` 与保存规则的固定 GT 完全一致。路径整体迁移后，内容一致仍可使用；缺失、陈旧或损坏明确报错，不回退实时转换。不要单独手改 `result`：需要同步完整规则及其哈希，通常应重新执行离线准备。
 
+已绑定准备好的 Parquet 行时，环境初始化直接使用该行已校验的游戏路径，通过 `SelectedGameAlfredTWEnv` 仅替换官方目录收集方法，跳过每个 worker 对整个 split 的重复扫描。日志出现 `[ALFWorld TRACE] Using saved Parquet game mapping; skipped full-split scan.` 表示生效。同一 worker 后续题目继续复用原有环境配置并切换游戏，不把第一题的单游戏列表当作题号索引。没有保存映射的验证或旧调用方式保留官方目录扫描；已有 Parquet 无需重新转换，worker 数量和 rollout/训练组装不变。
+
 Probe 仍兼容独立 SQLite。需要时单独构建；这不是正式训练的必需步骤：
 
 ```bash
