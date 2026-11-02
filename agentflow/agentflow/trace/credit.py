@@ -39,7 +39,8 @@ class TraceConfig:
     negative_threshold: float = 0.01
     gap_epsilon: float = 0.02
     length_ratio_max: float = 1.8
-    k_pairs_per_group: int = 2
+    # None allows cross-turn action pairs and removes only the group cap.
+    k_pairs_per_group: Optional[int] = 2
     max_pairs_per_step: int = 256
     answer_instruction: str = "Answer the question directly and concisely."
     max_gt_tokens: int = 256
@@ -58,6 +59,8 @@ class TraceConfig:
         for name in ("k", "k_pairs_per_group", "max_pairs_per_step", "max_gt_tokens",
                      "shared_prefix_max_tokens", "shared_prefix_max_mask_mib"):
             value = getattr(self, name)
+            if name == "k_pairs_per_group" and value is None:
+                continue
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"trace.{name} must be a positive integer")
         for name in (
@@ -111,7 +114,11 @@ class TraceConfig:
             raise ValueError(f"Unknown TRACE configuration fields: {sorted(unknown)}")
         if "pair_score_mode" in config and config["pair_score_mode"] not in ("igpo", "trace_fill"):
             raise ValueError("Unrecognized legacy trace.pair_score_mode; expected 'igpo' or 'trace_fill'")
-        result = cls(**{key: value for key, value in config.items() if key in known_fields})
+        values = {key: value for key, value in config.items() if key in known_fields}
+        group_cap = values.get("k_pairs_per_group")
+        if isinstance(group_cap, str) and group_cap.strip().lower() in ("none", "null"):
+            values["k_pairs_per_group"] = None
+        result = cls(**values)
         if legacy_fields:
             warnings.warn(
                 f"Ignoring trace-2b-only configuration fields: {sorted(legacy_fields)}. "
@@ -496,8 +503,8 @@ def _outcome_success(row, config):
     return float(reward) > config.outcome_success_threshold if _finite(reward) else None
 
 
-def pair_group_key(row):
-    """Keep action credit pairs within one original task/turn.
+def pair_group_key(row, config=None):
+    """Group action pairs by original task/turn unless the group cap is None.
 
     QA analysis and actual final answers retain their existing outcome groups.
     A missing or malformed action turn cannot be assigned to a synthetic turn.
@@ -516,18 +523,19 @@ def pair_group_key(row):
             return None
         if not math.isfinite(numeric_turn) or numeric_turn < 0 or not numeric_turn.is_integer():
             return None
-        turn = int(turn)
+        turn = int(turn) if TraceConfig.from_mapping(config).k_pairs_per_group is not None else None
     return row.get("uid"), row.get("turn_type"), source, turn
 
 
 def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
-    """Select action pairs within one question, original turn and type route.
+    """Select action pairs within one question and type route.
 
     Each row supplies ``index``, ``uid``, ``turn_type``, ``turn_index``, ``value``,
     ``credit``, ``valid``, ``length``, and ``old_per_token``. Returned indices are
     those supplied in each row, not positions in a filtered list. Actions may
-    pair across rollouts only at the same original turn; the per-group cap is
-    consequently per question/turn. QA analysis and actual final answers retain
+    normally pair only at the same original turn, with a per-question/turn cap.
+    A None group cap allows cross-turn pairs with only the global cap. QA
+    analysis and actual final answers retain
     their trusted-outcome groups without a new turn restriction. Tools always
     require strict signed credit. Outcome labels never require GT credit and,
     by default, do not match GT V.
@@ -568,7 +576,7 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
     groups = defaultdict(list)
     scores, success_flags = {}, {}
     for row in rows:
-        key = pair_group_key(row)
+        key = pair_group_key(row, cfg)
         if (
             key is None
             or not row.get("valid", True)
@@ -672,7 +680,7 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
     per_group = defaultdict(int)
     pairs = []
     for _, group_key, chosen_index, rejected_index in candidates:
-        if per_group[group_key] >= cfg.k_pairs_per_group:
+        if cfg.k_pairs_per_group is not None and per_group[group_key] >= cfg.k_pairs_per_group:
             counts["rejected_group_cap"] += 1
             continue
         # Continue counting after the original break point, without accepting

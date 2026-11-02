@@ -253,6 +253,54 @@ class TracePairTests(unittest.TestCase):
         self.assertEqual(len(selected), 256)
         self.assertTrue(all(rows[a]["turn_index"] == rows[b]["turn_index"] for a, b in selected))
 
+    def test_none_group_cap_allows_cross_turn_actions_for_qa_and_alfworld(self):
+        for task in ("qa", "alfworld"):
+            rows = [row(0, .4, turn_type="tool_plan", turn_index=1, task=task)]
+            rows.extend(row(i, -.1 * i, turn_type="tool_plan", turn_index=i + 1, task=task)
+                        for i in range(1, 5))
+            with self.subTest(task=task):
+                self.assertEqual(select_pairs(rows), [])
+                self.assertEqual(select_pairs(rows, {"k_pairs_per_group": None}),
+                                 [(0, 4), (0, 3), (0, 2), (0, 1)])
+                # Original turn IDs remain available for credit and diagnostics.
+                self.assertEqual([item["turn_index"] for item in rows], [1, 2, 3, 4, 5])
+
+    def test_none_group_cap_still_enforces_default_global_cap(self):
+        rows = [row(0, .4, turn_index=0)]
+        rows.extend(row(i, -.1 - i / 10000, turn_index=i) for i in range(1, 261))
+        metrics = {}
+        selected = select_pairs(rows, {"k_pairs_per_group": None}, metrics)
+        self.assertEqual(len(selected), 256)
+        self.assertEqual(selected[0], (0, 260))
+        self.assertEqual(selected[-1], (0, 5))
+        self.assertEqual(metrics["rejected_group_cap"], 0)
+        self.assertEqual(metrics["rejected_global_cap"], 4)
+
+    def test_none_group_cap_keeps_question_type_and_valid_turn_boundaries(self):
+        config = {"k_pairs_per_group": None}
+        for update in ({"uid": "other"}, {"turn_type": "other"}):
+            with self.subTest(update=update):
+                self.assertEqual(select_pairs([row(0), row(1, -.1, turn_index=4, **update)], config), [])
+        for turn in (None, True, -1, 1.5, "2", math.nan, math.inf):
+            with self.subTest(turn=turn):
+                self.assertEqual(select_pairs([row(0), row(1, -.1, turn_index=turn)], config), [])
+        missing = row(1, -.1)
+        del missing["turn_index"]
+        self.assertEqual(select_pairs([row(0), missing], config), [])
+
+    def test_none_group_cap_preserves_other_action_filters(self):
+        config = {"k_pairs_per_group": None}
+        for update in ({"value": .3}, {"credit": -.01}, {"length": 19},
+                       {"valid": False}, {"external_error": True},
+                       {"old_per_token": math.nan}, {"action_key": "same"}):
+            rows = [row(0, action_key="same"), row(1, -.1, turn_index=7)]
+            rows[1].update(update)
+            with self.subTest(update=update):
+                self.assertEqual(select_pairs(rows, config), [])
+        self.assertEqual(select_pairs([row(0), row(1, -.1, turn_index=7)],
+                                      dict(config, gap_epsilon=.21)), [])
+        self.assertEqual(select_pairs([row(0, .01), row(1, -.1, turn_index=7)], config), [])
+
     def test_different_question_or_type_cannot_pair(self):
         self.assertEqual(select_pairs([row(0), row(1, -0.1, uid="other")]), [])
         self.assertEqual(select_pairs([row(0), row(1, -0.1, turn_type="answer")]), [])
@@ -327,6 +375,16 @@ class TracePairTests(unittest.TestCase):
                 self.assertEqual(select_pairs(rows), [(0, 1)])
                 self.assertEqual(trace_credit.pair_group_key(rows[0]),
                                  trace_credit.pair_group_key(rows[1]))
+                config = {"k_pairs_per_group": None}
+                self.assertEqual(select_pairs(rows, config), [(0, 1)])
+                self.assertEqual(trace_credit.pair_group_key(rows[0], config),
+                                 trace_credit.pair_group_key(rows[1], config))
+
+    def test_none_group_cap_does_not_merge_qa_analysis_final_and_tool_routes(self):
+        rows = [self.outcome_row(0, 1, turn_type="analysis", turn_index=1),
+                self.outcome_row(1, 0, turn_type="final_answer", is_final=True, turn_index=8),
+                row(2, -.1, turn_type="tool_plan", turn_index=9)]
+        self.assertEqual(select_pairs(rows, {"k_pairs_per_group": None}), [])
 
     def test_only_actual_terminal_answers_use_outcome_labels(self):
         for turn_type in ("final_answer", "direct", "base"):
@@ -475,6 +533,24 @@ class TraceConfigTests(unittest.TestCase):
         self.assertEqual(TraceConfig.from_mapping().k, 3)
         self.assertEqual(TraceConfig.from_mapping().match_epsilon, 0.05)
         self.assertEqual(TraceConfig.from_mapping({"match_epsilon": 0.2}).match_epsilon, 0.2)
+
+    def test_nullable_group_cap_accepts_python_and_environment_null_values(self):
+        self.assertIsNone(TraceConfig(k_pairs_per_group=None).k_pairs_per_group)
+        for value in (None, "None", "null", " NONE ", " NULL "):
+            config = {"k_pairs_per_group": value}
+            with self.subTest(value=value):
+                self.assertIsNone(TraceConfig.from_mapping(config).k_pairs_per_group)
+                self.assertEqual(config, {"k_pairs_per_group": value})
+        self.assertEqual(TraceConfig.from_mapping({"k_pairs_per_group": 3}).k_pairs_per_group, 3)
+
+    def test_nullable_group_cap_rejects_other_invalid_values(self):
+        for value in (0, -1, True, False, 1.5, "", "all", "2", [], {}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                TraceConfig.from_mapping({"k_pairs_per_group": value})
+        # Null parsing is specific to the group cap; global caps stay mandatory.
+        for value in (None, "None", "null"):
+            with self.subTest(global_cap=value), self.assertRaises(ValueError):
+                TraceConfig.from_mapping({"max_pairs_per_step": value})
 
     def test_mixed_trace_2b_config_warns_and_preserves_trace_settings(self):
         trace_settings = {"k": 2, "gamma": 0.6, "match_epsilon": 0.03,

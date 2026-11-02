@@ -690,11 +690,11 @@ class AgentFlowTrainer(RayPPOTrainer):
             diagnostic_rows.extend(dict(row, index=row["index"] + offset) for row in rows)
             selection_metrics = {}
             selected_pairs = select_pairs(rows, cfg, metrics=selection_metrics)
-            # A task/turn quota applies across all history batches in this step.
+            # A configured task/turn quota applies across all history batches.
             accepted_pairs = []
             for chosen, rejected in selected_pairs:
-                group = pair_group_key(rows[chosen])
-                if group[2] == "trace":
+                group = pair_group_key(rows[chosen], cfg)
+                if group[2] == "trace" and cfg.k_pairs_per_group is not None:
                     if selected_per_group[group] >= cfg.k_pairs_per_group:
                         selection_metrics["rejected_group_cap"] += 1
                         selection_metrics["selected_unique"] -= 1
@@ -707,10 +707,10 @@ class AgentFlowTrainer(RayPPOTrainer):
             diagnostic_pairs.extend((chosen + offset, rejected + offset) for chosen, rejected in selected_pairs)
             for chosen, rejected in selected_pairs:
                 # Preserve the old group-mean per-token baseline convention in
-                # the same original task/turn/type progress neighborhood.
-                chosen_group = pair_group_key(rows[chosen])
+                # the configured task/type/(optional turn) progress neighborhood.
+                chosen_group = pair_group_key(rows[chosen], cfg)
                 peers = [r for r in rows if r["valid"] and r["length"] > 0
-                         and pair_group_key(r) == chosen_group
+                         and pair_group_key(r, cfg) == chosen_group
                          and np.isfinite(r["old_per_token"])
                          and (r["label_source"] == "trace" or r["outcome_valid"])
                          and ((r["label_source"] == "outcome" and not cfg.outcome_match_value)

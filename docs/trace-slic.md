@@ -2,7 +2,7 @@
 
 当前 QA 算法版本为 **v2a2**（动态范围回填），改动前为 **v2a1**（固定系数回填）。`v1`、`v2a`、`v2b`、`v2a1`、`v2a2` 的定义与固定提交见 [版本记录](trace-slic-change-log.md#版本名称与固定代码快照)。
 
-QA 的状态、终局和回填语义见下文；ALFWorld 的真实后状态与统一环境动作信用见 [ALFWorld 接入说明](alfworld-trace-goals.md)。两个任务的 SLIC 工具/环境动作均仅允许同题同原始 Turn id 配对。
+QA 的状态、终局和回填语义见下文；ALFWorld 的真实后状态与统一环境动作信用见 [ALFWorld 接入说明](alfworld-trace-goals.md)。两个任务的 SLIC 工具/环境动作默认仅允许同题同原始 Turn id 配对；`k_pairs_per_group=null` 时允许同题跨 Turn，且不设组内 Pair 上限。
 
 本实现按决策类型选择偏好标签：analysis 和实际最终回答使用可验证的最终任务结果，工具 Turn 使用 K-step GT 信用及可选的终局优势回填。配对质量优先；没有合格正负两侧时跳过，不为凑数量放宽条件。SLIC Loss、原 GRPO 训练公式和 Replay 更新剂量保持原样。
 
@@ -108,7 +108,7 @@ $$
 
 ## 配对、排序与 Loss
 
-候选必须同 `uid`、同决策类型和同标签来源。QA 工具和 ALFWorld 环境动作还必须具有相同原始 Turn id，允许来自不同 Rollout，不允许跨 Turn 配对；每题每 Turn 默认最多 2 对，多个 Turn 各有独立额度。QA analysis 和实际最终回答保留原 outcome 分组及规则，不新增 Turn id 限制。两侧均过滤无效响应、执行故障、重复动作、被丢弃的 Prompt 和异常数值。SLIC baseline 与配对分组使用同一原始 Turn id，避免跳过空日志后按压缩编号误配。
+候选必须同 `uid`、同决策类型和同标签来源。`k_pairs_per_group` 为正整数时，QA 工具和 ALFWorld 环境动作还必须具有相同原始 Turn id，允许来自不同 Rollout，不允许跨 Turn 配对；每题每 Turn 默认最多 2 对，多个 Turn 各有独立额度。设为 `null` 时，取消上述 Turn 分组和组内数量限制，允许同题同类型动作跨 Turn 配对，仍受全步 `max_pairs_per_step`（默认 256）限制。QA analysis 和实际最终回答保留原 outcome 分组及标签；`null` 也取消这些组的数量上限，但不混合决策类型或标签来源。两侧均过滤无效响应、执行故障、重复动作、被丢弃的 Prompt 和异常数值。SLIC baseline 使用与配对一致的分组及 V 邻域；原始 Turn 编号、信用窗口、有效性和其它 Pair 筛选条件不变。跨 Turn 模式没有额外的不同 Rollout 限制，同一 Rollout 的不同 Turn 也可能配对。
 
 工具候选要求：
 
@@ -148,7 +148,7 @@ Pair 两侧保留各自原始生成 Prompt、响应及原生 token IDs。仍使�
 | `negative_threshold` | `0.01` | 工具有效信用严格负阈值的绝对值 |
 | `gap_epsilon` | `0.02` | 工具正负信用差下限 |
 | `length_ratio_max` | `1.8` | 两侧响应最大长度比 |
-| `k_pairs_per_group` | `2` | 工具/环境动作按每题、每原始 Turn 限额；QA analysis/final 保留每题、类型、来源组限额 |
+| `k_pairs_per_group` | `2` | 正整数：工具/环境动作同题同原始 Turn 配对并按组限额；`null`：同题同类型跨 Turn，无组内限额。QA analysis/final 路由不变；全步上限始终保留 |
 | `max_pairs_per_step` | `256` | 每步原始 Pair 上限 |
 | `max_gt_tokens` | `256` | GT token 上限，超长跳过 |
 | `gt_alias_strategy` | `first` | 固定第一个非空 GT 别名 |
@@ -159,6 +159,8 @@ TRACE 论文提供 epsilon=0.1、gamma=0.8、K-step 归一化、终局回填 sca
 ```bash
 TRACE_MATCH_EPSILON=0.05 python train-roma/train_agent.py
 python train-roma/train_agent.py data.trace.terminal_fill_enabled=false
+# Same-question cross-turn pairing without a group cap; keeps the global cap.
+export TRACE_K_PAIRS_PER_GROUP=None  # null is also accepted; use 2 to restore same-turn pairs.
 ```
 
 评分依赖冻结参考模型，可能增加显存与前向成本。状态来自实际角色可见输入，历史窗口与模板变化仍可能影响 GT 信用；本轮未重构评分视图。训练指标定义见 [指标说明](trace-slic-metrics.md)。

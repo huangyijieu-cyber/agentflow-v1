@@ -506,6 +506,63 @@ class ActionReferenceTests(unittest.TestCase):
 
 
 class TraceTrainerIntegrationTests(unittest.TestCase):
+    def test_null_pair_limit_allows_cross_turn_and_preserves_native_inputs(self):
+        for limit in (None, "None", "null"):
+            with self.subTest(limit=limit):
+                rows, scores = standard_rows()
+                history, trainer = make_batch(rows), make_trainer(scores)
+                trainer._annotate_trace_credits(history)
+                history.non_tensor_batch["trace_original_turn"] = history.non_tensor_batch["turn_index_list"].copy()
+                history.non_tensor_batch["trace_original_turn"][4] = 7
+                self.assertIsNone(trainer._trans_to_dpo_batch([history]))
+                tensors = {key: value.clone() for key, value in history.batch.items()}
+                credits = history.non_tensor_batch["trace_credit"].copy()
+                native_turns = history.non_tensor_batch["turn_index_list"].copy()
+                trainer.config.data.trace["k_pairs_per_group"] = limit
+                pair = trainer._trans_to_dpo_batch([history])[0]
+                self.assertEqual(pair.non_tensor_batch["turn_index_list_a"].tolist(), [1])
+                self.assertEqual(pair.non_tensor_batch["turn_index_list_b"].tolist(), [7])
+                self.assertEqual(pair.non_tensor_batch["pair_turn"].tolist(), [1])
+                self.assertEqual(trainer._trace_pair_metrics["trace/pair/cross_turn_rate"], 1.)
+                np.testing.assert_array_equal(history.non_tensor_batch["trace_credit"], credits)
+                np.testing.assert_array_equal(history.non_tensor_batch["turn_index_list"], native_turns)
+                for key, value in tensors.items():
+                    torch.testing.assert_close(history.batch[key], value, equal_nan=True)
+
+    def test_null_pair_limit_removes_driver_quota_across_history_batches(self):
+        rows, scores = [], {}
+        for rollout in ("a", "b", "c", "d"):
+            for turn in range(3):
+                context = rollout + str(turn)
+                rows.append(make_row(context, rollout, turn,
+                                     turn_type="tool_plan" if turn < 2 else "final_answer"))
+                scores[context] = -4.
+        history, trainer = make_batch(rows), make_trainer(scores)
+        trainer._annotate_trace_credits(history)
+        history.non_tensor_batch["trace_credit"][:] = [
+            .2, .2, np.nan, .3, .3, np.nan, -.2, -.2, np.nan, -.3, -.3, np.nan]
+        trainer.config.data.trace["k_pairs_per_group"] = None
+        pairs = trainer._trans_to_trace_batch([history, history])
+        self.assertEqual(len(pairs), 32)  # Four positives times four negatives, in each history.
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/selected_unique"], 32)
+        self.assertGreater(trainer._trace_pair_metrics["trace/pair/cross_turn_rate"], 0.)
+        trainer.config.data.trace["max_pairs_per_step"] = 3
+        self.assertEqual(len(trainer._trans_to_trace_batch([history, history])), 3)
+
+    def test_null_pair_limit_uses_the_same_cross_turn_group_for_baseline(self):
+        rows, scores = standard_rows()
+        rows.extend([make_row("C0", "c", 0, old=-100.),
+                     make_row("C1", "c", 1, turn_type="final_answer")])
+        scores.update(C0=-4., C1=-4.)
+        history, trainer = make_batch(rows), make_trainer(scores)
+        trainer._annotate_trace_credits(history)
+        same_turn_pair = trainer._trans_to_dpo_batch([history])[0]
+        self.assertEqual(same_turn_pair.non_tensor_batch["group_baseline"].tolist(), [-2.])
+        trainer.config.data.trace["k_pairs_per_group"] = None
+        cross_turn_pair = trainer._trans_to_dpo_batch([history])[0]
+        self.assertEqual(cross_turn_pair.non_tensor_batch["group_size"].tolist(), [3])
+        self.assertAlmostEqual(cross_turn_pair.non_tensor_batch["group_baseline"][0], -104. / 3, places=5)
+
     def test_trace_pairing_uses_original_turn_ids_and_preserves_native_batch(self):
         rows, scores = standard_rows()
         history, trainer = make_batch(rows), make_trainer(scores)

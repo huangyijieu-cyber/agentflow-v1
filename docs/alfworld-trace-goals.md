@@ -193,4 +193,4 @@ python train-roma/diagnose_hccl_ports.py \
 
 当前回归通过 184 项 ALFWorld 测试和 135 项 TRACE 回归，覆盖单动作终止、末动作真实 delta、末三动作回填、缺失末状态、相邻状态不一致和 QA 既有路由。模型评分及模拟器在链路测试中使用 CPU 替身，未在服务器执行完整模型训练。更新代码后应重启训练及 rollout 进程；旧训练 rollout 的 base/outcome 元数据会被明确拒绝，离线 Parquet 不受影响。
 
-SLIC 工具/环境动作的配对现已恢复为同题、同原始 turn id：ALFWorld 所有动作及 QA 工具动作均按各 turn 独立扣取默认 2 对额度；baseline 也仅使用相同分组，空响应日志造成的压缩编号不能用作配对身份。QA analysis/final 的 outcome 分组、标签及配对规则保留；关闭 TRACE 后的这两个任务的 SLIC 动作配对也遵循同 turn 限制。K-step 信用仍沿真实轨迹计算，此限制只约束偏好对的两端，不改变信用窗口。
+SLIC 工具/环境动作默认按同题、同原始 turn id 配对：ALFWorld 所有动作及 QA 工具动作均按各 turn 独立扣取默认 2 对额度；baseline 也使用相同分组，空响应日志造成的压缩编号不能用作配对身份。开启 TRACE 时，设置 `TRACE_K_PAIRS_PER_GROUP=None`（或 `null`）允许同题同类型跨 turn 配对，取消组内数量上限，仍保留全步默认 256 对上限及其它筛选条件；设为正整数则保留同 turn 分组和对应额度。QA analysis/final 的 outcome 分组和标签保留。关闭 TRACE 后的这两个任务的 SLIC 动作配对仍遵循原有同 turn 限制。K-step 信用始终沿真实轨迹计算，该开关不改变信用窗口。

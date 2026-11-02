@@ -270,6 +270,76 @@ class AlfworldPipelineTests(unittest.TestCase):
                             == pair.non_tensor_batch["turn_index_list_b"][0] for pair in pairs))
         self.assertTrue(all(pair.non_tensor_batch["trace_label_source_a"][0] == "trace" for pair in pairs))
 
+    def nullable_pairing_history(self, path):
+        original = self.batch(path)
+        # Four actual environment trajectories supply multiple eligible pairs at
+        # each turn. Copy identities, while reusing the same scored states.
+        history = training.Proto(
+            {key: torch.cat([value, value], dim=0) for key, value in original.batch.items()},
+            {key: np.concatenate([value, value]) for key, value in original.non_tensor_batch.items()},
+            original.meta_info,
+        )
+        for key in ("rollout_id_list", "traj_id_list", "traj_uid"):
+            identities = original.non_tensor_batch[key].tolist()
+            history.non_tensor_batch[key] = np.array(
+                identities + [str(identity) + "_copy" for identity in identities], dtype=object)
+        return history
+
+    def nullable_pairing_trainer(self, cap, *, max_pairs=256):
+        trainer = self.trainer()
+        trainer.config.data.trace.update(k_pairs_per_group=cap, max_pairs_per_step=max_pairs)
+        # All action pre-states match in V. Only the final post-states differ,
+        # creating real signed local credit plus unchanged terminal filling.
+        trainer.ref_policy_wg.scores.update({
+            **{name + str(turn): -4. for name in ("A", "B") for turn in range(4)},
+            "A4": -1., "B4": -8.,
+        })
+        return trainer
+
+    def test_nullable_pair_quota_changes_only_pair_selection_in_both_entrypoints(self):
+        for path in ("train-roma/rollout.py", "train-roma/rollout_main_profiled.py"):
+            with self.subTest(path=path):
+                limited = self.nullable_pairing_history(path)
+                unlimited = self.nullable_pairing_history(path)
+                limited_trainer = self.nullable_pairing_trainer(2)
+                unlimited_trainer = self.nullable_pairing_trainer(None)
+                before = {key: value.clone() for key, value in unlimited.batch.items()}
+                original_turns = unlimited.non_tensor_batch["trace_original_turn"].copy()
+                limited_trainer._annotate_trace_credits(limited)
+                unlimited_trainer._annotate_trace_credits(unlimited)
+                for key in ("trace_gt_logp", "trace_next_gt_logp", "trace_value", "trace_next_value",
+                            "trace_local_credit", "trace_terminal_fill", "trace_credit"):
+                    np.testing.assert_array_equal(limited.non_tensor_batch[key], unlimited.non_tensor_batch[key])
+                same_turn_pairs = limited_trainer._trans_to_trace_batch([limited])
+                counts = {}
+                for pair in same_turn_pairs:
+                    left = int(pair.non_tensor_batch["turn_index_list_a"][0])
+                    right = int(pair.non_tensor_batch["turn_index_list_b"][0])
+                    self.assertEqual(left, right)
+                    counts[left] = counts.get(left, 0) + 1
+                self.assertEqual(counts, {1: 2, 2: 2, 3: 2})
+                cross_turn_pairs = unlimited_trainer._trans_to_trace_batch([unlimited])
+                self.assertEqual(len(cross_turn_pairs), 36)
+                self.assertTrue(any(pair.non_tensor_batch["turn_index_list_a"][0]
+                                    != pair.non_tensor_batch["turn_index_list_b"][0]
+                                    for pair in cross_turn_pairs))
+                self.assertEqual(unlimited_trainer._trace_pair_metrics["trace/pair/selected_unique"], 36)
+                for pair in cross_turn_pairs:
+                    self.assertEqual(pair.non_tensor_batch["trace_task_a"].tolist(), ["alfworld"])
+                    self.assertEqual(pair.non_tensor_batch["trace_label_source_a"].tolist(), ["trace"])
+                np.testing.assert_array_equal(unlimited.non_tensor_batch["trace_original_turn"], original_turns)
+                for key, value in before.items():
+                    self.assertTrue(torch.equal(unlimited.batch[key], value), key)
+
+    def test_nullable_pair_quota_still_obeys_the_global_pair_limit(self):
+        history = self.nullable_pairing_history("train-roma/rollout.py")
+        trainer = self.nullable_pairing_trainer(None, max_pairs=5)
+        trainer._annotate_trace_credits(history)
+        pairs = trainer._trans_to_trace_batch([history])
+        self.assertEqual(len(pairs), 5)
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/selected_unique"], 5)
+        self.assertGreater(trainer._trace_pair_metrics["trace/pair/rejected_global_cap"], 0)
+
     def test_single_action_episodes_score_terminal_post_state_without_extra_turn(self):
         for path in ("train-roma/rollout.py", "train-roma/rollout_main_profiled.py"):
             with self.subTest(path=path):
