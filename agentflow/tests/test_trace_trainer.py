@@ -352,6 +352,55 @@ class ActorInputViewTests(unittest.TestCase):
                 self.assertIn("trace_state_context", batch.non_tensor_batch)
 
 
+class SharedPrefixRoutingTests(unittest.TestCase):
+    def test_enabled_scoring_uses_one_shared_reference_call_and_preserves_credits(self):
+        class PrefixReference(FrozenReference):
+            def __init__(self, tokenizer, scores):
+                super().__init__(tokenizer, scores)
+                self.prefix_calls = []
+
+            def compute_ref_prefix_log_prob(self, probes):
+                self.prefix_calls.append(dict(probes.meta_info))
+                native = Proto(probes.batch, probes.non_tensor_batch,
+                               {"trace_gt_scoring": True, "temperature": 1.0})
+                result = super().compute_ref_log_prob(native)
+                result.meta_info["trace_prefix_metrics"] = {"trace/prefix_used": 1,
+                                                            "trace/prefix_saved_tokens": 123}
+                return result
+
+        rows, scores = standard_rows()
+        baseline, shared = make_trainer(scores), make_trainer(scores, {
+            "shared_prefix_scoring": True, "shared_prefix_max_tokens": 4096,
+            "shared_prefix_max_mask_mib": 64, "shared_prefix_verify": True})
+        shared.ref_policy_wg = PrefixReference(shared.tokenizer, scores)
+        original, optimized = make_batch(rows), make_batch(rows)
+        baseline._annotate_trace_credits(original)
+        metrics = shared._annotate_trace_credits(optimized)
+        self.assertEqual(len(shared.ref_policy_wg.prefix_calls), 1)
+        meta = shared.ref_policy_wg.prefix_calls[0]
+        self.assertEqual(meta["trace_prefix_max_tokens"], 4096)
+        self.assertEqual(meta["trace_prefix_max_mask_bytes"], 64 * 1024 * 1024)
+        self.assertIs(meta["trace_prefix_verify"], True)
+        self.assertEqual(meta["temperature"], 1.0)
+        self.assertEqual(metrics["trace/prefix_requested"], 1)
+        self.assertEqual(metrics["trace/prefix_used"], 1)
+        self.assertEqual(metrics["trace/prefix_saved_tokens"], 123)
+        for key in ("trace_gt_logp", "trace_value", "trace_local_credit", "trace_terminal_fill", "trace_credit"):
+            np.testing.assert_array_equal(original.non_tensor_batch[key], optimized.non_tensor_batch[key])
+        old_pairs = baseline._trans_to_trace_batch([original])
+        new_pairs = shared._trans_to_trace_batch([optimized])
+        self.assertEqual(len(old_pairs), len(new_pairs))
+        for old, new in zip(old_pairs, new_pairs):
+            for key in ("group_baseline", "turn_index_list_a", "turn_index_list_b"):
+                np.testing.assert_array_equal(old.non_tensor_batch[key], new.non_tensor_batch[key])
+
+    def test_enabled_scoring_rejects_stale_workers_instead_of_hiding_missing_support(self):
+        rows, scores = standard_rows()
+        trainer = make_trainer(scores, {"shared_prefix_scoring": True})
+        with self.assertRaisesRegex(RuntimeError, "updated reference workers"):
+            trainer._annotate_trace_credits(make_batch(rows))
+
+
 class ActionReferenceTests(unittest.TestCase):
     def test_trace_without_kl_skips_action_ref_but_still_scores_gt(self):
         for task in ("qa", "alfworld"):

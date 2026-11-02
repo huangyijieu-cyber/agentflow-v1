@@ -361,6 +361,7 @@ class AgentFlowTrainer(RayPPOTrainer):
         next_logps = np.full(size, np.nan, dtype=np.float64)
         scoring_seconds = 0.0
         prepare_seconds = postprocess_seconds = 0.0
+        prefix_metrics = {"trace/prefix_requested": int(cfg.shared_prefix_scoring)}
         if requests:
             prepare_start = time.perf_counter()
             pad_id = self.tokenizer.pad_token_id
@@ -372,11 +373,23 @@ class AgentFlowTrainer(RayPPOTrainer):
                 tensors=build_score_tensors(requests, pad_id),
                 meta_info={"trace_gt_scoring": True, "temperature": 1.0},
             )
+            if cfg.shared_prefix_scoring:
+                probes.meta_info.update({
+                    "trace_prefix_max_tokens": cfg.shared_prefix_max_tokens,
+                    "trace_prefix_max_mask_bytes": cfg.shared_prefix_max_mask_mib * 1024 * 1024,
+                    "trace_prefix_verify": cfg.shared_prefix_verify,
+                })
             scorer = self.actor_rollout_wg if self.ref_in_actor else self.ref_policy_wg
             probes, probe_padding = pad_dataproto_to_divisor(probes, scorer.world_size)
             prepare_seconds = time.perf_counter() - prepare_start
             scoring_start = time.perf_counter()
-            scored = scorer.compute_ref_log_prob(probes)
+            if cfg.shared_prefix_scoring:
+                if not hasattr(scorer, "compute_ref_prefix_log_prob"):
+                    raise RuntimeError("Shared-prefix GT scoring requires updated reference workers; restart training after updating code")
+                scored = scorer.compute_ref_prefix_log_prob(probes)
+                prefix_metrics.update(scored.meta_info.get("trace_prefix_metrics", {}))
+            else:
+                scored = scorer.compute_ref_log_prob(probes)
             scoring_seconds = time.perf_counter() - scoring_start
             postprocess_start = time.perf_counter()
             scored = unpad_dataproto(scored, pad_size=probe_padding)
@@ -582,6 +595,7 @@ class AgentFlowTrainer(RayPPOTrainer):
             "trace_within_final_prefix": within_prefix, "trace_label_source": label_sources,
         })
         metrics = {"trace/" + key: value for key, value in counters.items()}
+        metrics.update(prefix_metrics)
         for name in ("positive_threshold", "negative_threshold", "gap_epsilon", "match_epsilon"):
             metrics["trace/config/" + name] = getattr(cfg, name)
         metrics.update(summarize_states(

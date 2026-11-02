@@ -31,6 +31,10 @@ data:
     max_gt_tokens: 256
     gt_alias_strategy: first
     answer_instruction: Answer the question directly and concisely.
+    shared_prefix_scoring: false
+    shared_prefix_max_tokens: 8192
+    shared_prefix_max_mask_mib: 256
+    shared_prefix_verify: true
 
 actor_rollout_ref:
   rollout:

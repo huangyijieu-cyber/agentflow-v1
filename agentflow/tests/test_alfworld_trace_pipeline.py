@@ -180,6 +180,37 @@ class AlfworldPipelineTests(unittest.TestCase):
         self.assertTrue(non["trace_is_terminal"][3])
         self.assertEqual(non["trace_turn_type"][3], "tool_plan")
 
+    def test_shared_prefix_route_keeps_alfworld_post_state_credits_and_pairs(self):
+        class SharedReference(training.FrozenReference):
+            def compute_ref_prefix_log_prob(self, probes):
+                self.prefix_meta = dict(probes.meta_info)
+                native = training.Proto(probes.batch, probes.non_tensor_batch,
+                                        {"trace_gt_scoring": True, "temperature": 1.0})
+                scored = super().compute_ref_log_prob(native)
+                scored.meta_info["trace_prefix_metrics"] = {"trace/prefix_used": 1}
+                return scored
+
+        original, shared = self.batch("train-roma/rollout.py"), self.batch("train-roma/rollout.py")
+        old_trainer, new_trainer = self.trainer(), self.trainer()
+        new_trainer.config.data.trace["shared_prefix_scoring"] = True
+        scores = new_trainer.ref_policy_wg.scores
+        new_trainer.ref_policy_wg = SharedReference(new_trainer.tokenizer, scores)
+        old_trainer._annotate_trace_credits(original)
+        metrics = new_trainer._annotate_trace_credits(shared)
+        self.assertEqual(metrics["trace/prefix_used"], 1)
+        self.assertEqual(metrics["trace/scoring_requests"], 10)
+        self.assertEqual(len(new_trainer.ref_policy_wg.calls), 1)
+        self.assertTrue(new_trainer.ref_policy_wg.prefix_meta["trace_prefix_verify"])
+        self.assertEqual(shared.batch["responses"].shape[0], 8)
+        for key in ("trace_gt_logp", "trace_next_gt_logp", "trace_value", "trace_next_value",
+                    "trace_local_credit", "trace_terminal_fill", "trace_credit"):
+            np.testing.assert_array_equal(original.non_tensor_batch[key], shared.non_tensor_batch[key])
+        old_pairs, new_pairs = old_trainer._trans_to_trace_batch([original]), new_trainer._trans_to_trace_batch([shared])
+        self.assertEqual(len(old_pairs), len(new_pairs))
+        for old, new in zip(old_pairs, new_pairs):
+            for key in ("group_baseline", "turn_index_list_a", "turn_index_list_b"):
+                np.testing.assert_array_equal(old.non_tensor_batch[key], new.non_tensor_batch[key])
+
     def test_trainer_also_masks_invalid_state_without_daemon_cleanup(self):
         history, trainer = self.batch("train-roma/rollout.py"), self.trainer()
         history.non_tensor_batch["trace_scoring_valid"][0] = False

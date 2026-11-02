@@ -1054,6 +1054,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="olive", role="ref_prefix_compute_log_prob")
+    def compute_ref_prefix_log_prob(self, data: DataProto):
+        """Shared-prefix GT scoring; ordinary actor/ref paths remain unchanged."""
+        from agentflow.trace.prefix_backend import compute_reference_prefix
+
+        def reshard_reference(model):
+            if self.world_size > 1:
+                if fsdp_version(model) == 1:
+                    model._handle.reshard(True)
+                elif fsdp_version(model) == 2:
+                    model.reshard()
+
+        return compute_reference_prefix(
+            self, data, DataProto, device_name=get_device_name(), device_id=get_device_id(),
+            reshard=reshard_reference,
+        )
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         from verl.utils.logger import log_with_rank

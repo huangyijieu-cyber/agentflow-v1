@@ -110,6 +110,8 @@ export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305_with_gt.parquet
 
 ## TRACE 评分性能
 
+共享前缀与自定义四维 attention 的新评分路径、配置和分布式边界见 [TRACE 共享前缀 GT 评分](trace-shared-prefix.md)。以下 2026-11-02 日志记录的是新增该路径之前的独立序列批量评分，用于耗时对照。
+
 2026-11-02 提供的 ALFWorld 首步日志中，64 条 rollout 产生 1884 个训练 turn，3768 个动作前/后状态候选去重为 984 个实际 GT 评分请求。整个 step 用时 691.82 秒，分布如下；不能把 rollout 后的全部等待都归给参考模型：
 
 | 阶段 | 秒 |

@@ -44,12 +44,19 @@ class TraceConfig:
     answer_instruction: str = "Answer the question directly and concisely."
     max_gt_tokens: int = 256
     gt_alias_strategy: str = "first"
+    # Library callers keep the original scorer unless explicitly enabled.
+    shared_prefix_scoring: bool = False
+    shared_prefix_max_tokens: int = 8192
+    shared_prefix_max_mask_mib: int = 256
+    shared_prefix_verify: bool = True
 
     def __post_init__(self):
-        for name in ("enabled", "terminal_fill_enabled", "outcome_match_value"):
+        for name in ("enabled", "terminal_fill_enabled", "outcome_match_value",
+                     "shared_prefix_scoring", "shared_prefix_verify"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"trace.{name} must be a boolean")
-        for name in ("k", "k_pairs_per_group", "max_pairs_per_step", "max_gt_tokens"):
+        for name in ("k", "k_pairs_per_group", "max_pairs_per_step", "max_gt_tokens",
+                     "shared_prefix_max_tokens", "shared_prefix_max_mask_mib"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"trace.{name} must be a positive integer")
