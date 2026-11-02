@@ -35,6 +35,7 @@ CREDIT = load_source_module("trace_credit_trainer_test", ROOT / "agentflow/agent
 SCORING = CREDIT
 METRICS = load_source_module("trace_metrics_trainer_test", ROOT / "agentflow/agentflow/trace/metrics.py")
 EXECUTION = load_source_module("trace_execution_trainer_test", ROOT / "agentflow/agentflow/trace/execution.py")
+ALFWORLD = load_source_module("trace_alfworld_trainer_test", ROOT / "agentflow/agentflow/trace/alfworld.py")
 
 
 class Proto:
@@ -107,6 +108,8 @@ def load_trainer_methods():
         encode_state_requests=SCORING.encode_state_requests,
         build_score_tensors=SCORING.build_score_tensors, mean_gt_logps=SCORING.mean_gt_logps,
         pad_dataproto_to_divisor=pad_dataproto_to_divisor, unpad_dataproto=unpad_dataproto,
+        FORECAST_RESPONSE=ALFWORLD.FORECAST_RESPONSE,
+        FORECAST_SCORING_VERSION=ALFWORLD.FORECAST_SCORING_VERSION,
     )
     shell = ast.ClassDef(name="TrainerMethods", bases=[], keywords=[], body=methods, decorator_list=[])
     module = ast.fix_missing_locations(ast.Module(body=[shell], type_ignores=[]))
@@ -506,6 +509,22 @@ class ActionReferenceTests(unittest.TestCase):
 
 
 class TraceTrainerIntegrationTests(unittest.TestCase):
+    def test_qa_keeps_its_original_answer_target_despite_alfworld_forecast_metadata(self):
+        rows, scores = standard_rows()
+        history, trainer = make_batch(rows), make_trainer(scores)
+        history.non_tensor_batch["trace_task"] = np.full(len(rows), "qa", dtype=object)
+        history.non_tensor_batch["trace_goal_metadata"] = np.array(
+            [{"scoring_version": "old-or-unrelated", "scoring_response": ALFWORLD.FORECAST_RESPONSE}
+             for _ in rows], dtype=object)
+        original_gt = history.non_tensor_batch["trace_gt"].copy()
+        trainer._annotate_trace_credits(history)
+        for call in trainer.ref_policy_wg.calls:
+            for index in range(len(call)):
+                response = trainer.tokenizer.decode(
+                    call.batch["responses"][index][call.batch["response_mask"][index].bool()])
+                self.assertEqual(response, "AB")
+        np.testing.assert_array_equal(history.non_tensor_batch["trace_gt"], original_gt)
+
     def test_null_pair_limit_allows_cross_turn_and_preserves_native_inputs(self):
         for limit in (None, "None", "null"):
             with self.subTest(limit=limit):

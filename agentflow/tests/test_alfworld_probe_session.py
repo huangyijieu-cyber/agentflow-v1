@@ -185,6 +185,161 @@ class SessionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fixed across turns"):
             self.experiment.save_probe({"response": "success at {turn_index}"})
 
+    def forecast_snapshot(self):
+        import test_alfworld_goal_conversion as fixtures
+        builder = fixtures.GoalTests()
+        builder.setUp()
+        self.addCleanup(builder.tearDown)
+        spec = fixtures.converter.load_goal_spec(builder.create())
+        snapshot = self.sample()
+        for trajectory in snapshot["trajectories"]:
+            probe._save_goal_fields(trajectory, spec)
+            trajectory["goal"] = "Put a clean mug in a cabinet."
+            for state in trajectory["states"]:
+                final = state["state_index"] == 2
+                state.update(facts=fixtures.INITIAL + (["(isclean mug0)"] if final else []),
+                             state_context="OLD_V2A_CONTEXT_WITH_HISTORY", state_view="full_state",
+                             scoring_valid=True, goal_check_valid=True, goal_check=final,
+                             budget_source="environment_step_budget")
+        path = Path(self.temp.name) / "trajectories.json"
+        probe.atomic_json(path, snapshot)
+        return snapshot, path, spec
+
+    def test_new_defaults_share_training_forecast_and_preserve_saved_custom_probes(self):
+        goal = probe._goal_module()
+        self.assertEqual(probe.DEFAULT_CONFIG["probe"]["response"], goal.FORECAST_RESPONSE)
+        self.assertEqual(probe.DEFAULT_CONFIG["probe"]["prompt"], goal.FORECAST_INSTRUCTION)
+        saved_config = Path(self.temp.name) / "config.json"
+        before = probe.read_json(saved_config)["probe"]
+        reloaded = probe.Experiment(self.temp.name)
+        self.assertEqual(reloaded.config["probe"], before)
+        self.assertEqual(reloaded.config["probe"]["response"], "success")
+        self.assertEqual(reloaded.config["probe"]["prompt"], "forecast {remaining_steps}")
+
+    def test_forecast_rebuilds_old_full_state_cache_without_sampling_or_source_access(self):
+        snapshot, path, spec = self.forecast_snapshot()
+        original = path.read_bytes()
+        self.experiment.save_probe({"prompt": probe.FORECAST_INSTRUCTION,
+                                    "response": probe.FORECAST_RESPONSE, "state_view": "full_state"})
+        fake = FakeScorer()
+        forbidden = mock.Mock(side_effect=AssertionError("no environment, store or sampling during rescoring"))
+        with mock.patch.object(scoring, "_get_scorer", return_value=fake), \
+             mock.patch.object(probe, "make_environment", forbidden), \
+             mock.patch.object(probe, "_goal_store_module", forbidden), \
+             mock.patch.object(probe, "request_action", forbidden):
+            first = self.experiment.score(scorer=scoring.score_snapshots)
+            second = self.experiment.score(scorer=scoring.score_snapshots)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertNotEqual(first["id"], second["id"])
+        for trajectory in first["trajectories"]:
+            self.assertEqual(trajectory["goal_response"], spec["goal_response"])
+            self.assertEqual(trajectory["scoring_version"], probe.FORECAST_SCORING_VERSION)
+            self.assertEqual({state["response"] for state in trajectory["states"]}, {probe.FORECAST_RESPONSE})
+            for state in trajectory["states"]:
+                content = state["scoring_prompt"]
+                self.assertIn("Success conditions", content)
+                self.assertIn(spec["goal_response"], content)
+                self.assertIn(str(state["remaining_steps"]), content)
+                self.assertIn(probe.FORECAST_INSTRUCTION, content)
+                self.assertNotIn("OLD_V2A_CONTEXT_WITH_HISTORY", content)
+        sidecar = probe.read_json(Path(self.temp.name) / "goal_metadata.json")
+        self.assertEqual(sidecar["trajectories"][0]["scoring_version"], probe.FORECAST_SCORING_VERSION)
+        self.assertEqual(probe.read_json(path), snapshot)
+        forbidden.assert_not_called()
+
+    def test_custom_goal_probe_does_not_score_a_goal_copied_into_forecast_context(self):
+        _, path, spec = self.forecast_snapshot()
+        original = path.read_bytes()
+        self.experiment.save_probe({"prompt": probe.FORECAST_INSTRUCTION,
+                                    "response": probe.FORECAST_RESPONSE, "state_view": "full_state"})
+        with mock.patch.object(scoring, "_get_scorer", return_value=FakeScorer()):
+            self.experiment.score(scorer=scoring.score_snapshots)
+            self.experiment.save_probe({"prompt": "Describe the current state.", "response": "{goal_response}"})
+            custom = self.experiment.score(scorer=scoring.score_snapshots)
+        for trajectory in custom["trajectories"]:
+            self.assertEqual(trajectory["resolved_response"], spec["goal_response"])
+            for state in trajectory["states"]:
+                self.assertNotIn("Success conditions:", state["scoring_prompt"])
+                self.assertNotIn(spec["goal_response"], state["scoring_prompt"])
+                self.assertIn("Describe the current state.", state["scoring_prompt"])
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_forecast_requires_recorded_budget_instead_of_guessing_for_old_cache(self):
+        snapshot, _, _ = self.forecast_snapshot()
+        snapshot["trajectories"][0]["states"][1].pop("remaining_steps")
+        with self.assertRaisesRegex(ValueError, "remaining_steps"):
+            probe._render_forecast_snapshot(snapshot)
+
+    def test_forecast_rejects_old_sampling_budget_and_replay_recovers_environment_limit(self):
+        import test_alfworld_goal_conversion as fixtures
+        snapshot, path, spec = self.forecast_snapshot()
+        snapshot["sampling"]["max_steps"] = 100
+        for trajectory in snapshot["trajectories"]:
+            trajectory["initial_gamefile"] = [spec["gamefile"]]
+            for state in trajectory["states"]:
+                state["remaining_steps"] = 100 - state["state_index"]
+                state.pop("budget_source", None)
+        probe.atomic_json(path, snapshot)
+        original = path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "enrich --replay"):
+            probe._render_forecast_snapshot(snapshot)
+
+        replayed = []
+        class ReplayEnv(FakeEnv):
+            trace_step_budget = 50
+
+            def details(self, result):
+                self.step_count = self.index
+                self.trace_goal_spec = spec
+                self.trace_facts = fixtures.INITIAL + (["(isclean mug0)"] if self.index == 2 else [])
+                result[-1].update({"extra.gamefile": [spec["gamefile"]]}, trace_remaining_steps=50 - self.index,
+                                  trace_goal_check=self.index == 2, trace_goal_check_valid=True,
+                                  trace_scoring_valid=True)
+                return result
+
+            def reset(self, **kwargs):
+                return self.details(super().reset(**kwargs))
+
+            def step(self, response):
+                replayed.append(response)
+                return self.details(super().step(response))
+
+        store = SimpleNamespace(read_goal_spec=mock.Mock(return_value=spec))
+        with mock.patch.object(probe, "_goal_store_module", return_value=store):
+            converted = probe.enrich_snapshot(snapshot, replay=True, env_factory=ReplayEnv, forecast=True)
+        self.assertEqual(replayed, ["<action>act</action>"] * 8)
+        self.assertEqual(path.read_bytes(), original)
+        for trajectory in converted["trajectories"]:
+            self.assertEqual([state["remaining_steps"] for state in trajectory["states"]], [50, 49, 48])
+            self.assertEqual({state["budget_source"] for state in trajectory["states"]}, {"environment"})
+            for state in trajectory["states"]:
+                self.assertIn("Remaining action budget:\n" + str(state["remaining_steps"]), state["state_context"])
+        payload = probe._enrichment_payload(snapshot, converted, "source-hash")
+        self.assertEqual(payload["trajectories"][0]["states"][0]["budget_source"], "environment")
+
+    def test_recorded_environment_budget_overrides_unverified_old_remaining_steps(self):
+        snapshot, _, _ = self.forecast_snapshot()
+        state = snapshot["trajectories"][0]["states"][0]
+        state["remaining_steps"] = 100
+        state["budget_source"] = "sampling_limit_unverified"
+        state["env_info"]["trace_remaining_steps"] = 50
+        converted = probe._render_forecast_snapshot(snapshot)
+        current = converted["trajectories"][0]["states"][0]
+        self.assertEqual(current["remaining_steps"], 50)
+        self.assertEqual(current["budget_source"], "environment")
+        self.assertIn("Remaining action budget:\n50", current["state_context"])
+
+    def test_state_snapshot_uses_actual_environment_budget_before_sampling_default(self):
+        env = FakeEnv({})
+        env.trace_step_budget, env.step_count = 7, 2
+        state = probe.state_snapshot(env, "actor", {}, 2, {"max_steps": 50, "history_length": 4})
+        self.assertEqual(state["remaining_steps"], 5)
+        self.assertEqual(state["budget_source"], "environment_step_budget")
+        state = probe.state_snapshot(env, "actor", {"trace_remaining_steps": 3}, 2,
+                                     {"max_steps": 50, "history_length": 4})
+        self.assertEqual(state["remaining_steps"], 3)
+        self.assertEqual(state["budget_source"], "environment")
+
     def goal_tools(self):
         spec = {"goal_response": "A clean cup is on the table.", "goal_spec_hash": "same-goal",
                 "goal_source": "traj_data.json", "goal_task_type": "pick_clean_then_place_in_recep",

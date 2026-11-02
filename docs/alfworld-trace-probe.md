@@ -2,7 +2,7 @@
 
 入口：train-roma/alfworld_trace_probe.py。
 
-当前默认使用“离线实际 PDDL → 保存的固定英文 GT → 完整环境状态评分”，所有环境动作统一进行 TRACE 配对，并使用真实终局结果回填。转换来源、正式训练接入及配置见 [alfworld-trace-goals.md](alfworld-trace-goals.md)。
+当前默认使用 ALFWorld v2b：“离线实际 PDDL → 成功条件放入 Prompt → 完整事实与剩余预算 → 固定未来成功句 LogP”，所有环境动作统一进行 TRACE 配对，并使用真实终局结果回填。v2a 记录在 `alfworld-v2a`；模板与差异见 [评分版本](alfworld-scoring-versions.md)，正式训练接入见 [alfworld-trace-goals.md](alfworld-trace-goals.md)。
 
 默认选 data/train/alfworld/train_all_alfworld_3305.parquet 第 0 行，即 train_all_alfworld_0；从 question 解析环境编号 0，而不是使用该行的 id=1。同一题采样 4 条轨迹，每条最多 50 个动作，策略 temperature=0.7、history_length=4。
 
@@ -133,7 +133,7 @@ score 模式从不自动采样，也不导入 ALFWorld；缓存缺失或尚未�
 
 ## 旧轨迹补齐 GT 和完整状态（不重新采样）
 
-已有 trajectories.json 时继续使用同一 work-dir。窗口支持多个样本时，先切换到目标样本再补齐；命令行的 --work-dir 应指向实际包含该 trajectories.json 的目录（新样本通常是工作区下的 samples/<sample-id>/）。旧配置中的手写 Response 会保留；在窗口中将 Response 改为 `{goal_response}`，选择完整状态。
+已有 trajectories.json 时继续使用同一 work-dir。窗口支持多个样本时，先切换到目标样本再补齐；命令行的 --work-dir 应指向实际包含该 trajectories.json 的目录（新样本通常是工作区下的 samples/<sample-id>/）。旧配置中的 Prompt/Response 保留。切到 v2b 时，将 Response 改成 `The agent will successfully complete the task within the remaining action budget.`，Prompt 改为 [版本说明](alfworld-scoring-versions.md) 中的预测指令，并选择 `full_state`。若已保存完整 Goal 规则、事实和经核验的实际剩余预算，重新评分会自动重渲染上下文并保存 sidecar，不需要采样或读取原始游戏。缺规则先 enrich；缺完整事实或实际预算依据时使用 `enrich --replay` 重放原动作确认，不生成新动作。旧缓存仅按 sampling.max_steps 记录的预算不会被当作已核验的环境预算。
 
 若旧轨迹已保存完整 facts，可直接离线补齐：
 
@@ -168,7 +168,9 @@ user content 使用评分模型 tokenizer 的 chat template；只计算 assistan
 
 Prompt 支持 {goal}、{goal_response}、{remaining_steps}、{turn_index} 占位符。Response 支持 {goal}、{goal_response}，确保同一题、不同 Turn 的评分目标一致；其他普通大括号保持原样，方便直接写 JSON 或自然语言。
 
-默认 Response 为 {goal_response}，在每道题中替换为实际 PDDL 确定性转换并保存的完整成功状态描述。full-state Prompt 根据完整规则、初始事实、当前状态增删和当前观察，要求描述当前状态；不再附加累计动作/观察历史，原始历史仍保存。旧缓存包含完整事实时，可用 `enrich --work-dir ...` 重渲染评分上下文而无需重新采样。Response 表达目标状态，不作为当前已成功的证据。也可切换到手写固定 Response（例如原来的 The episode will end in success.）作为对照；比较时应记录 state_view。文本似然未自动做双候选归一化或成功率校准。
+v2b 默认 Response 为 `The agent will successfully complete the task within the remaining action budget.`，对所有题、所有 Turn 保持固定。原 `goal_response` 完整保留在 Prompt 的 Success conditions 区域，明确是要求而非当前事实。Prompt 包含完整规则、初始事实、当前状态增删、当前观察和实际剩余动作预算，不附加累计动作/观察历史。固定句仅作为 teacher-forcing 目标，不自由采样。已有缓存可在保存事实和规则上重渲染，无需重新采样。
+
+旧 `{goal_response}` 或其它手写 Response 仍可作为自定义对照。`full_state` 模式切回旧目标文本时，工具会移除 v2b Prompt 的成功条件原文，避免目标被直接复制进评分上下文。`saved` 模式按既有语义使用保存原文，手写 Response 时应检查它是否已经出现在上下文中。已有 config.json 不自动替换为新模板。文本似然尚未校准为实际成功率，比较时应同时记录 Prompt、Response 和 state_view。
 
 ## TRACE 计算口径
 

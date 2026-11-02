@@ -42,6 +42,17 @@ def _trace_module():
     return sys.modules[name]
 
 
+def _goal_module():
+    name = "_alfworld_probe_goal_conversion"
+    if name not in sys.modules:
+        path = Path(__file__).resolve().parents[1] / "agentflow/agentflow/trace/alfworld.py"
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
 def _finite(value):
     return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
 
@@ -296,6 +307,8 @@ def score_snapshots(snapshot: dict, probe: dict, scorer_config: dict, *, progres
     state_view = probe.get("state_view", "saved")
     if state_view not in ("full_state", "saved"):
         raise ValueError("probe.state_view must be full_state or saved")
+    forecast = (state_view == "full_state"
+                and response_template == _goal_module().FORECAST_RESPONSE)
     trajectories = snapshot.get("trajectories")
     if not isinstance(trajectories, list) or not trajectories:
         raise ValueError("The snapshot must contain at least one saved trajectory")
@@ -309,7 +322,11 @@ def score_snapshots(snapshot: dict, probe: dict, scorer_config: dict, *, progres
         if state_view == "full_state" and any(state.get("state_view") != "full_state"
                                                for state in trajectory.get("states", [])):
             raise ValueError("Full-state facts are missing from this cache. Run enrich --replay; observations alone are not full state.")
-    if "{goal_response}" in response_template:
+        if forecast and (trajectory.get("scoring_version") != _goal_module().FORECAST_SCORING_VERSION
+                         or any(state.get("scoring_version") != _goal_module().FORECAST_SCORING_VERSION
+                                for state in trajectory.get("states", []))):
+            raise ValueError("Forecast scoring requires v2b state contexts; run enrich or score through the Probe experiment to rebuild saved facts without sampling.")
+    if "{goal_response}" in response_template or forecast:
         hashes = {trajectory.get("goal_spec_hash") for trajectory in trajectories}
         if None in hashes or len(hashes) != 1:
             raise ValueError("Fixed goal responses require one verified goal_spec_hash for the saved task")
