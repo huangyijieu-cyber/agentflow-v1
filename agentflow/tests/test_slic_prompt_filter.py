@@ -1,71 +1,34 @@
-"""Exercise real SLiC pairing without importing distributed worker runtimes."""
-import ast
-import contextlib
-import io
-import random
+"""Dropped-prompt contracts through the production TRACE-SLiC pairing route.
+
+Reuse the CPU harness that extracts the complete trainer TRACE methods rather
+than extracting only the legacy pairing function with incomplete metadata.
+"""
 import unittest
-from collections import defaultdict
-from pathlib import Path
-from types import SimpleNamespace
 
-import numpy as np
-import torch
+import test_trace_trainer as training
 
 
-ROOT = Path(__file__).resolve().parents[2]
-
-
-class Proto:
-    def __init__(self, batch, non_tensor_batch, meta_info=None):
-        self.batch = batch
-        self.non_tensor_batch = non_tensor_batch
-        self.meta_info = meta_info or {}
-
-    @classmethod
-    def from_single_dict(cls, values):
-        return cls(
-            {key: value for key, value in values.items() if isinstance(value, torch.Tensor)},
-            {key: value for key, value in values.items() if not isinstance(value, torch.Tensor)},
-        )
-
-
-def load_pair_function():
-    path = ROOT / 'agentflow/verl/trainer.py'
-    tree = ast.parse(path.read_text())
-    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'AgentFlowTrainer')
-    fn = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == '_trans_to_dpo_batch')
-    scope = dict(torch=torch, np=np, random=random, defaultdict=defaultdict, DataProto=Proto)
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), 'exec'), scope)
-    return scope[fn.name]
-
-
-PAIR = load_pair_function()
-
-
-def run(rows, with_drop_mask=True):
-    # Each row is rollout_id, turn, reward, mean log-prob, is_dropped.
-    size = len(rows)
-    ids = torch.arange(size).reshape(size, 1).repeat(1, 2)
-    batch = {key: ids.clone() for key in ['input_ids', 'position_ids', 'prompts', 'responses']}
-    batch['attention_mask'] = torch.ones(size, 2)
-    batch['response_mask'] = torch.ones(size, 2)
-    batch['token_level_scores'] = torch.tensor([[row[2], 0.] for row in rows])
-    batch['old_log_probs'] = torch.tensor([[row[3], row[3]] for row in rows])
-    if with_drop_mask:
-        batch['is_drop_mask'] = torch.tensor([row[4] for row in rows], dtype=torch.bool)
-    non = {key: np.array(['q'] * size) for key in ['uid', 'data_id_list']}
-    non.update({key: np.array([row[0] for row in rows]) for key in ['rollout_id_list', 'traj_id_list', 'traj_uid']})
-    non['turn_index_list'] = np.array([row[1] for row in rows])
-    trainer = SimpleNamespace(
-        config=SimpleNamespace(
-            trainer=SimpleNamespace(n_gpus_per_node=1, nnodes=1),
-            data={'task': 'qa', 'replay_collection': 'uid-turn'},
-        ),
-        use_reference_policy=False,
-        global_steps=1,
-    )
-    with contextlib.redirect_stdout(io.StringIO()):
-        return PAIR(trainer, [Proto(batch, non, {'temperature': 0.7})])
+def run(rows, with_drop_mask=True, *, return_details=False):
+    # Each row is rollout_id, original turn, reward, mean LogP, is_dropped.
+    last_turn = {}
+    for rollout, turn, *_ in rows:
+        last_turn[rollout] = max(last_turn.get(rollout, -1), turn)
+    fixtures, scores = [], {}
+    for index, (rollout, turn, reward, old, dropped) in enumerate(rows):
+        final = turn == last_turn[rollout]
+        context = f"state-{index}"
+        fixtures.append(training.make_row(
+            context, rollout, turn, reward=reward, old=old, dropped=dropped,
+            turn_type="final_answer" if final else "tool_plan", is_final=final,
+            outcome_valid=True, outcome_success=reward > .5))
+        scores[context] = -4.
+    history = training.make_batch(fixtures)
+    if not with_drop_mask:
+        history.batch.pop("is_drop_mask")
+    trainer = training.make_trainer(scores)
+    trainer._annotate_trace_credits(history)
+    pairs = trainer._trans_to_dpo_batch([history])
+    return (pairs, trainer, history) if return_details else pairs
 
 
 class SlicPromptFilterTests(unittest.TestCase):
@@ -87,13 +50,47 @@ class SlicPromptFilterTests(unittest.TestCase):
     def test_dropped_last_turn_does_not_reclassify_intermediate_turn_as_answer(self):
         rows = [('short', 0, 1., -1., False), ('long', 0, 0., -3., False),
                 ('long', 1, 0., -5., True)]
-        self.assertIsNone(run(rows))
+        pairs, _, history = run(rows, return_details=True)
+        self.assertIsNone(pairs)
+        self.assertEqual(history.non_tensor_batch['turn_index_list'].tolist(), [0, 0, 1])
+        self.assertEqual(history.non_tensor_batch['trace_is_final'].tolist(), [True, False, True])
+        self.assertEqual(history.non_tensor_batch['trace_turn_type'].tolist(),
+                         ['final_answer', 'tool_plan', 'final_answer'])
+        self.assertEqual(history.non_tensor_batch['trace_label_source'].tolist(),
+                         ['outcome', 'trace', 'outcome'])
 
     def test_no_drop_field_remains_supported(self):
         rows = [('chosen', 0, 1., -1., False), ('rejected', 0, 0., -3., False)]
         pairs = run(rows, with_drop_mask=False)
         self.assertEqual(len(pairs), 1)
         self.assertEqual(float(pairs[0].non_tensor_batch['group_baseline'][0]), -2.)
+
+    def test_dropped_tool_on_either_side_cannot_create_credit_pair(self):
+        for index in (1, 4):
+            with self.subTest(dropped=index):
+                rows, scores = training.standard_rows()
+                rows[index]['dropped'] = True
+                trainer, history = training.make_trainer(scores), training.make_batch(rows)
+                trainer._annotate_trace_credits(history)
+                self.assertIsNone(trainer._trans_to_dpo_batch([history]))
+                self.assertEqual(trainer._trace_pair_metrics['trace/dropped_prompt_turns'], 1)
+
+    def test_dropped_tool_does_not_pollute_credit_pair_baseline(self):
+        rows, scores = training.standard_rows()
+        rows.extend([
+            training.make_row('C0', 'dropped', 0, turn_type='analysis'),
+            training.make_row('C1', 'dropped', 1, old=-100., dropped=True),
+            training.make_row('C2', 'dropped', 2, turn_type='final_answer'),
+        ])
+        scores.update(C0=-4., C1=-4., C2=-2.)
+        trainer, history = training.make_trainer(scores), training.make_batch(rows)
+        trainer._annotate_trace_credits(history)
+        pairs = trainer._trans_to_dpo_batch([history])
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0].non_tensor_batch['group_baseline'].tolist(), [-2.])
+        self.assertEqual(pairs[0].non_tensor_batch['group_size'].tolist(), [2])
+        self.assertEqual(pairs[0].non_tensor_batch['trace_label_source_a'].tolist(), ['trace'])
+        self.assertEqual(pairs[0].non_tensor_batch['trace_label_source_b'].tolist(), ['trace'])
 
 
 if __name__ == '__main__':
