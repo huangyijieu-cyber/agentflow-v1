@@ -540,11 +540,11 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
         history, trainer = make_batch(rows), make_trainer(scores)
         trainer._annotate_trace_credits(history)
         history.non_tensor_batch["trace_credit"][:] = [
-            .2, .2, np.nan, .3, .3, np.nan, -.2, -.2, np.nan, -.3, -.3, np.nan]
+            .2, .2, np.nan, .3, .3, np.nan, -.2, -.2, np.nan, -.3, -.4, np.nan]
         trainer.config.data.trace["k_pairs_per_group"] = None
         pairs = trainer._trans_to_trace_batch([history, history])
-        self.assertEqual(len(pairs), 32)  # Four positives times four negatives, in each history.
-        self.assertEqual(trainer._trace_pair_metrics["trace/pair/selected_unique"], 32)
+        self.assertEqual(len(pairs), 8)  # Four Chosen attempts in each history.
+        self.assertEqual(trainer._trace_pair_metrics["trace/pair/selected_unique"], 8)
         self.assertGreater(trainer._trace_pair_metrics["trace/pair/cross_turn_rate"], 0.)
         trainer.config.data.trace["max_pairs_per_step"] = 3
         self.assertEqual(len(trainer._trans_to_trace_batch([history, history])), 3)

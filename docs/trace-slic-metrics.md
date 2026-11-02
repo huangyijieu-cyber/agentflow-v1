@@ -1,6 +1,6 @@
 # TRACE-SLIC 训练观察指标
 
-指标接入原训练 metrics 字典，默认 console logger 输出，无需额外开关。比例为 0–1。本次精简只改日志统计，不改变信用计算、Pair 选择、训练 Loss 或 Replay 采样，也不新增配置。
+指标接入原训练 metrics 字典，默认 console logger 输出，无需额外开关。比例为 0–1。早期指标精简仅调整日志；当前 cache 式构对的候选计数口径见下文，无新增配置。
 
 `trace` 来源是工具局部信用加终局回填，`outcome` 来源是 analysis／实际最终回答的可信成功／失败标签。两种来源的 Pair 数分开观察；工具信用使用保留的 `credit_*` 名称，已移除与其完全相同的 `effective_credit_*`。
 
@@ -14,7 +14,7 @@
 | `trace/terminal_fill_p10/p50/p90` | 终局优势回填项分布 | 与局部信用一起看，判断回填是否主导 |
 | `trace/credit_p10/p50/p90` | 局部信用加回填后的有效工具信用 | 工具 Pair 使用此信号；幅度越大不等于效果越好 |
 | `trace/pair/trace_selected_unique`、`outcome_selected_unique` | 分布式补齐前的工具／奖励来源 Pair 数 | 区分两种监督构成；数量不作为质量目标 |
-| `trace/pair/tool_value_match_rate` | 工具正负候选中通过状态价值匹配的比例 | 只观察工具 margin 的筛选效果，避免奖励路线跳过匹配造成混淆 |
+| `trace/pair/tool_value_match_rate` | 工具轮转构对的实际尝试中，通过状态价值匹配的比例 | 只观察工具 margin 的筛选效果；与历史全组合分母不同，不能直接横比 |
 | `trace/pair/value_gap_p90/max`、`credit_gap_min` | 选中工具 Pair 的状态价值差、有效信用差 | 应满足 `match_epsilon`、`gap_epsilon`；小价值差、大信用差仅为代理信号，不能证明状态可比或动作因果贡献 |
 | `trace/external_error_turns`、`credit_windows_blocked_external` | 外部故障 Turn 数及受影响信用窗口数 | 区分基础设施问题与模型退化 |
 | `trace/outcome_invalid_rollouts` | 没有可信终局结果的 Rollout 数 | 增长时检查实际 final、verifier 和外部中断；不能直接当作失败负样本 |
@@ -62,7 +62,7 @@
 
 | 指标 | 定义 |
 | --- | --- |
-| `candidates_sign` | 同题、同类型、同来源组内具备正负两侧的候选组合数；工具/环境动作还按原始 Turn id 分组 |
+| `candidates_sign` | 组内按分数排序后，每个 Chosen 只轮转分配一个 Rejected 的实际尝试数；有负例时等于正例数，无负例时为 0。工具/环境动作是否按原始 Turn 分组由 `k_pairs_per_group` 控制 |
 | `groups_no_positive`、`groups_no_negative` | 缺少合格正侧／负侧的组数；中性组可能同时计入两者 |
 | `both_sign_group_rate` | 同时具备正负两侧的合格组数 / 有合格行的组数；无合格组时为 0 |
 | `tool_value_match_rate` | 工具候选通过价值匹配的比例；无工具候选时为 0 |
@@ -71,16 +71,18 @@
 | `rejected_length` | 因响应长度比过大被拒绝的组合数 |
 | `rejected_same_action` | 因两侧动作身份相同被拒绝的组合数 |
 | `rejected_group_cap`、`rejected_global_cap` | 通过质量过滤后，受到每组／每步数量上限限制的组合数 |
-| `selected_unique` | 补齐前最终选中的 Pair 数 |
+| `selected_unique` | 补齐前最终选中的 Pair 数；一次构对中 Chosen 不复用，Rejected 可循环复用 |
 | `trace_selected_unique`、`outcome_selected_unique` | 工具／奖励来源最终选中的 Pair 数 |
 | `question_coverage` | 最终 Pair 覆盖问题数 / 当前批次已有 Turn 的不同问题数；未返回任何 Turn 的问题不在分母 |
-| `cross_turn_rate` | 最终 Pair 两侧原始 Turn 编号不同的比例；工具/环境动作应为 0，QA outcome 路由保留原行为，因此所有来源合计值可能非零 |
+| `cross_turn_rate` | 最终 Pair 两侧原始 Turn 编号不同的比例；工具/环境动作在同 Turn 模式应为 0，`k_pairs_per_group=None` 时允许非零；QA outcome 路由原本允许跨 Turn |
 | `value_gap_{p50,p90,max}` | 最终工具 Pair 两侧动作前状态价值差，仅统计工具来源 |
 | `credit_gap_{min,p50,p90}` | 最终工具 Pair 两侧有效信用差，仅统计工具来源 |
 | `{type}/selected_unique` | 各决策类型最终选中的 Pair 数 |
 | `padding_duplicates` | 为分布式分区补齐而重复的 Pair 条数 |
 
 六个 `rejected_*` 原因按检查顺序互斥，可核对 `candidates_sign = 六个拒绝计数之和 + selected_unique`。累计通过阶段已删除；`groups_eligible`、`groups_both_signs`、`trace_candidates_sign`、`trace_after_value_match` 仅作为计算两个比例的内部计数，不再输出日志。
+
+候选采用 cache 式轮转：Chosen 分数降序、Rejected 分数升序，同分按样本索引排序。每个 Chosen 只尝试一个负例，过滤失败就跳过；未轮到的负例和未生成的其它正负组合不计入候选或拒绝数。历史版本的 `candidates_sign` 为正负组合乘积，工具匹配率分母也因此不同。分布式补齐和跨训练步 Replay 仍可能重复同一个 Pair。
 
 工具按有效信用差、奖励路线按最终奖励差降序选择，再按价值距离、旧策略平均 Token LogP 距离打破平局。全局上限仍基于候选原始差值排序，两种来源尚无尺度校准；触及全局上限时需观察分来源选中数量。精简日志没有改变这一选择逻辑。
 

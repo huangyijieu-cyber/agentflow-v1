@@ -1,16 +1,18 @@
 # TRACE 状态信用与分类型 SLIC 配对
 
-当前 QA 算法版本为 **v2a2**（动态范围回填），改动前为 **v2a1**（固定系数回填）。`v1`、`v2a`、`v2b`、`v2a1`、`v2a2` 的定义与固定提交见 [版本记录](trace-slic-change-log.md#版本名称与固定代码快照)。
+版本命名、差异、参数对照和代码快照统一维护于桌面文档 `webwalker-trace版本记录.md`。**v3a＝原 v2a1，v3b＝原 v2a2**。最新实验 **v3d** 沿用 v3c 的 Replay 容量 512、采样 ×4 和严格 V 匹配，主要设置为 `k_pairs_per_group=None`（YAML 为 `null`），允许同题同类型工具跨 Turn 配对并取消组内数量上限。QA 信用沿用 v3b 的动态范围回填；当前构对已恢复 cache 式轮转，具体规则见配对章节。
+
+**v3c、v3d 均开启严格价值匹配**：`outcome_match_value=true`、`match_epsilon=0.05`，analysis／final 也必须满足 `abs(V_i - V_j) <= 0.05`，并保留可信终局成功／失败标签。此处记录实验实际设置，基础配置默认值仍为 `false`。
 
 QA 的状态、终局和回填语义见下文；ALFWorld 的真实后状态与统一环境动作信用见 [ALFWorld 接入说明](alfworld-trace-goals.md)。两个任务的 SLIC 工具/环境动作默认仅允许同题同原始 Turn id 配对；`k_pairs_per_group=null` 时允许同题跨 Turn，且不设组内 Pair 上限。
 
-本实现按决策类型选择偏好标签：analysis 和实际最终回答使用可验证的最终任务结果，工具 Turn 使用 K-step GT 信用及可选的终局优势回填。配对质量优先；没有合格正负两侧时跳过，不为凑数量放宽条件。SLIC Loss、原 GRPO 训练公式和 Replay 更新剂量保持原样。
+本实现按决策类型选择偏好标签：analysis 和实际最终回答使用可验证的最终任务结果，工具 Turn 使用 K-step GT 信用及可选的终局优势回填。配对质量优先；没有合格正负两侧时跳过，不为凑数量放宽条件。SLIC Loss 和原 GRPO 训练公式保持原样；v3c／v3d 的 Replay 调整记录为用户实验设置。
 
-算法待办已完成实现与 CPU 集成回归，对应提交 `6eb6215` 已推送到 `trace` 分支。其后的指标精简也纳入 `trace` 分支，具体版本见 Git 提交记录；GPU/NPU 端训练效果尚未验证。修改状态见 [修改记录](trace-slic-change-log.md)。
+算法待办已完成实现与 CPU 集成回归，对应提交 `6eb6215` 已推送到 `trace` 分支。其后的指标精简也纳入 `trace` 分支，具体版本见 Git 提交记录；GPU/NPU 端训练效果尚未验证。版本状态见单独维护的 `webwalker-trace版本记录.md`。
 
 ## 状态与 GT 评分
 
-从 `v2a1` 起，QA 各类型 Turn 的 `trace_state_context` 统一使用问题与动作执行前的工具历史快照，不因切换到 final 而增删分析文本或改变评分模板。快照沿用生成时读取的有界工具历史，不扩大记忆窗口；实际生成 Prompt 保持原样。评分时统一附加：
+从 `v3a` 起，QA 各类型 Turn 的 `trace_state_context` 统一使用问题与动作执行前的工具历史快照，不因切换到 final 而增删分析文本或改变评分模板。快照沿用生成时读取的有界工具历史，不扩大记忆窗口；实际生成 Prompt 保持原样。评分时统一附加：
 
 ```text
 Answer the question directly and concisely.
@@ -119,11 +121,17 @@ $$
 \widetilde c_i-\widetilde c_j\geq\epsilon_{\mathrm{gap}}.
 $$
 
-analysis／final 依据可信成功／失败分池，默认不施加 GT 价值距离门槛；可用 `outcome_match_value=true` 显式开启。工具 Turn 仍要求严格正负有效信用，没有负样本不以终局 reward 兜底。两条路线都保留响应长度比、相同动作排除和数量上限。
+analysis／final 依据可信成功／失败分池。基础配置的 `outcome_match_value` 默认为 `false`；v3c、v3d 实验显式设为 `true`，额外要求两侧 V 有效且 `abs(V_i - V_j) <= 0.05`，baseline 同步采用 V 邻域。工具 Turn 仍要求严格正负有效信用，没有负样本不以终局 reward 兜底。两条路线都保留响应长度比、相同动作排除和相应数量上限。
+
+当前实现采用 cache 式构对：每组 Chosen 按偏好分数降序，Rejected 按分数升序；同分时按样本索引升序。第 k 个 Chosen 只尝试第 `k % len(negative)` 个 Rejected；负例不足时循环复用，每个 Chosen 最多生成一个候选。被分配的 Pair 不满足 V、长度或其它质量条件时跳过，不改配其它负例。工具使用有效信用作为偏好分数，analysis／final 使用终局 reward。该修改尚未另行命名，v3d 原实验仍对应全组合构对；版本更新统一维护桌面记录。
 
 通过条件的候选优先按对应偏好分数差降序选择：工具用回填后信用差，奖励路线用最终奖励差。价值距离、旧策略平均 Token LogP 距离仅依次打破平局；奖励路线无有效价值时不制造假值。每组、每步上限在分布式补齐之前应用。全局截断沿用候选的原始差值排序，尚未校准两种来源的分数尺度；触及全局上限时需观察各来源选中占比。
 
 Pair 两侧保留各自原始生成 Prompt、响应及原生 token IDs。仍使用现有 per-token calibration 与 Chosen SFT；不将 GT 信用塞入 Loss，不改变原 GRPO 优势。GT 可预测性接近并不证明证据相同或动作可交换，需要独立状态抽查与验证任务收益确认配对质量。
+
+## Replay
+
+此次核对的远程代码基线为 `d010f3c`：启动配置默认 `REPLAY_BUFFER_SIZE=512`，trainer 未配置时的缺省值为 8192，采样目标为 `16 * round(enq_ema)`。用户确认的 **v3c、v3d** 实验设置均为容量 **512**、采样目标 `4 * round(enq_ema)`，再沿用存量限制和分布式对齐；EMA 为 40、存量充足且可整除时采样 160 对。本次仅记录实验设置，未修改基线训练代码。
 
 ## 代码组织
 
