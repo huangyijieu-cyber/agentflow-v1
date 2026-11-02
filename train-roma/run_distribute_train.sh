@@ -173,6 +173,11 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64/driver/:$LD_LIBRARY_PATH
 source /usr/local/Ascend/cann/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/cann/nnal/atb/set_env.sh
 
+# Keep HCCL host ports outside the server's ephemeral range (32768-60999).
+# Set this on every node before Ray starts so its workers inherit the value.
+export HCCL_IF_BASE_PORT="${HCCL_IF_BASE_PORT:-20000}"
+echo "[HCCL] HCCL_IF_BASE_PORT=${HCCL_IF_BASE_PORT}, HCCL_HOST_SOCKET_PORT_RANGE=${HCCL_HOST_SOCKET_PORT_RANGE:-<unset>}"
+
 export MY_IP=$(hostname -I | awk '{print $1}')
 echo "MyIP: ${MY_IP}"
 export no_proxy="${MY_IP},${no_proxy}"

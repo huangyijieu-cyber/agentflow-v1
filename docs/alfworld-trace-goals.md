@@ -110,6 +110,16 @@ export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305_with_gt.parquet
 
 ## HCCL 端口故障定位
 
+分布式启动脚本 `train-roma/run_distribute_train.sh` 在加载 Ascend 环境后、启动 Ray 前，默认设置 `HCCL_IF_BASE_PORT=20000`，并输出它及更高优先级的 `HCCL_HOST_SOCKET_PORT_RANGE`。按 32 个端口规划 `20000–20031`，避开已观察服务器的系统临时端口范围 `32768–60999`，防止普通连接的自动源端口分配使用默认 HCCL 的 `60000` 段。此配置适用于 QA 和 ALFWorld，不改变训练、rollout、SP 或 TRACE 算法。
+
+所有节点使用相同配置，并确认该端口段没有其他固定服务使用、多节点间可以访问。脚本保留显式设置的 `HCCL_IF_BASE_PORT`；若使用自定义值，也应选择系统临时端口范围之外的可用端口段。`HCCL_HOST_SOCKET_PORT_RANGE` 的优先级更高，若平台或其他脚本设置了它，应删除该设置或把它配置到合适的端口段，避免覆盖本配置。只在 Ray 启动后的提交终端设置环境变量，不能保证已有 worker 继承；应在下一次正常启动训练及各节点 Ray 时生效，当前正在正常训练的进程无需中断。服务器若使用自己的 `start.sh`，将以下内容放在所有 Ascend 环境加载之后、`ray start` 之前即可：
+
+```bash
+export HCCL_IF_BASE_PORT="${HCCL_IF_BASE_PORT:-20000}"
+```
+
+这是固定在启动脚本中的长期配置，不需要每次手动运行 `sysctl` 或监控工具。它针对端口范围重叠；此前 `60006` 绑定失败时的具体占用连接仍未被捕获，不能把预防措施视为对占用进程的确认。官方配置说明见 [HCCL_IF_BASE_PORT](https://www.hiascend.com/doc_center/source/en/canncommercial/850/commlib/hcclug/hcclug_000090.html)。
+
 首次 actor `old_log_prob` 若报 `HcclGetRootInfo / Bind_Failed`，先核对成功 QA 的 TRACE、SP、模型和设备配置。两任务在这一阶段共用 actor 通信路径，GT 尚未评分，不能仅凭任务类型认定是 Goal 转换或参考模型导致。事后端口空闲也不能反推故障瞬间的占用者。
 
 可在服务器另一个终端先启动一次只读捕获，再按原命令正常启动 ALFWorld：
