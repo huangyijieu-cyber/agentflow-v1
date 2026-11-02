@@ -266,7 +266,7 @@ class AlfWorldEnv:
             )
         if isinstance(raw_facts, (list, tuple)) and len(raw_facts) == 1 and isinstance(raw_facts[0], list):
             raw_facts = raw_facts[0]
-        self.trace_facts = tools.normalize_facts(raw_facts)
+        self.trace_facts = tools.normalize_facts(raw_facts, objects=self.trace_goal_spec["objects"])
         if not self.trace_facts:
             raise RuntimeError("ALFWorld full-state TRACE received an empty fact set")
         if action is not None:

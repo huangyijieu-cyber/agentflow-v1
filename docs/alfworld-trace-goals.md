@@ -60,6 +60,8 @@ python agentflow/agentflow/trace/alfworld_goal_store.py build \
 
 完整状态以“初始事实 + 当前新增/删除事实”无损呈现，使用稳定短别名减少上下文长度。当前事实直接来自 TextWorld `PddlEnv` 的原始 `_facts`，通过 `AlfWorldTraceFacts` 包装器导出为 `extra.trace_raw_facts`，不根据生成的动作猜测执行效果。公开的 `facts` 使用 `loc 7` 等可能随机化的显示名称，不能与保存的 PDDL 标识混用。包装器只增加评分信息，保留官方观察、命令和显示名称；已有 GT Parquet 无需重新转换。失败动作不会自行修改事实；历史窗口缩短也不丢失持久事实。每个状态对照 `evaluate_goal(facts)` 和环境 `won`；不一致的状态保留供排查，但不用于评分/配对。
 
+TextWorld 动作执行后会把删除效果存为 `not_atlocation`、`not_holds`、`not_opened` 等显式否定事实，同时移除对应正事实。运行时先核验其基础谓词、参数数量和游戏对象，再投影到现有闭世界正事实集合：否定事实表示对应正事实缺席，状态渲染会保留初始事实的删除。未知谓词、未声明对象或同一事实同时为真和为假仍明确报错。该兼容不改变离线 Goal/GT 或已保存 Parquet。
+
 规则核验依据 ALFWorld 官方 [goal_library.py](https://github.com/alfworld/alfworld/blob/aaba6870f86c5be6a08a491f32a50b906227bc3e/alfworld/gen/goal_library.py)、[alfred.pddl](https://github.com/alfworld/alfworld/blob/aaba6870f86c5be6a08a491f32a50b906227bc3e/alfworld/data/alfred.pddl) 和 [TextWorld 环境包装器](https://github.com/alfworld/alfworld/blob/aaba6870f86c5be6a08a491f32a50b906227bc3e/alfworld/agents/environment/alfred_tw_env.py)。运行时仍以服务器实际加载的游戏为准。
 
 ## 正式训练接入

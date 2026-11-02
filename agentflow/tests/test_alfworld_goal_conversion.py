@@ -198,6 +198,67 @@ class GoalTests(unittest.TestCase):
         with self.assertRaises(converter.GoalConversionError):
             converter.load_goal_spec(self.create(initial=INITIAL + ["(not (and (isclean mug0) (ishot mug0)))"]))
 
+    def test_textworld_delete_effects_are_false_not_unknown_predicates(self):
+        spec = converter.load_goal_spec(self.create("look_at_obj_in_light"))
+        # Moving removes the old location and adds its explicit negation.
+        current = [fact for fact in INITIAL if fact != "(atlocation agent0 loc0)"]
+        current += ["(not_atlocation agent0 loc0)", "(atlocation agent0 loc1)",
+                    "(holds agent0 mug0)", "(istoggled lamp0)"]
+        canonical = converter.normalize_facts(current, objects=spec["objects"])
+        self.assertNotIn("(atlocation agent0 loc0)", canonical)
+        self.assertIn("(atlocation agent0 loc1)", canonical)
+        self.assertEqual(converter.normalize_facts(canonical), canonical)
+        # The lamp remains at loc0; keeping the old location would falsely
+        # mark the look task successful while the agent is elsewhere.
+        self.assertFalse(converter.evaluate_goal(spec, current))
+        self.assertFalse(converter.evaluate_goal(spec, canonical))
+        context = converter.render_full_state(spec, current)
+        self.assertNotIn("not_atlocation:", context)
+        removed = context.split("Initial facts that are now false:\n", 1)[1]
+        self.assertIn("atlocation: (agent0,loc0)", removed)
+        returned = [fact for fact in current if fact not in (
+            "(not_atlocation agent0 loc0)", "(atlocation agent0 loc1)")]
+        returned += ["(atlocation agent0 loc0)", "(not_atlocation agent0 loc1)"]
+        self.assertTrue(converter.evaluate_goal(spec, returned))
+
+    def test_negative_fact_formats_validate_all_supported_predicates(self):
+        for predicate, arity in converter.PREDICATE_ARITIES.items():
+            args = [f"entity{i}" for i in range(arity)]
+            for fact in (
+                tuple(["not_" + predicate, *args]),
+                NS(name="not_" + predicate, arguments=[NS(name=arg) for arg in args]),
+                {"name": "not_" + predicate, "arguments": args},
+                "(not_" + predicate + " " + " ".join(args) + ")",
+            ):
+                with self.subTest(predicate=predicate, fact=fact):
+                    self.assertEqual(converter.normalize_facts([fact], objects=dict.fromkeys(args)), [])
+
+    def test_negative_facts_do_not_bypass_consistency_or_identity_checks(self):
+        spec = converter.load_goal_spec(self.create())
+        for facts, message in (
+            (["(not_invisible mug0)"], "Unsupported environment predicate"),
+            (["(not_atlocation agent0)"], "Unsupported environment predicate"),
+            (["(not_not_isclean mug0)"], "Unsupported environment predicate"),
+            (["(not_isclean ?o)"], "cannot contain variables"),
+            (["(not_isclean another_game_object)"], "undeclared entity"),
+            (["(isclean mug0)", "(not_isclean mug0)"], "contradictory"),
+        ):
+            with self.subTest(facts=facts):
+                for function in (converter.evaluate_goal, converter.render_full_state):
+                    with self.assertRaisesRegex(converter.GoalConversionError, message):
+                        function(spec, INITIAL + facts)
+        with self.assertRaisesRegex(converter.GoalConversionError, "contradictory"):
+            converter.normalize_facts(["(not_isclean mug0)", "(isclean mug0)"])
+        self.assertEqual(converter.normalize_facts([
+            "(new-axiom@0 mug0)", "(not_new-axiom@1 mug0)", "(isclean mug0)"]), ["(isclean mug0)"])
+
+    def test_negative_goal_and_close_reopen_keep_closed_world_semantics(self):
+        spec = converter.load_goal_spec(self.create("pick_and_place_simple"))
+        spec["goal_ast"] = ["not", ["opened", "cabinet0"]]
+        self.assertTrue(converter.evaluate_goal(spec, ["(not_opened cabinet0)"]))
+        self.assertFalse(converter.evaluate_goal(spec, ["(opened cabinet0)"]))
+        self.assertTrue(converter.evaluate_goal(spec, ["(not_opened cabinet0)"]))
+
     def test_mismatched_task_types_targets_and_bindings_are_rejected(self):
         with self.assertRaises(converter.GoalConversionError):
             converter.load_goal_spec(self.create("pick_heat_then_place_in_recep", goal=placement("iscool")))

@@ -389,8 +389,14 @@ def _fact_tuple(value):
     raise GoalConversionError(f"Unsupported environment fact: {type(value).__name__}")
 
 
-def normalize_facts(facts) -> list[str]:
-    """Canonicalize complete environment facts without inventing missing facts."""
+def normalize_facts(facts, *, objects=None) -> list[str]:
+    """Project complete TextWorld state onto canonical positive PDDL facts.
+
+    PddlState.apply stores delete effects as ``not_<predicate>`` and removes
+    the corresponding positive fact. Under the existing closed-world view,
+    those explicit negatives are represented by absence from the positive set.
+    Validate them before dropping them; contradictory states are never scored.
+    """
     if facts is None:
         raise GoalConversionError("Full environment facts are missing")
     if hasattr(facts, "tolist"):
@@ -403,10 +409,12 @@ def normalize_facts(facts) -> list[str]:
         child = next(iter(facts))
         if not child or not isinstance(child[0], str) or child[0].strip().startswith("("):
             facts = child
-    result = set()
+    result, negatives = set(), set()
     for fact in facts:
         normalized = _fact_tuple(fact)
-        if normalized[0].startswith("new-axiom@"):
+        negative = normalized[0].startswith("not_")
+        predicate = normalized[0][4:] if negative else normalized[0]
+        if predicate.startswith("new-axiom@"):
             # Internal compiler propositions are not user-domain state facts.
             continue
         if any(not symbol or re.search(r"[\s();]", symbol) for symbol in normalized):
@@ -414,12 +422,20 @@ def normalize_facts(facts) -> list[str]:
                 f"Non-canonical environment fact: {normalized}. "
                 "Use raw PDDL identities, not human-readable TextWorld facts."
             )
-        arity = PREDICATE_ARITIES.get(normalized[0])
+        arity = PREDICATE_ARITIES.get(predicate)
         if arity is None or len(normalized) != arity + 1:
             raise GoalConversionError(f"Unsupported environment predicate: {normalized}")
         if any(x.startswith("?") for x in normalized):
             raise GoalConversionError("Environment facts cannot contain variables")
-        result.add(pddl_text(list(normalized)))
+        if objects is not None:
+            for argument in normalized[1:]:
+                if argument not in objects:
+                    raise GoalConversionError(f"Environment fact refers to undeclared entity: {argument}")
+        canonical = pddl_text([predicate, *normalized[1:]])
+        (negatives if negative else result).add(canonical)
+    contradictory = result & negatives
+    if contradictory:
+        raise GoalConversionError(f"Environment facts are contradictory: {sorted(contradictory)}")
     return sorted(result)
 
 
@@ -430,7 +446,7 @@ def _checked_facts(facts, objects) -> list[str]:
     every argument of a retained domain proposition must belong to the loaded
     problem or domain constants.
     """
-    canonical = normalize_facts(facts)
+    canonical = normalize_facts(facts, objects=objects)
     for fact in canonical:
         for argument in parse_pddl(fact)[1:]:
             if argument not in objects:

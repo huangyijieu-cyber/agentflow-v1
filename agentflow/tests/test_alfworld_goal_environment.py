@@ -66,7 +66,7 @@ class Tools:
         return {"gamefile": str(cls.normalize_gamefile(path)), "goal_response": "A clean mug is in a cabinet.",
                 "goal_source": "traj_data.json", "goal_task_type": "pick_clean_then_place_in_recep",
                 "template_version": "test", "source_sha256": {"game": "abc"},
-                "goal_ast": ["isclean", "mug0"], "answer_instruction": "Judge the recorded state.",
+                "goal_ast": ["isclean", "mug0"], "objects": {}, "answer_instruction": "Judge the recorded state.",
                 "goal_spec_hash": "stable-spec", "goal_store_path": store_path,
                 "goal_store_id": "persisted-store", "goal_store_entry": "train/actual/game.tw-pddl",
                 "goal_store_spec_sha256": "persisted-spec"}
@@ -76,7 +76,7 @@ class Tools:
         raise AssertionError("Training must never convert goals")
 
     @staticmethod
-    def normalize_facts(facts):
+    def normalize_facts(facts, *, objects=None):
         return sorted(facts)
 
     @staticmethod
@@ -251,7 +251,7 @@ class EnvironmentTests(unittest.TestCase):
              mock.patch.object(Tools, "read_dataset_gamefile", side_effect=AssertionError("SQLite mapping forbidden")):
             # Freeze the expected spec before forbidding the legacy reader.
             spec_reader.side_effect = None
-            spec_reader.return_value = {"goal_response": "A clean mug is in a cabinet.",
+            spec_reader.return_value = {"goal_response": "A clean mug is in a cabinet.", "objects": {},
                                        "answer_instruction": "Judge the recorded state.", "goal_spec_hash": "row-spec"}
             actor, _ = self.reset(env, question_id=0)
         self.assertEqual(base.game_files, [str(selected)])
@@ -609,6 +609,44 @@ class EnvironmentTests(unittest.TestCase):
         self.assertTrue(done)
         self.assertTrue(info["trace_goal_check"])
         self.assertTrue(info["trace_scoring_valid"])
+
+    def test_real_goal_tools_accept_delete_effects_after_environment_step(self):
+        import test_alfworld_goal_conversion as fixtures
+        held = [fact for fact in fixtures.INITIAL if fact != "(inreceptacle mug0 cabinet0)"]
+        held += ["(holds agent0 mug0)", "(isclean mug0)"]
+        placed = [fact for fact in held if fact != "(holds agent0 mug0)"]
+        placed += ["(not_holds agent0 mug0)", "(inreceptacle mug0 cabinet0)"]
+        with tempfile.TemporaryDirectory() as directory:
+            builder = fixtures.GoalTests()
+            builder.root = Path(directory)
+            spec = fixtures.converter.load_goal_spec(builder.create(initial=held))
+
+        class DeleteEffectSimulator(Simulator):
+            def reset(self):
+                observations, info = super().reset()
+                info["extra.trace_raw_facts"] = [[tuple(fixtures.converter.parse_pddl(fact)) for fact in held]]
+                return observations, info
+
+            def step(self, action):
+                observations, reward, done, info = super().step(action)
+                info["extra.trace_raw_facts"] = [[tuple(fixtures.converter.parse_pddl(fact)) for fact in placed]]
+                return observations, reward, done, info
+
+        self.scope["_goal_tools"] = lambda: fixtures.converter
+        env, _ = self.env(DeleteEffectSimulator())
+        with mock.patch.object(Tools, "read_goal_spec", return_value=spec):
+            self.reset(env, question_id=0)
+        self.assertFalse(env.trace_goal_check)
+        actor, reward, done, info = self.step(env, "<action>place mug</action>")
+        self.assertEqual(reward, 1)
+        self.assertTrue(done)
+        self.assertTrue(info["trace_goal_check"])
+        self.assertTrue(info["trace_scoring_valid"])
+        self.assertNotIn("(holds agent0 mug0)", info["trace_full_facts"])
+        self.assertNotIn("(not_holds agent0 mug0)", info["trace_full_facts"])
+        self.assertIn("holds: (agent0,mug0)", info["trace_state_context"].split(
+            "Initial facts that are now false:\n", 1)[1])
+        self.assertNotIn("Initial facts", actor)
 
     def test_legacy_mode_does_not_parse_rules_or_register_extra_state(self):
         env, base = self.env(trace=False)
