@@ -132,6 +132,20 @@ export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305_with_gt.parquet
 
 本地等价验证使用真实 `PreTrainedTokenizerFast`（Transformers 4.57.1 / Tokenizers 0.22.2，ByteLevel BPE 与 Jinja 模板），覆盖重复输入、Unicode、不同 GT/指令、缺失字段和长度边界。新旧 requests、行映射、计数和六个评分张量逐元素一致。3768 个候选、984 个唯一请求、约 1240-token 合成上下文的 CPU 基准中，编码中位耗时从 3.10 秒降至 0.424 秒，张量构造从 0.0357 秒降至 0.0188 秒；此结果仅说明本地 CPU 路径变化，未使用服务器的 Qwen tokenizer 或执行 NPU 训练。
 
+后续审查发现，完整状态和来源等 `trace_*` 非张量字段原先会随 action old/ref LogP、GRPO 和 SLIC 的 RPC 发给 worker，进入模型计算前才被丢弃。现在仅在 trainer 侧创建轻量输入视图，提前排除这些 driver 专用字段；保留全部训练 tensor、其它非张量字段（包括多模态输入和组内 baseline）及 `meta_info`。原主 batch 仍完整保留用于 TRACE、配对和 replay。`perf/actor_rpc_trace_fields_omitted` 报告 GRPO RPC 排除的字段数。这减少确定存在的序列化和运输开销，但不能仅凭代码断言它解释了 GRPO 更新从一分钟变成三分钟。
+
+GRPO 的 `dp_actor.py` forward/backward/optimizer 以及 actor 的默认 SP、microbatch、mini-batch 与适配前 `8083f0d` 相同；TRACE 的完整状态未加入策略 prompt，T+1 个评分状态也未变成额外 GRPO 行。所提供日志是第 1 步，真实训练行数约 1872、有效 token 总数约 115.8 万。比较更新速度应对齐这些数量、实际配置及稳态 step，不能将不同样本量或首次算子初始化的运行直接比较。当前向量化覆盖编码、张量构造和评分回填，credit 核心仍使用原公式与循环，未引入 IGPO 的全后缀奖励算法。
+
+双机十六卡在 SP=2、全局 batch 不变时将数据并行组从 4 增至 8，有机会缩短模型评分和更新时间，但 CPU 侧串行处理不会自动减半，跨机 FSDP 通信也会增加成本。应先保持训练题数、rollout 数和全局 mini-batch 不变，确认节点间 HCCL 网络与带宽，再对比相同数据量的稳态时间。
+
+## 零配对与阈值
+
+提供的首步日志中，`candidates_sign=10`，`rejected_value_match=4`，`rejected_same_action=6`，而 `rejected_credit_gap=0`，最终 0 对。因此该轮降低 gap 不会恢复配对。当前默认先要求 chosen credit > 0.01、rejected credit < -0.01，进入这一步的差值本已严格大于 0.02；在正负阈值不变时，gap=0.005 不会改变它们的筛选结果。相同上下文的同一动作可能因 K-step 后续行为不同而得到不同 credit，但当前 response 相同，仍会被过滤。相同上下文中的不同动作、满足正负和其它约束时可以正常配对。
+
+若实验意图仅为严格正负及至少 0.005 的信用差，可显式将 `TRACE_POSITIVE_THRESHOLD=0`、`TRACE_NEGATIVE_THRESHOLD=0` 和 `TRACE_GAP_EPSILON=0.005` 一起设置；这是候选门槛调整，代码不会自动应用，也不保证通过状态价值或相同动作过滤。保留同题同原始 turn、每 turn 最多两对。新增 `trace/config/{positive_threshold,negative_threshold,gap_epsilon,match_epsilon}` 指标打印实际采用的四个值。
+
+正式入口 `train-roma/train_agent.py` 读取 `train-roma/config.yaml`，同名环境变量优先于 YAML 默认值，命令行 Hydra 覆盖最后生效。仅修改 `config_grpo+slic.yaml` 或 `igpo_gap_epsilon` 不保证这个入口的 TRACE gap 发生变化。策略最近 4 步的上下文相同，也不等于 GT 评分上下文相同，后者包含规则、完整状态及累计全部动作历史；此差别可能影响 V 匹配。
+
 ## HCCL 端口故障定位
 
 分布式启动脚本 `train-roma/run_distribute_train.sh` 在加载 Ascend 环境后、启动 Ray 前，默认设置 `HCCL_IF_BASE_PORT=20000`，并输出它及更高优先级的 `HCCL_HOST_SOCKET_PORT_RANGE`。按 32 个端口规划 `20000–20031`，避开已观察服务器的系统临时端口范围 `32768–60999`，防止普通连接的自动源端口分配使用默认 HCCL 的 `60000` 段。此配置适用于 QA 和 ALFWorld，不改变训练、rollout、SP 或 TRACE 算法。

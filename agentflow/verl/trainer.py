@@ -244,6 +244,14 @@ class AgentFlowTrainer(RayPPOTrainer):
         return SequenceMatcher(None, a, b).ratio() >= thresh
 
 
+    def _actor_input_view(self, batch):
+        """Keep driver-only TRACE text out of model RPCs without changing rows."""
+        non_tensor_keys = [key for key in batch.non_tensor_batch if not key.startswith("trace_")]
+        if len(non_tensor_keys) == len(batch.non_tensor_batch):
+            return batch
+        return batch.select(batch_keys=list(batch.batch.keys()), non_tensor_batch_keys=non_tensor_keys)
+
+
     def _needs_action_ref_log_prob(self):
         """A frozen GT scorer does not itself require reference action scores."""
         if not self.use_reference_policy:
@@ -574,6 +582,8 @@ class AgentFlowTrainer(RayPPOTrainer):
             "trace_within_final_prefix": within_prefix, "trace_label_source": label_sources,
         })
         metrics = {"trace/" + key: value for key, value in counters.items()}
+        for name in ("positive_threshold", "negative_threshold", "gap_epsilon", "match_epsilon"):
+            metrics["trace/config/" + name] = getattr(cfg, name)
         metrics.update(summarize_states(
             row_logps, values, credits, types,
             [(str(uid), str(rollout)) for uid, rollout in zip(uids, rollouts)], turns, cfg,
@@ -1168,7 +1178,7 @@ class AgentFlowTrainer(RayPPOTrainer):
 
             # recompute old_log_probs
             with _timer("old_log_prob", timing_raw), torch.no_grad():
-                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                old_log_prob = self.actor_rollout_wg.compute_log_prob(self._actor_input_view(batch))
                 entropys = old_log_prob.batch["entropys"]
                 response_masks = batch.batch["response_mask"]
                 loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -1186,7 +1196,7 @@ class AgentFlowTrainer(RayPPOTrainer):
                 # compute reference log_prob
                 with _timer("ref", timing_raw), torch.no_grad():
                     ref_worker = self.actor_rollout_wg if self.ref_in_actor else self.ref_policy_wg
-                    ref_log_prob = ref_worker.compute_ref_log_prob(batch)
+                    ref_log_prob = ref_worker.compute_ref_log_prob(self._actor_input_view(batch))
                     print("ref_log_prob:", ref_log_prob)
                     batch = batch.union(ref_log_prob)
             elif self.use_reference_policy:
@@ -1344,7 +1354,9 @@ class AgentFlowTrainer(RayPPOTrainer):
                     with _timer("update_actor", timing_raw):
                         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                         batch.meta_info["max_response_length"] = self.config.data.max_response_length
-                        actor_output = self.actor_rollout_wg.update_actor(batch)
+                        metrics["perf/actor_rpc_trace_fields_omitted"] = sum(
+                            key.startswith("trace_") for key in batch.non_tensor_batch)
+                        actor_output = self.actor_rollout_wg.update_actor(self._actor_input_view(batch))
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
                     print(f"{time.strftime('%Y-%m-%d %H-%M-%S')}: >>> End GRPO")
@@ -1392,7 +1404,7 @@ class AgentFlowTrainer(RayPPOTrainer):
                                 
                                 # 建议：在DPO前也做长度检查，过滤极端长短样本
                                 # 可在 update_actor_by_dpo 内部或这里加
-                                dpo_output = self.actor_rollout_wg.update_actor_by_dpo(sample_batch)
+                                dpo_output = self.actor_rollout_wg.update_actor_by_dpo(self._actor_input_view(sample_batch))
                                 if "slic" in algorithm.split("+") and self.config.data.get("trace", {}).get("enabled", False):
                                     metrics["trace/replay/slic_updated"] = 1
                                 dpo_output_metrics = reduce_metrics(dpo_output.meta_info["metrics"])

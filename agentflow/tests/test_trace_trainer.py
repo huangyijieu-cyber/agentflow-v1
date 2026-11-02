@@ -67,6 +67,13 @@ class Proto:
                           {**self.non_tensor_batch, **other.non_tensor_batch},
                           {**self.meta_info, **other.meta_info})
 
+    def select(self, batch_keys=None, non_tensor_batch_keys=None):
+        return type(self)(
+            {key: self.batch[key] for key in batch_keys},
+            {key: self.non_tensor_batch[key] for key in non_tensor_batch_keys},
+            dict(self.meta_info),
+        )
+
 
 def pad_dataproto_to_divisor(proto, divisor):
     padding = (-len(proto)) % divisor
@@ -83,7 +90,7 @@ def load_trainer_methods():
     tree = ast.parse(path.read_text())
     trainer = next(node for node in tree.body if isinstance(node, ast.ClassDef)
                    and node.name == "AgentFlowTrainer")
-    names = {"_anchors_match", "_needs_action_ref_log_prob", "_annotate_trace_credits",
+    names = {"_anchors_match", "_actor_input_view", "_needs_action_ref_log_prob", "_annotate_trace_credits",
              "_trans_to_trace_batch", "_trans_to_dpo_batch"}
     methods = [node for node in trainer.body if isinstance(node, ast.FunctionDef) and node.name in names]
     if len(methods) != len(names):
@@ -280,6 +287,71 @@ def value_rollout(rollout, values, reward, *, uid="q", trusted=True, final=True)
     return rows, scores
 
 
+class ActorInputViewTests(unittest.TestCase):
+    def test_driver_trace_text_is_omitted_without_changing_model_inputs(self):
+        trainer = make_trainer({})
+        tensors = {name: torch.arange(6).reshape(2, 3) for name in
+                   ("input_ids", "responses", "old_log_probs", "advantages", "ref_log_prob", "rollout_is_weights")}
+        non_tensors = {
+            "uid": np.array(["a", "b"]),
+            "multi_modal_inputs": np.array([{"image": "a"}, {"image": "b"}], dtype=object),
+            "trace_state_context": np.array(["long state a", "long state b"]),
+            "trace_next_state_context": np.array(["next a", "next b"]),
+            "trace_credit": np.array([.1, -.1]),
+        }
+        batch = Proto(tensors, non_tensors, {"temperature": .7, "multi_turn": True, "max_response_length": 3})
+        view = trainer._actor_input_view(batch)
+        self.assertEqual(set(view.batch), set(batch.batch))
+        for key in batch.batch:
+            self.assertIs(view.batch[key], batch.batch[key])
+        self.assertEqual(set(view.non_tensor_batch), {"uid", "multi_modal_inputs"})
+        self.assertEqual(view.meta_info, batch.meta_info)
+        self.assertIs(view.non_tensor_batch["multi_modal_inputs"], batch.non_tensor_batch["multi_modal_inputs"])
+        self.assertEqual(set(batch.non_tensor_batch), set(non_tensors))
+        self.assertEqual(len(view), len(batch))
+
+    def test_pair_baselines_and_gt_temperature_metadata_are_preserved(self):
+        trainer = make_trainer({})
+        pair = Proto({"input_ids_a": torch.ones(1, 2), "input_ids_b": torch.zeros(1, 2)},
+                     {"group_baseline": np.array([-.2]), "born_step": np.array([1]),
+                      "trace_task_a": np.array(["alfworld"]), "trace_gt_b": np.array(["goal"])},
+                     {"trace_gt_scoring": True, "temperature": 1., "dpo_type": "slic"})
+        view = trainer._actor_input_view(pair)
+        self.assertEqual(set(view.non_tensor_batch), {"group_baseline", "born_step"})
+        self.assertIs(view.non_tensor_batch["group_baseline"], pair.non_tensor_batch["group_baseline"])
+        self.assertEqual(view.meta_info, pair.meta_info)
+        self.assertIn("trace_gt_b", pair.non_tensor_batch)
+
+    def test_non_trace_batches_keep_the_original_object(self):
+        batch = Proto({"input_ids": torch.ones(1, 2)}, {"uid": np.array(["q"])})
+        self.assertIs(make_trainer({})._actor_input_view(batch), batch)
+
+    def test_all_actor_rpc_call_sites_send_the_lightweight_view(self):
+        path = ROOT / "agentflow/verl/trainer.py"
+        tree = ast.parse(path.read_text())
+        step = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                    and node.name == "_train_step")
+        methods = {"compute_log_prob", "compute_ref_log_prob", "update_actor", "update_actor_by_dpo"}
+        calls = [node for node in ast.walk(step) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute) and node.func.attr in methods]
+        self.assertEqual({call.func.attr for call in calls}, methods)
+        batch = Proto({"input_ids": torch.ones(1, 2)},
+                      {"uid": np.array(["q"]), "trace_state_context": np.array(["large text"])},
+                      {"temperature": .7})
+        worker = SimpleNamespace(**{method: lambda data: data for method in methods})
+        trainer = make_trainer({})
+        trainer.actor_rollout_wg = worker
+        for call in calls:
+            with self.subTest(method=call.func.attr):
+                code = compile(ast.Expression(body=call), str(path), "eval")
+                sent = eval(code, {"self": trainer, "batch": batch,
+                                   "sample_batch": batch, "ref_worker": worker})
+                self.assertEqual(set(sent.non_tensor_batch), {"uid"})
+                self.assertIs(sent.batch["input_ids"], batch.batch["input_ids"])
+                self.assertEqual(sent.meta_info, batch.meta_info)
+                self.assertIn("trace_state_context", batch.non_tensor_batch)
+
+
 class ActionReferenceTests(unittest.TestCase):
     def test_trace_without_kl_skips_action_ref_but_still_scores_gt(self):
         for task in ("qa", "alfworld"):
@@ -374,6 +446,7 @@ class ActionReferenceTests(unittest.TestCase):
                     row["gt"] = gt
                 trainer, history = make_trainer(scores), make_batch(rows)
                 metrics = trainer._annotate_trace_credits(history)
+                self.assertEqual(metrics["trace/config/gap_epsilon"], trainer.config.data.trace.get("gap_epsilon", .02))
                 for phase in ("validation", "encoding", "scoring_prepare", "scoring",
                               "scoring_postprocess", "credit"):
                     self.assertGreaterEqual(metrics["trace/" + phase + "_seconds"], 0.)
