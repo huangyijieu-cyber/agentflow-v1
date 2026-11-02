@@ -4,6 +4,8 @@
 
 此实现使用完整环境状态进行参考模型评分（privileged/full-state）。策略模型继续接收原来的可见观察和有限历史。完整状态只进入评分上下文；固定 Response 描述成功条件，每道题的所有状态复用同一文本。
 
+评分 Prompt 现不再附加累计动作/观察历史：保留任务、环境规则、事实解释、初始事实、当前新增/删除事实、当前观察和固定评分指令。当前事实已包含 Goal 所需的持久标记；历史记录仍保留在环境/轨迹中用于排查，策略最近四步历史保持原样。此缩减只改变 ALFWorld full-state 评分文本，不改变 GT Response、信用公式或配对规则。已有 GT Parquet 无需重新转换，重启训练/rollout 进程后使用新文本。已有 Probe 缓存的 `state_context` 不会自动更新；含完整事实时运行 `enrich --work-dir ...` 重建评分 sidecar 后再评分，无需重新采样。
+
 ## 规则来源与转换
 
 离线入口是 `agentflow/agentflow/trace/alfworld_goal_store.py prepare`。在服务器仓库根目录运行一次：
@@ -146,7 +148,7 @@ GRPO 的 `dp_actor.py` forward/backward/optimizer 以及 actor 的默认 SP、mi
 
 若实验意图仅为严格正负及至少 0.005 的信用差，可显式将 `TRACE_POSITIVE_THRESHOLD=0`、`TRACE_NEGATIVE_THRESHOLD=0` 和 `TRACE_GAP_EPSILON=0.005` 一起设置；这是候选门槛调整，代码不会自动应用，也不保证通过状态价值或相同动作过滤。保留同题同原始 turn、每 turn 最多两对。新增 `trace/config/{positive_threshold,negative_threshold,gap_epsilon,match_epsilon}` 指标打印实际采用的四个值。
 
-正式入口 `train-roma/train_agent.py` 读取 `train-roma/config.yaml`，同名环境变量优先于 YAML 默认值，命令行 Hydra 覆盖最后生效。仅修改 `config_grpo+slic.yaml` 或 `igpo_gap_epsilon` 不保证这个入口的 TRACE gap 发生变化。策略最近 4 步的上下文相同，也不等于 GT 评分上下文相同，后者包含规则、完整状态及累计全部动作历史；此差别可能影响 V 匹配。
+正式入口 `train-roma/train_agent.py` 读取 `train-roma/config.yaml`，同名环境变量优先于 YAML 默认值，命令行 Hydra 覆盖最后生效。仅修改 `config_grpo+slic.yaml` 或 `igpo_gap_epsilon` 不保证这个入口的 TRACE gap 发生变化。策略最近 4 步的上下文相同，也不等于 GT 评分上下文相同，后者包含规则、完整状态和当前观察；此差别可能影响 V 匹配。评分文本已移除累计动作/观察历史，但当前观察仍可携带最近动作的反馈，因此相同完整事实也不保证评分 Prompt 完全一致。
 
 ## HCCL 端口故障定位
 
