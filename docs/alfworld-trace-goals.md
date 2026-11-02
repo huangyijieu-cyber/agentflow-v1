@@ -108,6 +108,20 @@ export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305_with_gt.parquet
 
 窗口使用和旧缓存升级见 [alfworld-trace-probe.md](alfworld-trace-probe.md)。建议先跑固定四条轨迹，查看 GT、Goal/环境校验、local credit、terminal fill 和最终 effective credit，再开始训练。文本 LogP 是参考模型对目标描述的支持程度；它的成功率校准与信用质量需要实验检验。
 
+## HCCL 端口故障定位
+
+首次 actor `old_log_prob` 若报 `HcclGetRootInfo / Bind_Failed`，先核对成功 QA 的 TRACE、SP、模型和设备配置。两任务在这一阶段共用 actor 通信路径，GT 尚未评分，不能仅凭任务类型认定是 Goal 转换或参考模型导致。事后端口空闲也不能反推故障瞬间的占用者。
+
+可在服务器另一个终端先启动一次只读捕获，再按原命令正常启动 ALFWorld：
+
+```bash
+python train-roma/diagnose_hccl_ports.py \
+  --port-range 60000-60031 --duration 900 \
+  --output /tmp/alfworld-hccl-port.jsonl
+```
+
+该工具仅持续读取 Linux `/proc`，记录端口的 LISTEN、ESTABLISHED、TIME_WAIT、可见占用进程和有限的 rank/HCCL 环境信息；不导入模型、不建立连接、不改端口或训练配置。报错后保留 JSONL，Ctrl+C 只停止捕获。现有输出拒绝覆盖。它只用于一次故障定位，不是后续每次训练的前置步骤；短于采样间隔的事件可能未被捕获，未观察到占用不等于端口始终空闲。
+
 ## 本地验证记录
 
 六类真实样例取自官方 `json_2.1.3_tw-pddl.zip`（release 0.4.2）和同路径的 `json_2.1.1_json.zip`（release 0.2.2）；均为 valid_unseen 中的原文件配对，解压校验 CRC，未重建元数据。六类转换和初始 Goal 计算均成功，初始 Goal 均为 false。
