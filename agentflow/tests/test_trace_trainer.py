@@ -62,6 +62,11 @@ class Proto:
             self.meta_info,
         )
 
+    def union(self, other):
+        return type(self)({**self.batch, **other.batch},
+                          {**self.non_tensor_batch, **other.non_tensor_batch},
+                          {**self.meta_info, **other.meta_info})
+
 
 def pad_dataproto_to_divisor(proto, divisor):
     padding = (-len(proto)) % divisor
@@ -78,7 +83,8 @@ def load_trainer_methods():
     tree = ast.parse(path.read_text())
     trainer = next(node for node in tree.body if isinstance(node, ast.ClassDef)
                    and node.name == "AgentFlowTrainer")
-    names = {"_anchors_match", "_annotate_trace_credits", "_trans_to_trace_batch", "_trans_to_dpo_batch"}
+    names = {"_anchors_match", "_needs_action_ref_log_prob", "_annotate_trace_credits",
+             "_trans_to_trace_batch", "_trans_to_dpo_batch"}
     methods = [node for node in trainer.body if isinstance(node, ast.FunctionDef) and node.name in names]
     if len(methods) != len(names):
         raise AssertionError("Required TRACE trainer methods were not found")
@@ -102,6 +108,39 @@ def load_trainer_methods():
 
 
 TrainerMethods = load_trainer_methods()
+
+
+def load_action_ref_stage():
+    """Run the production stage using CPU workers, without constructing Ray."""
+    path = ROOT / "agentflow/verl/trainer.py"
+    tree = ast.parse(path.read_text())
+    trainer = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                   and node.name == "AgentFlowTrainer")
+    step = next(node for node in trainer.body if isinstance(node, ast.FunctionDef)
+                and node.name == "_train_step")
+    body = next(node.body for node in ast.walk(step) if isinstance(getattr(node, "body", None), list)
+                and any(isinstance(statement, ast.Assign)
+                        and any(isinstance(target, ast.Name) and target.id == "needs_action_ref_log_prob"
+                                for target in statement.targets) for statement in node.body))
+    start = next(index for index, statement in enumerate(body)
+                 if isinstance(statement, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == "needs_action_ref_log_prob"
+                         for target in statement.targets))
+    stage = ast.parse("def action_ref_stage(self, batch, metrics, timing_raw): pass").body[0]
+    stage.body = body[start:start + 3] + [ast.Return(value=ast.Name(id="batch", ctx=ast.Load()))]
+
+    @contextlib.contextmanager
+    def timer(name, timing):
+        timing[name] = 0.0
+        yield
+
+    scope = {"torch": torch, "_timer": timer}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[stage], type_ignores=[])),
+                 str(path), "exec"), scope)
+    return scope[stage.name]
+
+
+action_ref_stage = load_action_ref_stage()
 
 
 class ConfigDict(dict):
@@ -201,7 +240,8 @@ def make_trainer(scores, trace=None):
         trainer=SimpleNamespace(n_gpus_per_node=1, nnodes=1),
         data=ConfigDict(task="qa", algorithm="slic", max_prompt_length=1024,
                         trace={"enabled": True, "k": 1, "terminal_fill_enabled": False, **(trace or {})}),
-        algorithm=ConfigDict(norm_adv_by_std_in_grpo=False),
+        algorithm=ConfigDict(norm_adv_by_std_in_grpo=False, use_kl_in_reward=False),
+        actor_rollout_ref=SimpleNamespace(actor=ConfigDict(use_kl_loss=False)),
     )
     trainer.algorithm = "slic"
     trainer.global_steps = 12
@@ -238,6 +278,109 @@ def value_rollout(rollout, values, reward, *, uid="q", trusted=True, final=True)
                              outcome_valid=trusted, outcome_success=reward > 0.5))
         scores[context] = 0.1 - 4.1 * np.exp(-value)
     return rows, scores
+
+
+class ActionReferenceTests(unittest.TestCase):
+    def test_trace_without_kl_skips_action_ref_but_still_scores_gt(self):
+        for task in ("qa", "alfworld"):
+            for algorithm in ("slic", "grpo+slic", "gigpo+slic"):
+                with self.subTest(task=task, algorithm=algorithm):
+                    rows, scores = standard_rows()
+                    trainer, history = make_trainer(scores), make_batch(rows)
+                    trainer.config.data["task"] = task
+                    trainer.algorithm = algorithm
+                    history.batch.pop("ref_log_prob")
+                    metrics, timing = {}, {}
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        history = action_ref_stage(trainer, history, metrics, timing)
+                    self.assertEqual(trainer.ref_policy_wg.calls, [])
+                    self.assertNotIn("ref_log_prob", history.batch)
+                    self.assertEqual(metrics["perf/action_ref_log_prob_skipped"], 1)
+                    self.assertEqual(timing["ref"], 0.)
+                    trainer._annotate_trace_credits(history)
+                    self.assertEqual(len(trainer.ref_policy_wg.calls), 1)
+                    pair = trainer._trans_to_trace_batch([history])[0]
+                    self.assertNotIn("ref_log_prob_a", pair.batch)
+                    self.assertEqual(pair.non_tensor_batch["turn_index_list_a"].tolist(), [1])
+                    self.assertEqual(pair.non_tensor_batch["turn_index_list_b"].tolist(), [1])
+
+    def test_either_kl_objective_keeps_the_real_action_reference_forward(self):
+        class Reference:
+            def __init__(self):
+                self.calls = []
+
+            def compute_ref_log_prob(self, batch):
+                self.calls.append(batch)
+                return Proto.from_dict({"ref_log_prob": torch.full_like(
+                    batch.batch["responses"], -0.75, dtype=torch.float32)})
+
+        for reward_kl, actor_kl in ((True, False), (False, True), (True, True)):
+            with self.subTest(reward_kl=reward_kl, actor_kl=actor_kl):
+                trainer, history = make_trainer({}), make_batch(standard_rows()[0])
+                trainer.config.algorithm["use_kl_in_reward"] = reward_kl
+                trainer.config.actor_rollout_ref.actor["use_kl_loss"] = actor_kl
+                trainer.ref_policy_wg = Reference()
+                history.batch.pop("ref_log_prob")
+                metrics, timing = {}, {}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    scored = action_ref_stage(trainer, history, metrics, timing)
+                self.assertEqual(len(trainer.ref_policy_wg.calls), 1)
+                torch.testing.assert_close(scored.batch["ref_log_prob"],
+                                           torch.full_like(scored.batch["responses"], -0.75,
+                                                           dtype=torch.float32))
+                self.assertEqual(metrics["perf/action_ref_log_prob_skipped"], 0)
+
+    def test_other_algorithms_and_disabled_trace_preserve_the_previous_requirement(self):
+        trainer = make_trainer({})
+        for algorithm in ("abpo", "grpo+abpo", "grpo+simpo", "slic+hspo", "unknown+slic", "grpo"):
+            with self.subTest(algorithm=algorithm):
+                trainer.algorithm = algorithm
+                self.assertTrue(trainer._needs_action_ref_log_prob())
+        trainer.algorithm = "grpo+slic"
+        trainer.config.data["trace"]["enabled"] = False
+        self.assertTrue(trainer._needs_action_ref_log_prob())
+        trainer.use_reference_policy = False
+        self.assertFalse(trainer._needs_action_ref_log_prob())
+
+    def test_missing_kl_configuration_does_not_silently_skip_action_scores(self):
+        trainer = make_trainer({})
+        del trainer.config.algorithm["use_kl_in_reward"]
+        self.assertTrue(trainer._needs_action_ref_log_prob())
+        trainer.config.algorithm["use_kl_in_reward"] = False
+        del trainer.config.actor_rollout_ref.actor["use_kl_loss"]
+        self.assertTrue(trainer._needs_action_ref_log_prob())
+        del trainer.config.actor_rollout_ref
+        self.assertTrue(trainer._needs_action_ref_log_prob())
+
+    def test_old_action_ref_fields_do_not_change_trace_pairs_or_baselines(self):
+        rows, scores = standard_rows()
+        trainer, previous = make_trainer(scores), make_batch(rows)
+        trainer._annotate_trace_credits(previous)
+        current = previous.select_rows(list(range(len(previous))))
+        current.batch.pop("ref_log_prob")
+        old_pair = trainer._trans_to_trace_batch([previous])[0]
+        new_pair = trainer._trans_to_trace_batch([current])[0]
+        self.assertEqual(set(old_pair.batch), set(new_pair.batch))
+        for name in old_pair.batch:
+            torch.testing.assert_close(old_pair.batch[name], new_pair.batch[name], equal_nan=True)
+        for name in ("group_baseline", "group_size", "turn_index_list_a", "turn_index_list_b"):
+            np.testing.assert_array_equal(old_pair.non_tensor_batch[name], new_pair.non_tensor_batch[name])
+
+    def test_trace_reports_separate_cpu_and_model_stages_including_no_requests(self):
+        rows, scores = standard_rows()
+        for gt in ("AB", ""):
+            with self.subTest(gt=gt):
+                for row in rows:
+                    row["gt"] = gt
+                trainer, history = make_trainer(scores), make_batch(rows)
+                metrics = trainer._annotate_trace_credits(history)
+                for phase in ("validation", "encoding", "scoring_prepare", "scoring",
+                              "scoring_postprocess", "credit"):
+                    self.assertGreaterEqual(metrics["trace/" + phase + "_seconds"], 0.)
+                if not gt:
+                    self.assertEqual(metrics["trace/scoring_seconds"], 0.)
+                    self.assertEqual(metrics["trace/scoring_prepare_seconds"], 0.)
+                    self.assertEqual(metrics["trace/scoring_postprocess_seconds"], 0.)
 
 
 class TraceTrainerIntegrationTests(unittest.TestCase):

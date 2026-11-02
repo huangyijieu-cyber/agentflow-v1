@@ -713,7 +713,11 @@ def encode_state_requests(
         raise ValueError("TRACE contexts and ground truths must be aligned")
     if answer_instructions is not None and len(answer_instructions) != len(contexts):
         raise ValueError("TRACE answer instructions and contexts must be aligned")
-    requests, row_requests, seen, target_cache = [], [], {}, {}
+    requests, seen, target_cache = [], {}, {}
+    row_requests = [None] * len(contexts)
+    # Pre/post boundaries and shared initial states are often repeated. Cache
+    # their actual template input before tokenization, independently of the GT.
+    contents, content_indices, valid_rows = [], {}, []
     counts = Counter(
         {
             key: 0
@@ -730,72 +734,93 @@ def encode_state_requests(
         answer = first_ground_truth(raw_gt)
         if answer is None:
             counts["missing_gt"] += 1
-            row_requests.append(None)
             continue
         if not isinstance(context, str) or not context.strip():
             counts["missing_state"] += 1
-            row_requests.append(None)
             continue
         if answer not in target_cache:
-            target_cache[answer] = tokenizer.encode(answer, add_special_tokens=False)
+            target_cache[answer] = tuple(tokenizer.encode(answer, add_special_tokens=False))
         target_ids = target_cache[answer]
         if not target_ids or len(target_ids) > max_gt_tokens:
             counts["invalid_gt_length"] += 1
-            row_requests.append(None)
             continue
         instruction = answer_instructions[row] if answer_instructions is not None else None
         instruction = answer_instruction if instruction is None else instruction
         if not isinstance(instruction, str) or not instruction.strip():
             raise ValueError("TRACE answer instruction must be a nonempty string")
         content = context.strip() + "\n\n" + instruction
-        prompt_ids = tokenizer.apply_chat_template(
-            [{"role": "user", "content": content}],
-            tokenize=True,
-            add_generation_prompt=True,
+        if content not in content_indices:
+            content_indices[content] = len(contents)
+            contents.append(content)
+        valid_rows.append((row, content_indices[content], target_ids))
+
+    conversations = [[{"role": "user", "content": content}] for content in contents]
+    if conversations and getattr(tokenizer, "is_fast", False):
+        # Hugging Face's batch chat-template API preserves the same special
+        # tokens as the scalar call and batches the fast tokenizer's native work.
+        # Leave padding/truncation disabled, exactly as in the scalar path.
+        encoded_prompts = tokenizer.apply_chat_template(
+            conversations, tokenize=True, add_generation_prompt=True,
         )
+    else:
+        # Minimal probe/test tokenizers and slow tokenizers need only implement
+        # the scalar API. They still benefit from pre-tokenization deduplication.
+        encoded_prompts = [tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True,
+        ) for messages in conversations]
+
+    prompt_keys = [tuple(ids) for ids in encoded_prompts]
+    for row, prompt_index, target_ids in valid_rows:
+        prompt_ids = prompt_keys[prompt_index]
         if not prompt_ids or len(prompt_ids) > max_prompt_length:
             counts["overlong_state"] += 1
-            row_requests.append(None)
             continue
-        key = (tuple(prompt_ids), tuple(target_ids))
+        key = (prompt_ids, target_ids)
         if key not in seen:
             seen[key] = len(requests)
             requests.append(
                 {"prompt_ids": list(prompt_ids), "target_ids": list(target_ids)}
             )
-        row_requests.append(seen[key])
+        row_requests[row] = seen[key]
     counts["scoring_requests"] = len(requests)
     return requests, row_requests, dict(counts)
 
 
 def build_score_tensors(requests, pad_token_id):
+    import numpy as np
     import torch
 
     if not requests:
         raise ValueError("Cannot build an empty TRACE scoring batch")
     prompt_width = max(len(r["prompt_ids"]) for r in requests)
     target_width = max(len(r["target_ids"]) for r in requests)
-    prompts = torch.full((len(requests), prompt_width), pad_token_id, dtype=torch.long)
-    responses = torch.full(
-        (len(requests), target_width), pad_token_id, dtype=torch.long
-    )
-    prompt_mask = torch.zeros_like(prompts)
-    response_mask = torch.zeros_like(responses)
+    # Build on CPU without launching thousands of tiny Torch operations. NumPy
+    # fills ragged rows and computes masks/positions in bulk; from_numpy shares
+    # each finished array with Torch without another full-batch copy.
+    prompts = np.full((len(requests), prompt_width), pad_token_id, dtype=np.int64)
+    responses = np.full((len(requests), target_width), pad_token_id, dtype=np.int64)
+    prompt_lengths = np.fromiter((len(r["prompt_ids"]) for r in requests), dtype=np.int64)
+    target_lengths = np.fromiter((len(r["target_ids"]) for r in requests), dtype=np.int64)
     for row, request in enumerate(requests):
         p, r = request["prompt_ids"], request["target_ids"]
-        prompts[row, -len(p) :] = torch.tensor(p, dtype=torch.long)
-        responses[row, : len(r)] = torch.tensor(r, dtype=torch.long)
-        prompt_mask[row, -len(p) :] = 1
-        response_mask[row, : len(r)] = 1
-    attention_mask = torch.cat((prompt_mask, response_mask), dim=-1)
-    return {
+        prompts[row, -len(p) :] = p
+        responses[row, : len(r)] = r
+    prompt_mask = np.arange(prompt_width)[None, :] >= prompt_width - prompt_lengths[:, None]
+    response_mask = np.arange(target_width)[None, :] < target_lengths[:, None]
+    attention_mask = np.concatenate((prompt_mask, response_mask), axis=-1).astype(np.int64)
+    response_mask = response_mask.astype(np.int64)
+    position_ids = attention_mask.cumsum(axis=-1)
+    position_ids -= 1
+    np.maximum(position_ids, 0, out=position_ids)
+    arrays = {
         "prompts": prompts,
         "responses": responses,
-        "input_ids": torch.cat((prompts, responses), dim=-1),
+        "input_ids": np.concatenate((prompts, responses), axis=-1),
         "attention_mask": attention_mask,
-        "position_ids": (attention_mask.cumsum(dim=-1) - 1).clamp(min=0),
+        "position_ids": position_ids,
         "response_mask": response_mask,
     }
+    return {key: torch.from_numpy(array) for key, array in arrays.items()}
 
 
 def mean_gt_logps(logps, response_mask):

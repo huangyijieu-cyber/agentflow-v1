@@ -29,6 +29,24 @@ class Tokenizer:
         return [1] + [ord(c) for c in messages[0]["content"]] + [2]
 
 
+class BatchTokenizer(Tokenizer):
+    """Model the HF fast tokenizer's scalar and batched template contract."""
+
+    is_fast = True
+
+    def __init__(self):
+        self.calls = []
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True):
+        self.calls.append(messages)
+        if isinstance(messages[0], list):
+            return [super(BatchTokenizer, self).apply_chat_template(
+                conversation, tokenize=tokenize, add_generation_prompt=add_generation_prompt,
+            ) for conversation in messages]
+        return super().apply_chat_template(messages, tokenize=tokenize,
+                                           add_generation_prompt=add_generation_prompt)
+
+
 class ScorePreparationTests(unittest.TestCase):
     def encode(self, contexts, gts, **kw):
         params = dict(max_prompt_length=1000, max_gt_tokens=256, answer_instruction="Answer.")
@@ -54,6 +72,64 @@ class ScorePreparationTests(unittest.TestCase):
         self.assertEqual(counts["overlong_state"], 1)
         self.assertEqual(counts["missing_state"], 1)
 
+    def test_fast_batch_and_scalar_paths_preserve_aliases_instructions_and_row_counts(self):
+        contexts = [" q ", "q", "q", "next", "q", "long" * 10, "long" * 10, None, "q", "q"]
+        gts = [["", "answer", "alias"], "answer", "other", "answer", "answer", "a", "a", "a", None, "x" * 20]
+        instructions = [None, None, None, None, "Other.", None, None, None, None, ""]
+        params = dict(max_prompt_length=30, max_gt_tokens=10, answer_instruction="Answer.",
+                      answer_instructions=instructions)
+        scalar = scoring.encode_state_requests(contexts, gts, Tokenizer(), **params)
+        tokenizer = BatchTokenizer()
+        batched = scoring.encode_state_requests(contexts, gts, tokenizer, **params)
+        self.assertEqual(batched, scalar)
+        requests, mapping, counts = batched
+        self.assertEqual(mapping[:5], [0, 0, 1, 2, 3])
+        self.assertEqual(mapping[5:], [None] * 5)
+        self.assertEqual(counts["overlong_state"], 2)
+        self.assertEqual(counts["missing_state"], 1)
+        self.assertEqual(counts["missing_gt"], 1)
+        self.assertEqual(counts["invalid_gt_length"], 1)
+        self.assertEqual(len(requests), 4)
+        self.assertEqual(len(tokenizer.calls), 1)
+        # Different GT strings share prompt encoding, while each instruction
+        # remains part of the actual prompt. The two overlong rows share work.
+        self.assertEqual(len(tokenizer.calls[0]), 4)
+
+    def test_scalar_tokenizer_encodes_a_shared_prompt_once_even_for_different_targets(self):
+        tokenizer = Tokenizer()
+        tokenizer.apply_chat_template = Mock(wraps=tokenizer.apply_chat_template)
+        requests, mapping, _ = scoring.encode_state_requests(
+            ["q", " q ", "q"], ["a", "b", "a"], tokenizer,
+            max_prompt_length=30, max_gt_tokens=10, answer_instruction="Answer.",
+        )
+        self.assertEqual(mapping, [0, 1, 0])
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(tokenizer.apply_chat_template.call_count, 1)
+
+    def test_different_texts_that_tokenize_identically_still_deduplicate(self):
+        class NormalizingTokenizer(Tokenizer):
+            def apply_chat_template(self, messages, **kwargs):
+                return super().apply_chat_template(
+                    [{"role": "user", "content": messages[0]["content"].lower()}], **kwargs)
+        requests, mapping, counts = scoring.encode_state_requests(
+            ["STATE", "state"], ["a", "a"], NormalizingTokenizer(),
+            max_prompt_length=30, max_gt_tokens=10, answer_instruction="Answer.",
+        )
+        self.assertEqual(mapping, [0, 0])
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(counts["scoring_requests"], 1)
+
+    def test_fast_tokenizer_empty_input_does_not_call_template(self):
+        tokenizer = BatchTokenizer()
+        requests, mapping, counts = scoring.encode_state_requests(
+            [None, "q"], ["a", None], tokenizer,
+            max_prompt_length=30, max_gt_tokens=10, answer_instruction="Answer.",
+        )
+        self.assertEqual(requests, [])
+        self.assertEqual(mapping, [None, None])
+        self.assertEqual(tokenizer.calls, [])
+        self.assertEqual(counts["scoring_requests"], 0)
+
     def test_left_prompt_right_target_padding_and_position_ids(self):
         requests = [{"prompt_ids": [1, 2], "target_ids": [4]},
                     {"prompt_ids": [1], "target_ids": [4, 5]}]
@@ -61,6 +137,28 @@ class ScorePreparationTests(unittest.TestCase):
         self.assertEqual(tensors["input_ids"].tolist(), [[1, 2, 4, 0], [0, 1, 4, 5]])
         self.assertEqual(tensors["attention_mask"].tolist(), [[1, 1, 1, 0], [0, 1, 1, 1]])
         self.assertEqual(tensors["position_ids"].tolist(), [[0, 1, 2, 2], [0, 0, 1, 2]])
+
+    def test_bulk_tensor_construction_matches_ragged_teacher_forcing_with_real_pad_tokens(self):
+        requests = [{"prompt_ids": [9, 0, 4], "target_ids": [0, 7]},
+                    {"prompt_ids": [0], "target_ids": [8]},
+                    {"prompt_ids": [1, 2], "target_ids": [3, 0, 5, 6]}]
+        tensors = scoring.build_score_tensors(requests, 0)
+        for key, tensor in tensors.items():
+            self.assertEqual(tensor.dtype, torch.long, key)
+            self.assertEqual(tensor.device.type, "cpu", key)
+        self.assertEqual(tensors["prompts"].tolist(), [[9, 0, 4], [0, 0, 0], [0, 1, 2]])
+        self.assertEqual(tensors["responses"].tolist(), [[0, 7, 0, 0], [8, 0, 0, 0], [3, 0, 5, 6]])
+        self.assertEqual(tensors["response_mask"].tolist(), [[1, 1, 0, 0], [1, 0, 0, 0], [1, 1, 1, 1]])
+        self.assertEqual(tensors["attention_mask"].tolist(),
+                         [[1, 1, 1, 1, 1, 0, 0], [0, 0, 1, 1, 0, 0, 0], [0, 1, 1, 1, 1, 1, 1]])
+        self.assertEqual(tensors["position_ids"].tolist(),
+                         [[0, 1, 2, 3, 4, 4, 4], [0, 0, 0, 1, 1, 1, 1], [0, 0, 1, 2, 3, 4, 5]])
+        # Tensor fields were separate before the optimization. Keep writes to
+        # one field from modifying input_ids behind another consumer's back.
+        original_inputs = tensors["input_ids"].clone()
+        tensors["prompts"][0, 0] = 99
+        tensors["responses"][0, 0] = 99
+        self.assertTrue(torch.equal(tensors["input_ids"], original_inputs))
 
     def test_logp_mean_masks_padding_and_preserves_invalid_rows(self):
         means = scoring.mean_gt_logps(

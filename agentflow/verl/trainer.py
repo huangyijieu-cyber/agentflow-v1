@@ -244,8 +244,32 @@ class AgentFlowTrainer(RayPPOTrainer):
         return SequenceMatcher(None, a, b).ratio() >= thresh
 
 
+    def _needs_action_ref_log_prob(self):
+        """A frozen GT scorer does not itself require reference action scores."""
+        if not self.use_reference_policy:
+            return False
+        parts = set(str(getattr(self, "algorithm", self.config.data.get("algorithm", ""))).split("+"))
+        # Keep the previous behavior for other losses and for non-TRACE runs.
+        # SLiC uses its group baseline, while GRPO/GiGPO only consume action
+        # reference LogP when a KL objective is explicitly enabled.
+        if (not self.config.data.get("trace", {}).get("enabled", False)
+                or "slic" not in parts or not parts <= {"grpo", "gigpo", "slic"}):
+            return True
+        algorithm_cfg = getattr(self.config, "algorithm", None)
+        rollout_cfg = getattr(self.config, "actor_rollout_ref", None)
+        if algorithm_cfg is None or rollout_cfg is None:
+            return True
+        actor_cfg = (rollout_cfg.get("actor") if hasattr(rollout_cfg, "get")
+                     else getattr(rollout_cfg, "actor", None))
+        if actor_cfg is None:
+            return True
+        return bool(algorithm_cfg.get("use_kl_in_reward", True)
+                    or actor_cfg.get("use_kl_loss", True))
+
+
     def _annotate_trace_credits(self, batch):
         """Score actual turn contexts with the frozen reference, then difference neighbors."""
+        trace_start = time.perf_counter()
         cfg = TraceConfig.from_mapping(self.config.data.get("trace", {}))
         if not self.use_reference_policy:
             raise RuntimeError("TRACE-SLIC requires a frozen reference policy")
@@ -316,6 +340,7 @@ class AgentFlowTrainer(RayPPOTrainer):
         instructions = non.get("trace_answer_instruction")
         score_instructions = (None if instructions is None else
                               list(instructions) + [instructions[row] for row in alfworld_rows])
+        encoding_start = time.perf_counter()
         requests, row_requests, counters = encode_state_requests(
             score_contexts, score_targets, self.tokenizer,
             max_prompt_length=self.config.data.max_prompt_length,
@@ -323,10 +348,13 @@ class AgentFlowTrainer(RayPPOTrainer):
             answer_instruction=cfg.answer_instruction,
             answer_instructions=score_instructions,
         )
+        encoding_seconds = time.perf_counter() - encoding_start
         row_logps = np.full(size, np.nan, dtype=np.float64)
         next_logps = np.full(size, np.nan, dtype=np.float64)
         scoring_seconds = 0.0
+        prepare_seconds = postprocess_seconds = 0.0
         if requests:
+            prepare_start = time.perf_counter()
             pad_id = self.tokenizer.pad_token_id
             if pad_id is None:
                 pad_id = self.tokenizer.eos_token_id
@@ -338,19 +366,27 @@ class AgentFlowTrainer(RayPPOTrainer):
             )
             scorer = self.actor_rollout_wg if self.ref_in_actor else self.ref_policy_wg
             probes, probe_padding = pad_dataproto_to_divisor(probes, scorer.world_size)
+            prepare_seconds = time.perf_counter() - prepare_start
             scoring_start = time.perf_counter()
             scored = scorer.compute_ref_log_prob(probes)
             scoring_seconds = time.perf_counter() - scoring_start
+            postprocess_start = time.perf_counter()
             scored = unpad_dataproto(scored, pad_size=probe_padding)
             probes = unpad_dataproto(probes, pad_size=probe_padding)
-            logps = mean_gt_logps(scored.batch["ref_log_prob"], probes.batch["response_mask"])
-            for row, request_index in enumerate(row_requests[:size]):
-                if request_index is not None:
-                    row_logps[row] = logps[request_index]
-            for row, request_index in zip(alfworld_rows, row_requests[size:]):
-                if request_index is not None:
-                    next_logps[row] = logps[request_index]
+            logps = np.asarray(mean_gt_logps(
+                scored.batch["ref_log_prob"], probes.batch["response_mask"]), dtype=np.float64)
+            request_indices = np.fromiter(
+                (-1 if index is None else index for index in row_requests),
+                dtype=np.int64, count=len(row_requests),
+            )
+            mapped = np.full(len(row_requests), np.nan, dtype=np.float64)
+            valid_requests = request_indices >= 0
+            mapped[valid_requests] = logps[request_indices[valid_requests]]
+            row_logps[:] = mapped[:size]
+            next_logps[np.asarray(alfworld_rows, dtype=np.int64)] = mapped[size:]
+            postprocess_seconds = time.perf_counter() - postprocess_start
 
+        credit_start = time.perf_counter()
         values = np.full(size, np.nan, dtype=np.float64)
         next_values = np.full(size, np.nan, dtype=np.float64)
         credits = np.full(size, np.nan, dtype=np.float64)
@@ -549,6 +585,10 @@ class AgentFlowTrainer(RayPPOTrainer):
         metrics["trace/credit_windows_blocked"] = int(blocked.sum())
         metrics["trace/post_final_turns"] = int((~within_prefix).sum())
         metrics["trace/scoring_seconds"] = scoring_seconds
+        metrics["trace/validation_seconds"] = encoding_start - trace_start
+        metrics["trace/encoding_seconds"] = encoding_seconds
+        metrics["trace/scoring_prepare_seconds"] = prepare_seconds
+        metrics["trace/scoring_postprocess_seconds"] = postprocess_seconds
         metrics["trace/scoring_invalid_result_turns"] = sum(
             index is not None and not np.isfinite(row_logps[row])
             for row, index in enumerate(row_requests[:size])
@@ -557,6 +597,7 @@ class AgentFlowTrainer(RayPPOTrainer):
             index is not None and not np.isfinite(next_logps[row])
             for row, index in zip(alfworld_rows, row_requests[size:])
         )
+        metrics["trace/credit_seconds"] = time.perf_counter() - credit_start
         return metrics
 
     def _trans_to_trace_batch(self, history_batch_list):
@@ -564,7 +605,7 @@ class AgentFlowTrainer(RayPPOTrainer):
         cfg = TraceConfig.from_mapping(self.config.data.get("trace", {}))
         split_keys = ["input_ids", "attention_mask", "old_log_probs", "position_ids",
                       "prompts", "response_mask", "responses", "token_level_scores"]
-        if self.use_reference_policy:
+        if self._needs_action_ref_log_prob():
             split_keys.append("ref_log_prob")
         common_keys = ["data_id_list", "uid", "traj_id_list", "traj_uid"]
         side_keys = ["turn_index_list", "rollout_id_list", "trace_turn_type",
@@ -1137,7 +1178,10 @@ class AgentFlowTrainer(RayPPOTrainer):
                 old_log_prob.batch.pop("entropys")
                 batch = batch.union(old_log_prob)
 
-            if self.use_reference_policy:
+            needs_action_ref_log_prob = self._needs_action_ref_log_prob()
+            metrics["perf/action_ref_log_prob_skipped"] = int(
+                self.use_reference_policy and not needs_action_ref_log_prob)
+            if needs_action_ref_log_prob:
                 print(f"use_reference_policy: {self.use_reference_policy}")
                 # compute reference log_prob
                 with _timer("ref", timing_raw), torch.no_grad():
@@ -1145,6 +1189,9 @@ class AgentFlowTrainer(RayPPOTrainer):
                     ref_log_prob = ref_worker.compute_ref_log_prob(batch)
                     print("ref_log_prob:", ref_log_prob)
                     batch = batch.union(ref_log_prob)
+            elif self.use_reference_policy:
+                timing_raw["ref"] = 0.0
+                print("Skipping unused action reference LogP; frozen TRACE GT scoring remains enabled.")
 
             # compute values
             if self.use_critic:

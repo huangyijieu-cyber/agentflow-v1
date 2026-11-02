@@ -108,6 +108,30 @@ export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305_with_gt.parquet
 
 窗口使用和旧缓存升级见 [alfworld-trace-probe.md](alfworld-trace-probe.md)。建议先跑固定四条轨迹，查看 GT、Goal/环境校验、local credit、terminal fill 和最终 effective credit，再开始训练。文本 LogP 是参考模型对目标描述的支持程度；它的成功率校准与信用质量需要实验检验。
 
+## TRACE 评分性能
+
+2026-11-02 提供的 ALFWorld 首步日志中，64 条 rollout 产生 1884 个训练 turn，3768 个动作前/后状态候选去重为 984 个实际 GT 评分请求。整个 step 用时 691.82 秒，分布如下；不能把 rollout 后的全部等待都归给参考模型：
+
+| 阶段 | 秒 |
+| --- | ---: |
+| rollout、组装和休眠（`timing_s/gen`） | 141.42 |
+| actor 动作旧 LogP | 84.06 |
+| 普通 reference 动作 LogP | 111.38 |
+| TRACE 编码、GT 评分和 credit | 185.24 |
+| 其中 GT reference 调用（已包含在上一项） | 112.98 |
+| GRPO 更新 | 166.85 |
+| SLIC 更新 | 0.002（本步没有合格配对） |
+
+性能优化保留环境、rollout、冻结参考模型、GT 文本、teacher-forcing token 序列、V/credit 公式与同 turn 配对规则。对于启用 TRACE、两种 KL 均关闭的 GRPO/GiGPO/SLIC 组合，跳过损失不消费的普通动作 reference LogP；GT reference 评分继续执行。其他算法或需要 KL 时保留动作 reference 评分。编码先按最终输入文本复用相同状态，再使用 HF fast tokenizer 的批量 chat-template 接口；非 fast tokenizer 兼容原标量接口。最终仍按 prompt/GT token IDs 去重，原始行的无效原因、长度限制和映射保持不变。CPU 张量构造和评分结果回填采用批量数组操作，避免逐行创建 Torch 小张量；缓存仅存在于本次评分调用，不跨训练 step 积累。
+
+批量分词可使用 fast tokenizer 的原生并行能力，并遵守部署环境的分词器并行设置。模型评分继续使用原有 Ray/FSDP/SP 分布式路径；不让 actor 与 reference 在同组 NPU 上额外并发，不改变 SP 或提高默认 microbatch。GT 虽短，模型仍需处理完整状态上下文；本地 CPU 微基准不等于服务器端的实际 step 加速。
+
+日志中的 `trace/scoring_seconds` 只包含 GT reference 调用；`timing_s/trace` 还包含编码、张量准备、credit 和统计。新增 `trace/validation_seconds`、`trace/encoding_seconds`、`trace/scoring_prepare_seconds`、`trace/scoring_postprocess_seconds` 和 `trace/credit_seconds` 分别报告校验、编码、评分张量准备、结果回填以及 credit/统计耗时。`perf/action_ref_log_prob_skipped=1` 且 `timing_s/ref=0` 表示省掉了普通动作 reference，GT 评分仍由 `trace/scoring_seconds` 计时。
+
+按上述单步数据，仅省掉普通动作 reference 就对应约 111 秒的原有工作量，但最终耗时需要用服务器上的后续 step 实测，不能承诺训练 step 与 rollout 一样短。本步选中 0 对是配对约束下的实际结果，性能改动不会放宽阈值或制造配对。
+
+本地等价验证使用真实 `PreTrainedTokenizerFast`（Transformers 4.57.1 / Tokenizers 0.22.2，ByteLevel BPE 与 Jinja 模板），覆盖重复输入、Unicode、不同 GT/指令、缺失字段和长度边界。新旧 requests、行映射、计数和六个评分张量逐元素一致。3768 个候选、984 个唯一请求、约 1240-token 合成上下文的 CPU 基准中，编码中位耗时从 3.10 秒降至 0.424 秒，张量构造从 0.0357 秒降至 0.0188 秒；此结果仅说明本地 CPU 路径变化，未使用服务器的 Qwen tokenizer 或执行 NPU 训练。
+
 ## HCCL 端口故障定位
 
 分布式启动脚本 `train-roma/run_distribute_train.sh` 在加载 Ascend 环境后、启动 Ray 前，默认设置 `HCCL_IF_BASE_PORT=20000`，并输出它及更高优先级的 `HCCL_HOST_SOCKET_PORT_RANGE`。按 32 个端口规划 `20000–20031`，避开已观察服务器的系统临时端口范围 `32768–60999`，防止普通连接的自动源端口分配使用默认 HCCL 的 `60000` 段。此配置适用于 QA 和 ALFWorld，不改变训练、rollout、SP 或 TRACE 算法。

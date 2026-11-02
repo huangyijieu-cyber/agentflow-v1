@@ -138,6 +138,33 @@ class AlfworldPipelineTests(unittest.TestCase):
                     self.assertEqual(pair.non_tensor_batch["trace_gt_a"].tolist(), [GOAL])
                     self.assertEqual(pair.non_tensor_batch["trace_task_a"].tolist(), ["alfworld"])
 
+    def test_skipping_action_reference_keeps_real_alfworld_gt_credit_and_pairs(self):
+        for path in ("train-roma/rollout.py", "train-roma/rollout_main_profiled.py"):
+            with self.subTest(path=path):
+                reference, optimized = self.batch(path), self.batch(path)
+                optimized.batch.pop("ref_log_prob")
+                original_trainer, optimized_trainer = self.trainer(), self.trainer()
+                original_trainer._annotate_trace_credits(reference)
+                metrics, timing = {}, {}
+                optimized = training.action_ref_stage(optimized_trainer, optimized, metrics, timing)
+                self.assertEqual(optimized_trainer.ref_policy_wg.calls, [])
+                optimized_trainer._annotate_trace_credits(optimized)
+                self.assertEqual(len(optimized_trainer.ref_policy_wg.calls), 1)
+                self.assertEqual(metrics["perf/action_ref_log_prob_skipped"], 1)
+                for key in ("trace_gt_logp", "trace_next_gt_logp", "trace_value", "trace_next_value",
+                            "trace_local_credit", "trace_terminal_fill", "trace_credit"):
+                    np.testing.assert_array_equal(reference.non_tensor_batch[key], optimized.non_tensor_batch[key])
+                original_pairs = original_trainer._trans_to_trace_batch([reference])
+                optimized_pairs = optimized_trainer._trans_to_trace_batch([optimized])
+                self.assertTrue(optimized_pairs)
+                self.assertEqual(len(original_pairs), len(optimized_pairs))
+                for old, new in zip(original_pairs, optimized_pairs):
+                    self.assertNotIn("ref_log_prob_a", new.batch)
+                    for key in old.batch:
+                        self.assertTrue(torch.equal(old.batch[key], new.batch[key]), key)
+                    for key in ("group_baseline", "group_size", "turn_index_list_a", "turn_index_list_b"):
+                        np.testing.assert_array_equal(old.non_tensor_batch[key], new.non_tensor_batch[key])
+
     def test_invalid_goal_state_blocks_reference_credit_and_terminal_labels(self):
         history, trainer = self.batch("train-roma/rollout.py", invalid=1), self.trainer()
         trainer._annotate_trace_credits(history)
