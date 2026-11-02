@@ -1,5 +1,7 @@
 # TRACE 状态信用与分类型 SLIC 配对
 
+当前 QA 算法版本为 **v2a2**（动态范围回填），改动前为 **v2a1**（固定系数回填）。`v1`、`v2a`、`v2b`、`v2a1`、`v2a2` 的定义与固定提交见 [版本记录](trace-slic-change-log.md#版本名称与固定代码快照)。
+
 QA 的状态、终局和回填语义见下文；ALFWorld 的真实后状态与统一环境动作信用见 [ALFWorld 接入说明](alfworld-trace-goals.md)。两个任务的 SLIC 工具/环境动作均仅允许同题同原始 Turn id 配对。
 
 本实现按决策类型选择偏好标签：analysis 和实际最终回答使用可验证的最终任务结果，工具 Turn 使用 K-step GT 信用及可选的终局优势回填。配对质量优先；没有合格正负两侧时跳过，不为凑数量放宽条件。SLIC Loss、原 GRPO 训练公式和 Replay 更新剂量保持原样。
@@ -8,7 +10,7 @@ QA 的状态、终局和回填语义见下文；ALFWorld 的真实后状态与�
 
 ## 状态与 GT 评分
 
-每个可训练 Turn 保存自己的 `trace_state_context`：从实际 Prompt 中去掉当前决策指令、Task 和输出格式要求，保留该角色原有问题、工具信息、分析或交互历史。统一附加：
+从 `v2a1` 起，QA 各类型 Turn 的 `trace_state_context` 统一使用问题与动作执行前的工具历史快照，不因切换到 final 而增删分析文本或改变评分模板。快照沿用生成时读取的有界工具历史，不扩大记忆窗口；实际生成 Prompt 保持原样。评分时统一附加：
 
 ```text
 Answer the question directly and concisely.
