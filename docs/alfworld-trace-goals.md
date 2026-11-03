@@ -2,9 +2,11 @@
 
 转换与训练已分开：只转换训练 Parquet 选中的题，将固定英文 GT 写入 `result`，同时在该 Parquet 中保存规则和游戏映射。训练直接读取该行 `result`，不在 reset 或 turn 中转换，也不依赖单独的 SQLite 文件。
 
-此实现使用完整环境状态进行参考模型评分（privileged/full-state）。策略模型继续接收原来的可见观察和有限历史。完整状态只进入评分上下文；固定 Response 描述成功条件，每道题的所有状态复用同一文本。
+此实现使用完整环境状态进行参考模型评分（privileged/full-state）。策略模型继续接收原来的可见观察和有限历史。当前 ALFWorld **v2b** 将 `result` 中的成功条件放进评分 Prompt，固定 Response 为 `The agent will successfully complete the task within the remaining action budget.`，同题所有状态使用相同 Response。原来评分成功条件原文的版本已保存为 `alfworld-v2a`（`3f7abe9`）；当前版本使用 `alfworld-v2b` 标签，与旧 QA 的 `v2a` / `v2b` 标签分开。完整模板和差异见 [ALFWorld 评分版本](alfworld-scoring-versions.md)。
 
-评分 Prompt 现不再附加累计动作/观察历史：保留任务、环境规则、事实解释、初始事实、当前新增/删除事实、当前观察和固定评分指令。当前事实已包含 Goal 所需的持久标记；历史记录仍保留在环境/轨迹中用于排查，策略最近四步历史保持原样。此缩减只改变 ALFWorld full-state 评分文本，不改变 GT Response、信用公式或配对规则。已有 GT Parquet 无需重新转换，重启训练/rollout 进程后使用新文本。已有 Probe 缓存的 `state_context` 不会自动更新；含完整事实时运行 `enrich --work-dir ...` 重建评分 sidecar 后再评分，无需重新采样。
+评分 Prompt 不附加累计动作/观察历史：保留任务、成功条件、环境规则、事实解释、初始事实、当前新增/删除事实、当前观察、剩余动作预算和固定预测指令。当前事实已包含 Goal 所需的持久标记；历史记录仍保留在环境/轨迹中用于排查，策略最近四步历史保持原样。预算为 `max(0, min(外层 max_step, 官方环境步数上限) - 已执行步数)`，仅描述现有上限，不改变模拟器或 rollout。成功提前终止时仍报告实际剩余预算，指令明确已满足全部条件即算完成。
+
+已有 GT Parquet 无需重新转换；其中 `result`、PDDL 规则和哈希均保持原格式。重启训练及 rollout 进程后生效，trainer 会拒绝缺少 v2b 评分版本信息的旧 ALFWorld rollout，避免旧 Prompt 与新 Response 混用。QA、信用公式、配对、GiGPO、actor 和 replay 机制保持原样。
 
 ## 规则来源与转换
 
@@ -33,7 +35,7 @@ python agentflow/agentflow/trace/alfworld_goal_store.py prepare \
 | `alfworld_game_key` | 选中游戏在 games-root 下的相对路径 |
 | `alfworld_goal_row` | 原始行号、question、题号和数据集/选择哈希 JSON |
 
-完整规则较长，因此不放进 `result`；`result` 只保存用于 teacher-forcing 的固定英文 Response。`extra_info_ground_truth` 等其余原始列保持原值。可以继续用 `data/parquet_viewer.py` 查看新文件中的 `result`。
+完整规则较长，因此不放进 `result`；`result` 只保存确定性英文成功条件。v2a 直接将它作为 teacher-forcing Response，v2b 将它放入 Prompt 的 Success conditions 区域，独立评分固定的未来成功句。`extra_info_ground_truth` 等其余原始列保持原值。可以继续用 `data/parquet_viewer.py` 查看新文件中的 `result`。
 
 原始 Parquet 默认保留，输出已存在时拒绝覆盖；明确重建才使用 `--overwrite`。进度实时显示已处理/总题数、百分比、耗时及 ETA。只有最终出现 `[complete] ... Training Parquet saved successfully.` 才表示新训练文件发布成功；100% 后仍有保存和校验阶段。
 
@@ -79,7 +81,7 @@ ALFWorld 环境、solver、两个 rollout 入口、daemon 和 trainer 均传递�
 | value match epsilon | 0.05 |
 | 正/负信用阈值、信用差阈值 | 0.01 / 0.01 / 0.02 |
 | length ratio / 每题每原始 turn 的 pair / 每步 pair | 1.8 / 2 / 256 |
-| GT token 上限 | 256，超长判无效，不截断 |
+| 评分 Response token 上限 | 256，超长判无效，不截断；v2b 评分固定未来成功句 |
 | GRPO、SLIC loss、Replay | 沿用现有 QA 实现 |
 
 首轮、中间轮和最后一轮都标为 `tool_plan`，仅在同题、同原始 turn id 内，按动作前 V 接近及严格正/负有效信用配对；每题每个 turn 默认独立最多 2 对。末动作不单独划入 `base` / outcome，它只能与其他轨迹中相同 turn id 的合格环境动作配对，不允许跨 turn。T 个动作对应 T+1 个真实状态，最后动作后的终止状态参与最后一步 `V_next - V`，但不新增模型回答或训练 turn。`trace_is_terminal` 只表示已完成的环境终止动作，用于截断信用窗口与终局回填；ALFWorld 的 `trace_is_final` 恒为 false。可信的步数预算耗尽属于终局失败；外部崩溃和无法核验的状态不作为失败奖励。
@@ -106,9 +108,9 @@ export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305_with_gt.parquet
 
 数据路径与 `BASE_DATA_DIR` 组合，由现有 `train-roma/config.yaml` 解析；使用自定义启动配置时，将 TASK、数据路径和 TRACE 配置传入两个 rollout 入口及训练进程。无需为 ALFWorld 改 QA 的 epsilon、K、gamma、配对阈值或 loss。参考模型保持冻结，且 tokenizer 必须与参考模型一致。
 
-完整状态比策略可见上下文长。`MAX_PROMPT_LENGTH` 必须容纳规则、完整初始事实、状态变化和评分指令；超过上限会排除该状态并记录无效原因，不静默截断。先用 Probe 检查实际 token 数，再据服务器显存/序列上限设置。固定 GT 超过 256 tokens 时同样会明确标记无效，可检查转换文本及模型 tokenizer 后再决定是否提高与 QA 共用的上限。
+完整状态比策略可见上下文长。`MAX_PROMPT_LENGTH` 必须容纳成功条件、规则、完整初始事实、状态变化、当前观察、剩余预算和评分指令；超过上限会排除该状态并记录无效原因，不静默截断。先用 Probe 检查实际 token 数，再据服务器显存/序列上限设置。评分 Response 仍受与 QA 共用的 256-token 上限约束；v2b 使用固定短句，不对 Prompt 中的成功条件应用这个 Response 长度上限。
 
-窗口使用和旧缓存升级见 [alfworld-trace-probe.md](alfworld-trace-probe.md)。建议先跑固定四条轨迹，查看 GT、Goal/环境校验、local credit、terminal fill 和最终 effective credit，再开始训练。文本 LogP 是参考模型对目标描述的支持程度；它的成功率校准与信用质量需要实验检验。
+窗口使用和旧缓存升级见 [alfworld-trace-probe.md](alfworld-trace-probe.md)。建议复用固定四条轨迹，查看评分 Prompt/Response、Goal/环境校验、local credit、terminal fill 和最终 effective credit，再开始训练。v2b 的文本 LogP 是参考模型对未来成功陈述的支持程度，其成功率校准、单调性与信用质量仍需用实际轨迹结果检验。
 
 ## TRACE 评分性能
 

@@ -24,6 +24,24 @@ DEFAULT_ANSWER_INSTRUCTION = (
     "they currently hold."
 )
 
+# Runtime scoring version; independent of the persisted PDDL/GT schema above.
+FORECAST_SCORING_VERSION = "alfworld-v2b-future-success-v1"
+FORECAST_RESPONSE = (
+    "The agent will successfully complete the task within the remaining action budget."
+)
+FORECAST_INSTRUCTION = (
+    "Predict whether the agent will satisfy all success conditions before the "
+    "remaining action budget is exhausted.\n"
+    "Base your prediction on the verified current state, the actions still "
+    "required, and the applicable environment rules.\n"
+    "Conditions that are not satisfied yet may be achieved through subsequent "
+    "actions. Do not assume that success is guaranteed or that future actions "
+    "will be perfect.\n"
+    "If all success conditions already hold, count the task as completed; no "
+    "further actions are required.\n"
+    "State your prediction about the final outcome of this episode."
+)
+
 PREDICATE_ARITIES = {
     "atlocation": 2, "receptacleatlocation": 2, "objectatlocation": 2,
     "openable": 1, "opened": 1, "inreceptacle": 2,
@@ -690,6 +708,25 @@ def render_full_state(spec, facts, *, observation=None, action_history=None,
         lines.append("Current observation (additional textual evidence):\n" + str(observation))
     lines.append("The desired goal is not an observed achievement. A true initial flag does not prove an action happened during this episode.")
     return "\n\n".join(lines)
+
+
+def render_forecast_state(spec, facts, *, task, goal_response, remaining_steps,
+                          observation=None) -> str:
+    """Condition a future-success forecast on requirements and verified facts.
+
+    The saved goal text remains unchanged and is explicitly a requirement, not
+    an observed achievement. No rollout outcome or reward is exposed here.
+    """
+    if not isinstance(goal_response, str) or not goal_response.strip():
+        raise GoalConversionError("Future-success scoring requires saved success conditions")
+    if isinstance(remaining_steps, bool) or not isinstance(remaining_steps, int) or remaining_steps < 0:
+        raise GoalConversionError("Remaining action budget must be a nonnegative integer")
+    return "\n\n".join((
+        f"Task: {task}",
+        "Success conditions (requirements, not observed facts):\n" + goal_response,
+        render_full_state(spec, facts, observation=observation),
+        f"Remaining action budget:\n{remaining_steps}",
+    ))
 
 
 def main(argv=None):
