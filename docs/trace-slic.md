@@ -1,6 +1,6 @@
 # TRACE 状态信用与分类型 SLIC 配对
 
-版本命名、差异、参数对照和代码快照统一维护于桌面文档 `webwalker-trace版本记录.md`。**v3a＝原 v2a1，v3b＝原 v2a2**。最新实验 **v3d** 沿用 v3c 的 Replay 容量 512、采样 ×4 和严格 V 匹配，主要设置为 `k_pairs_per_group=None`（YAML 为 `null`），允许同题同类型工具跨 Turn 配对并取消组内数量上限。QA 信用沿用 v3b 的动态范围回填；当前构对采用先 V 匹配、再在兼容负例池内排序轮转，具体规则见配对章节。
+版本命名、差异、参数对照和代码快照统一维护于桌面文档 `webwalker-trace版本记录.md`。**v3a＝原 v2a1，v3b＝原 v2a2**。最新实验 **v3d** 沿用 v3c 的 Replay 容量 512、采样 ×4 和严格 V 匹配，主要设置为 `k_pairs_per_group=None`（YAML 为 `null`），允许同题同类型工具跨 Turn 配对并取消组内数量上限。QA 信用沿用 v3b 的动态范围回填；当前构对默认先 V 匹配、再在兼容负例池内排序轮转；可关闭 `pair_round_robin` 恢复全组合候选，具体规则见配对章节。
 
 **v3c、v3d 均开启严格价值匹配**：`outcome_match_value=true`、`match_epsilon=0.05`，analysis／final 也必须满足 `abs(V_i - V_j) <= 0.05`，并保留可信终局成功／失败标签。此处记录实验实际设置，基础配置默认值仍为 `false`。
 
@@ -123,7 +123,9 @@ $$
 
 analysis／final 依据可信成功／失败分池。基础配置的 `outcome_match_value` 默认为 `false`；v3c、v3d 实验显式设为 `true`，额外要求两侧 V 有效且 `abs(V_i - V_j) <= 0.05`，baseline 同步采用 V 邻域。工具 Turn 仍要求严格正负有效信用，没有负样本不以终局 reward 兜底。两条路线都保留响应长度比、相同动作排除和相应数量上限。
 
-当前实现先做 V 匹配，再在兼容负例池内排序轮转：每组 Chosen 按偏好分数降序处理，同分按样本索引升序；对每个 Chosen，先筛出 `abs(V_i - V_j) <= match_epsilon` 的 Rejected。`match_epsilon=0` 要求浮点 V 精确相等，大于 0 时按每个 Chosen 的实际邻域筛选，不四舍五入分桶，也不传递合并邻域。兼容池内优先选择此前分配次数最少的负例，同次数按偏好分数升序、样本索引升序选择；固定兼容池中的负例用完后才循环。每个 Chosen 最多分配一次；没有兼容负例时记为 V 匹配拒绝，分配后仍按原信用差、长度和动作不同等条件过滤，失败不补选。analysis／final 仅在 `outcome_match_value=true` 时执行前置 V 筛选，否则沿用不匹配 V 的轮转。工具使用有效信用作为偏好分数，analysis／final 使用终局 reward；其余优先级、阈值、配对额度、信用与损失不变。v3d 原实验对应全组合构对，历史实验定义保持原记录。
+`pair_round_robin=true`（默认）时，先做 V 匹配，再在兼容负例池内排序轮转：每组 Chosen 按偏好分数降序处理，同分按样本索引升序；对每个 Chosen，先筛出 `abs(V_i - V_j) <= match_epsilon` 的 Rejected。`match_epsilon=0` 要求浮点 V 精确相等，大于 0 时按每个 Chosen 的实际邻域筛选，不四舍五入分桶，也不传递合并邻域。兼容池内优先选择此前分配次数最少的负例，同次数按偏好分数升序、样本索引升序选择；固定兼容池中的负例用完后才循环。每个 Chosen 最多分配一次；没有兼容负例时记为 V 匹配拒绝，分配后仍按原信用差、长度和动作不同等条件过滤，失败不补选。analysis／final 仅在 `outcome_match_value=true` 时执行前置 V 筛选，否则沿用不匹配 V 的轮转。工具使用有效信用作为偏好分数，analysis／final 使用终局 reward；其余优先级、阈值、配对额度、信用与损失不变。v3d 原实验对应全组合构对，历史实验定义保持原记录。
+
+`pair_round_robin=false` 时恢复全部正负组合枚举：一个 Chosen 可以与多个不同 Rejected 形成候选，每个组合仍须通过原有 V、信用差、长度和动作不同等条件。该开关只改变候选生成方式，不改变 `k_pairs_per_group` 的同 Turn/跨 Turn 分组、组内额度、全步上限、评分、信用、Loss 或 Replay。
 
 通过条件的候选优先按对应偏好分数差降序选择：工具用回填后信用差，奖励路线用最终奖励差。价值距离、旧策略平均 Token LogP 距离仅依次打破平局；奖励路线无有效价值时不制造假值。每组、每步上限在分布式补齐之前应用。全局截断沿用候选的原始差值排序，尚未校准两种来源的分数尺度；触及全局上限时需观察各来源选中占比。
 
@@ -156,6 +158,7 @@ Pair 两侧保留各自原始生成 Prompt、响应及原生 token IDs。仍使�
 | `negative_threshold` | `0.01` | 工具有效信用严格负阈值的绝对值 |
 | `gap_epsilon` | `0.02` | 工具正负信用差下限 |
 | `length_ratio_max` | `1.8` | 两侧响应最大长度比 |
+| `pair_round_robin` | `true` | 先 V 匹配再轮转，每个 Chosen 最多一个候选；`false` 恢复全组合枚举 |
 | `k_pairs_per_group` | `2` | 正整数：工具/环境动作同题同原始 Turn 配对并按组限额；`null`：同题同类型跨 Turn，无组内限额。QA analysis/final 路由不变；全步上限始终保留 |
 | `max_pairs_per_step` | `256` | 每步原始 Pair 上限 |
 | `max_gt_tokens` | `256` | GT token 上限，超长跳过 |
@@ -169,6 +172,8 @@ TRACE_MATCH_EPSILON=0.05 python train-roma/train_agent.py
 python train-roma/train_agent.py data.trace.terminal_fill_enabled=false
 # Same-question cross-turn pairing without a group cap; keeps the global cap.
 export TRACE_K_PAIRS_PER_GROUP=None  # null is also accepted; use 2 to restore same-turn pairs.
+# Disable round-robin and enumerate all positive-negative combinations.
+export TRACE_PAIR_ROUND_ROBIN=false  # true is the default.
 ```
 
 评分依赖冻结参考模型，可能增加显存与前向成本。状态来自实际角色可见输入，历史窗口与模板变化仍可能影响 GT 信用；本轮未重构评分视图。训练指标定义见 [指标说明](trace-slic-metrics.md)。

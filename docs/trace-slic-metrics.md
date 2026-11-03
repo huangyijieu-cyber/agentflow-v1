@@ -1,6 +1,6 @@
 # TRACE-SLIC 训练观察指标
 
-指标接入原训练 metrics 字典，默认 console logger 输出，无需额外开关。比例为 0–1。早期指标精简仅调整日志；当前先 V 匹配再排序轮转的候选计数口径见下文，无新增配置。
+指标接入原训练 metrics 字典，默认 console logger 输出，无需额外开关。比例为 0–1。早期指标精简仅调整日志；候选生成可由 `pair_round_robin` 切换：默认先 V 匹配再排序轮转，关闭则枚举全部正负组合；两种计数口径见下文。
 
 `trace` 来源是工具局部信用加终局回填，`outcome` 来源是 analysis／实际最终回答的可信成功／失败标签。两种来源的 Pair 数分开观察；工具信用使用保留的 `credit_*` 名称，已移除与其完全相同的 `effective_credit_*`。
 
@@ -14,7 +14,7 @@
 | `trace/terminal_fill_p10/p50/p90` | 终局优势回填项分布 | 与局部信用一起看，判断回填是否主导 |
 | `trace/credit_p10/p50/p90` | 局部信用加回填后的有效工具信用 | 工具 Pair 使用此信号；幅度越大不等于效果越好 |
 | `trace/pair/trace_selected_unique`、`outcome_selected_unique` | 分布式补齐前的工具／奖励来源 Pair 数 | 区分两种监督构成；数量不作为质量目标 |
-| `trace/pair/tool_value_match_rate` | 有可匹配负例池的工具 Chosen 数 / 工具 Chosen 尝试数 | 先检查 V 邻域是否非空，再分配负例；与旧盲轮转及全组合口径不能直接横比 |
+| `trace/pair/tool_value_match_rate` | 轮转模式：有兼容负例池的工具 Chosen 比例；全组合模式：工具正负组合通过 V 的比例 | 两种模式的分母不同，不能直接横比 |
 | `trace/pair/value_gap_p90/max`、`credit_gap_min` | 选中工具 Pair 的状态价值差、有效信用差 | 应满足 `match_epsilon`、`gap_epsilon`；小价值差、大信用差仅为代理信号，不能证明状态可比或动作因果贡献 |
 | `trace/external_error_turns`、`credit_windows_blocked_external` | 外部故障 Turn 数及受影响信用窗口数 | 区分基础设施问题与模型退化 |
 | `trace/outcome_invalid_rollouts` | 没有可信终局结果的 Rollout 数 | 增长时检查实际 final、verifier 和外部中断；不能直接当作失败负样本 |
@@ -62,16 +62,16 @@
 
 | 指标 | 定义 |
 | --- | --- |
-| `candidates_sign` | 组内 Chosen 尝试数：有负例时等于正例数，无负例时为 0；其中无兼容 V 负例池的 Chosen 计入 `rejected_value_match`。工具/环境动作是否按原始 Turn 分组由 `k_pairs_per_group` 控制 |
+| `candidates_sign` | 轮转模式：有负例时的 Chosen 数；全组合模式：正例数乘负例数；无负例时均为 0。工具/环境动作是否按原始 Turn 分组由 `k_pairs_per_group` 控制 |
 | `groups_no_positive`、`groups_no_negative` | 缺少合格正侧／负侧的组数；中性组可能同时计入两者 |
 | `both_sign_group_rate` | 同时具备正负两侧的合格组数 / 有合格行的组数；无合格组时为 0 |
-| `tool_value_match_rate` | 存在兼容 V 负例池的工具 Chosen 比例；无工具候选时为 0 |
-| `rejected_value_match` | 没有任何满足 V 阈值的负例而被跳过的 Chosen 数；outcome 未开启 V 匹配时不计此项 |
+| `tool_value_match_rate` | 轮转模式为存在兼容池的工具 Chosen 比例；全组合模式为工具组合通过 V 的比例；无工具候选时为 0 |
+| `rejected_value_match` | 轮转模式：没有兼容 V 负例池的 Chosen 数；全组合模式：V 不满足阈值的组合数。outcome 未开启 V 匹配时不计此项 |
 | `rejected_credit_gap` | 因工具有效信用差不足被拒绝的组合数；奖励路线不使用此门槛 |
 | `rejected_length` | 因响应长度比过大被拒绝的组合数 |
 | `rejected_same_action` | 因两侧动作身份相同被拒绝的组合数 |
 | `rejected_group_cap`、`rejected_global_cap` | 通过质量过滤后，受到每组／每步数量上限限制的组合数 |
-| `selected_unique` | 补齐前最终选中的 Pair 数；一次构对中 Chosen 不复用，Rejected 可循环复用 |
+| `selected_unique` | 补齐前最终选中的 Pair 数；轮转模式 Chosen 不复用，Rejected 可循环复用；全组合模式两侧均可出现在多个不同 Pair 中 |
 | `trace_selected_unique`、`outcome_selected_unique` | 工具／奖励来源最终选中的 Pair 数 |
 | `question_coverage` | 最终 Pair 覆盖问题数 / 当前批次已有 Turn 的不同问题数；未返回任何 Turn 的问题不在分母 |
 | `cross_turn_rate` | 最终 Pair 两侧原始 Turn 编号不同的比例；工具/环境动作在同 Turn 模式应为 0，`k_pairs_per_group=None` 时允许非零；QA outcome 路由原本允许跨 Turn |
@@ -82,7 +82,7 @@
 
 六个 `rejected_*` 原因按检查顺序互斥，可核对 `candidates_sign = 六个拒绝计数之和 + selected_unique`。累计通过阶段已删除；`groups_eligible`、`groups_both_signs`、`trace_candidates_sign`、`trace_after_value_match` 仅作为计算两个比例的内部计数，不再输出日志。
 
-每个 Chosen 先按 V 阈值筛兼容负例池，再从中选择已分配次数最少的负例，同次数按偏好分升序、样本索引升序选择。固定兼容池内负例用完后才循环；V 不兼容的负例不会先占用轮转位置。每个 Chosen 只尝试一个已匹配负例，之后信用差、长度或相同动作过滤失败仍直接跳过，不补选；未生成的其它正负组合不计入候选或拒绝数。旧盲轮转的 `rejected_value_match` 表示分配后 V 不匹配，当前表示完全没有兼容负例；历史全组合的 `candidates_sign` 为正负组合乘积，均不能直接横比。分布式补齐和跨训练步 Replay 仍可能重复同一个 Pair。
+每个 Chosen 先按 V 阈值筛兼容负例池，再从中选择已分配次数最少的负例，同次数按偏好分升序、样本索引升序选择。固定兼容池内负例用完后才循环；V 不兼容的负例不会先占用轮转位置。每个 Chosen 只尝试一个已匹配负例，之后信用差、长度或相同动作过滤失败仍直接跳过，不补选；未生成的其它正负组合不计入候选或拒绝数。这些规则适用于默认 `pair_round_robin=true`。设为 `false` 时恢复全部正负组合，每个组合独立检查 V 和其它门槛；`candidates_sign` 为正负例数乘积，`rejected_value_match` 为未通过 V 的组合数。两种模式的候选和匹配率分母不能直接横比。旧盲轮转的 V 拒绝则表示已分配负例不匹配，不等于当前轮转模式的完全没有兼容负例。分布式补齐和跨训练步 Replay 仍可能重复同一个 Pair。
 
 工具按有效信用差、奖励路线按最终奖励差降序选择，再按价值距离、旧策略平均 Token LogP 距离打破平局。全局上限仍基于候选原始差值排序，两种来源尚无尺度校准；触及全局上限时需观察分来源选中数量。精简日志没有改变这一选择逻辑。
 
@@ -107,4 +107,4 @@
 - `rewards/chosen/rejected/margin` 使用整段概率，长响应易下溢，需要结合 per-token gap、损失分项及梯度解释。
 - `val/queued_rollouts/completed_rollouts/valid_rollouts`、`completion_rate/valid_rollout_rate` 保留；两种比例分母均为排队轨迹数。`val/reward` 不把未返回轨迹自动记失败。
 
-本轮不修改 SLIC Loss、Replay 更新强度、GRPO 优势算法及配置。CPU 回归不能替代 GPU/NPU 训练收益验证；小状态距离与大信用差仍需独立状态抽查和验证集收益确认。
+`pair_round_robin` 只切换候选生成方式，不修改 SLIC Loss、Replay 更新强度、GRPO 优势算法或其它配对门槛。CPU 回归不能替代 GPU/NPU 训练收益验证；小状态距离与大信用差仍需独立状态抽查和验证集收益确认。

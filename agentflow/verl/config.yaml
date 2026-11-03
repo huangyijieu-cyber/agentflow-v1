@@ -26,6 +26,7 @@ data:
     negative_threshold: 0.01
     gap_epsilon: 0.02
     length_ratio_max: 1.8
+    pair_round_robin: true  # false enumerates all eligible positive-negative combinations.
     k_pairs_per_group: 2  # Positive int: same-turn cap; null: cross-turn, no group cap.
     max_pairs_per_step: 256
     max_gt_tokens: 256
