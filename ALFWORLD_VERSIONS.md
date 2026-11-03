@@ -1,10 +1,10 @@
 # ALFWorld 实验版本归档
 
-当前 `alfworld` 分支的正式训练为 **v2a 评分＋本次应用排序轮转**：评分 Prompt 不含累计动作/观察历史，固定 Response 为 Parquet `result` 中的完整成功状态描述；`TRACE_K_PAIRS_PER_GROUP=None`，同题允许跨 turn、无组内额度，保留全步默认 256 对上限。
+当前 `alfworld` 分支的正式训练为 **v2a 评分＋先 V 匹配再排序轮转**：评分 Prompt 不含累计动作/观察历史，固定 Response 为 Parquet `result` 中的完整成功状态描述；`TRACE_K_PAIRS_PER_GROUP=None`，同题允许跨 turn、无组内额度，保留全步默认 256 对上限。
 
-`41f0552` 先恢复 v2a 评分、None 跨 turn 和全组合候选；按用户随后指令，在其后的新提交应用已有的排序轮转。运行时评分仍来自 `3f7abe9`，保留 `ce3e972` 的独立测试夹具修复。历史 v2b 及已有标签保持原位置，`websearch` 分支不变。
+`41f0552` 先恢复 v2a 评分、None 跨 turn 和全组合候选，`ad412f6` 随后应用先分配负例再检查 V 的轮转。本次按用户纠正，将 `alfworld` 和 `websearch` 两分支的配对顺序都改为先 V 匹配再轮转。ALFWorld 评分仍来自 `3f7abe9`，保留 `ce3e972` 的独立测试夹具修复；历史 v2b 及已有标签保持原位置。
 
-排序轮转规则：每组 Chosen 按偏好分降序、Rejected 按偏好分升序，同分均按样本 index 升序；第 k 个 Chosen 只提案给 `negative[k % len(negative)]`，负例耗尽后循环。过滤失败跳过该 Chosen，不补选其它负例。合格候选的后续优先级、阈值及数量上限不变。
+先匹配再轮转：每组 Chosen 按偏好分降序、同分 index 升序；每个 Chosen 先找出满足 `abs(V_chosen - V_negative) <= match_epsilon` 的兼容负例。`match_epsilon=0` 要求精确相等，正值使用真实数值邻域，不四舍五入或传递合并。兼容池内优先分配此前分配次数最少的负例，同次数按偏好分升序、index 升序；同 V 桶因此用尽再循环。每个 Chosen 最多提案一次；无兼容池才计 V 拒绝。分配后仍检查原信用差、长度、动作不同等条件，失败不补选，该分配仍计用一次。`outcome_match_value=false` 的 outcome 路线仍跳过 V 匹配，使用完整负例池。本次不修改该开关、阈值、后续优先级及数量上限。
 
 ## 用户此前确认的实验定义（本次应用排序轮转之前）
 

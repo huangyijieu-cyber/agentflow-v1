@@ -1,6 +1,6 @@
 # ALFWorld v2a / v2b 评分版本
 
-当前 `alfworld` 分支使用 **v2a 评分＋本次应用排序轮转**：使用 Parquet `result` 的成功状态描述评分，Prompt 无累计动作/观察历史，`k_pairs_per_group=None`，同题可跨 turn。`41f0552` 恢复全组合候选后，用户另行要求应用排序轮转；这不改变下表记录的历史实验定义，也不新增版本名。具体提案与筛选规则见 [SLIC 配对](trace-slic.md)。
+当前 `alfworld` 分支使用 **v2a 评分＋先 V 匹配再排序轮转**：使用 Parquet `result` 的成功状态描述评分，Prompt 无累计动作/观察历史，`k_pairs_per_group=None`，同题可跨 turn。`41f0552` 恢复全组合候选，`ad412f6` 应用先轮转后检查 V；本次按用户纠正，在每个 Chosen 的真实 V 邻域内分配使用次数最少的负例。`websearch` 同步修正配对顺序，历史实验定义和标签保留，不新增版本名。具体分配与过滤规则见 [SLIC 配对](trace-slic.md)。
 
 本页命名仅用于 ALFWorld。仓库已有的裸 `v2a`、`v2b` 是旧 QA 标签。历史 `alfworld/v2a`、`alfworld/v2b` 及 `alfworld-v2a`、`alfworld-v2b` 标签保持原位置；旧归档 v2a/v2b 快照曾包含默认 cap=2 和排序轮转，与用户确认的实验配对定义不同。当前恢复版本请使用 `alfworld` 分支，详见 [版本归档](../ALFWORLD_VERSIONS.md)。
 

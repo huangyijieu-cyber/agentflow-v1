@@ -541,9 +541,12 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
     by default, do not match GT V.
 
     Within each group, visit Chosen rows by descending preference score and
-    Rejected rows by ascending score, breaking score ties by row index. Each
-    Chosen proposes exactly one pair; Rejected rows cycle only when exhausted.
-    A failed pair filter skips that Chosen without trying another Rejected.
+    Rejected rows by ascending score, breaking score ties by row index. First
+    restrict each Chosen's negative pool to its configured V neighborhood.
+    Choose a least-used Rejected from that pool, breaking usage ties by the
+    negative ordering. Equal-V pools therefore cycle only when exhausted.
+    Each Chosen proposes at most one pair; later credit/length/action filters
+    do not trigger another proposal, and a failed proposal consumes its turn.
 
     ``metrics`` optionally collects counts for this call, resetting these keys
     while preserving unrelated keys. Candidate counts describe these proposals,
@@ -640,9 +643,30 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
             counts["trace_candidates_sign"] += proposals
         if not negative:
             continue
-        for k, chosen in enumerate(positive):
-            rejected = negative[k % len(negative)]
-            match_value = not outcome or cfg.outcome_match_value
+        match_value = not outcome or cfg.outcome_match_value
+        negative_uses = Counter()
+        exact_value_pools = defaultdict(list)
+        if match_value and cfg.match_epsilon == 0:
+            for rejected in negative:
+                exact_value_pools[float(rejected["value"])].append(rejected)
+        for chosen in positive:
+            if not match_value:
+                compatible = negative
+            elif cfg.match_epsilon == 0:
+                compatible = exact_value_pools.get(float(chosen["value"]), ())
+            else:
+                compatible = [
+                    rejected for rejected in negative
+                    if abs(float(chosen["value"]) - float(rejected["value"]))
+                    <= cfg.match_epsilon
+                ]
+            if not compatible:
+                counts["rejected_value_match"] += 1
+                continue
+            # The compatible pool retains negative score/index order. Prefer
+            # unused members before reusing any member of this V neighborhood.
+            rejected = min(compatible, key=lambda row: negative_uses[row["index"]])
+            negative_uses[rejected["index"]] += 1
             value_gap = (
                 abs(float(chosen["value"]) - float(rejected["value"]))
                 if match_value
@@ -652,9 +676,6 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
             length_ratio = max(
                 float(chosen["length"]), float(rejected["length"])
             ) / min(float(chosen["length"]), float(rejected["length"]))
-            if match_value and value_gap > cfg.match_epsilon:
-                counts["rejected_value_match"] += 1
-                continue
             if not outcome:
                 counts["trace_after_value_match"] += 1
             if not outcome and credit_gap < cfg.gap_epsilon:
