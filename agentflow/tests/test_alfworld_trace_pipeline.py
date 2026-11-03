@@ -19,10 +19,8 @@ import test_trace_trainer as training
 
 EXECUTION = training.EXECUTION
 GOAL = "A clean mug is in a cabinet."
-INSTRUCTION = training.ALFWORLD.FORECAST_INSTRUCTION
-PROVENANCE = {"goal_spec_hash": "actual-game-v1", "source_sha256": {"gamefile": "official-game"},
-              "scoring_version": training.ALFWORLD.FORECAST_SCORING_VERSION,
-              "scoring_response": training.ALFWORLD.FORECAST_RESPONSE}
+INSTRUCTION = "Describe the current full state relative to the success conditions."
+PROVENANCE = {"goal_spec_hash": "actual-game-v1", "source_sha256": {"gamefile": "official-game"}}
 
 
 class AlfworldPipelineTests(unittest.TestCase):
@@ -132,9 +130,6 @@ class AlfworldPipelineTests(unittest.TestCase):
                         prompt = trainer.tokenizer.decode(call.batch["prompts"][row])
                         self.assertIn(INSTRUCTION, prompt)
                         self.assertNotIn("actor visible", prompt)
-                        response = trainer.tokenizer.decode(
-                            call.batch["responses"][row][call.batch["response_mask"][row].bool()])
-                        self.assertEqual(response, training.ALFWORLD.FORECAST_RESPONSE)
                 pairs = trainer._trans_to_trace_batch([history])
                 self.assertTrue(pairs)
                 self.assertTrue(all(pair.non_tensor_batch["trace_label_source_a"][0] == "trace" for pair in pairs))
@@ -230,29 +225,6 @@ class AlfworldPipelineTests(unittest.TestCase):
             trainer._annotate_trace_credits(history)
         self.assertEqual(trainer.ref_policy_wg.calls, [])
 
-    def test_v2b_rejects_legacy_or_changed_scoring_contract_before_model_call(self):
-        for change in ({"scoring_version": None}, {"scoring_version": "alfworld-v2a"},
-                       {"scoring_response": GOAL}, {"scoring_response": None}):
-            with self.subTest(change=change):
-                history, trainer = self.batch("train-roma/rollout.py"), self.trainer()
-                history.non_tensor_batch["trace_goal_metadata"][0] = dict(PROVENANCE, **change)
-                with self.assertRaisesRegex(ValueError, "v2b future-success"):
-                    trainer._annotate_trace_credits(history)
-                self.assertEqual(trainer.ref_policy_wg.calls, [])
-
-    def test_v2b_forecast_scoring_preserves_original_goal_and_provenance(self):
-        history, trainer = self.batch("train-roma/rollout.py"), self.trainer()
-        original_goals = history.non_tensor_batch["trace_gt"].copy()
-        original_provenance = copy.deepcopy(history.non_tensor_batch["trace_goal_metadata"])
-        trainer._annotate_trace_credits(history)
-        np.testing.assert_array_equal(history.non_tensor_batch["trace_gt"], original_goals)
-        np.testing.assert_array_equal(history.non_tensor_batch["trace_goal_metadata"], original_provenance)
-        for call in trainer.ref_policy_wg.calls:
-            for index in range(len(call)):
-                response = trainer.tokenizer.decode(
-                    call.batch["responses"][index][call.batch["response_mask"][index].bool()])
-                self.assertEqual(response, training.ALFWORLD.FORECAST_RESPONSE)
-
     def test_missing_actual_gt_cannot_fall_back_to_parquet(self):
         logs = self.logs("A")
         logs[0]["trace_gt"] = None
@@ -347,15 +319,11 @@ class AlfworldPipelineTests(unittest.TestCase):
                     counts[left] = counts.get(left, 0) + 1
                 self.assertEqual(counts, {1: 2, 2: 2, 3: 2})
                 cross_turn_pairs = unlimited_trainer._trans_to_trace_batch([unlimited])
-                self.assertEqual(len(cross_turn_pairs), 6)  # One attempt per positive action.
-                identities = [(pair.non_tensor_batch["rollout_id_list_a"][0],
-                               pair.non_tensor_batch["turn_index_list_a"][0]) for pair in cross_turn_pairs]
-                self.assertEqual(len(identities), len(set(identities)))
-                # These symmetric trajectories rank corresponding turns alike,
-                # while their baseline still sees the full cross-turn group.
-                self.assertEqual({int(pair.non_tensor_batch["group_size"][0]) for pair in same_turn_pairs}, {4})
-                self.assertEqual({int(pair.non_tensor_batch["group_size"][0]) for pair in cross_turn_pairs}, {16})
-                self.assertEqual(unlimited_trainer._trace_pair_metrics["trace/pair/selected_unique"], 6)
+                self.assertEqual(len(cross_turn_pairs), 36)
+                self.assertTrue(any(pair.non_tensor_batch["turn_index_list_a"][0]
+                                    != pair.non_tensor_batch["turn_index_list_b"][0]
+                                    for pair in cross_turn_pairs))
+                self.assertEqual(unlimited_trainer._trace_pair_metrics["trace/pair/selected_unique"], 36)
                 for pair in cross_turn_pairs:
                     self.assertEqual(pair.non_tensor_batch["trace_task_a"].tolist(), ["alfworld"])
                     self.assertEqual(pair.non_tensor_batch["trace_label_source_a"].tolist(), ["trace"])

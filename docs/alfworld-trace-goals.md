@@ -2,11 +2,11 @@
 
 转换与训练已分开：只转换训练 Parquet 选中的题，将固定英文 GT 写入 `result`，同时在该 Parquet 中保存规则和游戏映射。训练直接读取该行 `result`，不在 reset 或 turn 中转换，也不依赖单独的 SQLite 文件。
 
-此实现使用完整环境状态进行参考模型评分（privileged/full-state）。策略模型继续接收原来的可见观察和有限历史。当前 ALFWorld **v2b** 将 `result` 中的成功条件放进评分 Prompt，固定 Response 为 `The agent will successfully complete the task within the remaining action budget.`，同题所有状态使用相同 Response。原来评分成功条件原文的版本已保存为 `alfworld-v2a`（`3f7abe9`）；当前版本使用 `alfworld-v2b` 标签，与旧 QA 的 `v2a` / `v2b` 标签分开。完整模板和差异见 [ALFWorld 评分版本](alfworld-scoring-versions.md)。
+当前 `alfworld` 分支恢复用户确认的 v2a：`TRACE_K_PAIRS_PER_GROUP=None`、同题可跨 turn、无组内额度、全步默认最多 256 对，候选采用全组合枚举，未应用排序轮转。恢复以新提交记录，历史 v2a/v2b 标签保留原代码；完整区别见 [版本归档](../ALFWORLD_VERSIONS.md)。
 
-评分 Prompt 不附加累计动作/观察历史：保留任务、成功条件、环境规则、事实解释、初始事实、当前新增/删除事实、当前观察、剩余动作预算和固定预测指令。当前事实已包含 Goal 所需的持久标记；历史记录仍保留在环境/轨迹中用于排查，策略最近四步历史保持原样。预算为 `max(0, min(外层 max_step, 官方环境步数上限) - 已执行步数)`，仅描述现有上限，不改变模拟器或 rollout。成功提前终止时仍报告实际剩余预算，指令明确已满足全部条件即算完成。
+此实现使用完整环境状态进行参考模型评分（privileged/full-state）。策略模型继续接收原来的可见观察和有限历史。完整状态只进入评分上下文；固定 Response 描述成功条件，每道题的所有状态复用同一文本。
 
-已有 GT Parquet 无需重新转换；其中 `result`、PDDL 规则和哈希均保持原格式。重启训练及 rollout 进程后生效，trainer 会拒绝缺少 v2b 评分版本信息的旧 ALFWorld rollout，避免旧 Prompt 与新 Response 混用。QA、信用公式、配对、GiGPO、actor 和 replay 机制保持原样。
+评分 Prompt 现不再附加累计动作/观察历史：保留任务、环境规则、事实解释、初始事实、当前新增/删除事实、当前观察和固定评分指令。当前事实已包含 Goal 所需的持久标记；历史记录仍保留在环境/轨迹中用于排查，策略最近四步历史保持原样。此缩减只改变 ALFWorld full-state 评分文本，不改变 GT Response、信用公式或配对规则。已有 GT Parquet 无需重新转换，重启训练/rollout 进程后使用新文本。已有 Probe 缓存的 `state_context` 不会自动更新；含完整事实时运行 `enrich --work-dir ...` 重建评分 sidecar 后再评分，无需重新采样。
 
 ## 规则来源与转换
 
@@ -35,7 +35,7 @@ python agentflow/agentflow/trace/alfworld_goal_store.py prepare \
 | `alfworld_game_key` | 选中游戏在 games-root 下的相对路径 |
 | `alfworld_goal_row` | 原始行号、question、题号和数据集/选择哈希 JSON |
 
-完整规则较长，因此不放进 `result`；`result` 只保存确定性英文成功条件。v2a 直接将它作为 teacher-forcing Response，v2b 将它放入 Prompt 的 Success conditions 区域，独立评分固定的未来成功句。`extra_info_ground_truth` 等其余原始列保持原值。可以继续用 `data/parquet_viewer.py` 查看新文件中的 `result`。
+完整规则较长，因此不放进 `result`；`result` 只保存用于 teacher-forcing 的固定英文 Response。`extra_info_ground_truth` 等其余原始列保持原值。可以继续用 `data/parquet_viewer.py` 查看新文件中的 `result`。
 
 原始 Parquet 默认保留，输出已存在时拒绝覆盖；明确重建才使用 `--overwrite`。进度实时显示已处理/总题数、百分比、耗时及 ETA。只有最终出现 `[complete] ... Training Parquet saved successfully.` 才表示新训练文件发布成功；100% 后仍有保存和校验阶段。
 
@@ -80,11 +80,11 @@ ALFWorld 环境、solver、两个 rollout 入口、daemon 和 trainer 均传递�
 | terminal fill | 开启，scale=2.0 |
 | value match epsilon | 0.05 |
 | 正/负信用阈值、信用差阈值 | 0.01 / 0.01 / 0.02 |
-| length ratio / 每题每原始 turn 的 pair / 每步 pair | 1.8 / 2 / 256 |
-| 评分 Response token 上限 | 256，超长判无效，不截断；v2b 评分固定未来成功句 |
+| length ratio / 组内 pair 上限 / 每步 pair | 1.8 / None（无组内上限，允许跨 turn） / 256 |
+| GT token 上限 | 256，超长判无效，不截断 |
 | GRPO、SLIC loss、Replay | 沿用现有 QA 实现 |
 
-首轮、中间轮和最后一轮都标为 `tool_plan`，仅在同题、同原始 turn id 内，按动作前 V 接近及严格正/负有效信用配对；每题每个 turn 默认独立最多 2 对。末动作不单独划入 `base` / outcome，它只能与其他轨迹中相同 turn id 的合格环境动作配对，不允许跨 turn。T 个动作对应 T+1 个真实状态，最后动作后的终止状态参与最后一步 `V_next - V`，但不新增模型回答或训练 turn。`trace_is_terminal` 只表示已完成的环境终止动作，用于截断信用窗口与终局回填；ALFWorld 的 `trace_is_final` 恒为 false。可信的步数预算耗尽属于终局失败；外部崩溃和无法核验的状态不作为失败奖励。
+首轮、中间轮和最后一轮都标为 `tool_plan`，按动作前 V 接近及严格正/负有效信用配对。当前默认 None 允许同题跨原始 turn id，无组内额度；设为 2 则恢复同题同 turn、每 turn 最多 2 对。末动作不单独划入 `base` / outcome，遵循相同环境动作筛选条件。T 个动作对应 T+1 个真实状态，最后动作后的终止状态参与最后一步 `V_next - V`，但不新增模型回答或训练 turn。`trace_is_terminal` 只表示已完成的环境终止动作，用于截断信用窗口与终局回填；ALFWorld 的 `trace_is_final` 恒为 false。可信的步数预算耗尽属于终局失败；外部崩溃和无法核验的状态不作为失败奖励。
 
 固定 Response 的平均 token LogP 为 ell，`V_t = log((-ell_0 + epsilon) / (-ell_t + epsilon))`。pre-state 与 post-state 统一用该轨迹初始 ell_0 作基线。每个动作的真实转移为 `delta_t = V_(t+1) - V_t`，局部信用是最多 K 个连续真实动作 delta 的 gamma 加权平均，遇到环境终止动作则纳入该动作的 delta 后结束。缺失任何所需状态、编号缺口或外部故障均阻断窗口，不编造末状态或回退到 outcome 配对。
 
@@ -100,17 +100,18 @@ ALFWorld 环境、solver、两个 rollout 入口、daemon 和 trainer 均传递�
 export TASK=alfworld
 export ALGORITHM=grpo+slic
 export TRACE_ENABLED=true
+export TRACE_K_PAIRS_PER_GROUP=None
 export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305_with_gt.parquet
 # TEST_DATA_PATH 设为自己实际存在的 ALFWorld 验证 Parquet。
 ```
 
-训练只需要准备好的 Parquet，不需要设置 `ALFWORLD_TRACE_GOALS`。该配置保留用于旧 SQLite/Probe 兼容。每个 worker 需能访问相同内容的训练文件和原始游戏数据。第二次及后续训练继续使用 `..._with_gt.parquet`，无需重新转换。验证环境关闭 ALFWorld TRACE 的完整状态评分，继续按环境奖励验证，不要求为验证集额外转换 GT。
+从 v2b 恢复后需重启训练及 rollout 进程，使用新 rollout/replay 数据，不混用旧 v2b 的上下文、信用或偏好对。已有 GT Parquet 无需重新转换。训练只需要准备好的 Parquet，不需要设置 `ALFWORLD_TRACE_GOALS`。该配置保留用于旧 SQLite/Probe 兼容。每个 worker 需能访问相同内容的训练文件和原始游戏数据。第二次及后续训练继续使用 `..._with_gt.parquet`，无需重新转换。验证环境关闭 ALFWorld TRACE 的完整状态评分，继续按环境奖励验证，不要求为验证集额外转换 GT。
 
 数据路径与 `BASE_DATA_DIR` 组合，由现有 `train-roma/config.yaml` 解析；使用自定义启动配置时，将 TASK、数据路径和 TRACE 配置传入两个 rollout 入口及训练进程。无需为 ALFWorld 改 QA 的 epsilon、K、gamma、配对阈值或 loss。参考模型保持冻结，且 tokenizer 必须与参考模型一致。
 
-完整状态比策略可见上下文长。`MAX_PROMPT_LENGTH` 必须容纳成功条件、规则、完整初始事实、状态变化、当前观察、剩余预算和评分指令；超过上限会排除该状态并记录无效原因，不静默截断。先用 Probe 检查实际 token 数，再据服务器显存/序列上限设置。评分 Response 仍受与 QA 共用的 256-token 上限约束；v2b 使用固定短句，不对 Prompt 中的成功条件应用这个 Response 长度上限。
+完整状态比策略可见上下文长。`MAX_PROMPT_LENGTH` 必须容纳规则、完整初始事实、状态变化和评分指令；超过上限会排除该状态并记录无效原因，不静默截断。先用 Probe 检查实际 token 数，再据服务器显存/序列上限设置。固定 GT 超过 256 tokens 时同样会明确标记无效，可检查转换文本及模型 tokenizer 后再决定是否提高与 QA 共用的上限。
 
-窗口使用和旧缓存升级见 [alfworld-trace-probe.md](alfworld-trace-probe.md)。建议复用固定四条轨迹，查看评分 Prompt/Response、Goal/环境校验、local credit、terminal fill 和最终 effective credit，再开始训练。v2b 的文本 LogP 是参考模型对未来成功陈述的支持程度，其成功率校准、单调性与信用质量仍需用实际轨迹结果检验。
+窗口使用和旧缓存升级见 [alfworld-trace-probe.md](alfworld-trace-probe.md)。建议先跑固定四条轨迹，查看 GT、Goal/环境校验、local credit、terminal fill 和最终 effective credit，再开始训练。文本 LogP 是参考模型对目标描述的支持程度；它的成功率校准与信用质量需要实验检验。
 
 ## TRACE 评分性能
 
@@ -128,7 +129,7 @@ export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305_with_gt.parquet
 | GRPO 更新 | 166.85 |
 | SLIC 更新 | 0.002（本步没有合格配对） |
 
-性能优化保留环境、rollout、冻结参考模型、GT 文本、teacher-forcing token 序列、V/credit 公式与同 turn 配对规则。对于启用 TRACE、两种 KL 均关闭的 GRPO/GiGPO/SLIC 组合，跳过损失不消费的普通动作 reference LogP；GT reference 评分继续执行。其他算法或需要 KL 时保留动作 reference 评分。编码先按最终输入文本复用相同状态，再使用 HF fast tokenizer 的批量 chat-template 接口；非 fast tokenizer 兼容原标量接口。最终仍按 prompt/GT token IDs 去重，原始行的无效原因、长度限制和映射保持不变。CPU 张量构造和评分结果回填采用批量数组操作，避免逐行创建 Torch 小张量；缓存仅存在于本次评分调用，不跨训练 step 积累。
+这些评分性能优化保留环境、rollout、冻结参考模型、GT 文本、teacher-forcing token 序列、V/credit 公式及所选配对规则；当前 v2a 的 None 跨 turn 设置独立于评分加速。对于启用 TRACE、两种 KL 均关闭的 GRPO/GiGPO/SLIC 组合，跳过损失不消费的普通动作 reference LogP；GT reference 评分继续执行。其他算法或需要 KL 时保留动作 reference 评分。编码先按最终输入文本复用相同状态，再使用 HF fast tokenizer 的批量 chat-template 接口；非 fast tokenizer 兼容原标量接口。最终仍按 prompt/GT token IDs 去重，原始行的无效原因、长度限制和映射保持不变。CPU 张量构造和评分结果回填采用批量数组操作，避免逐行创建 Torch 小张量；缓存仅存在于本次评分调用，不跨训练 step 积累。
 
 批量分词可使用 fast tokenizer 的原生并行能力，并遵守部署环境的分词器并行设置。模型评分继续使用原有 Ray/FSDP/SP 分布式路径；不让 actor 与 reference 在同组 NPU 上额外并发，不改变 SP 或提高默认 microbatch。GT 虽短，模型仍需处理完整状态上下文；本地 CPU 微基准不等于服务器端的实际 step 加速。
 
@@ -148,7 +149,7 @@ GRPO 的 `dp_actor.py` forward/backward/optimizer 以及 actor 的默认 SP、mi
 
 提供的首步日志中，`candidates_sign=10`，`rejected_value_match=4`，`rejected_same_action=6`，而 `rejected_credit_gap=0`，最终 0 对。因此该轮降低 gap 不会恢复配对。当前默认先要求 chosen credit > 0.01、rejected credit < -0.01，进入这一步的差值本已严格大于 0.02；在正负阈值不变时，gap=0.005 不会改变它们的筛选结果。相同上下文的同一动作可能因 K-step 后续行为不同而得到不同 credit，但当前 response 相同，仍会被过滤。相同上下文中的不同动作、满足正负和其它约束时可以正常配对。
 
-若实验意图仅为严格正负及至少 0.005 的信用差，可显式将 `TRACE_POSITIVE_THRESHOLD=0`、`TRACE_NEGATIVE_THRESHOLD=0` 和 `TRACE_GAP_EPSILON=0.005` 一起设置；这是候选门槛调整，代码不会自动应用，也不保证通过状态价值或相同动作过滤。保留同题同原始 turn、每 turn 最多两对。新增 `trace/config/{positive_threshold,negative_threshold,gap_epsilon,match_epsilon}` 指标打印实际采用的四个值。
+若实验意图仅为严格正负及至少 0.005 的信用差，可显式将 `TRACE_POSITIVE_THRESHOLD=0`、`TRACE_NEGATIVE_THRESHOLD=0` 和 `TRACE_GAP_EPSILON=0.005` 一起设置；这是候选门槛调整，代码不会自动应用，也不保证通过状态价值或相同动作过滤。当前配对范围由 `TRACE_K_PAIRS_PER_GROUP` 控制，默认 None 允许跨 turn；门槛调整不改变该设置。新增 `trace/config/{positive_threshold,negative_threshold,gap_epsilon,match_epsilon}` 指标打印实际采用的四个值。
 
 正式入口 `train-roma/train_agent.py` 读取 `train-roma/config.yaml`，同名环境变量优先于 YAML 默认值，命令行 Hydra 覆盖最后生效。仅修改 `config_grpo+slic.yaml` 或 `igpo_gap_epsilon` 不保证这个入口的 TRACE gap 发生变化。策略最近 4 步的上下文相同，也不等于 GT 评分上下文相同，后者包含规则、完整状态和当前观察；此差别可能影响 V 匹配。评分文本已移除累计动作/观察历史，但当前观察仍可携带最近动作的反馈，因此相同完整事实也不保证评分 Prompt 完全一致。
 
@@ -197,4 +198,4 @@ python train-roma/diagnose_hccl_ports.py \
 
 当前回归通过 184 项 ALFWorld 测试和 135 项 TRACE 回归，覆盖单动作终止、末动作真实 delta、末三动作回填、缺失末状态、相邻状态不一致和 QA 既有路由。模型评分及模拟器在链路测试中使用 CPU 替身，未在服务器执行完整模型训练。更新代码后应重启训练及 rollout 进程；旧训练 rollout 的 base/outcome 元数据会被明确拒绝，离线 Parquet 不受影响。
 
-SLIC 工具/环境动作默认按同题、同原始 turn id 配对：ALFWorld 所有动作及 QA 工具动作均按各 turn 独立扣取默认 2 对额度；baseline 也使用相同分组，空响应日志造成的压缩编号不能用作配对身份。开启 TRACE 时，设置 `TRACE_K_PAIRS_PER_GROUP=None`（或 `null`）允许同题同类型跨 turn 配对，取消组内数量上限，仍保留全步默认 256 对上限及其它筛选条件；设为正整数则保留同 turn 分组和对应额度。QA analysis/final 的 outcome 分组和标签保留。关闭 TRACE 后的这两个任务的 SLIC 动作配对仍遵循原有同 turn 限制。K-step 信用始终沿真实轨迹计算，该开关不改变信用窗口。
+当前分支开启 TRACE 的训练配置默认 `TRACE_K_PAIRS_PER_GROUP=None`（或 `null`）：同题同类型动作允许跨 turn，取消组内数量上限，仍保留全步默认 256 对上限及其它筛选条件；候选枚举全部正负组合，未应用排序轮转。显式设为正整数则恢复同 turn 分组和对应额度，设为 2 时每题每 turn 最多 2 对。baseline 使用与配对相同的分组；空响应日志造成的压缩编号不能用作配对身份。QA analysis/final 的 outcome 分组和标签保留。关闭 TRACE 后的这两个任务的 SLIC 动作配对仍遵循原有同 turn 限制。K-step 信用始终沿真实轨迹计算，该开关不改变信用窗口。

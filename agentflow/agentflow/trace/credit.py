@@ -540,14 +540,8 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
     require strict signed credit. Outcome labels never require GT credit and,
     by default, do not match GT V.
 
-    Within each group, visit Chosen rows by descending preference score and
-    Rejected rows by ascending score, breaking score ties by row index. Each
-    Chosen proposes exactly one pair; Rejected rows cycle only when exhausted.
-    A failed pair filter skips that Chosen without trying another Rejected.
-
     ``metrics`` optionally collects counts for this call, resetting these keys
-    while preserving unrelated keys. Candidate counts describe these proposals,
-    rather than all positive-negative combinations. Filters form an ordered,
+    while preserving unrelated keys.  Candidate filters form an ordered,
     mutually exclusive funnel: sign, value, credit gap, length, distinct action,
     group cap, then global cap.  Every count is an absolute count, not a rate.
     Group sign-absence counts may overlap (a neutral-only group lacks both).
@@ -632,60 +626,55 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
         counts["groups_no_positive"] += not positive
         counts["groups_no_negative"] += not negative
         counts["groups_both_signs"] += bool(positive and negative)
-        positive.sort(key=lambda row: (-scores[row["index"]], row["index"]))
-        negative.sort(key=lambda row: (scores[row["index"]], row["index"]))
-        proposals = len(positive) if negative else 0
-        counts["candidates_sign"] += proposals
+        counts["candidates_sign"] += len(positive) * len(negative)
         if not outcome:
-            counts["trace_candidates_sign"] += proposals
-        if not negative:
-            continue
-        for k, chosen in enumerate(positive):
-            rejected = negative[k % len(negative)]
-            match_value = not outcome or cfg.outcome_match_value
-            value_gap = (
-                abs(float(chosen["value"]) - float(rejected["value"]))
-                if match_value
-                else 0.0
-            )
-            credit_gap = scores[chosen["index"]] - scores[rejected["index"]]
-            length_ratio = max(
-                float(chosen["length"]), float(rejected["length"])
-            ) / min(float(chosen["length"]), float(rejected["length"]))
-            if match_value and value_gap > cfg.match_epsilon:
-                counts["rejected_value_match"] += 1
-                continue
-            if not outcome:
-                counts["trace_after_value_match"] += 1
-            if not outcome and credit_gap < cfg.gap_epsilon:
-                counts["rejected_credit_gap"] += 1
-                continue
-            if length_ratio > cfg.length_ratio_max:
-                counts["rejected_length"] += 1
-                continue
-            chosen_key, rejected_key = chosen.get("action_key"), rejected.get(
-                "action_key"
-            )
-            if (
-                chosen_key is not None
-                and rejected_key is not None
-                and chosen_key == rejected_key
-            ):
-                counts["rejected_same_action"] += 1
-                continue
-            priority = (
-                -credit_gap,
-                value_gap,
-                abs(
-                    float(chosen["old_per_token"])
-                    - float(rejected["old_per_token"])
-                ),
-                chosen["index"],
-                rejected["index"],
-            )
-            candidates.append(
-                (priority, group_key, chosen["index"], rejected["index"])
-            )
+            counts["trace_candidates_sign"] += len(positive) * len(negative)
+        for chosen in positive:
+            for rejected in negative:
+                match_value = not outcome or cfg.outcome_match_value
+                value_gap = (
+                    abs(float(chosen["value"]) - float(rejected["value"]))
+                    if match_value
+                    else 0.0
+                )
+                credit_gap = scores[chosen["index"]] - scores[rejected["index"]]
+                length_ratio = max(
+                    float(chosen["length"]), float(rejected["length"])
+                ) / min(float(chosen["length"]), float(rejected["length"]))
+                if match_value and value_gap > cfg.match_epsilon:
+                    counts["rejected_value_match"] += 1
+                    continue
+                if not outcome:
+                    counts["trace_after_value_match"] += 1
+                if not outcome and credit_gap < cfg.gap_epsilon:
+                    counts["rejected_credit_gap"] += 1
+                    continue
+                if length_ratio > cfg.length_ratio_max:
+                    counts["rejected_length"] += 1
+                    continue
+                chosen_key, rejected_key = chosen.get("action_key"), rejected.get(
+                    "action_key"
+                )
+                if (
+                    chosen_key is not None
+                    and rejected_key is not None
+                    and chosen_key == rejected_key
+                ):
+                    counts["rejected_same_action"] += 1
+                    continue
+                priority = (
+                    -credit_gap,
+                    value_gap,
+                    abs(
+                        float(chosen["old_per_token"])
+                        - float(rejected["old_per_token"])
+                    ),
+                    chosen["index"],
+                    rejected["index"],
+                )
+                candidates.append(
+                    (priority, group_key, chosen["index"], rejected["index"])
+                )
 
     candidates.sort(key=lambda item: item[0])
     per_group = defaultdict(int)

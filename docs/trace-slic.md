@@ -1,10 +1,10 @@
 # TRACE 状态信用与分类型 SLIC 配对
 
-版本命名、差异、参数对照和代码快照统一维护于桌面文档 `webwalker-trace版本记录.md`。**v3a＝原 v2a1，v3b＝原 v2a2**。最新实验 **v3d** 沿用 v3c 的 Replay 容量 512、采样 ×4 和严格 V 匹配，主要设置为 `k_pairs_per_group=None`（YAML 为 `null`），允许同题同类型工具跨 Turn 配对并取消组内数量上限。QA 信用沿用 v3b 的动态范围回填；当前构对已恢复 cache 式轮转，具体规则见配对章节。
+版本命名、差异、参数对照和代码快照统一维护于桌面文档 `webwalker-trace版本记录.md`。**v3a＝原 v2a1，v3b＝原 v2a2**。最新实验 **v3d** 沿用 v3c 的 Replay 容量 512、采样 ×4 和严格 V 匹配，主要设置为 `k_pairs_per_group=None`（YAML 为 `null`），允许同题同类型工具跨 Turn 配对并取消组内数量上限。QA 信用沿用 v3b 的动态范围回填。当前 `alfworld` 分支按用户确认的 ALFWorld v2a 恢复为全组合候选，未应用排序轮转；QA 历史实验定义保持原记录。
 
 **v3c、v3d 均开启严格价值匹配**：`outcome_match_value=true`、`match_epsilon=0.05`，analysis／final 也必须满足 `abs(V_i - V_j) <= 0.05`，并保留可信终局成功／失败标签。此处记录实验实际设置，基础配置默认值仍为 `false`。
 
-QA 的状态、终局和回填语义见下文；ALFWorld 的真实后状态与统一环境动作信用见 [ALFWorld 接入说明](alfworld-trace-goals.md)。两个任务的 SLIC 工具/环境动作默认仅允许同题同原始 Turn id 配对；`k_pairs_per_group=null` 时允许同题跨 Turn，且不设组内 Pair 上限。
+QA 的状态、终局和回填语义见下文；ALFWorld 的真实后状态与统一环境动作信用见 [ALFWorld 接入说明](alfworld-trace-goals.md)。当前分支训练配置默认 `k_pairs_per_group=null`，允许同题跨 Turn 且无组内 Pair 上限；显式设为正整数时，工具/环境动作仅允许同题同原始 Turn id 配对。底层库 `TraceConfig()` 未传配置时仍默认 2。
 
 本实现按决策类型选择偏好标签：analysis 和实际最终回答使用可验证的最终任务结果，工具 Turn 使用 K-step GT 信用及可选的终局优势回填。配对质量优先；没有合格正负两侧时跳过，不为凑数量放宽条件。SLIC Loss 和原 GRPO 训练公式保持原样；v3c／v3d 的 Replay 调整记录为用户实验设置。
 
@@ -110,7 +110,7 @@ $$
 
 ## 配对、排序与 Loss
 
-候选必须同 `uid`、同决策类型和同标签来源。`k_pairs_per_group` 为正整数时，QA 工具和 ALFWorld 环境动作还必须具有相同原始 Turn id，允许来自不同 Rollout，不允许跨 Turn 配对；每题每 Turn 默认最多 2 对，多个 Turn 各有独立额度。设为 `null` 时，取消上述 Turn 分组和组内数量限制，允许同题同类型动作跨 Turn 配对，仍受全步 `max_pairs_per_step`（默认 256）限制。QA analysis 和实际最终回答保留原 outcome 分组及标签；`null` 也取消这些组的数量上限，但不混合决策类型或标签来源。两侧均过滤无效响应、执行故障、重复动作、被丢弃的 Prompt 和异常数值。SLIC baseline 使用与配对一致的分组及 V 邻域；原始 Turn 编号、信用窗口、有效性和其它 Pair 筛选条件不变。跨 Turn 模式没有额外的不同 Rollout 限制，同一 Rollout 的不同 Turn 也可能配对。
+候选必须同 `uid`、同决策类型和同标签来源。`k_pairs_per_group` 为正整数时，QA 工具和 ALFWorld 环境动作还必须具有相同原始 Turn id，允许来自不同 Rollout，不允许跨 Turn 配对；若设为 2，则每题每 Turn 最多 2 对，多个 Turn 各有独立额度。设为 `null` 时，取消上述 Turn 分组和组内数量限制，允许同题同类型动作跨 Turn 配对，仍受全步 `max_pairs_per_step`（默认 256）限制。QA analysis 和实际最终回答保留原 outcome 分组及标签；`null` 也取消这些组的数量上限，但不混合决策类型或标签来源。两侧均过滤无效响应、执行故障、重复动作、被丢弃的 Prompt 和异常数值。SLIC baseline 使用与配对一致的分组及 V 邻域；原始 Turn 编号、信用窗口、有效性和其它 Pair 筛选条件不变。跨 Turn 模式没有额外的不同 Rollout 限制，同一 Rollout 的不同 Turn 也可能配对。
 
 工具候选要求：
 
@@ -123,7 +123,7 @@ $$
 
 analysis／final 依据可信成功／失败分池。基础配置的 `outcome_match_value` 默认为 `false`；v3c、v3d 实验显式设为 `true`，额外要求两侧 V 有效且 `abs(V_i - V_j) <= 0.05`，baseline 同步采用 V 邻域。工具 Turn 仍要求严格正负有效信用，没有负样本不以终局 reward 兜底。两条路线都保留响应长度比、相同动作排除和相应数量上限。
 
-当前实现采用 cache 式构对：每组 Chosen 按偏好分数降序，Rejected 按分数升序；同分时按样本索引升序。第 k 个 Chosen 只尝试第 `k % len(negative)` 个 Rejected；负例不足时循环复用，每个 Chosen 最多生成一个候选。被分配的 Pair 不满足 V、长度或其它质量条件时跳过，不改配其它负例。工具使用有效信用作为偏好分数，analysis／final 使用终局 reward。该修改尚未另行命名，v3d 原实验仍对应全组合构对；版本更新统一维护桌面记录。
+当前实现对每组的全部合格正例与负例作全组合候选枚举，再逐对检查 V、信用差、长度及动作不同等条件，最后按下述优先级和总额度选择。同一个 Chosen 可以匹配多个不同 Rejected；某个组合失败不阻止检查其余组合。这里没有“每个 Chosen 仅尝试一个 Rejected”的排序轮转。工具使用有效信用作为偏好分数，analysis／final 使用终局 reward。
 
 通过条件的候选优先按对应偏好分数差降序选择：工具用回填后信用差，奖励路线用最终奖励差。价值距离、旧策略平均 Token LogP 距离仅依次打破平局；奖励路线无有效价值时不制造假值。每组、每步上限在分布式补齐之前应用。全局截断沿用候选的原始差值排序，尚未校准两种来源的分数尺度；触及全局上限时需观察各来源选中占比。
 
@@ -156,7 +156,7 @@ Pair 两侧保留各自原始生成 Prompt、响应及原生 token IDs。仍使�
 | `negative_threshold` | `0.01` | 工具有效信用严格负阈值的绝对值 |
 | `gap_epsilon` | `0.02` | 工具正负信用差下限 |
 | `length_ratio_max` | `1.8` | 两侧响应最大长度比 |
-| `k_pairs_per_group` | `2` | 正整数：工具/环境动作同题同原始 Turn 配对并按组限额；`null`：同题同类型跨 Turn，无组内限额。QA analysis/final 路由不变；全步上限始终保留 |
+| `k_pairs_per_group` | 当前训练配置 `null`；库默认 `2` | 正整数：工具/环境动作同题同原始 Turn 配对并按组限额；`null`：同题同类型跨 Turn，无组内限额。QA analysis/final 路由不变；全步上限始终保留 |
 | `max_pairs_per_step` | `256` | 每步原始 Pair 上限 |
 | `max_gt_tokens` | `256` | GT token 上限，超长跳过 |
 | `gt_alias_strategy` | `first` | 固定第一个非空 GT 别名 |

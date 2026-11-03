@@ -43,7 +43,6 @@ from agentflow.trace.credit import (
     state_values,
 )
 from agentflow.trace.metrics import summarize_selected_pairs, summarize_states
-from agentflow.trace.alfworld import FORECAST_RESPONSE, FORECAST_SCORING_VERSION
 
 import os
 import json
@@ -294,7 +293,6 @@ class AgentFlowTrainer(RayPPOTrainer):
         tasks = non.get("trace_task", [None] * size)
         provenance = non.get("trace_goal_metadata", [None] * size)
         game_by_uid = {}
-        scoring_targets = list(ground_truths)
         for row, task in enumerate(tasks):
             if task != "alfworld":
                 continue
@@ -309,16 +307,6 @@ class AgentFlowTrainer(RayPPOTrainer):
             if key in game_by_uid and game_by_uid[key] != fingerprint:
                 raise ValueError("ALFWorld TRACE uid contains different actual games or goal templates")
             game_by_uid[key] = fingerprint
-        for row, task in enumerate(tasks):
-            if task != "alfworld":
-                continue
-            item = provenance[row]
-            if (item.get("scoring_version") != FORECAST_SCORING_VERSION
-                    or item.get("scoring_response") != FORECAST_RESPONSE):
-                raise ValueError("ALFWorld TRACE requires v2b future-success scoring metadata; restart rollout workers and refresh old rollout caches")
-            # Parquet GT remains the verified task's success conditions. Only
-            # the independently scored continuation changes to the fixed forecast.
-            scoring_targets[row] = FORECAST_RESPONSE
         # Full-state facts are diagnostic inputs to the reference only. Invalid
         # simulator/verifier states must never become valid scoring requests,
         # even if metadata reaches the trainer without the daemon adapter.
@@ -356,7 +344,7 @@ class AgentFlowTrainer(RayPPOTrainer):
         # Encoding all requests together deduplicates s_(t+1) against the next
         # action's pre-state while preserving the native T-action batch.
         score_contexts = contexts + [next_contexts[row] for row in alfworld_rows]
-        score_targets = scoring_targets + [scoring_targets[row] for row in alfworld_rows]
+        score_targets = list(ground_truths) + [ground_truths[row] for row in alfworld_rows]
         instructions = non.get("trace_answer_instruction")
         score_instructions = (None if instructions is None else
                               list(instructions) + [instructions[row] for row in alfworld_rows])

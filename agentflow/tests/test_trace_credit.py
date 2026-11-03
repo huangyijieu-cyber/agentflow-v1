@@ -234,12 +234,12 @@ class TracePairTests(unittest.TestCase):
         self.assertEqual(select_pairs([row(0), missing]), [])
 
     def test_same_question_has_an_independent_two_pair_budget_at_each_turn(self):
-        rows = [row(0, .5, turn_index=1), row(1, .4, turn_index=1),
-                row(2, .3, turn_index=1), row(3, -.3, turn_index=1),
-                row(4, .5, turn_index=2), row(5, .4, turn_index=2),
-                row(6, .3, turn_index=2), row(7, -.3, turn_index=2)]
+        rows = [row(0, .4, turn_index=1), row(1, -.1, turn_index=1),
+                row(2, -.2, turn_index=1), row(3, -.3, turn_index=1),
+                row(4, .4, turn_index=2), row(5, -.1, turn_index=2),
+                row(6, -.2, turn_index=2), row(7, -.3, turn_index=2)]
         selected = select_pairs(rows)
-        self.assertEqual(selected, [(0, 3), (4, 7), (1, 3), (5, 7)])
+        self.assertEqual(selected, [(0, 3), (4, 7), (0, 2), (4, 6)])
         self.assertEqual(len(selected), 4)
         self.assertTrue(all(rows[a]["turn_index"] == rows[b]["turn_index"] for a, b in selected))
 
@@ -247,7 +247,7 @@ class TracePairTests(unittest.TestCase):
         rows = []
         for turn in range(140):
             start = len(rows)
-            rows.extend([row(start, .4, turn_index=turn), row(start + 1, .3, turn_index=turn),
+            rows.extend([row(start, .4, turn_index=turn), row(start + 1, -.1, turn_index=turn),
                          row(start + 2, -.2, turn_index=turn)])
         selected = select_pairs(rows)
         self.assertEqual(len(selected), 256)
@@ -261,41 +261,20 @@ class TracePairTests(unittest.TestCase):
             with self.subTest(task=task):
                 self.assertEqual(select_pairs(rows), [])
                 self.assertEqual(select_pairs(rows, {"k_pairs_per_group": None}),
-                                 [(0, 4)])
+                                 [(0, 4), (0, 3), (0, 2), (0, 1)])
                 # Original turn IDs remain available for credit and diagnostics.
                 self.assertEqual([item["turn_index"] for item in rows], [1, 2, 3, 4, 5])
 
     def test_none_group_cap_still_enforces_default_global_cap(self):
-        rows = [row(i, .4, turn_index=i) for i in range(260)]
-        rows.append(row(260, -.1, turn_index=260))
+        rows = [row(0, .4, turn_index=0)]
+        rows.extend(row(i, -.1 - i / 10000, turn_index=i) for i in range(1, 261))
         metrics = {}
         selected = select_pairs(rows, {"k_pairs_per_group": None}, metrics)
         self.assertEqual(len(selected), 256)
         self.assertEqual(selected[0], (0, 260))
-        self.assertEqual(selected[-1], (255, 260))
+        self.assertEqual(selected[-1], (0, 5))
         self.assertEqual(metrics["rejected_group_cap"], 0)
         self.assertEqual(metrics["rejected_global_cap"], 4)
-
-    def test_chosen_is_used_once_and_rejected_cycles_only_after_exhaustion(self):
-        rows = [row(i, credit) for i, credit in enumerate((.5, .4, .3, .2, .1, -.3, -.2))]
-        expected = {0: 5, 1: 6, 2: 5, 3: 6, 4: 5}
-        for cap in (None, 10):
-            for ordered in (rows, list(reversed(rows))):
-                with self.subTest(cap=cap, reversed=ordered is not rows):
-                    metrics = {}
-                    selected = select_pairs(ordered, {"k_pairs_per_group": cap}, metrics)
-                    self.assertEqual(dict(selected), expected)
-                    self.assertEqual(len(selected), len({chosen for chosen, _ in selected}))
-                    self.assertEqual(metrics["candidates_sign"], 5)
-                    self.assertEqual(metrics["trace_candidates_sign"], 5)
-
-    def test_more_negatives_do_not_create_multiple_pairs_for_one_chosen(self):
-        rows = [row(0, .4), row(1, -.1), row(2, -.3), row(3, -.2)]
-        for ordered in (rows, list(reversed(rows))):
-            metrics = {}
-            self.assertEqual(select_pairs(ordered, {"k_pairs_per_group": None}, metrics), [(0, 2)])
-            self.assertEqual(metrics["candidates_sign"], 1)
-            self.assertEqual(metrics["selected_unique"], 1)
 
     def test_none_group_cap_keeps_question_type_and_valid_turn_boundaries(self):
         config = {"k_pairs_per_group": None}
@@ -349,25 +328,25 @@ class TracePairTests(unittest.TestCase):
         self.assertEqual(select_pairs([row(0, old_per_token=-1), row(1, -0.1, old_per_token=-100)]), [(0, 1)])
 
     def test_priority_and_group_and_global_caps(self):
-        rows = [row(0, .4), row(1, .3), row(2, .2), row(3, -.3),
-                row(4, .1, uid="q2"), row(5, -.2, uid="q2")]
-        self.assertEqual(select_pairs(rows), [(0, 3), (1, 3), (4, 5)])
-        self.assertEqual(select_pairs(list(reversed(rows)), {"max_pairs_per_step": 2}), [(0, 3), (1, 3)])
+        rows = [row(0, 0.1), row(1, -0.1, value=0.21), row(2, -0.2, value=0.2),
+                row(3, -0.3, value=0.2), row(4, 0.1, uid="q2"), row(5, -0.2, uid="q2")]
+        self.assertEqual(select_pairs(rows), [(0, 3), (0, 2), (4, 5)])
+        self.assertEqual(select_pairs(list(reversed(rows)), {"max_pairs_per_step": 2}), [(0, 3), (0, 2)])
         self.assertEqual(select_pairs(rows, {"k_pairs_per_group": 1}), [(0, 3), (4, 5)])
 
-    def test_failed_value_match_skips_chosen_without_trying_other_negatives(self):
-        rows = [row(0, .1), row(1, -.1),
-                row(2, -.4, value=.28), row(3, -.8, value=.4)]
-        config = {"k_pairs_per_group": 1, "match_epsilon": .1}
-        for ordered in (rows, list(reversed(rows))):
-            metrics = {}
-            self.assertEqual(select_pairs(ordered, config, metrics), [])
-            self.assertEqual(metrics["candidates_sign"], 1)
-            self.assertEqual(metrics["rejected_value_match"], 1)
+    def test_credit_gap_priority_keeps_value_match_as_hard_filter(self):
+        rows = [row(0, 0.1), row(1, -0.1),
+                row(2, -0.4, value=0.28), row(3, -0.8, value=0.4)]
+        config = {"k_pairs_per_group": 1, "match_epsilon": 0.1}
+        # The stronger contrast wins within the matched neighborhood; the
+        # largest contrast is ineligible because its state is too far away.
+        self.assertEqual(select_pairs(rows, config), [(0, 2)])
+        self.assertEqual(select_pairs(list(reversed(rows)), config), [(0, 2)])
 
     def test_equal_credit_gaps_prefer_closer_states(self):
-        rows = [row(0, .1, value=.24), row(1, .1, value=.21), row(2, -.2)]
-        self.assertEqual(select_pairs(rows, {"k_pairs_per_group": 1}), [(1, 2)])
+        rows = [row(0, 0.1), row(1, -0.2, value=0.24),
+                row(2, -0.2, value=0.21)]
+        self.assertEqual(select_pairs(rows, {"k_pairs_per_group": 1}), [(0, 2)])
 
     def test_no_negative_and_disabled_return_no_pairs(self):
         self.assertEqual(select_pairs([row(0), row(1)]), [])
@@ -406,28 +385,6 @@ class TracePairTests(unittest.TestCase):
                 self.outcome_row(1, 0, turn_type="final_answer", is_final=True, turn_index=8),
                 row(2, -.1, turn_type="tool_plan", turn_index=9)]
         self.assertEqual(select_pairs(rows, {"k_pairs_per_group": None}), [])
-
-    def test_cache_style_outcome_assignment_keeps_strict_value_matching(self):
-        for kind in ("analysis", "final_answer", "direct", "base"):
-            config = {"k_pairs_per_group": None, "outcome_match_value": True}
-            rows = [self.outcome_row(0, 1, turn_type=kind, value=0., is_final=True),
-                    self.outcome_row(1, 0, turn_type=kind, value=.06, is_final=True),
-                    self.outcome_row(2, 0, turn_type=kind, value=.04, is_final=True)]
-            with self.subTest(kind=kind):
-                metrics = {}
-                self.assertEqual(select_pairs(rows, config, metrics), [])
-                self.assertEqual(metrics["candidates_sign"], 1)
-                self.assertEqual(metrics["rejected_value_match"], 1)
-                rows[1]["value"] = .05
-                self.assertEqual(select_pairs(rows, config), [(0, 1)])
-
-    def test_outcome_chosen_is_unique_and_negative_pool_can_cycle(self):
-        rows = [self.outcome_row(0, 1), self.outcome_row(1, 1), self.outcome_row(2, 1),
-                self.outcome_row(3, 0), self.outcome_row(4, 0)]
-        expected = [(0, 3), (1, 4), (2, 3)]
-        config = {"k_pairs_per_group": None}
-        self.assertEqual(select_pairs(rows, config), expected)
-        self.assertEqual(select_pairs(list(reversed(rows)), config), expected)
 
     def test_only_actual_terminal_answers_use_outcome_labels(self):
         for turn_type in ("final_answer", "direct", "base"):
@@ -531,7 +488,7 @@ class TracePairTests(unittest.TestCase):
         self.assertEqual(metrics["candidates_sign"], 1)
 
     def test_metrics_omit_redundant_counts_and_keep_tool_match_denominator(self):
-        rows = [row(0), row(1, -.1), row(2, .1, value=.5),
+        rows = [row(0), row(1, -0.1), row(2, -0.1, value=0.5),
                 self.outcome_row(3, 1), self.outcome_row(4, 0)]
         metrics = {}
         self.assertEqual(select_pairs(rows, metrics=metrics), [(3, 4), (0, 1)])
@@ -548,12 +505,12 @@ class TracePairTests(unittest.TestCase):
         self.assertTrue(removed.isdisjoint(metrics))
 
     def test_metrics_caps_keep_original_selection_and_count_all_survivors(self):
-        rows = [row(0, .4), row(1, .3), row(2, .2), row(3, -.3),
-                row(4, .1, uid="q2"), row(5, -.2, uid="q2")]
+        rows = [row(0), row(1, -0.1, value=0.21), row(2, -0.2),
+                row(3, -0.3), row(4, uid="q2"), row(5, -0.2, uid="q2")]
         for group_cap, global_cap, expected in (
                 (1, 1, [(0, 3)]), (1, 2, [(0, 3), (4, 5)]),
-                (2, 2, [(0, 3), (1, 3)]),
-                (2, 256, [(0, 3), (1, 3), (4, 5)])):
+                (2, 2, [(0, 3), (0, 2)]),
+                (2, 256, [(0, 3), (0, 2), (4, 5)])):
             config = {"k_pairs_per_group": group_cap, "max_pairs_per_step": global_cap}
             with self.subTest(config=config):
                 metrics = {}

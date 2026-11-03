@@ -221,36 +221,6 @@ class ScoringTests(unittest.TestCase):
         self.assertTrue(trajectory["turns"][-1]["outcome_valid"])
         self.assertEqual(trajectory["turns"][0]["terminal_fill"], 2 * .8 ** 2)
 
-    def test_forecast_rejects_old_state_contexts_before_backend_requests(self):
-        goal = scoring._goal_module()
-        backend = FakeScorer()
-        with self.assertRaisesRegex(ValueError, "v2b state contexts"):
-            self.run_score(self.full_state_saved(), scorer=backend,
-                           probe={"response": goal.FORECAST_RESPONSE, "state_view": "full_state"})
-        self.assertFalse(backend.calls)
-
-    def test_forecast_scores_one_fixed_future_response_and_retains_original_goal(self):
-        goal = scoring._goal_module()
-        snapshot = self.full_state_saved()
-        trajectory = snapshot["trajectories"][0]
-        original_goal = trajectory["goal_response"]
-        trajectory["scoring_version"] = goal.FORECAST_SCORING_VERSION
-        for state in trajectory["states"]:
-            state["scoring_version"] = goal.FORECAST_SCORING_VERSION
-            state["state_context"] += ("\nSuccess conditions:\n" + original_goal
-                                       + "\nRemaining action budget:\n" + str(state["remaining_steps"]))
-        result, _ = self.run_score(snapshot, probe={"prompt": goal.FORECAST_INSTRUCTION,
-                                                   "response": goal.FORECAST_RESPONSE,
-                                                   "state_view": "full_state"})
-        scored = result["trajectories"][0]
-        self.assertEqual(scored["goal_response"], original_goal)
-        self.assertEqual({state["response"] for state in scored["states"]}, {goal.FORECAST_RESPONSE})
-        self.assertEqual({turn["response"] for turn in scored["turns"]}, {goal.FORECAST_RESPONSE})
-        for state in scored["states"]:
-            self.assertIn(original_goal, state["scoring_prompt"])
-            self.assertIn(goal.FORECAST_INSTRUCTION, state["scoring_prompt"])
-            self.assertNotIn(goal.FORECAST_RESPONSE, state["scoring_prompt"])
-
     def test_invalid_terminal_poststate_keeps_action_type_and_blocks_credit_and_fill(self):
         snapshot = self.full_state_saved()
         snapshot["trajectories"][0]["states"][-1].update(goal_check_valid=False, scoring_valid=False)

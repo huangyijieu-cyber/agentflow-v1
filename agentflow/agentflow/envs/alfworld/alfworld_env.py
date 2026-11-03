@@ -130,8 +130,6 @@ def _create_trace_environment(base_env, batch_size=1):
             request_infos.extras.append("expert_plan")
     else:
         raise NotImplementedError(f"Unsupported ALFWorld training method: {training_method}")
-    # Record the existing simulator limit for scoring, without changing it.
-    base_env._trace_step_budget = budget
     wrappers.append(AlfWorldTraceFacts)
     env_id = textworld.gym.register_games(
         base_env.game_files, request_infos, batch_size=batch_size,
@@ -215,7 +213,6 @@ class AlfWorldEnv:
         self.trace_goal_check_valid = False
         self.trace_action_history = []
         self.trace_scoring_valid = False
-        self.trace_step_budget = self.max_step
 
         # 对应集合
         self._env_instances = {}
@@ -231,13 +228,14 @@ class AlfWorldEnv:
         if self.trace_task is not None:
             self.trace_goal_spec = _parquet_goal_tools().read_parquet_task_goal(
                 self.trace_task, info.get("extra.gamefile"))
-            # The filled dataset result remains the authoritative success conditions.
+            # The filled dataset result is the authoritative scoring target.
             self.trace_gt = self.trace_task["result"]
         else:
             self.trace_goal_spec = _saved_goal_tools().read_goal_spec(
                 self.trace_goals_path, info.get("extra.gamefile"))
             self.trace_gt = self.trace_goal_spec["goal_response"]
-        self.trace_answer_instruction = _goal_tools().FORECAST_INSTRUCTION
+        self.trace_answer_instruction = self.trace_goal_spec.get(
+            "answer_instruction", ALFWORLD_TRACE_INSTRUCTION)
         self.trace_goal_metadata = {
             key: deepcopy(self.trace_goal_spec.get(key))
             for key in ("gamefile", "goal_source", "goal_task_type", "template_version",
@@ -253,10 +251,6 @@ class AlfWorldEnv:
                 "parquet_goal_row": self.trace_task.get("alfworld_goal_row"),
                 "parquet_game_key": self.trace_task.get("alfworld_game_key"),
             })
-        self.trace_goal_metadata.update({
-            "scoring_version": _goal_tools().FORECAST_SCORING_VERSION,
-            "scoring_response": _goal_tools().FORECAST_RESPONSE,
-        })
         self.trace_action_history = []
 
     def _refresh_trace_state(self, info, observation, action=None):
@@ -285,11 +279,9 @@ class AlfWorldEnv:
         won = _environment_flag(info.get("won"))
         self.trace_goal_check_valid = won is not None and won == self.trace_goal_check
         self.trace_scoring_valid = self.trace_goal_check_valid
-        self.trace_state_context = tools.render_forecast_state(
-            self.trace_goal_spec, self.trace_facts, task=self.task,
-            goal_response=self.trace_gt,
-            remaining_steps=max(0, self.trace_step_budget - self.step_count),
-            observation=observation,
+        self.trace_state_context = f"Task: {self.task}\n\n" + tools.render_full_state(
+            self.trace_goal_spec, self.trace_facts,
+            observation=observation, action_history=self.trace_action_history,
         )
         self._write_trace_info(info)
         if not self.trace_goal_check_valid:
@@ -309,7 +301,6 @@ class AlfWorldEnv:
             "trace_goal_check": self.trace_goal_check,
             "trace_goal_check_valid": self.trace_goal_check_valid,
             "trace_scoring_valid": self.trace_scoring_valid,
-            "trace_remaining_steps": max(0, self.trace_step_budget - self.step_count),
         })
 
     def _trace_failed_action(self, info, action, observation, *, external=False):
@@ -333,11 +324,9 @@ class AlfWorldEnv:
         else:
             # Rejected format/illegal actions never reached the simulator, so
             # its last verified facts remain the actual unchanged state.
-            self.trace_state_context = _goal_tools().render_forecast_state(
-                self.trace_goal_spec, self.trace_facts, task=self.task,
-                goal_response=self.trace_gt,
-                remaining_steps=max(0, self.trace_step_budget - self.step_count),
-                observation=observation,
+            self.trace_state_context = f"Task: {self.task}\n\n" + _goal_tools().render_full_state(
+                self.trace_goal_spec, self.trace_facts,
+                observation=observation, action_history=self.trace_action_history,
             )
         self._write_trace_info(info)
         return info
@@ -555,9 +544,6 @@ class AlfWorldEnv:
             self.env.close()
         self.env = (_create_trace_environment(base_env, batch_size=1) if self.trace_enabled
                     else base_env.init_env(batch_size=1))
-        if self.trace_enabled:
-            self.trace_step_budget = min(
-                self.max_step, getattr(base_env, "_trace_step_budget", self.max_step))
         obs, info = self.env.reset()
         if mapped_gamefile is not None:
             actual_gamefile = _goal_tools().normalize_gamefile(info.get("extra.gamefile"))

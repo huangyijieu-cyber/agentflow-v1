@@ -349,42 +349,6 @@ class GoalTests(unittest.TestCase):
         self.assertNotEqual(converter.render_full_state(spec, INITIAL, observation=observation), context)
         self.assertNotEqual(converter.render_full_state(spec, current, observation="A different current observation."), context)
 
-    def test_future_success_prompt_reuses_goal_as_requirements_and_reports_budget(self):
-        spec = converter.load_goal_spec(self.create())
-        saved = copy.deepcopy(spec)
-        context = converter.render_forecast_state(
-            spec, INITIAL, task="put a clean mug in a cabinet.",
-            goal_response=spec["goal_response"], remaining_steps=49,
-            observation="The agent is standing by the cabinet.")
-        self.assertTrue(context.startswith("Task: put a clean mug in a cabinet."))
-        self.assertIn("Success conditions (requirements, not observed facts):\n" + spec["goal_response"], context)
-        self.assertIn(spec["rules_context"], context)
-        self.assertIn(spec["initial_context"], context)
-        self.assertTrue(context.endswith("Remaining action budget:\n49"))
-        self.assertNotIn(converter.FORECAST_RESPONSE, context)
-        self.assertNotIn("Recorded environment action history", context)
-        self.assertNotIn("won:", context)
-        self.assertNotIn("reward:", context)
-        self.assertEqual(spec, saved)
-        exhausted = converter.render_forecast_state(
-            spec, INITIAL, task="put a clean mug in a cabinet.",
-            goal_response=spec["goal_response"], remaining_steps=0)
-        self.assertTrue(exhausted.endswith("Remaining action budget:\n0"))
-        self.assertEqual(converter.FORECAST_RESPONSE,
-                         "The agent will successfully complete the task within the remaining action budget.")
-        self.assertIn("future actions will be perfect", converter.FORECAST_INSTRUCTION)
-        self.assertIn("If all success conditions already hold", converter.FORECAST_INSTRUCTION)
-
-    def test_future_success_prompt_rejects_missing_goal_and_invalid_budget(self):
-        spec = converter.load_goal_spec(self.create())
-        for budget in (None, True, -1, 1.5, "49"):
-            with self.subTest(budget=budget), self.assertRaises(converter.GoalConversionError):
-                converter.render_forecast_state(spec, INITIAL, task="task", goal_response=spec["goal_response"],
-                                                remaining_steps=budget)
-        for goal in (None, "", " "):
-            with self.subTest(goal=goal), self.assertRaises(converter.GoalConversionError):
-                converter.render_forecast_state(spec, INITIAL, task="task", goal_response=goal, remaining_steps=49)
-
     def test_slice_metadata_and_actual_goal_must_agree(self):
         params = {"object_target": "Mug", "parent_target": "Cabinet", "object_sliced": True}
         with self.assertRaisesRegex(converter.GoalConversionError, "Slice condition"):

@@ -21,10 +21,6 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 ENV_PATH = ROOT / "agentflow/agentflow/envs/alfworld/alfworld_env.py"
-_FORECAST_SPEC = importlib.util.spec_from_file_location(
-    "alfworld_environment_forecast", ROOT / "agentflow/agentflow/trace/alfworld.py")
-FORECAST = importlib.util.module_from_spec(_FORECAST_SPEC)
-_FORECAST_SPEC.loader.exec_module(FORECAST)
 
 
 def extract(path, name, scope):
@@ -53,10 +49,6 @@ class Memory:
 
 
 class Tools:
-    FORECAST_INSTRUCTION = FORECAST.FORECAST_INSTRUCTION
-    FORECAST_RESPONSE = FORECAST.FORECAST_RESPONSE
-    FORECAST_SCORING_VERSION = FORECAST.FORECAST_SCORING_VERSION
-
     @staticmethod
     def read_dataset_gamefile(store_path, data_type, task_type, question_id, games_root):
         return None
@@ -94,12 +86,6 @@ class Tools:
     @staticmethod
     def render_full_state(spec, facts, *, observation=None, action_history=None):
         return f"Full-state rules and initial facts.\nCurrent facts: {facts}\nObservation: {observation}\nHistory: {action_history}"
-
-    @classmethod
-    def render_forecast_state(cls, spec, facts, *, task, goal_response, remaining_steps, observation=None):
-        return (f"Task: {task}\n\nSuccess conditions (requirements, not observed facts):\n{goal_response}\n\n"
-                + cls.render_full_state(spec, facts, observation=observation)
-                + f"\n\nRemaining action budget:\n{remaining_steps}")
 
 
 class Simulator:
@@ -166,11 +152,7 @@ class EnvironmentTests(unittest.TestCase):
         self.assertNotIn("secret", actor)
         self.assertIn("secret", initial)
         self.assertEqual(env.trace_gt, "A clean mug is in a cabinet.")
-        self.assertEqual(env.trace_answer_instruction, FORECAST.FORECAST_INSTRUCTION)
-        self.assertEqual(info["trace_remaining_steps"], 50)
-        self.assertIn("Success conditions (requirements, not observed facts):\n" + env.trace_gt, initial)
-        self.assertEqual(env.trace_goal_metadata["scoring_version"], FORECAST.FORECAST_SCORING_VERSION)
-        self.assertEqual(env.trace_goal_metadata["scoring_response"], FORECAST.FORECAST_RESPONSE)
+        self.assertEqual(env.trace_answer_instruction, "Judge the recorded state.")
         self.assertEqual(env.trace_goal_metadata["goal_store_id"], "persisted-store")
         self.assertEqual(env.trace_goal_metadata["goal_store_path"], "/saved/goals.sqlite")
         self.assertFalse(env.trace_goal_check)
@@ -180,25 +162,9 @@ class EnvironmentTests(unittest.TestCase):
         self.assertTrue(info["trace_goal_check"])
         self.assertTrue(info["trace_goal_check_valid"])
         self.assertEqual(info["trace_state_view"], "full_state")
-        self.assertEqual(info["trace_remaining_steps"], 49)  # Early success keeps the real remaining budget.
         self.assertIn("inreceptacle", env.trace_state_context)
         self.assertNotIn("secret", actor)
         self.assertEqual(env.trace_gt, "A clean mug is in a cabinet.")
-
-    def test_forecast_budget_respects_existing_simulator_limit_and_outer_limit(self):
-        for outer_limit, simulator_limit, expected in ((50, 30, 30), (10, 30, 10)):
-            with self.subTest(outer=outer_limit, simulator=simulator_limit):
-                env, base = self.env(Simulator(endless=True), max_step=outer_limit)
-                base._trace_step_budget = simulator_limit
-                _, info = self.reset(env, question_id=0)
-                self.assertEqual(info["trace_remaining_steps"], expected)
-                self.assertIn(f"Remaining action budget:\n{expected}", env.trace_state_context)
-                _, _, done, info = self.step(env, "<action>place mug</action>")
-                self.assertFalse(done)
-                self.assertEqual(info["trace_remaining_steps"], expected - 1)
-                self.assertIn(f"Remaining action budget:\n{expected - 1}", env.trace_state_context)
-                self.assertEqual(env.max_step, outer_limit)
-                self.assertEqual(base._trace_step_budget, simulator_limit)
 
     def test_separate_training_sessions_only_read_the_saved_store(self):
         with mock.patch.object(Tools, "read_goal_spec", wraps=Tools.read_goal_spec) as read, \
@@ -335,7 +301,7 @@ class EnvironmentTests(unittest.TestCase):
                 self.assertIn("Initial state (before this episode's first action):", context)
                 self.assertIn("holds: (agent0,mug0)", context)
             self.assertEqual(env.trace_gt, saved_spec["goal_response"])
-            self.assertEqual(env.trace_answer_instruction, fixtures.converter.FORECAST_INSTRUCTION)
+            self.assertEqual(env.trace_answer_instruction, saved_spec["answer_instruction"])
             self.assertEqual(output.read_bytes(), saved_bytes)
 
     def test_prepared_row_result_loads_without_sqlite_or_actor_gt_injection(self):
@@ -651,7 +617,6 @@ class EnvironmentTests(unittest.TestCase):
         self.assertTrue(info["invalid_action"])
         self.assertFalse(env.trace_action_history[-1]["executed"])
         self.assertEqual(reward, 0)
-        self.assertEqual(info["trace_remaining_steps"], 49)
 
     def test_format_error_does_not_apply_effects(self):
         env, _ = self.env()
@@ -682,7 +647,6 @@ class EnvironmentTests(unittest.TestCase):
         self.assertFalse(info["terminated"])
         self.assertTrue(info["trace_goal_check_valid"])
         self.assertEqual(reward, 0)
-        self.assertEqual(info["trace_remaining_steps"], 0)
 
     def test_goal_engine_disagreement_retains_diagnostic_but_invalidates_score(self):
         env, _ = self.env(Simulator(mismatch=True))
@@ -800,7 +764,6 @@ class RegistrationTests(unittest.TestCase):
         self.assertIn("trace_raw_facts", requested["extras"])
         args = gym.register_games.call_args
         self.assertEqual(args.kwargs["max_episode_steps"], 50)
-        self.assertEqual(base._trace_step_budget, 50)
         self.assertEqual(args.kwargs["wrappers"], ["demangler", "infos-wrapper", "expert", "raw-facts-wrapper"])
         self.assertTrue(args.kwargs["asynchronous"])
         official.AlfredExpert.assert_called_once_with(expert_type="handcoded")

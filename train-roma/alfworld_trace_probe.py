@@ -38,25 +38,6 @@ import uuid
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_DATASET = "data/train/alfworld/train_all_alfworld_3305.parquet"
-
-
-def _goal_module():
-    name = "_alfworld_probe_goal_conversion"
-    if name not in sys.modules:
-        path = REPO_ROOT / "agentflow/agentflow/trace/alfworld.py"
-        spec = importlib.util.spec_from_file_location(name, path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-    return sys.modules[name]
-
-
-# The shared module uses only the standard library; importing defaults never
-# starts ALFWorld or loads model/tokenizer weights.
-FORECAST_SCORING_VERSION = _goal_module().FORECAST_SCORING_VERSION
-FORECAST_RESPONSE = _goal_module().FORECAST_RESPONSE
-FORECAST_INSTRUCTION = _goal_module().FORECAST_INSTRUCTION
-
 DEFAULT_CONFIG = {
     "dataset": {"path": DEFAULT_DATASET, "row_index": 0},
     "sampling": {
@@ -76,8 +57,13 @@ DEFAULT_CONFIG = {
         "max_context_tokens": 16384, "device": "auto",
     },
     "probe": {
-        "prompt": FORECAST_INSTRUCTION,
-        "response": FORECAST_RESPONSE, "state_view": "full_state",
+        "prompt": (
+            "Based on the applicable environment rules, initial state, current "
+            "full state and recorded action history above, describe the current "
+            "state in relation to the task's success conditions. Desired goal "
+            "conditions are not evidence that they already hold."
+        ),
+        "response": "{goal_response}", "state_view": "full_state",
         "epsilon": 0.1, "k": 3, "gamma": 0.8, "max_response_tokens": 256,
         "terminal_fill_enabled": True, "terminal_fill_scale": 2.0,
         "norm_adv_by_std_in_grpo": False, "outcome_success_threshold": 0.5,
@@ -341,6 +327,17 @@ def request_action(prompt, sampling, trajectory_index, turn_index):
             "response_token_ids": choice.get("token_ids"), "usage": result.get("usage")}
 
 
+def _goal_module():
+    name = "_alfworld_probe_goal_conversion"
+    if name not in sys.modules:
+        path = REPO_ROOT / "agentflow/agentflow/trace/alfworld.py"
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
 def _goal_store_module():
     name = "_alfworld_probe_goal_store"
     if name not in sys.modules:
@@ -367,59 +364,6 @@ def _save_goal_fields(trajectory, spec):
                        "goal_task_type": spec.get("goal_task_type", spec.get("task_type")),
                        "goal_spec_hash": spec.get("goal_spec_hash"),
                        "state_view": "full_state"})
-
-
-def _uses_forecast(probe):
-    """Keep existing editable probes intact; only the fixed forecast uses v2b."""
-    return (probe.get("state_view") == "full_state"
-            and probe.get("response") == FORECAST_RESPONSE)
-
-
-def _render_forecast_snapshot(snapshot, *, forecast=True):
-    """Render saved facts for this probe without sampling or source reads.
-
-    Custom fixed-goal probes retain a state-only view, avoiding a copy of their
-    target in the forecast view's success-condition definition.
-    """
-    converted = copy.deepcopy(snapshot)
-    module = _goal_module()
-    for trajectory in converted.get("trajectories", []):
-        spec, goal = trajectory.get("goal_spec"), trajectory.get("goal_response")
-        if (not isinstance(spec, dict) or not isinstance(goal, str) or not goal.strip()
-                or spec.get("goal_response") != goal):
-            raise ValueError("Forecast scoring requires the saved goal_spec and unchanged goal_response; run enrich first.")
-        for state in trajectory.get("states", []):
-            facts = state.get("facts")
-            if facts is None:
-                facts = (state.get("env_info") or {}).get("trace_full_facts")
-            if facts is None and state.get("scoring_valid") is False:
-                state["scoring_version"] = FORECAST_SCORING_VERSION if forecast else None
-                continue
-            if facts is None:
-                raise ValueError("Forecast scoring requires complete saved facts; run enrich --replay without sampling.")
-            remaining = state.get("remaining_steps")
-            if forecast:
-                recorded_remaining = (state.get("env_info") or {}).get("trace_remaining_steps")
-                if recorded_remaining is not None:
-                    remaining = recorded_remaining
-                    state["budget_source"] = "environment"
-                elif state.get("budget_source") not in ("environment", "environment_step_budget"):
-                    raise ValueError(
-                        "Forecast scoring requires a verified environment remaining_steps budget; "
-                        "run enrich --replay to confirm the actual budget without sampling new actions.")
-                if type(remaining) is not int or remaining < 0:
-                    raise ValueError("Forecast scoring requires a saved nonnegative remaining_steps value for every state.")
-                state["remaining_steps"] = remaining
-            if forecast:
-                state["state_context"] = module.render_forecast_state(
-                    spec, facts, task=trajectory.get("goal", ""), goal_response=goal,
-                    remaining_steps=remaining, observation=state.get("observation"))
-            else:
-                state["state_context"] = (f"Task: {trajectory.get('goal', '')}\n\n"
-                                          + module.render_full_state(spec, facts, observation=state.get("observation")))
-            state["scoring_version"] = FORECAST_SCORING_VERSION if forecast else None
-        trajectory["scoring_version"] = FORECAST_SCORING_VERSION if forecast else None
-    return converted
 
 
 def _full_facts(env, info):
@@ -456,17 +400,8 @@ def state_snapshot(env, actor_prompt, info, index, sampling, *, prior_turns=(), 
                    f"Recent observations and actions: {json.dumps(history, ensure_ascii=False)}\n\n"
                    f"Current observation: {observation}\n\n"
                    f"Available actions: {json.dumps(actions, ensure_ascii=False)}")
-    remaining = info.get("trace_remaining_steps")
-    budget_source = "environment"
-    if remaining is None:
-        verified_budget = getattr(env, "trace_step_budget", None)
-        budget_source = "environment_step_budget" if verified_budget is not None else "sampling_limit_unverified"
-        remaining = max(0, (verified_budget if verified_budget is not None else sampling["max_steps"])
-                        - getattr(env, "step_count", index))
     return {"state_index": index, "state_context": context, "observation": observation,
-            "available_actions": actions, "remaining_steps": remaining, "budget_source": budget_source,
-            "scoring_version": (info.get("trace_goal_metadata") or
-                                getattr(env, "trace_goal_metadata", {}) or {}).get("scoring_version"),
+            "available_actions": actions, "remaining_steps": max(0, sampling["max_steps"] - index),
             "is_post_state": index > 0, "is_terminal_state": bool(done),
             "env_info": compact_env_info(info), "facts": facts,
             "state_view": "full_state" if facts is not None else "legacy_observed",
@@ -840,7 +775,7 @@ def capture_parallel_trajectories(snapshot, sampling, save, directory, progress=
 
 
 def enrich_snapshot(snapshot, *, replay=False, env_factory=make_environment, progress=None,
-                    trace_goals_path=None, forecast=False):
+                    trace_goals_path=None):
     """Read preconverted goals and recover states; never convert or generate actions."""
     if not snapshot.get("complete"):
         raise ValueError("Finish the initial sampling before enriching its cache")
@@ -860,7 +795,6 @@ def enrich_snapshot(snapshot, *, replay=False, env_factory=make_environment, pro
             specs[key] = store.read_goal_spec(store_path, gamefile)
         spec = specs[key]
         _save_goal_fields(trajectory, spec)
-        trajectory["scoring_version"] = None
         if replay:
             progress(f"Enriching {trajectory['trajectory_id']} by replay only; no policy requests")
             env = env_factory(sampling)
@@ -911,7 +845,7 @@ def enrich_snapshot(snapshot, *, replay=False, env_factory=make_environment, pro
             check = module.evaluate_goal(spec, facts)
             won = flag((state.get("env_info") or {}).get("won"))
             check_valid = won is not None and check is won
-            state.update({"facts": facts, "state_view": "full_state", "scoring_version": None,
+            state.update({"facts": facts, "state_view": "full_state",
                           "state_context": module.render_full_state(spec, facts,
                               observation=state.get("observation"), action_history=history),
                           "goal_check": check, "goal_check_valid": check_valid,
@@ -923,15 +857,15 @@ def enrich_snapshot(snapshot, *, replay=False, env_factory=make_environment, pro
     hashes = {trajectory.get("goal_spec_hash") for trajectory in converted.get("trajectories", [])}
     if len(hashes) != 1:
         raise ValueError("The four saved rollouts do not share the same actual goal specification")
-    return _render_forecast_snapshot(converted) if forecast else converted
+    return converted
 
 
 def _enrichment_payload(original, converted, source_hash):
     trajectories = []
     fields = ("goal_response", "goal_spec", "goal_metadata", "goal_source", "goal_task_type",
-              "goal_spec_hash", "state_view", "scoring_version")
+              "goal_spec_hash", "state_view")
     state_fields = ("state_index", "state_context", "facts", "state_view", "scoring_valid",
-                    "goal_check", "goal_check_valid", "remaining_steps", "budget_source", "scoring_version")
+                    "goal_check", "goal_check_valid")
     for trajectory in converted["trajectories"]:
         trajectories.append({"trajectory_id": trajectory["trajectory_id"],
                              **{key: trajectory.get(key) for key in fields},
@@ -1125,8 +1059,7 @@ class Experiment:
             source_hash = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
             converted = enrich_snapshot(snapshot, replay=replay, env_factory=env_factory,
                                         progress=self.progress,
-                                        trace_goals_path=self.config["sampling"].get("trace_goals_path"),
-                                        forecast=_uses_forecast(self.config["probe"]))
+                                        trace_goals_path=self.config["sampling"].get("trace_goals_path"))
             payload = _enrichment_payload(snapshot, converted, source_hash)
             atomic_json(self.directory / "goal_metadata.json", payload)
             self.progress("Saved goal_metadata.json; original trajectories and actions are unchanged.")
@@ -1139,7 +1072,7 @@ class Experiment:
         source_hash = hashlib.sha256((self.directory / "trajectories.json").read_bytes()).hexdigest()
         sidecar = read_json(self.directory / "goal_metadata.json")
         if sidecar:
-            snapshot = _merge_enrichment(snapshot, sidecar, source_hash)
+            return _merge_enrichment(snapshot, sidecar, source_hash)
         complete = all(trajectory.get("goal_response") and all(
             state.get("state_view") == "full_state" for state in trajectory["states"])
             for trajectory in snapshot.get("trajectories", []))
@@ -1147,18 +1080,9 @@ class Experiment:
             hashes = {trajectory.get("goal_spec_hash") for trajectory in snapshot["trajectories"]}
             if len(hashes) != 1:
                 raise ValueError("Saved goal specifications differ across rollouts")
-            forecast = _uses_forecast(probe)
-            forecast_contexts = any(state.get("scoring_version") == FORECAST_SCORING_VERSION
-                                    for trajectory in snapshot["trajectories"] for state in trajectory["states"])
-            if not forecast and not forecast_contexts:
-                return snapshot
-            converted = _render_forecast_snapshot(snapshot, forecast=forecast)
-            payload = _enrichment_payload(snapshot, converted, source_hash)
-            atomic_json(self.directory / "goal_metadata.json", payload)
-            return _merge_enrichment(snapshot, payload, source_hash)
+            return snapshot
         converted = enrich_snapshot(snapshot, replay=False, progress=self.progress,
-                                    trace_goals_path=self.config["sampling"].get("trace_goals_path"),
-                                    forecast=_uses_forecast(probe))
+                                    trace_goals_path=self.config["sampling"].get("trace_goals_path"))
         payload = _enrichment_payload(snapshot, converted, source_hash)
         atomic_json(self.directory / "goal_metadata.json", payload)
         return _merge_enrichment(snapshot, payload, source_hash)
