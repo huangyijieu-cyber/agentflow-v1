@@ -2,11 +2,13 @@
 
 转换与训练已分开：只转换训练 Parquet 选中的题，将固定英文 GT 写入 `result`，同时在该 Parquet 中保存规则和游戏映射。训练直接读取该行 `result`，不在 reset 或 turn 中转换，也不依赖单独的 SQLite 文件。
 
-当前 `alfworld` 分支默认使用 v2a 评分＋先 V 匹配再排序轮转：`TRACE_K_PAIRS_PER_GROUP=None`、同题可跨 turn、无组内额度、全步默认最多 256 对不变。`41f0552` 恢复 v2a，`ad412f6` 应用先轮转后检查 V；本次按用户纠正与 `websearch` 同步改为先匹配再轮转。历史 v2a/v2b 实验定义和标签保留原记录，完整区别见 [版本归档](../ALFWORLD_VERSIONS.md)。
+当前 `alfworld` 分支沿用 v2a 成功状态 Response，full-state 评分新增 actor 原生最近历史窗口；默认配对仍为先 V 匹配再排序轮转：`TRACE_K_PAIRS_PER_GROUP=None`、同题可跨 turn、无组内额度、全步默认最多 256 对不变。`41f0552` 恢复 v2a，`ad412f6` 应用先轮转后检查 V；此前已按用户纠正与 `websearch` 同步改为先匹配再轮转。历史 v2a/v2b 实验定义和标签保留原记录，完整区别见 [版本归档](../ALFWORLD_VERSIONS.md)。
 
 此实现使用完整环境状态进行参考模型评分（privileged/full-state）。策略模型继续接收原来的可见观察和有限历史。完整状态只进入评分上下文；固定 Response 描述成功条件，每道题的所有状态复用同一文本。
 
-评分 Prompt 现不再附加累计动作/观察历史：保留任务、环境规则、事实解释、初始事实、当前新增/删除事实、当前观察和固定评分指令。当前事实已包含 Goal 所需的持久标记；历史记录仍保留在环境/轨迹中用于排查，策略最近四步历史保持原样。此缩减只改变 ALFWorld full-state 评分文本，不改变 GT Response、信用公式或配对规则。已有 GT Parquet 无需重新转换，重启训练/rollout 进程后使用新文本。已有 Probe 缓存的 `state_context` 不会自动更新；含完整事实时运行 `enrich --work-dir ...` 重建评分 sidecar 后再评分，无需重新采样。
+当前评分 Prompt 保留任务、环境规则、事实解释、初始事实、当前新增/删除事实、当前观察和固定评分指令，并追加与 actor 完全相同的原生最近历史快照，默认 4 条实际存入 memory 的记录，自定义 history_length 时严格跟随实际窗口。快照直接复用 `_build_prompt()` 的 `SimpleMemory.fetch(history_length)` 文本，每条为动作前 observation 与解析后的 action，保留原编号、引号和换行；不从累计 `trace_action_history` 截取最后 4 条动作后观察。初始化或 history_length<=0 时不附加历史，格式/命令校验失败或外部异常未写 memory 时沿用旧窗口；模拟器正常返回但动作未生效的记录仍按原逻辑写入。本次只增加 ALFWorld 评分信息导出，不改 actor Prompt、memory 规则、窗口配置或环境初始化，QA / websearch 评分保持原样。原 v2a 标签仍无此历史段，本次不另起版本名或移动标签。
+
+GT Response/result、信用公式、轮转开关及额度不变，已有 GT Parquet 无需重新转换。更新后重启训练/rollout 进程，不混用旧评分信用。新 Probe 缓存保存原生快照及版本；旧缓存缺快照时，即使含完整事实也需 `enrich --replay --work-dir ...` 重放已存动作并核验原 actor Prompt，重建 sidecar 后再评分，不重新采样。旧 sidecar 不可作为新 full-state 契约；`saved` 自定义实验保留原样。
 
 ## 规则来源与转换
 
@@ -107,11 +109,11 @@ export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305_with_gt.parquet
 # TEST_DATA_PATH 设为自己实际存在的 ALFWorld 验证 Parquet。
 ```
 
-从 v2b 恢复后需重启训练及 rollout 进程，使用新 rollout/replay 数据，不混用旧 v2b 的上下文、信用或偏好对。已有 GT Parquet 无需重新转换。训练只需要准备好的 Parquet，不需要设置 `ALFWORLD_TRACE_GOALS`。该配置保留用于旧 SQLite/Probe 兼容。每个 worker 需能访问相同内容的训练文件和原始游戏数据。第二次及后续训练继续使用 `..._with_gt.parquet`，无需重新转换。验证环境关闭 ALFWorld TRACE 的完整状态评分，继续按环境奖励验证，不要求为验证集额外转换 GT。
+本次更新后需重启训练及 rollout 进程，使用带原生历史窗口的新评分 rollout/replay，不混用旧无窗口、累计历史或 v2b 的信用和偏好对。已有 GT Parquet 无需重新转换。训练只需要准备好的 Parquet，不需要设置 `ALFWORLD_TRACE_GOALS`。该配置保留用于旧 SQLite/Probe 兼容。每个 worker 需能访问相同内容的训练文件和原始游戏数据。第二次及后续训练继续使用 `..._with_gt.parquet`，无需重新转换。验证环境关闭 ALFWorld TRACE 的完整状态评分，继续按环境奖励验证，不要求为验证集额外转换 GT。
 
 数据路径与 `BASE_DATA_DIR` 组合，由现有 `train-roma/config.yaml` 解析；使用自定义启动配置时，将 TASK、数据路径和 TRACE 配置传入两个 rollout 入口及训练进程。无需为 ALFWorld 改 QA 的 epsilon、K、gamma、配对阈值或 loss。参考模型保持冻结，且 tokenizer 必须与参考模型一致。
 
-完整状态比策略可见上下文长。`MAX_PROMPT_LENGTH` 必须容纳规则、完整初始事实、状态变化和评分指令；超过上限会排除该状态并记录无效原因，不静默截断。先用 Probe 检查实际 token 数，再据服务器显存/序列上限设置。固定 GT 超过 256 tokens 时同样会明确标记无效，可检查转换文本及模型 tokenizer 后再决定是否提高与 QA 共用的上限。
+完整状态比策略可见上下文长。`MAX_PROMPT_LENGTH` 必须容纳规则、完整初始事实、状态变化、原生最近历史窗口和评分指令；超过上限会排除该状态并记录无效原因，不静默截断。先用 Probe 检查实际 token 数，再据服务器显存/序列上限设置。固定 GT 超过 256 tokens 时同样会明确标记无效，可检查转换文本及模型 tokenizer 后再决定是否提高与 QA 共用的上限。
 
 窗口使用和旧缓存升级见 [alfworld-trace-probe.md](alfworld-trace-probe.md)。建议先跑固定四条轨迹，查看 GT、Goal/环境校验、local credit、terminal fill 和最终 effective credit，再开始训练。文本 LogP 是参考模型对目标描述的支持程度；它的成功率校准与信用质量需要实验检验。
 
@@ -153,7 +155,7 @@ GRPO 的 `dp_actor.py` forward/backward/optimizer 以及 actor 的默认 SP、mi
 
 若实验意图仅为严格正负及至少 0.005 的信用差，可显式将 `TRACE_POSITIVE_THRESHOLD=0`、`TRACE_NEGATIVE_THRESHOLD=0` 和 `TRACE_GAP_EPSILON=0.005` 一起设置；这是候选门槛调整，代码不会自动应用，也不保证通过状态价值或相同动作过滤。当前配对范围由 `TRACE_K_PAIRS_PER_GROUP` 控制，默认 None 允许跨 turn；门槛调整不改变该设置。新增 `trace/config/{positive_threshold,negative_threshold,gap_epsilon,match_epsilon}` 指标打印实际采用的四个值。
 
-正式入口 `train-roma/train_agent.py` 读取 `train-roma/config.yaml`，同名环境变量优先于 YAML 默认值，命令行 Hydra 覆盖最后生效。仅修改 `config_grpo+slic.yaml` 或 `igpo_gap_epsilon` 不保证这个入口的 TRACE gap 发生变化。策略最近 4 步的上下文相同，也不等于 GT 评分上下文相同，后者包含规则、完整状态和当前观察；此差别可能影响 V 匹配。评分文本已移除累计动作/观察历史，但当前观察仍可携带最近动作的反馈，因此相同完整事实也不保证评分 Prompt 完全一致。
+正式入口 `train-roma/train_agent.py` 读取 `train-roma/config.yaml`，同名环境变量优先于 YAML 默认值，命令行 Hydra 覆盖最后生效。仅修改 `config_grpo+slic.yaml` 或 `igpo_gap_epsilon` 不保证这个入口的 TRACE gap 发生变化。策略最近 4 步的上下文相同，也不等于 GT 评分上下文相同，后者包含规则、完整状态和当前观察；此差别可能影响 V 匹配。评分文本不输入累计全历史，但含 actor 原生最近窗口，当前观察也可携带动作反馈；因此相同完整事实并不保证评分 Prompt 完全一致。
 
 ## HCCL 端口故障定位
 
@@ -196,7 +198,7 @@ python train-roma/diagnose_hccl_ports.py \
 
 新增 Parquet 流程另用上述六类真实样例运行了完整 `prepare` 命令：原六列（除 result）保持一致，六行 GT 非空，四列规则/映射写入成功，中间 SQLite 已删除。目录收集采用官网构造器与收集方法的独立测试替身（本地未安装 TextWorld）；新进程禁用 Arrow 导入与转换器后仍能读取六行并核验源文件。该验证不代表已在本地转换服务器的全部 3305 个游戏，也未执行模型训练。
 
-统一动作配对改动不改变离线 GT/规则格式：已经准备好的 `..._with_gt.parquet` 可以直接复用，不需要重新转换。已有 Probe 缓存只要保留了全部 T+1 个真实状态，也可以直接重新评分，无需重新采样。
+统一动作配对改动不改变离线 GT/规则格式：已经准备好的 `..._with_gt.parquet` 可以直接复用，不需要重新转换。已有 Probe 缓存若同时保留 T+1 个真实状态及本次契约的原生历史快照和版本，可以直接重新评分；缺快照的旧缓存先用 `enrich --replay` 重放已存动作核验 actor Prompt，无需重新采样。
 
 当前回归通过 184 项 ALFWorld 测试和 135 项 TRACE 回归，覆盖单动作终止、末动作真实 delta、末三动作回填、缺失末状态、相邻状态不一致和 QA 既有路由。模型评分及模拟器在链路测试中使用 CPU 替身，未在服务器执行完整模型训练。更新代码后应重启训练及 rollout 进程；旧训练 rollout 的 base/outcome 元数据会被明确拒绝，离线 Parquet 不受影响。
 

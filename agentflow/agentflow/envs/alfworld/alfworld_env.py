@@ -212,6 +212,8 @@ class AlfWorldEnv:
         self.trace_goal_check = None
         self.trace_goal_check_valid = False
         self.trace_action_history = []
+        self.trace_actor_history = ""
+        self.trace_actor_history_steps = 0
         self.trace_scoring_valid = False
 
         # 对应集合
@@ -281,7 +283,7 @@ class AlfWorldEnv:
         self.trace_scoring_valid = self.trace_goal_check_valid
         self.trace_state_context = f"Task: {self.task}\n\n" + tools.render_full_state(
             self.trace_goal_spec, self.trace_facts,
-            observation=observation, action_history=self.trace_action_history,
+            observation=observation, actor_history=self.trace_actor_history,
         )
         self._write_trace_info(info)
         if not self.trace_goal_check_valid:
@@ -293,6 +295,9 @@ class AlfWorldEnv:
     def _write_trace_info(self, info):
         info.update({
             "trace_full_facts": deepcopy(self.trace_facts),
+            "trace_actor_history": self.trace_actor_history,
+            "trace_actor_history_steps": self.trace_actor_history_steps,
+            "trace_actor_history_length": self.history_length,
             "trace_state_context": self.trace_state_context,
             "trace_gt": self.trace_gt,
             "trace_answer_instruction": self.trace_answer_instruction,
@@ -326,7 +331,7 @@ class AlfWorldEnv:
             # its last verified facts remain the actual unchanged state.
             self.trace_state_context = f"Task: {self.task}\n\n" + _goal_tools().render_full_state(
                 self.trace_goal_spec, self.trace_facts,
-                observation=observation, action_history=self.trace_action_history,
+                observation=observation, actor_history=self.trace_actor_history,
             )
         self._write_trace_info(info)
         return info
@@ -368,6 +373,13 @@ class AlfWorldEnv:
                 obs_key="text_obs",
                 action_key="action"
             )
+
+        if self.trace_enabled:
+            # Reuse exactly the bounded text inserted into the actor prompt.
+            # Trace's cumulative action log has post-action observations instead.
+            has_history = not init and self.history_length > 0
+            self.trace_actor_history = memory_contexts[0] if has_history else ""
+            self.trace_actor_history_steps = int(valid_lens[0]) if has_history else 0
 
         # admissible_actions 是 batch 格式，如 [['go to kitchen', 'take apple']]
         actions_list = admissible_actions[0] if (isinstance(admissible_actions, list) and len(admissible_actions) > 0) else []

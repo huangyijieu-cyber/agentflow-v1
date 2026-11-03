@@ -42,6 +42,30 @@ def _trace_module():
     return sys.modules[name]
 
 
+def _actor_history_version():
+    name = "_alfworld_probe_goal_conversion"
+    if name not in sys.modules:
+        path = Path(__file__).resolve().parents[1] / "agentflow/agentflow/trace/alfworld.py"
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name].ACTOR_HISTORY_SCORING_VERSION
+
+
+def _validate_actor_history(state, expected_length):
+    history = state.get("trace_actor_history")
+    steps, length = state.get("trace_actor_history_steps"), state.get("trace_actor_history_length")
+    valid = (isinstance(history, str) and type(steps) is int and type(length) is int
+             and 0 <= steps <= length and (bool(history.strip()) if steps else history == ""))
+    if expected_length is not None:
+        valid = valid and type(expected_length) is int and length == expected_length
+    if not valid or state.get("scoring_context_version") != _actor_history_version():
+        raise ValueError(
+            "Full-state actor history is missing, stale, or inconsistent with the saved memory window. "
+            "Run enrich --replay without sampling new actions.")
+
+
 def _finite(value):
     return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
 
@@ -307,8 +331,13 @@ def score_snapshots(snapshot: dict, probe: dict, scorer_config: dict, *, progres
             raise ValueError("Saved goal_response is missing. Run enrich first; no new sampling is needed.")
         resolved_targets[trajectory["trajectory_id"]] = _render(response_template, fields)
         if state_view == "full_state" and any(state.get("state_view") != "full_state"
+                                               and state.get("scoring_valid") is not False
                                                for state in trajectory.get("states", [])):
             raise ValueError("Full-state facts are missing from this cache. Run enrich --replay; observations alone are not full state.")
+        if state_view == "full_state":
+            for state in trajectory.get("states", []):
+                if state.get("scoring_valid") is not False:
+                    _validate_actor_history(state, (snapshot.get("sampling") or {}).get("history_length"))
     if "{goal_response}" in response_template:
         hashes = {trajectory.get("goal_spec_hash") for trajectory in trajectories}
         if None in hashes or len(hashes) != 1:

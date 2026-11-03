@@ -349,6 +349,24 @@ class GoalTests(unittest.TestCase):
         self.assertNotEqual(converter.render_full_state(spec, INITIAL, observation=observation), context)
         self.assertNotEqual(converter.render_full_state(spec, current, observation="A different current observation."), context)
 
+    def test_full_state_includes_only_the_explicit_actor_history_snapshot_verbatim(self):
+        spec = converter.load_goal_spec(self.create("look_at_obj_in_light"))
+        history = "[Observation 3: 'A quote: \' and a newline\nkept as-is', Action 3: 'use lamp']"
+        original = copy.deepcopy(spec)
+        context = converter.render_full_state(spec, INITIAL, observation="Now.", actor_history=history,
+                                              action_history=["UNBOUNDED_CUMULATIVE_HISTORY"])
+        self.assertIn("Recent observations and actions (same history window as the actor):\n" + history,
+                      context)
+        self.assertNotIn("UNBOUNDED_CUMULATIVE_HISTORY", context)
+        self.assertNotIn(spec["goal_response"], context)
+        self.assertEqual(spec, original)
+        self.assertEqual(converter.render_full_state(spec, INITIAL, actor_history=""),
+                         converter.render_full_state(spec, INITIAL))
+        for invalid in ([], {}, 4):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(converter.GoalConversionError, "formatted history string"):
+                    converter.render_full_state(spec, INITIAL, actor_history=invalid)
+
     def test_slice_metadata_and_actual_goal_must_agree(self):
         params = {"object_target": "Mug", "parent_target": "Cabinet", "object_sliced": True}
         with self.assertRaisesRegex(converter.GoalConversionError, "Slice condition"):

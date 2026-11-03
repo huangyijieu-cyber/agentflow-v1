@@ -2,15 +2,15 @@
 
 入口：train-roma/alfworld_trace_probe.py。
 
-当前恢复为 ALFWorld v2a，默认使用“离线实际 PDDL → 保存的固定英文 GT → 完整环境状态评分”，所有环境动作统一进行 TRACE 配对，并使用真实终局结果回填。转换来源、正式训练接入及配置见 [alfworld-trace-goals.md](alfworld-trace-goals.md)。
+当前沿用 ALFWorld v2a 的成功状态 Response，full-state 评分新增 actor 原生最近历史窗口（默认 4 条），使用“离线实际 PDDL → 保存的固定英文 GT → 完整环境状态及原生窗口评分”，所有环境动作统一进行 TRACE 配对，并使用真实终局结果回填。转换来源、正式训练接入及配置见 [alfworld-trace-goals.md](alfworld-trace-goals.md)。
 
 默认选 data/train/alfworld/train_all_alfworld_3305.parquet 第 0 行，即 train_all_alfworld_0；从 question 解析环境编号 0，而不是使用该行的 id=1。同一题采样 4 条轨迹，每条最多 50 个动作，策略 temperature=0.7、history_length=4。
 
-首次采样保存真实动作、生成 Prompt/Response、可见状态、环境返回和最后动作后的状态。随后修改评分 Prompt/固定 Response 只重新评分这些状态；即使重启脚本，也不会重新生成已完成的轨迹。在窗口中可新建样本并切换历史样本；每个样本独立保存轨迹和评分，原有 work-dir 根目录的缓存也可继续使用。
+首次采样保存真实动作、生成 Prompt/Response、可见状态、环境返回、每个状态的 actor 原生历史快照及版本和最后动作后的状态。随后修改评分 Prompt/固定 Response 只重新评分这些状态；即使重启脚本，也不会重新生成已完成的轨迹。在窗口中可新建样本并切换历史样本；每个样本独立保存轨迹和评分，原有 work-dir 根目录的缓存也可继续使用。
 
 ## 启动窗口
 
-正式训练使用填好 `result` 的 Parquet，见 [离线准备步骤](alfworld-trace-goals.md#规则来源与转换)。本 Probe 继续使用兼容的独立 SQLite；按该文的 `build --dataset ...` 命令生成 `alfworld_trace_goals.sqlite`。新采样和旧缓存补 GT 都只读取这个文件，不在窗口中执行转换。已经保存完整 GT/状态的轨迹可以直接评分，无需再次读取转换文件。
+正式训练使用填好 `result` 的 Parquet，见 [离线准备步骤](alfworld-trace-goals.md#规则来源与转换)。本 Probe 继续使用兼容的独立 SQLite；按该文的 `build --dataset ...` 命令生成 `alfworld_trace_goals.sqlite`。新采样和旧缓存补 GT 都只读取这个文件，不在窗口中执行转换。已经保存完整 GT/状态及本次契约原生快照的轨迹可以直接评分，无需再次读取转换文件；旧缓存缺快照时按下文执行 `enrich --replay`。
 
 在平时能运行 ALFWorld 的 Python 环境、仓库根目录中执行。下面的模型名、服务地址和 tokenizer 路径须对应实际部署；采样与评分可使用不同服务。
 
@@ -131,11 +131,11 @@ python train-roma/alfworld_trace_probe.py run --work-dir outputs/probe_case_01
 
 score 模式从不自动采样，也不导入 ALFWorld；缓存缺失或尚未完成时直接报错。采样中断后可再次使用 sample：重放并核对已保存动作来恢复环境，只为缺失后缀调用模型。若环境重放不一致，停止并保留缓存，不混入不同状态。
 
-## 旧轨迹补齐 GT 和完整状态（不重新采样）
+## 旧轨迹补齐 GT、完整状态和原生历史窗口（不重新采样）
 
 已有 trajectories.json 时继续使用同一 work-dir。窗口支持多个样本时，先切换到目标样本再补齐；命令行的 --work-dir 应指向实际包含该 trajectories.json 的目录（新样本通常是工作区下的 samples/<sample-id>/）。旧配置中的手写 Response 会保留；在窗口中将 Response 改为 `{goal_response}`，选择完整状态。
 
-若旧轨迹已保存完整 facts，可直接离线补齐：
+若轨迹已保存完整 facts 以及本次契约的原生历史快照和版本，可直接离线补齐；仅有 facts 不足以重建 actor 实际使用的窗口：
 
 ```bash
 python train-roma/alfworld_trace_probe.py enrich \
@@ -143,7 +143,7 @@ python train-roma/alfworld_trace_probe.py enrich \
   --work-dir /path/to/old_probe
 ```
 
-只有可见观察的旧缓存，需要在原 ALFWorld 数据与环境中重放保存的动作：
+缺少原生历史快照或版本的旧缓存（包括已有完整 facts 的缓存和旧 sidecar），需要在原 ALFWorld 数据与环境中重放保存的动作并逐步核验原 actor Prompt：
 
 ```bash
 python train-roma/alfworld_trace_probe.py enrich --replay \
@@ -153,7 +153,7 @@ python train-roma/alfworld_trace_probe.py enrich --replay \
   --alfworld-data /path/to/alfworld-master/json_data
 ```
 
-也可点击窗口中的旧缓存补齐按钮。该操作不调用策略模型，不生成新动作；原 trajectories.json 字节保持不变，补齐内容写入 goal_metadata.json。使用缓存中实际 gamefile，逐步核对环境观察/终局结果，重放不一致会报错。若路径已迁移，应在相同相对数据布局下恢复原路径（例如软链接），不能换成按编号重新扫描的另一个游戏。随后只运行 score 或点击重新评分。
+也可点击窗口中的旧缓存补齐按钮。该操作不调用策略模型，不生成新动作；原 trajectories.json 字节保持不变，补齐内容写入 goal_metadata.json。使用缓存中实际 gamefile，逐步核对环境观察、终局结果及原 actor Prompt，从真正的 `_build_prompt()` 恢复原生窗口；重放不一致会报错。旧 sidecar 不能冒充新 full-state 契约。若路径已迁移，应在相同相对数据布局下恢复原路径（例如软链接），不能换成按编号重新扫描的另一个游戏。随后只运行 score 或点击重新评分。
 
 ## 可修改的评分文本
 
@@ -168,7 +168,7 @@ user content 使用评分模型 tokenizer 的 chat template；只计算 assistan
 
 Prompt 支持 {goal}、{goal_response}、{remaining_steps}、{turn_index} 占位符。Response 支持 {goal}、{goal_response}，确保同一题、不同 Turn 的评分目标一致；其他普通大括号保持原样，方便直接写 JSON 或自然语言。
 
-默认 Response 为 {goal_response}，在每道题中替换为实际 PDDL 确定性转换并保存的完整成功状态描述。若原 work-dir 曾用于 v2b，自定义 config.json 会保留旧值，应将 Response 恢复为 {goal_response}，将 Prompt 恢复为描述当前状态的指令，并以保存的完整事实运行 `enrich` 重建 v2a 上下文；直接重评分旧 v2b 的 state_context 会混用评分版本。full-state Prompt 根据完整规则、初始事实、当前状态增删和当前观察，要求描述当前状态；不再附加累计动作/观察历史，原始历史仍保存。旧缓存包含完整事实时，可用 `enrich --work-dir ...` 重渲染评分上下文而无需重新采样。Response 表达目标状态，不作为当前已成功的证据。也可切换到手写固定 Response（例如原来的 The episode will end in success.）作为对照；比较时应记录 state_view。文本似然未自动做双候选归一化或成功率校准。
+默认 Response 为 {goal_response}，在每道题中替换为实际 PDDL 确定性转换并保存的完整成功状态描述。若原 work-dir 曾用于 v2b，自定义 config.json 会保留旧值，应将 Response 恢复为 {goal_response}，将 Prompt 恢复为描述当前状态的指令，并按当前缓存契约重建评分上下文；直接重评分旧 v2b 的 state_context 会混用评分版本。full-state Prompt 根据完整规则、初始事实、当前状态增删、当前观察及 actor 原生最近窗口，要求描述当前状态。窗口直接复用 `SimpleMemory.fetch(history_length)` 已插入 actor Prompt 的原文，默认最近 4 条已存记录；自定义 history_length 跟随原设置，初始状态及 history_length<=0 时为空。每条为动作前 observation 和解析 action，保留原绝对编号与换行；格式/命令校验失败及外部异常未写 memory 时沿用旧窗口，模拟器正常返回但动作未生效仍按原逻辑存入。不能用 `trace_action_history` 最后 4 条动作后观察替代。旧缓存缺该快照时用 `enrich --replay --work-dir ...` 重放已存动作核验 actor Prompt，不重新采样；`state_view="saved"` 的自定义原样上下文实验保留，不自动改成新的 full-state。Response 表达目标状态，不作为当前已成功的证据。也可切换到手写固定 Response（例如原来的 The episode will end in success.）作为对照；比较时应记录 state_view。文本似然未自动做双候选归一化或成功率校准。
 
 ## TRACE 计算口径
 
@@ -205,7 +205,7 @@ API key 从配置指定的环境变量读取，默认 OPENAI_API_KEY；配置和
 | samples/<sample-id>/ | 窗口中新建样本的独立配置、轨迹及评分；根目录原有样本保留 |
 | partial_trajectories/ | 并行采样断点；窗口可显式恢复损坏 JSON，原文件另存备份 |
 | trajectories.json | 首次固定轨迹与 T+1 个状态；后续评分不修改 |
-| goal_metadata.json | 旧缓存补齐的实际 GT、完整事实与来源校验；绑定原缓存 SHA-256 |
+| goal_metadata.json | 旧缓存补齐的实际 GT、完整事实、原生历史快照及版本、来源校验；绑定原缓存 SHA-256 |
 | runs/<run-id>.json | 每次评分的完整文本、token LogP、V、delta、credit、无效原因及配置 |
 | latest.json | 最新完整结果 |
 | latest.csv | 每轨迹每动作的数值及两套 Prompt/Response |

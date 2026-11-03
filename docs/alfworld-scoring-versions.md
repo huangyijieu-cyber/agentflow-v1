@@ -1,12 +1,14 @@
 # ALFWorld v2a / v2b 评分版本
 
-当前 `alfworld` 分支使用 **v2a 评分＋先 V 匹配再排序轮转**：使用 Parquet `result` 的成功状态描述评分，Prompt 无累计动作/观察历史，`k_pairs_per_group=None`，同题可跨 turn。`41f0552` 恢复全组合候选，`ad412f6` 应用先轮转后检查 V；本次按用户纠正，先得到每个 Chosen 的有序 V 兼容负例列表，再在相同列表对应的池内严格使用 `pos[k] -> neg[k % len(neg)]`，每池独立游标；不同列表即使重叠也不合并。`websearch` 同步修正配对顺序，历史实验定义和标签保留，不新增版本名。新开关 `TRACE_PAIR_ROUND_ROBIN`（`data.trace.pair_round_robin`）默认 true，保持上述轮转；false 恢复全部正负组合，评分文本及其它过滤、额度不变。它与控制分组和组内 cap 的 `TRACE_K_PAIRS_PER_GROUP` 独立。具体分配与过滤规则见 [SLIC 配对](trace-slic.md)。
+当前 `alfworld` 分支使用 **v2a 评分＋先 V 匹配再排序轮转**：使用 Parquet `result` 的成功状态描述评分；当前 full-state Prompt 新增 actor 原生最近历史窗口（默认 4 条），不是累计历史。`k_pairs_per_group=None`，同题可跨 turn。`41f0552` 恢复全组合候选，`ad412f6` 应用先轮转后检查 V；此前已按用户纠正，先得到每个 Chosen 的有序 V 兼容负例列表，再在相同列表对应的池内严格使用 `pos[k] -> neg[k % len(neg)]`，每池独立游标；不同列表即使重叠也不合并。`websearch` 同步修正配对顺序，历史实验定义和标签保留，不新增版本名。新开关 `TRACE_PAIR_ROUND_ROBIN`（`data.trace.pair_round_robin`）默认 true，保持上述轮转；false 恢复全部正负组合，评分文本及其它过滤、额度不变。它与控制分组和组内 cap 的 `TRACE_K_PAIRS_PER_GROUP` 独立。具体分配与过滤规则见 [SLIC 配对](trace-slic.md)。
 
 本页命名仅用于 ALFWorld。仓库已有的裸 `v2a`、`v2b` 是旧 QA 标签。历史 `alfworld/v2a`、`alfworld/v2b` 及 `alfworld-v2a`、`alfworld-v2b` 标签保持原位置；旧归档 v2a/v2b 快照曾包含默认 cap=2 和排序轮转，与用户确认的实验配对定义不同。当前恢复版本请使用 `alfworld` 分支，详见 [版本归档](../ALFWORLD_VERSIONS.md)。
 
-| 项目 | ALFWorld v2a | ALFWorld v2b |
+下表保留历史 v2a/v2b 定义；原 v2a 标签无历史窗口。当前分支在 v2a Response 基础上新增的 actor 最近窗口见下一节，不另起版本名。此次评分窗口适配只更新 `alfworld`，QA / `websearch` 评分保持原样。
+
+| 项目 | 历史 ALFWorld v2a | 历史 ALFWorld v2b |
 | --- | --- | --- |
-| 版本位置 | 当前 `alfworld` 分支，评分源码来自 `3f7abe9` | 历史未来成功句评分实现 |
+| 版本位置 | 历史成功条件评分源码 `3f7abe9`，原 v2a 标签 | 历史未来成功句评分实现 |
 | `result` | 保存原 PDDL 成功条件 | 复用原值与哈希，不重转 |
 | 成功条件位置 | 固定 teacher-forcing Response | Prompt 中明确标为 requirements |
 | 固定评分 Response | 每题不同的完整成功状态陈述 | 所有题统一的未来成功句 |
@@ -16,17 +18,27 @@
 | 此前实验配对定义 | None、同题跨 turn、全组合候选、全步默认 256 对 | 同 v2a；旧归档标签未完全符合此定义 |
 | actor、rollout 组装、信用公式及损失 | 本次恢复未另作修改 | 未来成功句评分改动不改变这些公式 |
 
-## 当前 v2a 评分格式
+## 当前分支的评分格式
 
-Prompt 包含任务、环境规则及谓词语义、完整初始事实、当前事实相对初始事实的新增/删除、当前观察和以下指令；不附加累计动作/观察历史，也不输入 v2b 的剩余动作预算：
+Prompt 包含任务、环境规则及谓词语义、完整初始事实、当前事实相对初始事实的新增/删除、当前观察，并追加 actor 实际收到的原生最近历史窗口，最后附加以下指令；不输入累计全历史或 v2b 的剩余动作预算：
 
 ```text
 Based on the applicable environment rules, the initial state, and the current full environment state above, describe the current state in relation to the task goal. Desired goal conditions are not evidence that they currently hold.
 ```
 
+原生窗口直接复用 `_build_prompt()` 中 `SimpleMemory.fetch(history_length)` 的文本，默认最近 4 条已存记录，自定义窗口则跟随实际设置。每条保存动作前 observation 和解析后的 action，保留原绝对编号及换行，例如：
+
+```text
+Recent observations and actions (same history window as the actor):
+[Observation 12: '{observation before action 12}', Action 12: '{parsed action 12}']
+[Observation 13: '{observation before action 13}', Action 13: '{parsed action 13}']
+```
+
+初始化或 history_length<=0 时没有历史段。格式/命令校验失败和外部异常未存 memory 时沿用原窗口，模拟器正常返回但动作无效的记录仍遵循原有写入逻辑。这里不是取 `trace_action_history` 的最后 4 条；后者记录动作后的 observation，与原生窗口的时序不同。actor Prompt、memory 写入及环境初始化均保持原样。
+
 固定 Response 直接读取本题的 Parquet `result`，即确定性转换的完整 PDDL 成功状态陈述。同题全部状态使用同一 Response，仅平均其 tokens 的 teacher-forcing LogP；不将目标原文作为 v2b 的 Success conditions 区块提前放进 Prompt。共享前缀与原 reference fallback 继续使用相同输入和目标。
 
-已有 GT Parquet 无需重新转换。恢复后重启训练与 rollout 进程，使用新 rollout/replay 数据，避免混入 v2b 上下文或旧信用。Probe 的自定义配置可能仍保留 v2b 的 Prompt/Response；应恢复 `{goal_response}` 和上述当前状态指令，并以已保存的完整事实重建评分上下文，无需重新采样。
+已有 GT Parquet 无需重新转换。更新后重启训练与 rollout 进程，使用新评分契约的 rollout/replay，避免混入旧信用。新 Probe 缓存保存原生快照和版本；旧缓存缺快照时，只有完整事实仍不足以恢复 actor 实际窗口，需 `enrich --replay` 重放保存动作并核验原 actor Prompt，不重新采样。旧 sidecar 不会自动视为新 full-state；`saved` 自定义实验保留原样。若原自定义 Prompt/Response 来自 v2b，应恢复 `{goal_response}` 和上述当前状态指令。
 
 ## 历史 v2b 评分格式
 

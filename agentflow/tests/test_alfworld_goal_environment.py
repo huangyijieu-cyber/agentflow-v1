@@ -84,8 +84,8 @@ class Tools:
         return "(inreceptacle mug0 cabinet0)" in facts
 
     @staticmethod
-    def render_full_state(spec, facts, *, observation=None, action_history=None):
-        return f"Full-state rules and initial facts.\nCurrent facts: {facts}\nObservation: {observation}\nHistory: {action_history}"
+    def render_full_state(spec, facts, *, observation=None, action_history=None, actor_history=None):
+        return f"Full-state rules and initial facts.\nCurrent facts: {facts}\nObservation: {observation}\nHistory: {actor_history}"
 
 
 class Simulator:
@@ -144,6 +144,91 @@ class EnvironmentTests(unittest.TestCase):
     def step(self, env, response):
         with contextlib.redirect_stdout(io.StringIO()):
             return env.step(response)
+
+    def use_native_memory(self):
+        scope = {"BaseMemory": object, "List": list, "Dict": dict, "Any": object, "Tuple": tuple}
+        self.scope["SimpleMemory"] = extract(
+            ROOT / "agentflow/agentflow/envs/memory/memory.py", "SimpleMemory", scope)
+
+    def test_scoring_reuses_the_actor_native_window_and_keeps_actor_prompts_identical(self):
+        self.use_native_memory()
+
+        class RollingSimulator(Simulator):
+            def __init__(self):
+                super().__init__(endless=True)
+                self.turn = 0
+
+            def step(self, action):
+                observations, rewards, dones, info = super().step(action)
+                self.turn += 1
+                return [f"Observation_{self.turn}: a 'quoted' line\nand another line."], rewards, dones, info
+
+        simulator = RollingSimulator()
+        env, _ = self.env(simulator)
+        actor, initial = self.reset(env, question_id=0)
+        baseline, _ = self.env(RollingSimulator(), trace=False)
+        original_actor, _ = self.reset(baseline, question_id=0)
+        self.assertEqual(actor, original_actor)
+        self.assertEqual(initial["trace_actor_history"], "")
+        self.assertEqual(initial["trace_actor_history_steps"], 0)
+        self.assertEqual(initial["trace_actor_history_length"], 4)
+        for index in range(6):
+            response = "A thought before acting.\n<action>place mug</action>"
+            actor, reward, done, info = self.step(env, response)
+            original_actor, original_reward, original_done, _ = self.step(baseline, response)
+            self.assertEqual((actor, reward, done), (original_actor, original_reward, original_done))
+            expected = env.memory.fetch(4)[0][0]
+            self.assertEqual(env.trace_actor_history, expected)
+            self.assertEqual(info["trace_actor_history"], expected)
+            self.assertEqual(info["trace_actor_history_steps"], min(index + 1, 4))
+            self.assertIn(expected, actor)
+            self.assertIn(expected, env.trace_state_context)
+            self.assertNotIn("<action>", expected)
+        self.assertIn("[Observation 3:", expected)
+        self.assertIn("[Observation 6:", expected)
+        self.assertNotIn("[Observation 1:", expected)
+        self.assertNotIn("[Observation 2:", expected)
+        self.assertIn("a 'quoted' line\nand another line.", expected)
+        self.scope["_create_trace_environment"] = mock.Mock(return_value=simulator)
+        _, info = self.reset(env, question_id=0)
+        self.assertEqual(env.trace_actor_history, "")
+        self.assertEqual(info["trace_actor_history_steps"], 0)
+
+    def test_disabled_actor_history_never_fetches_or_leaks_an_old_window(self):
+        self.use_native_memory()
+        for length in (0, -1):
+            with self.subTest(length=length):
+                env, _ = self.env(Simulator(endless=True))
+                env.history_length = length
+                env.trace_actor_history = "stale episode history"
+                env.trace_actor_history_steps = 4
+                with mock.patch.object(env.memory, "fetch", side_effect=AssertionError("history is disabled")):
+                    self.reset(env, question_id=0)
+                    actor, _, _, info = self.step(env, "<action>place mug</action>")
+                self.assertEqual(info["trace_actor_history"], "")
+                self.assertEqual(info["trace_actor_history_steps"], 0)
+                self.assertNotIn("stale episode history", actor + env.trace_state_context)
+
+    def test_nonstored_failures_keep_the_actor_window_instead_of_appending_trace_history(self):
+        self.use_native_memory()
+        for failure in ("format", "illegal", "external"):
+            with self.subTest(failure=failure):
+                simulator = Simulator(endless=True)
+                env, _ = self.env(simulator)
+                self.reset(env, question_id=0)
+                self.step(env, "<action>place mug</action>")
+                previous = env.trace_actor_history
+                saved_memory = copy.deepcopy(env.memory[0])
+                if failure == "external":
+                    simulator.crash = True
+                response = {"format": "not an action", "illegal": "<action>fly to moon</action>",
+                            "external": "<action>place mug</action>"}[failure]
+                _, _, done, info = self.step(env, response)
+                self.assertTrue(done)
+                self.assertEqual(env.memory[0], saved_memory)
+                self.assertEqual(info["trace_actor_history"], previous)
+                self.assertEqual(info["trace_actor_history_steps"], 1)
+                self.assertEqual(len(env.trace_action_history), 2)
 
     def test_hidden_facts_only_enter_scoring_context_and_gt_stays_fixed(self):
         env, _ = self.env()
@@ -227,7 +312,7 @@ class EnvironmentTests(unittest.TestCase):
                 self.reset(env, question_id=0)
             env._init_env.assert_not_called()
 
-    def test_real_fact_renderer_omits_history_after_steps_and_invalid_actions(self):
+    def test_real_fact_renderer_reuses_actor_window_after_steps_and_invalid_actions(self):
         import test_alfworld_goal_conversion as fixtures
         store_path = ROOT / "agentflow/agentflow/trace/alfworld_goal_store.py"
         module_spec = importlib.util.spec_from_file_location("history_free_environment_store", store_path)
@@ -278,6 +363,8 @@ class EnvironmentTests(unittest.TestCase):
             self.assertEqual(reward, 0.)
             self.assertIn("HISTORY_ONLY_OBSERVATION", actor)
             self.assertIn("take mug", actor)
+            self.assertIn(env.trace_actor_history, actor)
+            self.assertIn(env.trace_actor_history, env.trace_state_context)
             self.assertEqual(len(env.trace_action_history), 2)
             self.assertEqual(env.trace_action_history[0]["environment_last_action"], "HISTORY_ONLY_EXECUTION")
             self.assertIn("holds: (agent0,mug0)", env.trace_state_context)
@@ -295,7 +382,7 @@ class EnvironmentTests(unittest.TestCase):
             contexts.append(env.trace_state_context)
             for context in contexts:
                 self.assertNotIn("Recorded environment action history:", context)
-                self.assertNotIn("HISTORY_ONLY_OBSERVATION", context)
+                self.assertIn("HISTORY_ONLY_OBSERVATION", context)
                 self.assertNotIn("HISTORY_ONLY_EXECUTION", context)
                 self.assertIn(saved_spec["rules_context"], context)
                 self.assertIn("Initial state (before this episode's first action):", context)
