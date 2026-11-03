@@ -181,7 +181,7 @@ delta_t = V_(t+1) - V_t
 credit_t = sum(gamma**j * delta_(t+j)) / sum(gamma**j)
 ```
 
-默认 epsilon=0.1、K=3、gamma=0.8。所有真实环境动作统一为 tool_plan/TRACE，不单独隔离首轮或末轮，也不新增 final_answer turn。当前正式训练默认 `TRACE_K_PAIRS_PER_GROUP=None`，允许同题跨 turn、无组内额度，保留全步默认 256 对上限，使用正负全组合候选而非排序轮转；设为 2 则恢复同题同原始 turn id、每 turn 最多 2 对。T 个动作保存 T+1 个真实状态，末状态用于计算最后一次动作的真实 `V_next - V`；它没有模型回答，不作为额外配对候选。
+默认 epsilon=0.1、K=3、gamma=0.8。所有真实环境动作统一为 tool_plan/TRACE，不单独隔离首轮或末轮，也不新增 final_answer turn。当前正式训练默认 `TRACE_K_PAIRS_PER_GROUP=None`，允许同题跨 turn、无组内额度，保留全步默认 256 对上限。正式训练在 `41f0552` 后按用户新指令应用排序轮转：Chosen 分数降序、Rejected 分数升序，同分按 index 升序；每个 Chosen 仅提案给 `negative[k % len(negative)]` 一次，负例耗尽后循环，过滤失败不补选。评分窗口本身的 LogP/信用计算不变；将 `TRACE_K_PAIRS_PER_GROUP` 设为 2 则恢复同题同原始 turn id、每 turn 最多 2 对。T 个动作保存 T+1 个真实状态，末状态用于计算最后一次动作的真实 `V_next - V`；它没有模型回答，不作为额外配对候选。
 
 终局优势按同题可靠终局轨迹的 GRPO 规则计算，ALFWorld 默认开启固定系数 terminal fill，scale=2.0；QA 使用其原有动态范围缩放。K 按真实动作计数并包含末动作，K=3 最多向末三个动作回填（包含末动作自身）；回填折扣为 `gamma ** (terminal_action_turn - current_action_turn)`。局部信用、回填量、最终有效信用分别展示。只有一个可靠结果或同组奖励相同时优势可能为零。环境奖励不改写参考模型 LogP 或 V。外部故障、Goal 与 won 不一致、缺完整状态、编号缺口或超长输入会阻断相应窗口；不截断、不跨缺口拼接。无效数值在输出中为 null，并注明原因。
 

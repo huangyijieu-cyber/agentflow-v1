@@ -1,6 +1,6 @@
 # TRACE 状态信用与分类型 SLIC 配对
 
-版本命名、差异、参数对照和代码快照统一维护于桌面文档 `webwalker-trace版本记录.md`。**v3a＝原 v2a1，v3b＝原 v2a2**。最新实验 **v3d** 沿用 v3c 的 Replay 容量 512、采样 ×4 和严格 V 匹配，主要设置为 `k_pairs_per_group=None`（YAML 为 `null`），允许同题同类型工具跨 Turn 配对并取消组内数量上限。QA 信用沿用 v3b 的动态范围回填。当前 `alfworld` 分支按用户确认的 ALFWorld v2a 恢复为全组合候选，未应用排序轮转；QA 历史实验定义保持原记录。
+版本命名、差异、参数对照和代码快照统一维护于桌面文档 `webwalker-trace版本记录.md`。**v3a＝原 v2a1，v3b＝原 v2a2**。最新实验 **v3d** 沿用 v3c 的 Replay 容量 512、采样 ×4 和严格 V 匹配，主要设置为 `k_pairs_per_group=None`（YAML 为 `null`），允许同题同类型工具跨 Turn 配对并取消组内数量上限。QA 信用沿用 v3b 的动态范围回填。当前 `alfworld` 分支在 `41f0552` 恢复 v2a 评分后，按用户新指令应用排序轮转；None 跨 Turn 设置保持不变。QA 历史实验定义及 `websearch` 分支保持原样。
 
 **v3c、v3d 均开启严格价值匹配**：`outcome_match_value=true`、`match_epsilon=0.05`，analysis／final 也必须满足 `abs(V_i - V_j) <= 0.05`，并保留可信终局成功／失败标签。此处记录实验实际设置，基础配置默认值仍为 `false`。
 
@@ -123,7 +123,7 @@ $$
 
 analysis／final 依据可信成功／失败分池。基础配置的 `outcome_match_value` 默认为 `false`；v3c、v3d 实验显式设为 `true`，额外要求两侧 V 有效且 `abs(V_i - V_j) <= 0.05`，baseline 同步采用 V 邻域。工具 Turn 仍要求严格正负有效信用，没有负样本不以终局 reward 兜底。两条路线都保留响应长度比、相同动作排除和相应数量上限。
 
-当前实现对每组的全部合格正例与负例作全组合候选枚举，再逐对检查 V、信用差、长度及动作不同等条件，最后按下述优先级和总额度选择。同一个 Chosen 可以匹配多个不同 Rejected；某个组合失败不阻止检查其余组合。这里没有“每个 Chosen 仅尝试一个 Rejected”的排序轮转。工具使用有效信用作为偏好分数，analysis／final 使用终局 reward。
+当前实现采用排序轮转：每组 Chosen 按偏好分数降序，Rejected 按分数升序；同分时按样本 index 升序。第 k 个 Chosen 只提案给 `negative[k % len(negative)]`，每个 Chosen 一次，负例耗尽后循环。提案未通过 V、信用差、长度或动作不同等过滤时跳过该 Chosen，不尝试其它负例。工具使用有效信用作为偏好分数，analysis／final 使用终局 reward。通过过滤后的优先级、阈值和 cap 保持不变。
 
 通过条件的候选优先按对应偏好分数差降序选择：工具用回填后信用差，奖励路线用最终奖励差。价值距离、旧策略平均 Token LogP 距离仅依次打破平局；奖励路线无有效价值时不制造假值。每组、每步上限在分布式补齐之前应用。全局截断沿用候选的原始差值排序，尚未校准两种来源的分数尺度；触及全局上限时需观察各来源选中占比。
 

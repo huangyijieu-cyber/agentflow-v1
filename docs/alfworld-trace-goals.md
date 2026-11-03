@@ -2,7 +2,7 @@
 
 转换与训练已分开：只转换训练 Parquet 选中的题，将固定英文 GT 写入 `result`，同时在该 Parquet 中保存规则和游戏映射。训练直接读取该行 `result`，不在 reset 或 turn 中转换，也不依赖单独的 SQLite 文件。
 
-当前 `alfworld` 分支恢复用户确认的 v2a：`TRACE_K_PAIRS_PER_GROUP=None`、同题可跨 turn、无组内额度、全步默认最多 256 对，候选采用全组合枚举，未应用排序轮转。恢复以新提交记录，历史 v2a/v2b 标签保留原代码；完整区别见 [版本归档](../ALFWORLD_VERSIONS.md)。
+当前 `alfworld` 分支为 v2a 评分＋本次应用排序轮转：`TRACE_K_PAIRS_PER_GROUP=None`、同题可跨 turn、无组内额度、全步默认最多 256 对不变。`41f0552` 恢复 v2a 后，用户另行要求应用排序轮转；历史 v2a/v2b 实验定义和标签保留原记录，完整区别见 [版本归档](../ALFWORLD_VERSIONS.md)。
 
 此实现使用完整环境状态进行参考模型评分（privileged/full-state）。策略模型继续接收原来的可见观察和有限历史。完整状态只进入评分上下文；固定 Response 描述成功条件，每道题的所有状态复用同一文本。
 
@@ -198,4 +198,4 @@ python train-roma/diagnose_hccl_ports.py \
 
 当前回归通过 184 项 ALFWorld 测试和 135 项 TRACE 回归，覆盖单动作终止、末动作真实 delta、末三动作回填、缺失末状态、相邻状态不一致和 QA 既有路由。模型评分及模拟器在链路测试中使用 CPU 替身，未在服务器执行完整模型训练。更新代码后应重启训练及 rollout 进程；旧训练 rollout 的 base/outcome 元数据会被明确拒绝，离线 Parquet 不受影响。
 
-当前分支开启 TRACE 的训练配置默认 `TRACE_K_PAIRS_PER_GROUP=None`（或 `null`）：同题同类型动作允许跨 turn，取消组内数量上限，仍保留全步默认 256 对上限及其它筛选条件；候选枚举全部正负组合，未应用排序轮转。显式设为正整数则恢复同 turn 分组和对应额度，设为 2 时每题每 turn 最多 2 对。baseline 使用与配对相同的分组；空响应日志造成的压缩编号不能用作配对身份。QA analysis/final 的 outcome 分组和标签保留。关闭 TRACE 后的这两个任务的 SLIC 动作配对仍遵循原有同 turn 限制。K-step 信用始终沿真实轨迹计算，该开关不改变信用窗口。
+当前分支开启 TRACE 的训练配置默认 `TRACE_K_PAIRS_PER_GROUP=None`（或 `null`）：同题同类型动作允许跨 turn，取消组内数量上限，仍保留全步默认 256 对上限及其它筛选条件；候选采用排序轮转：Chosen 分数降序、Rejected 分数升序，同分按 index 升序；每个 Chosen 只提案一次，按 `negative[k % len(negative)]` 循环，过滤失败不补选。合格提案的后续优先级和阈值不变。显式设为正整数则恢复同 turn 分组和对应额度，设为 2 时每题每 turn 最多 2 对。baseline 使用与配对相同的分组；空响应日志造成的压缩编号不能用作配对身份。QA analysis/final 的 outcome 分组和标签保留。关闭 TRACE 后的这两个任务的 SLIC 动作配对仍遵循原有同 turn 限制。K-step 信用始终沿真实轨迹计算，该开关不改变信用窗口。
