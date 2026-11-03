@@ -1,6 +1,6 @@
 # TRACE-SLIC 训练观察指标
 
-指标接入原训练 metrics 字典，默认 console logger 输出，无需额外开关。比例为 0–1。早期指标精简只调整统计；当前 `alfworld` 与 `websearch` 均修正为先 V 匹配再轮转，候选计数口径见下文。
+指标接入原训练 metrics 字典，默认 console logger 输出，无需额外开关。比例为 0–1。早期指标精简只调整统计；当前 `alfworld` 与 `websearch` 均支持 `TRACE_PAIR_ROUND_ROBIN`（`data.trace.pair_round_robin`），默认 true 保持先 V 匹配再轮转，false 枚举全部正负组合；指标分母按模式区分如下。
 
 `trace` 来源是工具局部信用加终局回填，`outcome` 来源是 analysis／实际最终回答的可信成功／失败标签。两种来源的 Pair 数分开观察；工具信用使用保留的 `credit_*` 名称，已移除与其完全相同的 `effective_credit_*`。
 
@@ -14,7 +14,7 @@
 | `trace/terminal_fill_p10/p50/p90` | 终局优势回填项分布 | 与局部信用一起看，判断回填是否主导 |
 | `trace/credit_p10/p50/p90` | 局部信用加回填后的有效工具信用 | 工具 Pair 使用此信号；幅度越大不等于效果越好 |
 | `trace/pair/trace_selected_unique`、`outcome_selected_unique` | 分布式补齐前的工具／奖励来源 Pair 数 | 区分两种监督构成；数量不作为质量目标 |
-| `trace/pair/tool_value_match_rate` | 工具 Chosen 尝试中存在 V 兼容负例池的比例 | 分母是有负例组的 Chosen 数，与旧全组合候选计数不能直接横比 |
+| `trace/pair/tool_value_match_rate` | true：存在 V 兼容池的工具 Chosen 尝试比例；false：通过 V 的工具组合比例 | 两种模式分母分别为 Chosen 尝试数、正负组合数，不能直接横比 |
 | `trace/pair/value_gap_p90/max`、`credit_gap_min` | 选中工具 Pair 的状态价值差、有效信用差 | 应满足 `match_epsilon`、`gap_epsilon`；小价值差、大信用差仅为代理信号，不能证明状态可比或动作因果贡献 |
 | `trace/external_error_turns`、`credit_windows_blocked_external` | 外部故障 Turn 数及受影响信用窗口数 | 区分基础设施问题与模型退化 |
 | `trace/outcome_invalid_rollouts` | 没有可信终局结果的 Rollout 数 | 增长时检查实际 final、verifier 和外部中断；不能直接当作失败负样本 |
@@ -62,16 +62,16 @@
 
 | 指标 | 定义 |
 | --- | --- |
-| `candidates_sign` | 同题、同类型、同来源组内的 Chosen 尝试数之和：有负例时等于正例数（包括无 V 兼容池的尝试），无负例时为 0；工具/环境动作在正整数 cap 模式还按原始 Turn id 分组，None 模式不按 Turn 分组 |
+| `candidates_sign` | true：有负例时为正例数，无负例时为 0，含无 V 兼容池的尝试；false：正例数 × 负例数。均按同题/类型/来源的组求和；正整数 cap 还按 Turn 分组，None 不按 Turn 分组 |
 | `groups_no_positive`、`groups_no_negative` | 缺少合格正侧／负侧的组数；中性组可能同时计入两者 |
 | `both_sign_group_rate` | 同时具备正负两侧的合格组数 / 有合格行的组数；无合格组时为 0 |
-| `tool_value_match_rate` | 工具 Chosen 中存在 V 兼容负例池的尝试比例；无工具尝试时为 0 |
-| `rejected_value_match` | 需要 V 匹配却没有任何兼容负例的 Chosen 尝试数；不是先盲分配某个负例后检查 V 的拒绝数 |
+| `tool_value_match_rate` | true：存在 V 兼容池的工具 Chosen 数 / 工具 Chosen 尝试数；false：通过 V 的工具组合数 / 全部工具候选组合数；无相应分母时为 0 |
+| `rejected_value_match` | true：需要 V 匹配却无兼容负例的 Chosen 尝试数；false：不满足 V 门槛的组合数。outcome 路线是否要求 V 仍由原 `outcome_match_value` 控制 |
 | `rejected_credit_gap` | 因工具有效信用差不足被拒绝的组合数；奖励路线不使用此门槛 |
 | `rejected_length` | 因响应长度比过大被拒绝的组合数 |
 | `rejected_same_action` | 因两侧动作身份相同被拒绝的组合数 |
 | `rejected_group_cap`、`rejected_global_cap` | 通过质量过滤后，受到每组／每步数量上限限制的组合数 |
-| `selected_unique` | 补齐前最终选中的 Pair 数；一次构对中 Chosen 不复用，Rejected 可循环复用 |
+| `selected_unique` | 补齐前最终选中的 Pair 数；true 中每个 Chosen 至多一次、Rejected 可循环；false 中 Chosen 可与多个不同 Rejected 配对 |
 | `trace_selected_unique`、`outcome_selected_unique` | 工具／奖励来源最终选中的 Pair 数 |
 | `question_coverage` | 最终 Pair 覆盖问题数 / 当前批次已有 Turn 的不同问题数；未返回任何 Turn 的问题不在分母 |
 | `cross_turn_rate` | 最终 Pair 两侧原始 Turn 编号不同的比例；工具/环境动作同 Turn 模式应为 0，当前 None 跨 Turn 模式可非零；QA outcome 路由保留原行为 |
@@ -82,7 +82,7 @@
 
 六个 `rejected_*` 原因按检查顺序互斥，可核对 `candidates_sign = 六个拒绝计数之和 + selected_unique`。累计通过阶段已删除；`groups_eligible`、`groups_both_signs`、`trace_candidates_sign`、`trace_after_value_match` 仅作为计算两个比例的内部计数，不再输出日志。
 
-每个 Chosen 先按 `abs(V_chosen - V_negative) <= match_epsilon` 找兼容负例；0 为精确匹配，正值为真实邻域，不取整或传递合并。在兼容池内选分配次数最少的负例，同次数按偏好分升序、index 升序；同 V 桶用尽后循环。每个 Chosen 最多分配一次，信用差、长度、动作不同等后续过滤失败不补选，但仍记录该次分配。`outcome_match_value=false` 时 outcome 路线跳过 V。未生成的其它正负组合不计入候选或拒绝数。旧全组合版本的 `candidates_sign` 为正负例数乘积之和，不能与当前分母直接横比；分布式补齐及跨步 Replay 仍可能重复同一 Pair。通过过滤的工具 Pair 按有效信用差、奖励路线按最终奖励差降序选择，再按价值距离、旧策略平均 Token LogP 距离打破平局。全局上限仍基于候选原始差值排序，两种来源尚无尺度校准；触及全局上限时需观察分来源选中数量。精简日志没有改变这一选择逻辑。
+`pair_round_robin=true` 时，每个 Chosen 先按 `abs(V_chosen - V_negative) <= match_epsilon` 找兼容负例；0 为精确匹配，正值为真实邻域，不取整或传递合并。在兼容池内选分配次数最少的负例，同次数按偏好分升序、index 升序；同 V 桶用尽后循环。每个 Chosen 最多分配一次，信用差、长度、动作不同等后续过滤失败不补选，但仍记录该次分配。`outcome_match_value=false` 时 outcome 路线跳过 V。未生成的其它正负组合不计入候选或拒绝数。`pair_round_robin=false` 恢复全组合计数，`candidates_sign` 为正负例数乘积之和，V 拒绝按组合计数；两模式分母不能直接横比；分布式补齐及跨步 Replay 仍可能重复同一 Pair。通过过滤的工具 Pair 按有效信用差、奖励路线按最终奖励差降序选择，再按价值距离、旧策略平均 Token LogP 距离打破平局。全局上限仍基于候选原始差值排序，两种来源尚无尺度校准；触及全局上限时需观察分来源选中数量。精简日志没有改变这一选择逻辑。
 
 `trace/invalid_action_turns`、`trace/duplicate_turns`、`trace/dropped_prompt_turns` 是行级过滤原因，彼此可能重叠。原 `replay/n_new_pairs` 可能包含补齐条数，不能替代 `selected_unique`。
 

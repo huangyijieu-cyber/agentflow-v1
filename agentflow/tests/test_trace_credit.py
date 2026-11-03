@@ -297,6 +297,66 @@ class TracePairTests(unittest.TestCase):
             self.assertEqual(metrics["candidates_sign"], 1)
             self.assertEqual(metrics["selected_unique"], 1)
 
+    def test_round_robin_switch_restores_all_eligible_combinations(self):
+        rows = [row(0, .4), row(1, .3), row(2, -.4), row(3, -.3), row(4, -.2)]
+        for ordered in (rows, list(reversed(rows))):
+            metrics = {}
+            config = {"k_pairs_per_group": None, "pair_round_robin": False}
+            selected = select_pairs(ordered, config, metrics)
+            self.assertEqual(set(selected), {(a, b) for a in (0, 1) for b in (2, 3, 4)})
+            self.assertEqual(len(selected), 6)
+            self.assertEqual(metrics["candidates_sign"], 6)
+            self.assertEqual(metrics["trace_after_value_match"], 6)
+            config["pair_round_robin"] = True
+            self.assertEqual(dict(select_pairs(ordered, config, metrics)), {0: 2, 1: 3})
+            self.assertEqual(metrics["candidates_sign"], 2)
+
+    def test_all_combinations_keeps_value_and_quality_filters(self):
+        rows = [row(0, .3, action_key="same"),
+                row(1, -.4, value=.3), row(2, -.3, action_key="same"),
+                row(3, -.2, length=19), row(4, -.1, action_key="different")]
+        config = {"k_pairs_per_group": None, "match_epsilon": 0,
+                  "pair_round_robin": False}
+        metrics = {}
+        self.assertEqual(select_pairs(rows, config, metrics), [(0, 4)])
+        self.assertEqual(metrics["candidates_sign"], 4)
+        self.assertEqual(metrics["rejected_value_match"], 1)
+        self.assertEqual(metrics["rejected_length"], 1)
+        self.assertEqual(metrics["rejected_same_action"], 1)
+        self.assertEqual(metrics["trace_after_value_match"], 3)
+        self.assertEqual(metrics["selected_unique"], 1)
+        config["pair_round_robin"] = True
+        self.assertEqual(select_pairs(rows, config, metrics), [])
+        self.assertEqual(metrics["candidates_sign"], 1)
+        self.assertEqual(metrics["rejected_same_action"], 1)
+
+    def test_all_combinations_switch_is_independent_of_turn_and_global_caps(self):
+        for task in ("qa", "alfworld"):
+            rows = []
+            for turn in (1, 2):
+                start = len(rows)
+                rows.extend([row(start, .4, turn_type="tool_plan", turn_index=turn, task=task),
+                             row(start + 1, -.1, turn_type="tool_plan", turn_index=turn, task=task),
+                             row(start + 2, -.2, turn_type="tool_plan", turn_index=turn, task=task),
+                             row(start + 3, -.3, turn_type="tool_plan", turn_index=turn, task=task)])
+            config = {"k_pairs_per_group": None, "pair_round_robin": False}
+            with self.subTest(task=task):
+                cross_turn = select_pairs(rows, config)
+                self.assertEqual(len(cross_turn), 12)
+                self.assertTrue(any(rows[a]["turn_index"] != rows[b]["turn_index"]
+                                    for a, b in cross_turn))
+                config["k_pairs_per_group"] = 2
+                same_turn = select_pairs(rows, config)
+                self.assertEqual(len(same_turn), 4)
+                self.assertTrue(all(rows[a]["turn_index"] == rows[b]["turn_index"]
+                                    for a, b in same_turn))
+                config["max_pairs_per_step"] = 3
+                metrics = {}
+                self.assertEqual(len(select_pairs(rows, config, metrics)), 3)
+                self.assertEqual(metrics["candidates_sign"], 6)
+                self.assertEqual(metrics["rejected_group_cap"], 1)
+                self.assertEqual(metrics["rejected_global_cap"], 2)
+
     def test_none_group_cap_keeps_question_type_and_valid_turn_boundaries(self):
         config = {"k_pairs_per_group": None}
         for update in ({"uid": "other"}, {"turn_type": "other"}):
@@ -513,6 +573,23 @@ class TracePairTests(unittest.TestCase):
         self.assertEqual(select_pairs(rows, config), expected)
         self.assertEqual(select_pairs(list(reversed(rows)), config), expected)
 
+    def test_all_combinations_keeps_outcome_labels_and_optional_value_gate(self):
+        for kind in ("analysis", "final_answer", "direct", "base"):
+            rows = [self.outcome_row(0, 1, turn_type=kind, value=0., is_final=True),
+                    self.outcome_row(1, 1, turn_type=kind, value=0., is_final=True),
+                    self.outcome_row(2, 0, turn_type=kind, value=0., is_final=True),
+                    self.outcome_row(3, 0, turn_type=kind, value=.1, is_final=True)]
+            config = {"k_pairs_per_group": None, "pair_round_robin": False,
+                      "match_epsilon": 0}
+            with self.subTest(kind=kind):
+                self.assertEqual(select_pairs(rows, config), [(0, 2), (0, 3), (1, 2), (1, 3)])
+                config["outcome_match_value"] = True
+                metrics = {}
+                self.assertEqual(select_pairs(rows, config, metrics), [(0, 2), (1, 2)])
+                self.assertEqual(metrics["candidates_sign"], 4)
+                self.assertEqual(metrics["rejected_value_match"], 2)
+                self.assertEqual(metrics["selected_unique"], 2)
+
     def test_only_actual_terminal_answers_use_outcome_labels(self):
         for turn_type in ("final_answer", "direct", "base"):
             with self.subTest(turn_type=turn_type):
@@ -656,6 +733,14 @@ class TracePairTests(unittest.TestCase):
 
 
 class TraceConfigTests(unittest.TestCase):
+    def test_pair_round_robin_is_enabled_by_default_and_requires_a_boolean(self):
+        self.assertTrue(TraceConfig().pair_round_robin)
+        self.assertFalse(TraceConfig.from_mapping({"pair_round_robin": False}).pair_round_robin)
+        for value in (None, 0, 1, "true", "false", [], {}):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "pair_round_robin must be a boolean"):
+                    TraceConfig.from_mapping({"pair_round_robin": value})
+
     def test_defaults_and_mapping(self):
         self.assertEqual(TraceConfig.from_mapping().k, 3)
         self.assertEqual(TraceConfig.from_mapping().match_epsilon, 0.05)

@@ -123,7 +123,9 @@ $$
 
 analysis／final 依据可信成功／失败分池。基础配置的 `outcome_match_value` 默认为 `false`；v3c、v3d 实验显式设为 `true`，额外要求两侧 V 有效且 `abs(V_i - V_j) <= 0.05`，baseline 同步采用 V 邻域。工具 Turn 仍要求严格正负有效信用，没有负样本不以终局 reward 兜底。两条路线都保留响应长度比、相同动作排除和相应数量上限。
 
-当前实现先 V 匹配再轮转：Chosen 按偏好分数降序、同分 index 升序处理；对每个 Chosen 先筛出 `abs(V_chosen - V_negative) <= match_epsilon` 的兼容负例池。epsilon 为 0 时精确匹配，为正时使用真实数值邻域，不按小数位取整，也不传递合并邻域。兼容池内选分配次数最少的负例，同次数按偏好分升序、index 升序，因此同 V 桶内负例用尽后再循环。每个 Chosen 最多提案一次；无兼容池才计 V 拒绝。分配后信用差、长度、动作不同等过滤失败时不补选，所分配负例的次数仍加一。工具使用有效信用、analysis／final 使用终局 reward 作为偏好分；`outcome_match_value=false` 时 outcome 路线仍跳过 V 匹配，以完整负例池分配。本次不改变该开关、原阈值、合格候选的后续优先级和 cap。
+`pair_round_robin=true`（默认）时，先 V 匹配再轮转：Chosen 按偏好分数降序、同分 index 升序处理；对每个 Chosen 先筛出 `abs(V_chosen - V_negative) <= match_epsilon` 的兼容负例池。epsilon 为 0 时精确匹配，为正时使用真实数值邻域，不按小数位取整，也不传递合并邻域。兼容池内选分配次数最少的负例，同次数按偏好分升序、index 升序，因此同 V 桶内负例用尽后再循环。每个 Chosen 最多提案一次；无兼容池才计 V 拒绝。分配后信用差、长度、动作不同等过滤失败时不补选，所分配负例的次数仍加一。工具使用有效信用、analysis／final 使用终局 reward 作为偏好分；`outcome_match_value=false` 时 outcome 路线仍跳过 V 匹配，以完整负例池分配。本次不改变该开关、原阈值、合格候选的后续优先级和 cap。
+
+`pair_round_robin=false` 时，枚举原组内全部合格正例与负例的组合，同一个 Chosen 可与多个不同 Rejected 配对；逐对应用相同的 V 门槛、信用差、长度、动作不同等过滤。它与 `k_pairs_per_group` 独立：后者仍控制同 Turn/跨 Turn 分组及组内 cap，None 跨 Turn 无组内 cap、2 同 Turn 最多 2 对；全步默认 256 对始终保留。
 
 通过条件的候选优先按对应偏好分数差降序选择：工具用回填后信用差，奖励路线用最终奖励差。价值距离、旧策略平均 Token LogP 距离仅依次打破平局；奖励路线无有效价值时不制造假值。每组、每步上限在分布式补齐之前应用。全局截断沿用候选的原始差值排序，尚未校准两种来源的分数尺度；触及全局上限时需观察各来源选中占比。
 
@@ -156,6 +158,7 @@ Pair 两侧保留各自原始生成 Prompt、响应及原生 token IDs。仍使�
 | `negative_threshold` | `0.01` | 工具有效信用严格负阈值的绝对值 |
 | `gap_epsilon` | `0.02` | 工具正负信用差下限 |
 | `length_ratio_max` | `1.8` | 两侧响应最大长度比 |
+| `pair_round_robin` | `true` | 先 V 兼容池内轮转；`false` 枚举全部正负组合。与分组和组 cap 独立 |
 | `k_pairs_per_group` | 当前训练配置 `null`；库默认 `2` | 正整数：工具/环境动作同题同原始 Turn 配对并按组限额；`null`：同题同类型跨 Turn，无组内限额。QA analysis/final 路由不变；全步上限始终保留 |
 | `max_pairs_per_step` | `256` | 每步原始 Pair 上限 |
 | `max_gt_tokens` | `256` | GT token 上限，超长跳过 |
@@ -169,6 +172,8 @@ TRACE_MATCH_EPSILON=0.05 python train-roma/train_agent.py
 python train-roma/train_agent.py data.trace.terminal_fill_enabled=false
 # Same-question cross-turn pairing without a group cap; keeps the global cap.
 export TRACE_K_PAIRS_PER_GROUP=None  # null is also accepted; use 2 to restore same-turn pairs.
+export TRACE_PAIR_ROUND_ROBIN=true   # data.trace.pair_round_robin; default
+# export TRACE_PAIR_ROUND_ROBIN=false  # All positive-negative combinations; same filters/caps.
 ```
 
 评分依赖冻结参考模型，可能增加显存与前向成本。状态来自实际角色可见输入，历史窗口与模板变化仍可能影响 GT 信用；本轮未重构评分视图。训练指标定义见 [指标说明](trace-slic-metrics.md)。

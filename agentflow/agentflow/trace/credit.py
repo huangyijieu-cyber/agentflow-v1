@@ -39,6 +39,7 @@ class TraceConfig:
     negative_threshold: float = 0.01
     gap_epsilon: float = 0.02
     length_ratio_max: float = 1.8
+    pair_round_robin: bool = True
     # None allows cross-turn action pairs and removes only the group cap.
     k_pairs_per_group: Optional[int] = 2
     max_pairs_per_step: int = 256
@@ -52,7 +53,7 @@ class TraceConfig:
     shared_prefix_verify: bool = True
 
     def __post_init__(self):
-        for name in ("enabled", "terminal_fill_enabled", "outcome_match_value",
+        for name in ("enabled", "terminal_fill_enabled", "outcome_match_value", "pair_round_robin",
                      "shared_prefix_scoring", "shared_prefix_verify"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"trace.{name} must be a boolean")
@@ -547,6 +548,8 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
     negative ordering. Equal-V pools therefore cycle only when exhausted.
     Each Chosen proposes at most one pair; later credit/length/action filters
     do not trigger another proposal, and a failed proposal consumes its turn.
+    With ``pair_round_robin=False``, enumerate all positive-negative pairs
+    instead, retaining the same V, quality, group-cap and global-cap checks.
 
     ``metrics`` optionally collects counts for this call, resetting these keys
     while preserving unrelated keys. Candidate counts describe these proposals,
@@ -637,7 +640,7 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
         counts["groups_both_signs"] += bool(positive and negative)
         positive.sort(key=lambda row: (-scores[row["index"]], row["index"]))
         negative.sort(key=lambda row: (scores[row["index"]], row["index"]))
-        proposals = len(positive) if negative else 0
+        proposals = len(positive) * (1 if cfg.pair_round_robin else len(negative)) if negative else 0
         counts["candidates_sign"] += proposals
         if not outcome:
             counts["trace_candidates_sign"] += proposals
@@ -660,53 +663,60 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
                     if abs(float(chosen["value"]) - float(rejected["value"]))
                     <= cfg.match_epsilon
                 ]
-            if not compatible:
-                counts["rejected_value_match"] += 1
-                continue
-            # The compatible pool retains negative score/index order. Prefer
-            # unused members before reusing any member of this V neighborhood.
-            rejected = min(compatible, key=lambda row: negative_uses[row["index"]])
-            negative_uses[rejected["index"]] += 1
-            value_gap = (
-                abs(float(chosen["value"]) - float(rejected["value"]))
-                if match_value
-                else 0.0
-            )
-            credit_gap = scores[chosen["index"]] - scores[rejected["index"]]
-            length_ratio = max(
-                float(chosen["length"]), float(rejected["length"])
-            ) / min(float(chosen["length"]), float(rejected["length"]))
-            if not outcome:
-                counts["trace_after_value_match"] += 1
-            if not outcome and credit_gap < cfg.gap_epsilon:
-                counts["rejected_credit_gap"] += 1
-                continue
-            if length_ratio > cfg.length_ratio_max:
-                counts["rejected_length"] += 1
-                continue
-            chosen_key, rejected_key = chosen.get("action_key"), rejected.get(
-                "action_key"
-            )
-            if (
-                chosen_key is not None
-                and rejected_key is not None
-                and chosen_key == rejected_key
-            ):
-                counts["rejected_same_action"] += 1
-                continue
-            priority = (
-                -credit_gap,
-                value_gap,
-                abs(
-                    float(chosen["old_per_token"])
-                    - float(rejected["old_per_token"])
-                ),
-                chosen["index"],
-                rejected["index"],
-            )
-            candidates.append(
-                (priority, group_key, chosen["index"], rejected["index"])
-            )
+            if cfg.pair_round_robin:
+                if not compatible:
+                    counts["rejected_value_match"] += 1
+                    continue
+                # The compatible pool retains negative score/index order.
+                # Prefer unused members before reusing this V neighborhood.
+                rejected = min(compatible, key=lambda row: negative_uses[row["index"]])
+                negative_uses[rejected["index"]] += 1
+                proposed_negatives = (rejected,)
+            else:
+                # Count every signed combination, including incompatible V.
+                counts["rejected_value_match"] += len(negative) - len(compatible)
+                proposed_negatives = compatible
+            for rejected in proposed_negatives:
+                value_gap = (
+                    abs(float(chosen["value"]) - float(rejected["value"]))
+                    if match_value
+                    else 0.0
+                )
+                credit_gap = scores[chosen["index"]] - scores[rejected["index"]]
+                length_ratio = max(
+                    float(chosen["length"]), float(rejected["length"])
+                ) / min(float(chosen["length"]), float(rejected["length"]))
+                if not outcome:
+                    counts["trace_after_value_match"] += 1
+                if not outcome and credit_gap < cfg.gap_epsilon:
+                    counts["rejected_credit_gap"] += 1
+                    continue
+                if length_ratio > cfg.length_ratio_max:
+                    counts["rejected_length"] += 1
+                    continue
+                chosen_key, rejected_key = chosen.get("action_key"), rejected.get(
+                    "action_key"
+                )
+                if (
+                    chosen_key is not None
+                    and rejected_key is not None
+                    and chosen_key == rejected_key
+                ):
+                    counts["rejected_same_action"] += 1
+                    continue
+                priority = (
+                    -credit_gap,
+                    value_gap,
+                    abs(
+                        float(chosen["old_per_token"])
+                        - float(rejected["old_per_token"])
+                    ),
+                    chosen["index"],
+                    rejected["index"],
+                )
+                candidates.append(
+                    (priority, group_key, chosen["index"], rejected["index"])
+                )
 
     candidates.sort(key=lambda item: item[0])
     per_group = defaultdict(int)

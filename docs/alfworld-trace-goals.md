@@ -2,7 +2,7 @@
 
 转换与训练已分开：只转换训练 Parquet 选中的题，将固定英文 GT 写入 `result`，同时在该 Parquet 中保存规则和游戏映射。训练直接读取该行 `result`，不在 reset 或 turn 中转换，也不依赖单独的 SQLite 文件。
 
-当前 `alfworld` 分支为 v2a 评分＋先 V 匹配再排序轮转：`TRACE_K_PAIRS_PER_GROUP=None`、同题可跨 turn、无组内额度、全步默认最多 256 对不变。`41f0552` 恢复 v2a，`ad412f6` 应用先轮转后检查 V；本次按用户纠正与 `websearch` 同步改为先匹配再轮转。历史 v2a/v2b 实验定义和标签保留原记录，完整区别见 [版本归档](../ALFWORLD_VERSIONS.md)。
+当前 `alfworld` 分支默认使用 v2a 评分＋先 V 匹配再排序轮转：`TRACE_K_PAIRS_PER_GROUP=None`、同题可跨 turn、无组内额度、全步默认最多 256 对不变。`41f0552` 恢复 v2a，`ad412f6` 应用先轮转后检查 V；本次按用户纠正与 `websearch` 同步改为先匹配再轮转。历史 v2a/v2b 实验定义和标签保留原记录，完整区别见 [版本归档](../ALFWORLD_VERSIONS.md)。
 
 此实现使用完整环境状态进行参考模型评分（privileged/full-state）。策略模型继续接收原来的可见观察和有限历史。完整状态只进入评分上下文；固定 Response 描述成功条件，每道题的所有状态复用同一文本。
 
@@ -81,6 +81,7 @@ ALFWorld 环境、solver、两个 rollout 入口、daemon 和 trainer 均传递�
 | value match epsilon | 0.05 |
 | 正/负信用阈值、信用差阈值 | 0.01 / 0.01 / 0.02 |
 | length ratio / 组内 pair 上限 / 每步 pair | 1.8 / None（无组内上限，允许跨 turn） / 256 |
+| pair_round_robin | true；false 枚举全部正负组合，过滤及额度相同 |
 | GT token 上限 | 256，超长判无效，不截断 |
 | GRPO、SLIC loss、Replay | 沿用现有 QA 实现 |
 
@@ -101,6 +102,7 @@ export TASK=alfworld
 export ALGORITHM=grpo+slic
 export TRACE_ENABLED=true
 export TRACE_K_PAIRS_PER_GROUP=None
+export TRACE_PAIR_ROUND_ROBIN=true  # false：全部正负组合
 export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305_with_gt.parquet
 # TEST_DATA_PATH 设为自己实际存在的 ALFWorld 验证 Parquet。
 ```
@@ -198,4 +200,4 @@ python train-roma/diagnose_hccl_ports.py \
 
 当前回归通过 184 项 ALFWorld 测试和 135 项 TRACE 回归，覆盖单动作终止、末动作真实 delta、末三动作回填、缺失末状态、相邻状态不一致和 QA 既有路由。模型评分及模拟器在链路测试中使用 CPU 替身，未在服务器执行完整模型训练。更新代码后应重启训练及 rollout 进程；旧训练 rollout 的 base/outcome 元数据会被明确拒绝，离线 Parquet 不受影响。
 
-当前分支开启 TRACE 的训练配置默认 `TRACE_K_PAIRS_PER_GROUP=None`（或 `null`）：同题同类型动作允许跨 turn，取消组内数量上限，仍保留全步默认 256 对上限及其它筛选条件；每个 Chosen 先按 `abs(V_chosen - V_negative) <= match_epsilon` 筛出兼容负例（0 精确相等，正值为真实邻域，不取整或传递合并），再选分配次数最少者，同次数按偏好分升序、index 升序；Chosen 按偏好分降序、同分 index 升序处理。同 V 桶内负例用尽后循环，每个 Chosen 最多一次；无兼容池才计 V 拒绝。分配后信用差、长度、动作不同等过滤失败不补选，该负例仍计分配一次。合格提案的后续优先级和阈值不变。显式设为正整数则恢复同 turn 分组和对应额度，设为 2 时每题每 turn 最多 2 对。baseline 使用与配对相同的分组；空响应日志造成的压缩编号不能用作配对身份。QA analysis/final 的 outcome 分组和标签保留。关闭 TRACE 后的这两个任务的 SLIC 动作配对仍遵循原有同 turn 限制。K-step 信用始终沿真实轨迹计算，该开关不改变信用窗口。
+当前分支开启 TRACE 的训练配置默认 `TRACE_K_PAIRS_PER_GROUP=None`（或 `null`）：同题同类型动作允许跨 turn，取消组内数量上限，仍保留全步默认 256 对上限及其它筛选条件；`TRACE_PAIR_ROUND_ROBIN=true`（默认，对应 `data.trace.pair_round_robin`）时，每个 Chosen 先按 `abs(V_chosen - V_negative) <= match_epsilon` 筛出兼容负例（0 精确相等，正值为真实邻域，不取整或传递合并），再选分配次数最少者，同次数按偏好分升序、index 升序；Chosen 按偏好分降序、同分 index 升序处理。同 V 桶内负例用尽后循环，每个 Chosen 最多一次；无兼容池才计 V 拒绝。分配后信用差、长度、动作不同等过滤失败不补选，该负例仍计分配一次。设为 false 则枚举原组全部正负组合，同一个 Chosen 可匹配多个负例；V 门槛、信用及其它质量筛选、后续优先级和额度相同。轮转开关与 `TRACE_K_PAIRS_PER_GROUP` 独立，后者显式设为正整数则恢复同 turn 分组和对应额度，设为 2 时每题每 turn 最多 2 对。baseline 使用与配对相同的分组；空响应日志造成的压缩编号不能用作配对身份。QA analysis/final 的 outcome 分组和标签保留。关闭 TRACE 后的这两个任务的 SLIC 动作配对仍遵循原有同 turn 限制。K-step 信用始终沿真实轨迹计算，该开关不改变信用窗口。
