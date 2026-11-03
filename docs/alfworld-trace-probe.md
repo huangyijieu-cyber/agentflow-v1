@@ -2,7 +2,7 @@
 
 入口：train-roma/alfworld_trace_probe.py。
 
-当前沿用 ALFWorld v2a 的成功状态 Response，full-state 评分新增 actor 原生最近历史窗口（默认 4 条），使用“离线实际 PDDL → 保存的固定英文 GT → 完整环境状态及原生窗口评分”，所有环境动作统一进行 TRACE 配对，并使用真实终局结果回填。转换来源、正式训练接入及配置见 [alfworld-trace-goals.md](alfworld-trace-goals.md)。
+当前实验为 **ALFWorld v2_e**，标签 `alfworld/v2_e`，功能逻辑基于 `7152e73`，记录提交另将 ALFWorld 三份训练配置轮转默认值固化为 false；沿用 v2_a 的成功状态 Response，full-state 评分新增 actor 原生最近历史窗口（默认 4 条），使用“离线实际 PDDL → 保存的固定英文 GT → 完整环境状态及原生窗口评分”，所有环境动作统一进行 TRACE 配对，并使用真实终局结果回填。用户已确认 v2_d/v2_e 均为 `pair_round_robin=false` 全组合，v2_e 相对 v2_d 仅增加评分最近历史窗口；v2_d 的精确基线/标签未固定。库默认 true 及 websearch 配置保持原样。转换来源、正式训练接入及配置见 [alfworld-trace-goals.md](alfworld-trace-goals.md)。
 
 默认选 data/train/alfworld/train_all_alfworld_3305.parquet 第 0 行，即 train_all_alfworld_0；从 question 解析环境编号 0，而不是使用该行的 id=1。同一题采样 4 条轨迹，每条最多 50 个动作，策略 temperature=0.7、history_length=4。
 
@@ -181,7 +181,7 @@ delta_t = V_(t+1) - V_t
 credit_t = sum(gamma**j * delta_(t+j)) / sum(gamma**j)
 ```
 
-默认 epsilon=0.1、K=3、gamma=0.8。所有真实环境动作统一为 tool_plan/TRACE，不单独隔离首轮或末轮，也不新增 final_answer turn。当前正式训练默认 `TRACE_K_PAIRS_PER_GROUP=None`，允许同题跨 turn、无组内额度，保留全步默认 256 对上限。正式训练默认 `TRACE_PAIR_ROUND_ROBIN=true`（`data.trace.pair_round_robin`），先 V 匹配再轮转：Chosen 偏好分降序、同分 index 升序；每个 Chosen 先筛出 `abs(V_chosen - V_negative) <= match_epsilon` 的兼容负例（0 精确相等，正值为真实邻域，不取整或传递合并），兼容列表按负例偏好分升序、index 升序排列，以有序负例索引元组标识组内池；同池 Chosen 按正例顺序从 0 局部编号 k，严格分配 `compatible[k % len(compatible)]`。每池游标独立，质量过滤失败仍前进、不补选；每个 Chosen 最多一次，无兼容池才计 V 拒绝。epsilon=0 是各精确 V 池；正值时相同兼容列表共享游标，不同列表即使重叠也独立、不传递合并。`websearch` 同步修正该顺序，原 `outcome_match_value=false` 时仍跳过 V、组内全负例池使用一个游标。`export TRACE_PAIR_ROUND_ROBIN=false` 可切换为原组全部正负组合，同一个 Chosen 可匹配多个负例，V 门槛、质量筛选和额度相同。此开关不影响评分窗口的 LogP/信用计算，也不改变分组；`TRACE_K_PAIRS_PER_GROUP` 设为 2 仍是同题同原始 turn id、每 turn 最多 2 对。T 个动作保存 T+1 个真实状态，末状态用于计算最后一次动作的真实 `V_next - V`；它没有模型回答，不作为额外配对候选。
+默认 epsilon=0.1、K=3、gamma=0.8。所有真实环境动作统一为 tool_plan/TRACE，不单独隔离首轮或末轮，也不新增 final_answer turn。当前正式训练默认 `TRACE_K_PAIRS_PER_GROUP=None`，允许同题跨 turn、无组内额度，保留全步默认 256 对上限。ALFWorld 正式训练及 v2_d/v2_e 实验均为 `TRACE_PAIR_ROUND_ROBIN=false`（`data.trace.pair_round_robin`），组内全组合；库默认 true 保留，若显式开启 true，则先 V 匹配再轮转：Chosen 偏好分降序、同分 index 升序；每个 Chosen 先筛出 `abs(V_chosen - V_negative) <= match_epsilon` 的兼容负例（0 精确相等，正值为真实邻域，不取整或传递合并），兼容列表按负例偏好分升序、index 升序排列，以有序负例索引元组标识组内池；同池 Chosen 按正例顺序从 0 局部编号 k，严格分配 `compatible[k % len(compatible)]`。每池游标独立，质量过滤失败仍前进、不补选；每个 Chosen 最多一次，无兼容池才计 V 拒绝。epsilon=0 是各精确 V 池；正值时相同兼容列表共享游标，不同列表即使重叠也独立、不传递合并。`websearch` 同步修正该顺序，原 `outcome_match_value=false` 时仍跳过 V、组内全负例池使用一个游标。`export TRACE_PAIR_ROUND_ROBIN=false` 可切换为原组全部正负组合，同一个 Chosen 可匹配多个负例，V 门槛、质量筛选和额度相同。此开关不影响评分窗口的 LogP/信用计算，也不改变分组；`TRACE_K_PAIRS_PER_GROUP` 设为 2 仍是同题同原始 turn id、每 turn 最多 2 对。T 个动作保存 T+1 个真实状态，末状态用于计算最后一次动作的真实 `V_next - V`；它没有模型回答，不作为额外配对候选。
 
 终局优势按同题可靠终局轨迹的 GRPO 规则计算，ALFWorld 默认开启固定系数 terminal fill，scale=2.0；QA 使用其原有动态范围缩放。K 按真实动作计数并包含末动作，K=3 最多向末三个动作回填（包含末动作自身）；回填折扣为 `gamma ** (terminal_action_turn - current_action_turn)`。局部信用、回填量、最终有效信用分别展示。只有一个可靠结果或同组奖励相同时优势可能为零。环境奖励不改写参考模型 LogP 或 V。外部故障、Goal 与 won 不一致、缺完整状态、编号缺口或超长输入会阻断相应窗口；不截断、不跨缺口拼接。无效数值在输出中为 null，并注明原因。
 

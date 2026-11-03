@@ -1,24 +1,19 @@
-# ALFWorld v2a / v2b 评分版本
+# ALFWorld 评分版本（当前 v2_e）
 
-当前 `alfworld` 分支使用 **v2a 评分＋先 V 匹配再排序轮转**：使用 Parquet `result` 的成功状态描述评分；当前 full-state Prompt 新增 actor 原生最近历史窗口（默认 4 条），不是累计历史。`k_pairs_per_group=None`，同题可跨 turn。`41f0552` 恢复全组合候选，`ad412f6` 应用先轮转后检查 V；此前已按用户纠正，先得到每个 Chosen 的有序 V 兼容负例列表，再在相同列表对应的池内严格使用 `pos[k] -> neg[k % len(neg)]`，每池独立游标；不同列表即使重叠也不合并。`websearch` 同步修正配对顺序，历史实验定义和标签保留，不新增版本名。新开关 `TRACE_PAIR_ROUND_ROBIN`（`data.trace.pair_round_robin`）默认 true，保持上述轮转；false 恢复全部正负组合，评分文本及其它过滤、额度不变。它与控制分组和组内 cap 的 `TRACE_K_PAIRS_PER_GROUP` 独立。具体分配与过滤规则见 [SLIC 配对](trace-slic.md)。
+当前实验为 **v2_e**，标签 `alfworld/v2_e`。v2_d/v2_e 均使用 v2_a 的 Parquet `result` 成功状态 Response、`pair_round_robin=false` 全组合；v2_e 相对 v2_d 仅增加 actor 原生最近历史窗口（默认 4 条）。功能逻辑基于 `7152e73`，本次记录提交另外包含固化为 false 的三份 ALFWorld 训练配置和版本文档。K_PAIRS 默认 None，其它过滤及总额度不变。库默认 true 保留，可显式启用先 V 匹配后的池内严格取模轮转。本次窗口适配仅更新 ALFWorld，QA/websearch 评分保持原样，内部缓存契约版本常量不因实验命名而变化。
 
-本页命名仅用于 ALFWorld。仓库已有的裸 `v2a`、`v2b` 是旧 QA 标签。历史 `alfworld/v2a`、`alfworld/v2b` 及 `alfworld-v2a`、`alfworld-v2b` 标签保持原位置；旧归档 v2a/v2b 快照曾包含默认 cap=2 和排序轮转，与用户确认的实验配对定义不同。当前恢复版本请使用 `alfworld` 分支，详见 [版本归档](../ALFWORLD_VERSIONS.md)。
+各版本及中间未命名改动见 [版本归档](../ALFWORLD_VERSIONS.md)，配对开关和额度见 [SLIC 配对](trace-slic.md)。原 v2_a/v2_b 标签保留原代码；用户实验口径 K_PAIRS=None 与旧标签默认 2 的差异须区分。历史代码已含旧轮转，不能记作无轮转实现。v2_d 已确认评分沿用 v2_a、无最近 4 步历史、`pair_round_robin=false`，其它过滤及 K 分组/总 cap 不变；该实验尚未固定精确提交或标签，v2_c 仍未定义。
 
-下表保留历史 v2a/v2b 定义；原 v2a 标签无历史窗口。当前分支在 v2a Response 基础上新增的 actor 最近窗口见下一节，不另起版本名。此次评分窗口适配只更新 `alfworld`，QA / `websearch` 评分保持原样。
+| 项目 | 历史 v2_a | 历史 v2_b | 当前 v2_e |
+| --- | --- | --- | --- |
+| `result` | 原 PDDL 成功条件 | 复用原值和哈希 | 复用原值和哈希，无需重转 |
+| 目标位置 | 固定 Response | Prompt 的 requirements 区域 | 固定 Response |
+| Response | 每题完整成功状态描述 | 统一未来成功句 | 同 v2_a，同题所有 turn 固定 |
+| 评分历史 | 无累计历史 | 无累计历史 | actor 原生最近窗口，默认 4 条 |
+| 剩余预算 | 未显式输入 | 显式输入 | 未显式输入 |
+| 配对代码 | 先轮转再检查 V | 沿用旧轮转 | 实验 false 全组合，与 v2_d 相同；仍可显式开启 true |
 
-| 项目 | 历史 ALFWorld v2a | 历史 ALFWorld v2b |
-| --- | --- | --- |
-| 版本位置 | 历史成功条件评分源码 `3f7abe9`，原 v2a 标签 | 历史未来成功句评分实现 |
-| `result` | 保存原 PDDL 成功条件 | 复用原值与哈希，不重转 |
-| 成功条件位置 | 固定 teacher-forcing Response | Prompt 中明确标为 requirements |
-| 固定评分 Response | 每题不同的完整成功状态陈述 | 所有题统一的未来成功句 |
-| 指令 | 描述当前状态与目标的关系 | 预测剩余预算内最终是否成功 |
-| 剩余动作预算 | 未显式输入 | 使用原模拟器与外层上限的较小值，逐动作递减 |
-| 完整动作/观察历史 | 不输入 | 不输入 |
-| 此前实验配对定义 | None、同题跨 turn、全组合候选、全步默认 256 对 | 同 v2a；旧归档标签未完全符合此定义 |
-| actor、rollout 组装、信用公式及损失 | 本次恢复未另作修改 | 未来成功句评分改动不改变这些公式 |
-
-## 当前分支的评分格式
+## v2_e 评分格式
 
 Prompt 包含任务、环境规则及谓词语义、完整初始事实、当前事实相对初始事实的新增/删除、当前观察，并追加 actor 实际收到的原生最近历史窗口，最后附加以下指令；不输入累计全历史或 v2b 的剩余动作预算：
 

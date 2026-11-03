@@ -1,6 +1,6 @@
 # TRACE-SLIC 训练观察指标
 
-指标接入原训练 metrics 字典，默认 console logger 输出，无需额外开关。比例为 0–1。早期指标精简只调整统计；当前 `alfworld` 与 `websearch` 均支持 `TRACE_PAIR_ROUND_ROBIN`（`data.trace.pair_round_robin`），默认 true 保持先 V 匹配再轮转，false 枚举全部正负组合；指标分母按模式区分如下。
+指标接入原训练 metrics 字典，默认 console logger 输出，无需额外开关。比例为 0–1。早期指标精简只调整统计；当前 `alfworld` 与 `websearch` 均支持 `TRACE_PAIR_ROUND_ROBIN`（`data.trace.pair_round_robin`），true 使用先 V 匹配再轮转，false 枚举全部正负组合；当前 ALFWorld v2_d/v2_e 实验及 v2_e 训练默认均为 false，WebSearch 默认仍为 true。指标分母按模式区分如下。
 
 `trace` 来源是工具局部信用加终局回填，`outcome` 来源是 analysis／实际最终回答的可信成功／失败标签。两种来源的 Pair 数分开观察；工具信用使用保留的 `credit_*` 名称，已移除与其完全相同的 `effective_credit_*`。
 

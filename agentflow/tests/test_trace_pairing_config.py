@@ -76,27 +76,27 @@ class PairingSwitchLaunchTests(unittest.TestCase):
                 for index, credit in enumerate((.4, -.1, -.2))]
         return CREDIT.select_pairs(rows, config)
 
-    def test_package_default_enables_round_robin(self):
+    def test_package_default_preserves_v2_e_all_combinations(self):
         document = yaml.safe_load((ROOT / "agentflow/verl/config.yaml").read_text())
-        self.assertIs(document["data"]["trace"]["pair_round_robin"], True)
-        self.assertTrue(CREDIT.TraceConfig.from_mapping(document["data"]["trace"]).pair_round_robin)
+        self.assertIs(document["data"]["trace"]["pair_round_robin"], False)
+        self.assertFalse(CREDIT.TraceConfig.from_mapping(document["data"]["trace"]).pair_round_robin)
 
     def test_both_training_yaml_files_export_the_switch(self):
         for filename in ("config.yaml", "config_grpo+slic.yaml"):
             with self.subTest(filename=filename):
                 document = yaml.safe_load((ROOT / "train-roma" / filename).read_text())
                 self.assertEqual(document["env"]["TRACE_PAIR_ROUND_ROBIN"],
-                                 "${env:TRACE_PAIR_ROUND_ROBIN,true}")
+                                 "${env:TRACE_PAIR_ROUND_ROBIN,false}")
                 self.assertEqual(document["python_args"]["data.trace.pair_round_robin"],
                                  "${TRACE_PAIR_ROUND_ROBIN}")
 
-    def test_default_launch_preserves_round_robin_selection(self):
+    def test_default_launch_preserves_v2_e_all_combinations(self):
         for filename in ("config.yaml", "config_grpo+slic.yaml"):
             with self.subTest(filename=filename):
                 config, command = self.launch_config(filename)
-                self.assertTrue(config.pair_round_robin)
-                self.assertIn("data.trace.pair_round_robin=true", command)
-                self.assertEqual(self.pairs(config), [(0, 2)])
+                self.assertFalse(config.pair_round_robin)
+                self.assertIn("data.trace.pair_round_robin=false", command)
+                self.assertEqual(self.pairs(config), [(0, 2), (0, 1)])
 
     def test_env_switch_changes_selection_without_changing_other_controls(self):
         for filename in ("config.yaml", "config_grpo+slic.yaml"):

@@ -2,11 +2,11 @@
 
 转换与训练已分开：只转换训练 Parquet 选中的题，将固定英文 GT 写入 `result`，同时在该 Parquet 中保存规则和游戏映射。训练直接读取该行 `result`，不在 reset 或 turn 中转换，也不依赖单独的 SQLite 文件。
 
-当前 `alfworld` 分支沿用 v2a 成功状态 Response，full-state 评分新增 actor 原生最近历史窗口；默认配对仍为先 V 匹配再排序轮转：`TRACE_K_PAIRS_PER_GROUP=None`、同题可跨 turn、无组内额度、全步默认最多 256 对不变。`41f0552` 恢复 v2a，`ad412f6` 应用先轮转后检查 V；此前已按用户纠正与 `websearch` 同步改为先匹配再轮转。历史 v2a/v2b 实验定义和标签保留原记录，完整区别见 [版本归档](../ALFWORLD_VERSIONS.md)。
+当前实验为 **ALFWorld v2_e**，标签 `alfworld/v2_e`，功能逻辑基于 `7152e73`，本次记录提交另固化三份 ALFWorld 训练配置 `pair_round_robin=false`。v2_d/v2_e 均沿用 v2_a 成功状态 Response、false 全组合，v2_e 相对 v2_d 仅在 full-state 评分新增 actor 原生最近历史窗口；其它过滤、K_PAIRS=None 跨 turn/无组内 cap、全步默认 256 对不变。v2_d 的精确源码/标签未固定；库默认 true 和 websearch 配置不变。旧标签保留原位置；历史 v2_a/v2_b 实际代码已含旧轮转，用户实验口径 None 与旧标签默认 2 的差异见 [版本归档](../ALFWORLD_VERSIONS.md)。
 
 此实现使用完整环境状态进行参考模型评分（privileged/full-state）。策略模型继续接收原来的可见观察和有限历史。完整状态只进入评分上下文；固定 Response 描述成功条件，每道题的所有状态复用同一文本。
 
-当前评分 Prompt 保留任务、环境规则、事实解释、初始事实、当前新增/删除事实、当前观察和固定评分指令，并追加与 actor 完全相同的原生最近历史快照，默认 4 条实际存入 memory 的记录，自定义 history_length 时严格跟随实际窗口。快照直接复用 `_build_prompt()` 的 `SimpleMemory.fetch(history_length)` 文本，每条为动作前 observation 与解析后的 action，保留原编号、引号和换行；不从累计 `trace_action_history` 截取最后 4 条动作后观察。初始化或 history_length<=0 时不附加历史，格式/命令校验失败或外部异常未写 memory 时沿用旧窗口；模拟器正常返回但动作未生效的记录仍按原逻辑写入。本次只增加 ALFWorld 评分信息导出，不改 actor Prompt、memory 规则、窗口配置或环境初始化，QA / websearch 评分保持原样。原 v2a 标签仍无此历史段，本次不另起版本名或移动标签。
+当前评分 Prompt 保留任务、环境规则、事实解释、初始事实、当前新增/删除事实、当前观察和固定评分指令，并追加与 actor 完全相同的原生最近历史快照，默认 4 条实际存入 memory 的记录，自定义 history_length 时严格跟随实际窗口。快照直接复用 `_build_prompt()` 的 `SimpleMemory.fetch(history_length)` 文本，每条为动作前 observation 与解析后的 action，保留原编号、引号和换行；不从累计 `trace_action_history` 截取最后 4 条动作后观察。初始化或 history_length<=0 时不附加历史，格式/命令校验失败或外部异常未写 memory 时沿用旧窗口；模拟器正常返回但动作未生效的记录仍按原逻辑写入。本次只增加 ALFWorld 评分信息导出，不改 actor Prompt、memory 规则、窗口配置或环境初始化，QA / websearch 评分保持原样。原 v2_a 标签仍无此历史段；本次以 v2_e 记录，已有标签不移动，内部缓存契约版本常量保持不变。
 
 GT Response/result、信用公式、轮转开关及额度不变，已有 GT Parquet 无需重新转换。更新后重启训练/rollout 进程，不混用旧评分信用。新 Probe 缓存保存原生快照及版本；旧缓存缺快照时，即使含完整事实也需 `enrich --replay --work-dir ...` 重放已存动作并核验原 actor Prompt，重建 sidecar 后再评分，不重新采样。旧 sidecar 不可作为新 full-state 契约；`saved` 自定义实验保留原样。
 
@@ -83,7 +83,7 @@ ALFWorld 环境、solver、两个 rollout 入口、daemon 和 trainer 均传递�
 | value match epsilon | 0.05 |
 | 正/负信用阈值、信用差阈值 | 0.01 / 0.01 / 0.02 |
 | length ratio / 组内 pair 上限 / 每步 pair | 1.8 / None（无组内上限，允许跨 turn） / 256 |
-| pair_round_robin | true；false 枚举全部正负组合，过滤及额度相同 |
+| pair_round_robin | ALFWorld 训练及 v2_d/v2_e 实验为 false 全组合；库默认 true，可显式启用轮转；其它过滤及额度相同 |
 | GT token 上限 | 256，超长判无效，不截断 |
 | GRPO、SLIC loss、Replay | 沿用现有 QA 实现 |
 
@@ -104,7 +104,7 @@ export TASK=alfworld
 export ALGORITHM=grpo+slic
 export TRACE_ENABLED=true
 export TRACE_K_PAIRS_PER_GROUP=None
-export TRACE_PAIR_ROUND_ROBIN=true  # false：全部正负组合
+export TRACE_PAIR_ROUND_ROBIN=false  # v2_d / v2_e 保持相同，仅比较评分历史窗口
 export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305_with_gt.parquet
 # TEST_DATA_PATH 设为自己实际存在的 ALFWorld 验证 Parquet。
 ```
@@ -133,7 +133,7 @@ export TRAIN_DATA_PATH=train/alfworld/train_all_alfworld_3305_with_gt.parquet
 | GRPO 更新 | 166.85 |
 | SLIC 更新 | 0.002（本步没有合格配对） |
 
-这些评分性能优化保留环境、rollout、冻结参考模型、GT 文本、teacher-forcing token 序列、V/credit 公式及所选配对规则；当前 v2a 的 None 跨 turn 设置独立于评分加速。对于启用 TRACE、两种 KL 均关闭的 GRPO/GiGPO/SLIC 组合，跳过损失不消费的普通动作 reference LogP；GT reference 评分继续执行。其他算法或需要 KL 时保留动作 reference 评分。编码先按最终输入文本复用相同状态，再使用 HF fast tokenizer 的批量 chat-template 接口；非 fast tokenizer 兼容原标量接口。最终仍按 prompt/GT token IDs 去重，原始行的无效原因、长度限制和映射保持不变。CPU 张量构造和评分结果回填采用批量数组操作，避免逐行创建 Torch 小张量；缓存仅存在于本次评分调用，不跨训练 step 积累。
+这些评分性能优化保留环境、rollout、冻结参考模型、GT 文本、teacher-forcing token 序列、V/credit 公式及所选配对规则；当前 v2_e 的 None 跨 turn 设置独立于评分加速。对于启用 TRACE、两种 KL 均关闭的 GRPO/GiGPO/SLIC 组合，跳过损失不消费的普通动作 reference LogP；GT reference 评分继续执行。其他算法或需要 KL 时保留动作 reference 评分。编码先按最终输入文本复用相同状态，再使用 HF fast tokenizer 的批量 chat-template 接口；非 fast tokenizer 兼容原标量接口。最终仍按 prompt/GT token IDs 去重，原始行的无效原因、长度限制和映射保持不变。CPU 张量构造和评分结果回填采用批量数组操作，避免逐行创建 Torch 小张量；缓存仅存在于本次评分调用，不跨训练 step 积累。
 
 批量分词可使用 fast tokenizer 的原生并行能力，并遵守部署环境的分词器并行设置。模型评分继续使用原有 Ray/FSDP/SP 分布式路径；不让 actor 与 reference 在同组 NPU 上额外并发，不改变 SP 或提高默认 microbatch。GT 虽短，模型仍需处理完整状态上下文；本地 CPU 微基准不等于服务器端的实际 step 加速。
 
@@ -202,4 +202,4 @@ python train-roma/diagnose_hccl_ports.py \
 
 当前回归通过 184 项 ALFWorld 测试和 135 项 TRACE 回归，覆盖单动作终止、末动作真实 delta、末三动作回填、缺失末状态、相邻状态不一致和 QA 既有路由。模型评分及模拟器在链路测试中使用 CPU 替身，未在服务器执行完整模型训练。更新代码后应重启训练及 rollout 进程；旧训练 rollout 的 base/outcome 元数据会被明确拒绝，离线 Parquet 不受影响。
 
-当前分支开启 TRACE 的训练配置默认 `TRACE_K_PAIRS_PER_GROUP=None`（或 `null`）：同题同类型动作允许跨 turn，取消组内数量上限，仍保留全步默认 256 对上限及其它筛选条件；`TRACE_PAIR_ROUND_ROBIN=true`（默认，对应 `data.trace.pair_round_robin`）时，每个 Chosen 先按 `abs(V_chosen - V_negative) <= match_epsilon` 筛出兼容负例（0 精确相等，正值为真实邻域，不取整或传递合并），兼容列表按负例偏好分升序、index 升序排列，以有序负例索引元组标识组内池；同池 Chosen 按偏好分降序、index 升序从 0 局部编号 k，严格分配 `compatible[k % len(compatible)]`。每池游标独立，质量过滤失败仍前进、不补选；每个 Chosen 最多一次，无兼容池才计 V 拒绝。epsilon=0 是各精确 V 池；正值时相同兼容列表共享游标，不同列表即使重叠也独立，不传递合并。设为 false 则枚举原组全部正负组合，同一个 Chosen 可匹配多个负例；V 门槛、信用及其它质量筛选、后续优先级和额度相同。轮转开关与 `TRACE_K_PAIRS_PER_GROUP` 独立，后者显式设为正整数则恢复同 turn 分组和对应额度，设为 2 时每题每 turn 最多 2 对。baseline 使用与配对相同的分组；空响应日志造成的压缩编号不能用作配对身份。QA analysis/final 的 outcome 分组和标签保留。关闭 TRACE 后的这两个任务的 SLIC 动作配对仍遵循原有同 turn 限制。K-step 信用始终沿真实轨迹计算，该开关不改变信用窗口。
+当前分支开启 TRACE 的训练配置默认 `TRACE_K_PAIRS_PER_GROUP=None`（或 `null`）：同题同类型动作允许跨 turn，取消组内数量上限，仍保留全步默认 256 对上限及其它筛选条件；ALFWorld 训练默认 `TRACE_PAIR_ROUND_ROBIN=false`（对应 `data.trace.pair_round_robin`），按原组全组合构对；若显式设为 true，每个 Chosen 先按 `abs(V_chosen - V_negative) <= match_epsilon` 筛出兼容负例（0 精确相等，正值为真实邻域，不取整或传递合并），兼容列表按负例偏好分升序、index 升序排列，以有序负例索引元组标识组内池；同池 Chosen 按偏好分降序、index 升序从 0 局部编号 k，严格分配 `compatible[k % len(compatible)]`。每池游标独立，质量过滤失败仍前进、不补选；每个 Chosen 最多一次，无兼容池才计 V 拒绝。epsilon=0 是各精确 V 池；正值时相同兼容列表共享游标，不同列表即使重叠也独立，不传递合并。设为 false 则枚举原组全部正负组合，同一个 Chosen 可匹配多个负例；V 门槛、信用及其它质量筛选、后续优先级和额度相同。轮转开关与 `TRACE_K_PAIRS_PER_GROUP` 独立，后者显式设为正整数则恢复同 turn 分组和对应额度，设为 2 时每题每 turn 最多 2 对。baseline 使用与配对相同的分组；空响应日志造成的压缩编号不能用作配对身份。QA analysis/final 的 outcome 分组和标签保留。关闭 TRACE 后的这两个任务的 SLIC 动作配对仍遵循原有同 turn 限制。K-step 信用始终沿真实轨迹计算，该开关不改变信用窗口。

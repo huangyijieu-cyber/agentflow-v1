@@ -34,7 +34,7 @@ env:
   TRACE_NEGATIVE_THRESHOLD: ${env:TRACE_NEGATIVE_THRESHOLD,0.01}
   TRACE_GAP_EPSILON: ${env:TRACE_GAP_EPSILON,0.02}
   TRACE_LENGTH_RATIO_MAX: ${env:TRACE_LENGTH_RATIO_MAX,1.8}
-  TRACE_PAIR_ROUND_ROBIN: ${env:TRACE_PAIR_ROUND_ROBIN,true}  # false enumerates all eligible positive-negative combinations.
+  TRACE_PAIR_ROUND_ROBIN: ${env:TRACE_PAIR_ROUND_ROBIN,false}  # v2_e: inherit v2_d all-combinations pairing.
   TRACE_K_PAIRS_PER_GROUP: ${env:TRACE_K_PAIRS_PER_GROUP,None}  # Positive int: same-turn cap; None/null: cross-turn, no group cap.
   TRACE_MAX_PAIRS_PER_STEP: ${env:TRACE_MAX_PAIRS_PER_STEP,256}
   TRACE_MAX_GT_TOKENS: ${env:TRACE_MAX_GT_TOKENS,256}

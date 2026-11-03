@@ -123,7 +123,9 @@ $$
 
 analysis／final 依据可信成功／失败分池。基础配置的 `outcome_match_value` 默认为 `false`；v3c、v3d 实验显式设为 `true`，额外要求两侧 V 有效且 `abs(V_i - V_j) <= 0.05`，baseline 同步采用 V 邻域。工具 Turn 仍要求严格正负有效信用，没有负样本不以终局 reward 兜底。两条路线都保留响应长度比、相同动作排除和相应数量上限。
 
-`pair_round_robin=true`（默认）时，先 V 匹配再轮转：Chosen 按偏好分数降序、同分 index 升序处理；对每个 Chosen 先筛出 `abs(V_chosen - V_negative) <= match_epsilon` 的兼容负例池。epsilon 为 0 时精确匹配，为正时使用真实数值邻域，不按小数位取整，也不传递合并邻域。兼容列表按负例偏好分升序、index 升序排列；以有序负例索引元组作为组内池身份。属于同一池的 Chosen 按上述正例顺序局部编号 k（从 0 开始），严格分配 `compatible[k % len(compatible)]`，即该池的 `pos[k] -> neg[k % len(neg)]`。各池游标独立，分配后立即前进，信用差、长度、动作不同等后续过滤失败也不回退或补选。epsilon=0 时按各精确 V 池循环；epsilon>0 时相同兼容列表共享游标，不同列表即使有重叠也独立，不传递合并。每个 Chosen 最多提案一次，无兼容池才计 V 拒绝。工具使用有效信用、analysis／final 使用终局 reward 作为偏好分；`outcome_match_value=false` 时 outcome 路线仍跳过 V 匹配，组内完整负例池使用一个游标。本次不改变该开关、原阈值、合格候选的后续优先级和 cap。
+当前 ALFWorld `v2_d` / `v2_e` 实验均设置 `pair_round_robin=false`；本分支 v2_e 训练配置已将默认值固定为 false，库调用 `TraceConfig()` 与 WebSearch 的默认值仍为 true。
+
+`pair_round_robin=true` 时，先 V 匹配再轮转：Chosen 按偏好分数降序、同分 index 升序处理；对每个 Chosen 先筛出 `abs(V_chosen - V_negative) <= match_epsilon` 的兼容负例池。epsilon 为 0 时精确匹配，为正时使用真实数值邻域，不按小数位取整，也不传递合并邻域。兼容列表按负例偏好分升序、index 升序排列；以有序负例索引元组作为组内池身份。属于同一池的 Chosen 按上述正例顺序局部编号 k（从 0 开始），严格分配 `compatible[k % len(compatible)]`，即该池的 `pos[k] -> neg[k % len(neg)]`。各池游标独立，分配后立即前进，信用差、长度、动作不同等后续过滤失败也不回退或补选。epsilon=0 时按各精确 V 池循环；epsilon>0 时相同兼容列表共享游标，不同列表即使有重叠也独立，不传递合并。每个 Chosen 最多提案一次，无兼容池才计 V 拒绝。工具使用有效信用、analysis／final 使用终局 reward 作为偏好分；`outcome_match_value=false` 时 outcome 路线仍跳过 V 匹配，组内完整负例池使用一个游标。本次不改变该开关、原阈值、合格候选的后续优先级和 cap。
 
 `pair_round_robin=false` 时，枚举原组内全部合格正例与负例的组合，同一个 Chosen 可与多个不同 Rejected 配对；逐对应用相同的 V 门槛、信用差、长度、动作不同等过滤。它与 `k_pairs_per_group` 独立：后者仍控制同 Turn/跨 Turn 分组及组内 cap，None 跨 Turn 无组内 cap、2 同 Turn 最多 2 对；全步默认 256 对始终保留。
 
@@ -158,7 +160,7 @@ Pair 两侧保留各自原始生成 Prompt、响应及原生 token IDs。仍使�
 | `negative_threshold` | `0.01` | 工具有效信用严格负阈值的绝对值 |
 | `gap_epsilon` | `0.02` | 工具正负信用差下限 |
 | `length_ratio_max` | `1.8` | 两侧响应最大长度比 |
-| `pair_round_robin` | `true` | 先 V 兼容池内轮转；`false` 枚举全部正负组合。与分组和组 cap 独立 |
+| `pair_round_robin` | ALFWorld v2_e 训练 `false`；库 `true` | 先 V 兼容池内轮转；`false` 枚举全部正负组合。与分组和组 cap 独立 |
 | `k_pairs_per_group` | 当前训练配置 `null`；库默认 `2` | 正整数：工具/环境动作同题同原始 Turn 配对并按组限额；`null`：同题同类型跨 Turn，无组内限额。QA analysis/final 路由不变；全步上限始终保留 |
 | `max_pairs_per_step` | `256` | 每步原始 Pair 上限 |
 | `max_gt_tokens` | `256` | GT token 上限，超长跳过 |
@@ -172,8 +174,8 @@ TRACE_MATCH_EPSILON=0.05 python train-roma/train_agent.py
 python train-roma/train_agent.py data.trace.terminal_fill_enabled=false
 # Same-question cross-turn pairing without a group cap; keeps the global cap.
 export TRACE_K_PAIRS_PER_GROUP=None  # null is also accepted; use 2 to restore same-turn pairs.
-export TRACE_PAIR_ROUND_ROBIN=true   # data.trace.pair_round_robin; default
-# export TRACE_PAIR_ROUND_ROBIN=false  # All positive-negative combinations; same filters/caps.
+export TRACE_PAIR_ROUND_ROBIN=false  # ALFWorld v2_d/v2_e: all combinations; same filters/caps.
+# export TRACE_PAIR_ROUND_ROBIN=true   # Enable V-matched pool-local modulo rotation.
 ```
 
 评分依赖冻结参考模型，可能增加显存与前向成本。状态来自实际角色可见输入，历史窗口与模板变化仍可能影响 GT 信用；本轮未重构评分视图。训练指标定义见 [指标说明](trace-slic-metrics.md)。
