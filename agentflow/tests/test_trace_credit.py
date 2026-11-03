@@ -478,9 +478,26 @@ class TracePairTests(unittest.TestCase):
         config = {"k_pairs_per_group": None, "match_epsilon": .05}
         for ordered in (rows, list(reversed(rows))):
             selected = select_pairs(ordered, config)
-            self.assertEqual(selected, [(0, 3), (1, 4), (2, 4)])
+            self.assertEqual(selected, [(0, 3), (1, 3), (2, 4)])
             self.assertTrue(all(abs(rows[a]["value"] - rows[b]["value"]) <= .05
                                 for a, b in selected))
+
+    def test_modulo_rotation_uses_a_local_cursor_for_each_compatible_list(self):
+        rows = [row(0, .6, value=0.), row(1, .5, value=.04), row(2, .4, value=.04),
+                row(3, -.4, value=0.), row(4, -.3, value=.08)]
+        config = {"k_pairs_per_group": None, "match_epsilon": .05}
+        for ordered in (rows, list(reversed(rows))):
+            # [3] starts at k=0 independently of [3, 4], whose two positive
+            # members are assigned at local k=0 and k=1, not least usage.
+            self.assertEqual(select_pairs(ordered, config), [(0, 3), (1, 3), (2, 4)])
+
+    def test_different_values_share_the_cursor_when_compatible_lists_match(self):
+        rows = [row(0, .6, value=0.), row(1, .5, value=.02),
+                row(2, .4, value=.04), row(3, .3, value=.02),
+                row(4, -.3, value=0.), row(5, -.2, value=.04), row(6, -.1, value=.2)]
+        config = {"k_pairs_per_group": None, "match_epsilon": .05}
+        for ordered in (rows, list(reversed(rows))):
+            self.assertEqual(dict(select_pairs(ordered, config)), {0: 4, 1: 5, 2: 4, 3: 5})
 
     def test_failed_quality_filter_consumes_assignment_without_replacement(self):
         for bad_negative in ({"action_key": "same"}, {"length": 19}):

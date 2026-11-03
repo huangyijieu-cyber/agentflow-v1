@@ -82,7 +82,7 @@
 
 六个 `rejected_*` 原因按检查顺序互斥，可核对 `candidates_sign = 六个拒绝计数之和 + selected_unique`。累计通过阶段已删除；`groups_eligible`、`groups_both_signs`、`trace_candidates_sign`、`trace_after_value_match` 仅作为计算两个比例的内部计数，不再输出日志。
 
-`pair_round_robin=true` 时，每个 Chosen 先按 `abs(V_chosen - V_negative) <= match_epsilon` 找兼容负例；0 为精确匹配，正值为真实邻域，不取整或传递合并。在兼容池内选分配次数最少的负例，同次数按偏好分升序、index 升序；同 V 桶用尽后循环。每个 Chosen 最多分配一次，信用差、长度、动作不同等后续过滤失败不补选，但仍记录该次分配。`outcome_match_value=false` 时 outcome 路线跳过 V。未生成的其它正负组合不计入候选或拒绝数。`pair_round_robin=false` 恢复全组合计数，`candidates_sign` 为正负例数乘积之和，V 拒绝按组合计数；两模式分母不能直接横比；分布式补齐及跨步 Replay 仍可能重复同一 Pair。通过过滤的工具 Pair 按有效信用差、奖励路线按最终奖励差降序选择，再按价值距离、旧策略平均 Token LogP 距离打破平局。全局上限仍基于候选原始差值排序，两种来源尚无尺度校准；触及全局上限时需观察分来源选中数量。精简日志没有改变这一选择逻辑。
+`pair_round_robin=true` 时，每个 Chosen 先按 `abs(V_chosen - V_negative) <= match_epsilon` 找兼容负例；0 为精确匹配，正值为真实邻域，不取整或传递合并。兼容列表按负例偏好分升序、index 升序排列，以其有序索引元组标识组内池。同池 Chosen 按偏好分降序、index 升序从 0 局部编号 k，严格分配 `compatible[k % len(compatible)]`；每池独立游标，分配后即前进，后续质量过滤失败也不回退或补选。0 对应各精确 V 池；正值时相同兼容列表共享游标，不同列表即使重叠也独立。每个 Chosen 最多分配一次；`outcome_match_value=false` 时 outcome 路线跳过 V，组内全负例池使用一个游标。未生成的其它正负组合不计入候选或拒绝数。`pair_round_robin=false` 恢复全组合计数，`candidates_sign` 为正负例数乘积之和，V 拒绝按组合计数；两模式分母不能直接横比；分布式补齐及跨步 Replay 仍可能重复同一 Pair。通过过滤的工具 Pair 按有效信用差、奖励路线按最终奖励差降序选择，再按价值距离、旧策略平均 Token LogP 距离打破平局。全局上限仍基于候选原始差值排序，两种来源尚无尺度校准；触及全局上限时需观察分来源选中数量。精简日志没有改变这一选择逻辑。
 
 `trace/invalid_action_turns`、`trace/duplicate_turns`、`trace/dropped_prompt_turns` 是行级过滤原因，彼此可能重叠。原 `replay/n_new_pairs` 可能包含补齐条数，不能替代 `selected_unique`。
 

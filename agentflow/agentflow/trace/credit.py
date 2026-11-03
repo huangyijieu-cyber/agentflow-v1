@@ -544,8 +544,9 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
     Within each group, visit Chosen rows by descending preference score and
     Rejected rows by ascending score, breaking score ties by row index. First
     restrict each Chosen's negative pool to its configured V neighborhood.
-    Choose a least-used Rejected from that pool, breaking usage ties by the
-    negative ordering. Equal-V pools therefore cycle only when exhausted.
+    Chosen rows with the same ordered compatible negative list share a local
+    counter k, starting at zero: pos[k] pairs with neg[k % len(neg)]. Different
+    compatible lists have independent counters, even when they overlap.
     Each Chosen proposes at most one pair; later credit/length/action filters
     do not trigger another proposal, and a failed proposal consumes its turn.
     With ``pair_round_robin=False``, enumerate all positive-negative pairs
@@ -647,7 +648,7 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
         if not negative:
             continue
         match_value = not outcome or cfg.outcome_match_value
-        negative_uses = Counter()
+        pool_positions = Counter()
         exact_value_pools = defaultdict(list)
         if match_value and cfg.match_epsilon == 0:
             for rejected in negative:
@@ -667,10 +668,12 @@ def select_pairs(rows: Sequence[Mapping[str, Any]], config=None, metrics=None):
                 if not compatible:
                     counts["rejected_value_match"] += 1
                     continue
-                # The compatible pool retains negative score/index order.
-                # Prefer unused members before reusing this V neighborhood.
-                rejected = min(compatible, key=lambda row: negative_uses[row["index"]])
-                negative_uses[rejected["index"]] += 1
+                # V matching fixes the ordered pool before its local modulo
+                # rotation; another pool never advances this pool's counter.
+                pool_key = tuple(row["index"] for row in compatible)
+                k = pool_positions[pool_key]
+                rejected = compatible[k % len(compatible)]
+                pool_positions[pool_key] += 1
                 proposed_negatives = (rejected,)
             else:
                 # Count every signed combination, including incompatible V.

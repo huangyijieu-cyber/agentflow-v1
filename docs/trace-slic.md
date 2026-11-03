@@ -123,7 +123,7 @@ $$
 
 analysis／final 依据可信成功／失败分池。基础配置的 `outcome_match_value` 默认为 `false`；v3c、v3d 实验显式设为 `true`，额外要求两侧 V 有效且 `abs(V_i - V_j) <= 0.05`，baseline 同步采用 V 邻域。工具 Turn 仍要求严格正负有效信用，没有负样本不以终局 reward 兜底。两条路线都保留响应长度比、相同动作排除和相应数量上限。
 
-`pair_round_robin=true`（默认）时，先 V 匹配再轮转：Chosen 按偏好分数降序、同分 index 升序处理；对每个 Chosen 先筛出 `abs(V_chosen - V_negative) <= match_epsilon` 的兼容负例池。epsilon 为 0 时精确匹配，为正时使用真实数值邻域，不按小数位取整，也不传递合并邻域。兼容池内选分配次数最少的负例，同次数按偏好分升序、index 升序，因此同 V 桶内负例用尽后再循环。每个 Chosen 最多提案一次；无兼容池才计 V 拒绝。分配后信用差、长度、动作不同等过滤失败时不补选，所分配负例的次数仍加一。工具使用有效信用、analysis／final 使用终局 reward 作为偏好分；`outcome_match_value=false` 时 outcome 路线仍跳过 V 匹配，以完整负例池分配。本次不改变该开关、原阈值、合格候选的后续优先级和 cap。
+`pair_round_robin=true`（默认）时，先 V 匹配再轮转：Chosen 按偏好分数降序、同分 index 升序处理；对每个 Chosen 先筛出 `abs(V_chosen - V_negative) <= match_epsilon` 的兼容负例池。epsilon 为 0 时精确匹配，为正时使用真实数值邻域，不按小数位取整，也不传递合并邻域。兼容列表按负例偏好分升序、index 升序排列；以有序负例索引元组作为组内池身份。属于同一池的 Chosen 按上述正例顺序局部编号 k（从 0 开始），严格分配 `compatible[k % len(compatible)]`，即该池的 `pos[k] -> neg[k % len(neg)]`。各池游标独立，分配后立即前进，信用差、长度、动作不同等后续过滤失败也不回退或补选。epsilon=0 时按各精确 V 池循环；epsilon>0 时相同兼容列表共享游标，不同列表即使有重叠也独立，不传递合并。每个 Chosen 最多提案一次，无兼容池才计 V 拒绝。工具使用有效信用、analysis／final 使用终局 reward 作为偏好分；`outcome_match_value=false` 时 outcome 路线仍跳过 V 匹配，组内完整负例池使用一个游标。本次不改变该开关、原阈值、合格候选的后续优先级和 cap。
 
 `pair_round_robin=false` 时，枚举原组内全部合格正例与负例的组合，同一个 Chosen 可与多个不同 Rejected 配对；逐对应用相同的 V 门槛、信用差、长度、动作不同等过滤。它与 `k_pairs_per_group` 独立：后者仍控制同 Turn/跨 Turn 分组及组内 cap，None 跨 Turn 无组内 cap、2 同 Turn 最多 2 对；全步默认 256 对始终保留。
 

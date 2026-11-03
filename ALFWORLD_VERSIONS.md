@@ -4,7 +4,7 @@
 
 `41f0552` 先恢复 v2a 评分、None 跨 turn 和全组合候选，`ad412f6` 随后应用先分配负例再检查 V 的轮转。本次按用户纠正，将 `alfworld` 和 `websearch` 两分支的配对顺序都改为先 V 匹配再轮转。ALFWorld 评分仍来自 `3f7abe9`，保留 `ce3e972` 的独立测试夹具修复；历史 v2b 及已有标签保持原位置。
 
-先匹配再轮转：每组 Chosen 按偏好分降序、同分 index 升序；每个 Chosen 先找出满足 `abs(V_chosen - V_negative) <= match_epsilon` 的兼容负例。`match_epsilon=0` 要求精确相等，正值使用真实数值邻域，不四舍五入或传递合并。兼容池内优先分配此前分配次数最少的负例，同次数按偏好分升序、index 升序；同 V 桶因此用尽再循环。每个 Chosen 最多提案一次；无兼容池才计 V 拒绝。分配后仍检查原信用差、长度、动作不同等条件，失败不补选，该分配仍计用一次。`outcome_match_value=false` 的 outcome 路线仍跳过 V 匹配，使用完整负例池。本次不修改该开关、阈值、后续优先级及数量上限。
+先匹配再轮转：每组 Chosen 按偏好分降序、同分 index 升序；每个 Chosen 先找出满足 `abs(V_chosen - V_negative) <= match_epsilon` 的兼容负例。`match_epsilon=0` 要求精确相等，正值使用真实数值邻域，不四舍五入或传递合并。兼容负例按偏好分升序、index 升序排列，并以其有序索引元组标识组内兼容池。同池 Chosen 按上述顺序从 0 局部编号 k，严格分配 `compatible[k % len(compatible)]`；每池游标独立，分配后即前进，后续质量过滤失败也不回退或补选。epsilon=0 时是各精确 V 池；epsilon>0 时相同兼容列表共享游标，不同列表即使重叠也独立轮转，不传递合并。每个 Chosen 最多提案一次，无兼容池才计 V 拒绝；信用差、长度、动作不同等筛选不变。`outcome_match_value=false` 的 outcome 路线仍跳过 V 匹配，在组内完整负例池使用一个游标。本次不修改该开关、阈值、后续优先级及数量上限。
 
 `TRACE_PAIR_ROUND_ROBIN`（`data.trace.pair_round_robin`）默认 `true`，保持上述实现；设为 `false` 则枚举原分组的全部正负组合，同一个 Chosen 可匹配多个不同负例。两种模式使用相同 V 门槛、正负信用、质量过滤和额度。该开关与 `TRACE_K_PAIRS_PER_GROUP` 独立：None 仍跨 turn、无组内 cap；2 仍同 turn、每组最多 2 对。两任务分支均支持此开关，不新增版本名或移动历史标签。
 
