@@ -993,7 +993,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
-        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["temperature"] = 1.0 if data.meta_info.get("trace_gt_scoring", False) else self.config.rollout.temperature
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
@@ -1032,7 +1032,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
-        data.meta_info["temperature"] = self.config.rollout.temperature
+        # GT predictability uses the frozen model's untempered distribution;
+        # action log probabilities keep the existing rollout temperature.
+        data.meta_info["temperature"] = 1.0 if data.meta_info.get("trace_gt_scoring", False) else self.config.rollout.temperature
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
@@ -1051,6 +1053,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.ref_policy.actor_module.reshard()
 
         return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="olive", role="ref_prefix_compute_log_prob")
+    def compute_ref_prefix_log_prob(self, data: DataProto):
+        """Shared-prefix GT scoring; ordinary actor/ref paths remain unchanged."""
+        from agentflow.trace.prefix_backend import compute_reference_prefix
+
+        def reshard_reference(model):
+            if self.world_size > 1:
+                if fsdp_version(model) == 1:
+                    model._handle.reshard(True)
+                elif fsdp_version(model) == 2:
+                    model.reshard()
+
+        return compute_reference_prefix(
+            self, data, DataProto, device_name=get_device_name(), device_id=get_device_id(),
+            reshard=reshard_reference,
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):

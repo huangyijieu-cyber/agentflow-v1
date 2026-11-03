@@ -790,7 +790,9 @@ class AgentModeDaemon:
             # Example triplet.prompt: {"token_ids": [...]}
             # Example triplet.response: {"token_ids": [...]}
             trace_list = [
-                {"prompt_ids": t.prompt.get("token_ids", []), "response_ids": t.response.get("token_ids", [])}
+                {"prompt_ids": t.prompt.get("token_ids", []),
+                 "response_ids": t.response.get("token_ids", []),
+                 "metadata": t.metadata or {}}
                 for t in rollout.triplets
             ]
 
@@ -811,6 +813,7 @@ class AgentModeDaemon:
                 "reward": final_reward,
                 "trace_list": trace_list,
                 "data_id": original_sample["data_id"],
+                "trace_gt": original_sample.get("result"),
                 "anchor_list": anchor_list,
                 "turn_flags": rollout.metadata.get("turn_flags") if rollout.metadata else None,
             }
@@ -840,6 +843,15 @@ class AgentModeDaemon:
         reward_list, data_id_list, rollout_id_list, turn_index_list, is_drop_list = [], [], [], [], []
         anchor_list, traj_id_list, active_mask_list = [], [], []
         turn_valid_list, turn_dup_list = [], []   # DPO pair chosen 端质量标记
+        trace_state_contexts, trace_turn_types, trace_original_turns = [], [], []
+        trace_next_contexts, trace_next_valids, trace_terminal_flags = [], [], []
+        trace_ground_truths, trace_valid_list, trace_action_keys = [], [], []
+        trace_answer_instructions, trace_goal_metadata, trace_state_views, trace_tasks = [], [], [], []
+        trace_scoring_valids, trace_goal_checks, trace_goal_check_valids = [], [], []
+        trace_dup_list = []
+        trace_external_errors, trace_error_types, trace_error_sources = [], [], []
+        trace_final_flags, trace_outcome_valids, trace_outcome_successes = [], [], []
+        trace_outcome_rewards = []
         n_trunc_sample_because_of_response = 0
         valid_samples = 0
         all_samples_num = 0
@@ -863,6 +875,9 @@ class AgentModeDaemon:
                 #     turn_reward = sample_info["reward"] * (discount_factor ** (n_turns - 1 - turn_index))
                 # reward_list.append(turn_reward)
                 prompt_ids, response_ids = trace["prompt_ids"], trace["response_ids"]
+                # Keep pre-truncation quality for TRACE pair filtering.
+                trace_response_valid = bool(response_ids) and len(response_ids) <= max_response_length
+                trace_prompt_valid = bool(prompt_ids) and len(prompt_ids) <= max_prompt_length
                 all_samples_num += 1
 
                 if len(prompt_ids) == 0 and len(response_ids) == 0:
@@ -906,6 +921,63 @@ class AgentModeDaemon:
                 _f = _flags[turn_index] if turn_index < len(_flags) else {}
                 turn_valid_list.append(bool(_f.get("valid", True)))
                 turn_dup_list.append(bool(_f.get("dup", False)))
+                trace_dup_list.append(bool(_f.get("trace_dup", _f.get("dup", False))))
+                trace_metadata = trace["metadata"]
+                is_alfworld = trace_metadata.get("trace_task") == "alfworld"
+                task_gt = sample_info["trace_gt"]
+                if is_alfworld and (not isinstance(task_gt, str) or not task_gt.strip()):
+                    raise ValueError("ALFWorld TRACE requires a nonempty prepared Parquet result")
+                if is_alfworld and trace_metadata.get("trace_gt") != task_gt:
+                    raise ValueError("ALFWorld Parquet result differs from the verified environment goal")
+                state_context = trace_metadata.get("trace_state_context")
+                scoring_valid = trace_metadata.get("trace_scoring_valid", not is_alfworld) is True
+                if is_alfworld and not scoring_valid:
+                    state_context = None
+                trace_state_contexts.append(state_context)
+                next_valid = trace_metadata.get("trace_next_scoring_valid") is True
+                next_context = trace_metadata.get("trace_next_state_context")
+                trace_next_contexts.append(next_context if next_valid else None)
+                trace_next_valids.append(next_valid)
+                trace_terminal_flags.append(bool(trace_metadata.get("trace_is_terminal", False)))
+                trace_turn_types.append(trace_metadata.get("trace_turn_type", "unknown"))
+                # Retain original numbering even when an empty turn is skipped.
+                trace_original_turns.append(trace_metadata.get("trace_original_turn", turn_index))
+                trace_ground_truths.append(task_gt)
+                trace_answer_instructions.append(trace_metadata.get("trace_answer_instruction"))
+                trace_goal_metadata.append(trace_metadata.get("trace_goal_metadata"))
+                trace_state_views.append(trace_metadata.get("trace_state_view"))
+                trace_tasks.append(trace_metadata.get("trace_task"))
+                trace_scoring_valids.append(scoring_valid)
+                goal_check = trace_metadata.get("trace_goal_check")
+                trace_goal_checks.append(goal_check if isinstance(goal_check, bool) else None)
+                trace_goal_check_valids.append(trace_metadata.get("trace_goal_check_valid") is True)
+                trace_action_keys.append(trace_metadata.get("trace_action_key"))
+                trace_external_errors.append(bool(trace_metadata.get("trace_external_error", False)))
+                trace_error_types.append(trace_metadata.get("trace_error_type") or "")
+                trace_error_sources.append(trace_metadata.get("trace_error_source") or "")
+                trace_final_flags.append(bool(trace_metadata.get("trace_is_final", False)))
+                trace_outcome_valids.append(bool(trace_metadata.get("trace_outcome_valid", False)))
+                outcome_success = trace_metadata.get("trace_outcome_success")
+                trace_outcome_successes.append(outcome_success if isinstance(outcome_success, bool) else None)
+                outcome_reward = trace_metadata.get("trace_outcome_reward")
+                try:
+                    outcome_reward = float(outcome_reward)
+                except (TypeError, ValueError, OverflowError):
+                    outcome_reward = float("nan")
+                trace_outcome_rewards.append(outcome_reward)
+                outcome_role = (not is_alfworld and
+                                (trace_turn_types[-1] == "analysis" or trace_final_flags[-1]))
+                trace_valid_list.append(bool(
+                    _f.get("trace_valid", _f.get("valid", True))
+                    and not _f.get("trace_dup", _f.get("dup", False))
+                    and not trace_metadata.get("trace_tool_failed", False)
+                    and not trace_external_errors[-1]
+                    and scoring_valid
+                    and trace_metadata.get("trace_extraction_valid", True) is not False
+                    and trace_metadata.get("finish_reason") in ("stop", "eos", "end_turn")
+                    and (outcome_role or (isinstance(state_context, str) and state_context.strip()))
+                    and trace_response_valid and trace_prompt_valid
+                ))
 
         logger.info(f"[STEP-WISE DEBUG]: valid response trace length in this training step is [{valid_samples}/{all_samples_num}]")
         if valid_samples == 0:
@@ -979,6 +1051,39 @@ class AgentModeDaemon:
         data_proto.non_tensor_batch["active_mask_list"] = np.array(active_mask_list)
         data_proto.non_tensor_batch["turn_valid_list"] = np.array(turn_valid_list)
         data_proto.non_tensor_batch["turn_dup_list"] = np.array(turn_dup_list)
+        data_proto.non_tensor_batch["trace_state_context"] = np.array(trace_state_contexts, dtype=object)
+        data_proto.non_tensor_batch["trace_next_state_context"] = np.array(trace_next_contexts, dtype=object)
+        data_proto.non_tensor_batch["trace_next_scoring_valid"] = np.array(trace_next_valids, dtype=bool)
+        data_proto.non_tensor_batch["trace_is_terminal"] = np.array(trace_terminal_flags, dtype=bool)
+        data_proto.non_tensor_batch["trace_turn_type"] = np.array(trace_turn_types, dtype=object)
+        data_proto.non_tensor_batch["trace_action_key"] = np.array(trace_action_keys, dtype=object)
+        data_proto.non_tensor_batch["trace_original_turn"] = np.array(trace_original_turns, dtype=np.int64)
+        # np.array(list_of_equal_length_alias_lists, dtype=object) becomes 2-D.
+        # Assign cells individually to preserve one GT object per training row.
+        trace_gt_array = np.empty(len(trace_ground_truths), dtype=object)
+        for index, ground_truth in enumerate(trace_ground_truths):
+            trace_gt_array[index] = ground_truth
+        data_proto.non_tensor_batch["trace_gt"] = trace_gt_array
+        data_proto.non_tensor_batch["trace_answer_instruction"] = np.array(trace_answer_instructions, dtype=object)
+        # Explicit object allocation prevents numpy from expanding nested provenance dictionaries.
+        goal_metadata_array = np.empty(len(trace_goal_metadata), dtype=object)
+        for index, provenance in enumerate(trace_goal_metadata):
+            goal_metadata_array[index] = provenance
+        data_proto.non_tensor_batch["trace_goal_metadata"] = goal_metadata_array
+        data_proto.non_tensor_batch["trace_state_view"] = np.array(trace_state_views, dtype=object)
+        data_proto.non_tensor_batch["trace_task"] = np.array(trace_tasks, dtype=object)
+        data_proto.non_tensor_batch["trace_scoring_valid"] = np.array(trace_scoring_valids, dtype=bool)
+        data_proto.non_tensor_batch["trace_goal_check"] = np.array(trace_goal_checks, dtype=object)
+        data_proto.non_tensor_batch["trace_goal_check_valid"] = np.array(trace_goal_check_valids, dtype=bool)
+        data_proto.non_tensor_batch["trace_valid"] = np.array(trace_valid_list, dtype=bool)
+        data_proto.non_tensor_batch["trace_dup"] = np.array(trace_dup_list, dtype=bool)
+        data_proto.non_tensor_batch["trace_external_error"] = np.array(trace_external_errors, dtype=bool)
+        data_proto.non_tensor_batch["trace_error_type"] = np.array(trace_error_types, dtype=object)
+        data_proto.non_tensor_batch["trace_error_source"] = np.array(trace_error_sources, dtype=object)
+        data_proto.non_tensor_batch["trace_is_final"] = np.array(trace_final_flags, dtype=bool)
+        data_proto.non_tensor_batch["trace_outcome_valid"] = np.array(trace_outcome_valids, dtype=bool)
+        data_proto.non_tensor_batch["trace_outcome_success"] = np.array(trace_outcome_successes, dtype=object)
+        data_proto.non_tensor_batch["trace_outcome_reward"] = np.array(trace_outcome_rewards, dtype=np.float64)
 
         logger.info(f"[STEP-WISE-DEBUG]: transform {len(input_ids_list)} data to torch tensor.")
         return data_proto, data_metrics

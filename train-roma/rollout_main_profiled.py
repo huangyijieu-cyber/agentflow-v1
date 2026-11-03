@@ -24,6 +24,7 @@ from autogen_ext.tools.mcp import StdioServerParams
 from agentflow import Trainer, LitAgent, NamedResources, LLM, reward, configure_logger, DevTaskLoader
 
 from agentflow.solver import construct_solver
+from agentflow.trace.execution import annotate_trace_outcome
 from agentflow.rollout_timing import finish_rollout, profiling_enabled
 from datetime import datetime
 import uuid, json
@@ -31,6 +32,7 @@ from filelock import FileLock
 import asyncio
 
 from utils import compute_score, load_and_set_env_from_yaml
+from rollout import _compute_turn_flags, _compute_extraction_counts, _remove_injected_qa_output_format
 from transformers import AutoTokenizer
 
 import logging
@@ -38,7 +40,8 @@ configure_logger(logging.INFO)
 
 
 @reward
-async def evaluate(question: str, groundtruth: any, answer_extracted: any, val: bool = False) -> float:
+async def evaluate(question: str, groundtruth: any, answer_extracted: any, val: bool = False,
+                   trace_outcome: Optional[dict] = None) -> float:
     """
     Evaluates if the extracted answer is correct by calling an LLM judge.
     """
@@ -46,12 +49,13 @@ async def evaluate(question: str, groundtruth: any, answer_extracted: any, val: 
     groundtruth_str = str(groundtruth)
     answer_extracted_str = str(answer_extracted)
 
+    score_kwargs = {"return_details": True} if trace_outcome is not None else {}
     is_correct = await asyncio.to_thread(
-        compute_score,
-        question_str,
-        groundtruth_str,
-        answer_extracted_str
+        compute_score, question_str, groundtruth_str, answer_extracted_str, **score_kwargs,
     )
+    if trace_outcome is not None:
+        trace_outcome.update(is_correct)
+        is_correct = is_correct["legacy_result"]
 
     return 1.0 if is_correct else 0.0
 
@@ -223,6 +227,12 @@ class RolloutAgent(LitAgent):
 
     async def _solve_and_evaluate(self, rollout_id: str, rollout: AgentFlowRollout, task: Any, step_n: int, val: bool = False, is_train: bool = True):
         """A helper function to run the agent, parse the result, and evaluate it."""
+        # Keep validation independent of a goal artifact restricted to training.
+        if self.task == "alfworld":
+            if is_train:
+                rollout.solver.env.set_trace_task(task)
+            else:
+                rollout.solver.env.trace_enabled = False
         profile_val = val and profiling_enabled()
         rollout_started = time.perf_counter() if profile_val else 0.0
         result = {}
@@ -276,10 +286,12 @@ class RolloutAgent(LitAgent):
         idx = task.get("extra_info", {}).get("idx", "unknown_idx")
 
         reward_started = time.perf_counter() if profile_val else 0.0
+        verifier_outcome = {}
         if self.task == "qa":
             ## 纯QA
             # Evaluate the answer against the ground truth
-            reward_value = await evaluate(task["question"], str(task["result"]), answer, val)  # reward is tracked with the decorator
+            reward_value = await evaluate(task["question"], str(task["result"]), answer, val,
+                                          trace_outcome=verifier_outcome)
             print("answer: {} ground_truth: {} reward: {}".format(answer, task["result"], reward_value))
             rollout_data = {
                 "step": task.get("step", ""), # TODO: check whether it can be solved
@@ -344,19 +356,76 @@ class RolloutAgent(LitAgent):
         # print(f"Return reward value, Rollout data saved to: {save_path}")
 
         def encode_logs(tokenizer, logs):
-            return [Triplet(prompt = {"token_ids": tokenizer.encode(log["prompt"], add_special_tokens=False)},
-                                response = {"token_ids": tokenizer.encode(log["response"], add_special_tokens=False)},
-                                reward = None) for log in logs]
+            triplets = []
+            for turn_index, log in enumerate(logs):
+                prompt_ids = log.get("prompt_token_ids")
+                response_ids = log.get("response_token_ids")
+                finish_reason = log.get("finish_reason")
+
+                if prompt_ids is None or response_ids is None:
+                    raise RuntimeError(
+                        f"Planner turn {turn_index} is missing exact vLLM token ids. "
+                        "Refusing to train/evaluate on re-tokenized text."
+                    )
+
+                triplets.append(
+                    Triplet(
+                        prompt={"token_ids": list(prompt_ids)},
+                        response={"token_ids": list(response_ids)},
+                        reward=None,
+                        metadata={
+                            "finish_reason": finish_reason,
+                            "trace_state_context": log.get("trace_state_context"),
+                            "trace_next_state_context": log.get("trace_next_state_context"),
+                            "trace_next_scoring_valid": log.get("trace_next_scoring_valid", False),
+                            "trace_task": log.get("trace_task"),
+                            "trace_gt": log.get("trace_gt"),
+                            "trace_answer_instruction": log.get("trace_answer_instruction"),
+                            "trace_goal_metadata": log.get("trace_goal_metadata"),
+                            "trace_state_view": log.get("trace_state_view"),
+                            "trace_scoring_valid": log.get("trace_scoring_valid", True),
+                            "trace_goal_check": log.get("trace_goal_check"),
+                            "trace_goal_check_valid": log.get("trace_goal_check_valid"),
+                            "trace_turn_type": log.get("trace_turn_type", "unknown"),
+                            "trace_original_turn": log.get("trace_original_turn", turn_index),
+                            "trace_action_key": log.get("trace_action_key"),
+                            "trace_tool_failed": bool(log.get("trace_tool_failed", False)),
+                            "trace_extraction_valid": log.get("extraction_valid", True),
+                            "trace_external_error": bool(log.get("trace_external_error", False)),
+                            "trace_error_type": log.get("trace_error_type", ""),
+                            "trace_error_source": log.get("trace_error_source", ""),
+                            "trace_is_final": bool(log.get("trace_is_final", False)),
+                            "trace_is_terminal": bool(log.get("trace_is_terminal", False)),
+                            "trace_outcome_valid": bool(log.get("trace_outcome_valid", False)),
+                            "trace_outcome_success": log.get("trace_outcome_success"),
+                            "trace_outcome_reward": log.get("trace_outcome_reward"),
+                        },
+                    )
+                )
+            return triplets
 
 
         ## planner logs
         planner_logs = result["planner_logs"]
+        outcome_metadata = annotate_trace_outcome(
+            planner_logs, result, reward_value, verifier_outcome, self.task,
+        )
+        if self.task == "qa":
+            _remove_injected_qa_output_format(planner_logs, prompt, task["question"])
         encoding_started = time.perf_counter() if profile_val else 0.0
         try:
             # Rollout.metadata is declared as Dict[str, Any].  Passing None
             # explicitly bypasses the model's default_factory and causes a
             # Pydantic ValidationError for QA rollouts, whose anchor is None.
-            metadata = {}
+            # This entrypoint historically had no legacy valid/dup flags.
+            # Keep those daemon defaults while adding TRACE-specific quality.
+            metadata = {"turn_flags": [
+                {"trace_valid": flags["trace_valid"], "trace_dup": flags["trace_dup"]}
+                for flags in _compute_turn_flags(planner_logs, self.task)
+            ]}
+            metadata.update(outcome_metadata)
+            if self.task == "qa":
+                metadata["extraction_counts"] = _compute_extraction_counts(planner_logs)
             if anchor is not None:
                 metadata["anchor"] = anchor
             rollout_package = Rollout(
@@ -514,10 +583,8 @@ class RolloutAgent(LitAgent):
 if __name__ == "__main__":
     from util.parse_config import get_values_from_yaml
     from util.port_cleanup import kill_process_on_port
-    from util.get_pub_ip import get_public_ip_with_fallback
     from pprint import pprint
 
-    # server_public_ip = get_public_ip_with_fallback()
     server_public_ip = "127.0.0.1"
 
     print(f"server_public_ip: {server_public_ip}")

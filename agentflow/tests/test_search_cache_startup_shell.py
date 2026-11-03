@@ -113,7 +113,8 @@ class StartupShellTests(unittest.TestCase):
         # Execute only the safe activation block, never the full launchers'
         # process cleanup, dependency installation or training commands.
         self.env_file.write_text('SEARCH_CACHE_TOKEN=test-token\n')
-        for filename in ("run_train.sh", "run_distribute_train.sh", "run_train_forever.sh"):
+        # The distributed launcher has a task gate, covered by test_distributed_network_routing.py.
+        for filename in ("run_train.sh", "run_train_forever.sh"):
             script = (ROOT / "train-roma" / filename).read_text()
             marker = 'if [[ "${SEARCH_CACHE_ENABLED:-}" =~'
             block = script[script.index(marker):].split("\nfi", 1)[0] + "\nfi\n"

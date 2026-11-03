@@ -30,7 +30,23 @@ def load_and_set_env_from_yaml(config_file_path: str):
             # Convert non-string values to string.
             str_val = str(value)            
             start_prefix = "${env:"
-            if str_val.startswith(start_prefix) and "," in str_val:
+            if key == "TASK":
+                # Match the shell task resolver even for literal YAML TASKs.
+                # Import locally so this loader remains independently usable.
+                import re as task_re
+                task_value = os.environ["TASK"] if "TASK" in os.environ else value
+                if "TASK" not in os.environ and isinstance(task_value, str):
+                    match = task_re.fullmatch(r"\$\{env:([A-Za-z_][A-Za-z0-9_]*),(.*?)\}", task_value.strip())
+                    if match is not None:
+                        variable, default = match.groups()
+                        task_value = os.environ.get(variable, default)
+                if not isinstance(task_value, str):
+                    raise ValueError("TASK must be a nonempty task name")
+                str_val = task_value.strip().lower()
+                if task_re.fullmatch(r"[a-z][a-z0-9_-]*", str_val) is None:
+                    raise ValueError("TASK must be a nonempty task name containing letters, digits, '_' or '-'")
+                print(f"  Exported TASK={str_val}")
+            elif str_val.startswith(start_prefix) and "," in str_val:
                 env_variable = str_val.split(",")[0][len(start_prefix):]
                 env_default = str_val.split(",")[1][:-len("}")]
                 org_val = str_val
@@ -175,7 +191,8 @@ class AnswerVerification(BaseModel):
 
 
 
-def compute_score(question: str,  groundtruth: str, answer_extracted: str,) -> bool:
+def compute_score(question: str, groundtruth: str, answer_extracted: str,
+                  return_details: bool = False):
     """
     Uses gpt-4o to determine if the extracted answer matches the groundtruth.
     
@@ -185,8 +202,17 @@ def compute_score(question: str,  groundtruth: str, answer_extracted: str,) -> b
         groundtruth: The correct answer label (e.g., "A").
 
     Returns:
-        A boolean indicating whether the answer is correct.
+        By default the original correctness result. With ``return_details``,
+        return a strict boolean verdict and its validity alongside the legacy
+        result, so parsing failures are not used as TRACE negative labels.
     """
+    def finish(value, valid=True):
+        if return_details:
+            return {"valid": bool(valid and isinstance(value, bool)),
+                    "success": value if valid and isinstance(value, bool) else None,
+                    "legacy_result": value}
+        return value
+
     if llm_scorer_engine is None:
         raise RuntimeError("LLM Scorer engine is not available.")
         
@@ -245,7 +271,7 @@ Required JSON structure:
     verification_result = llm_scorer_engine(query_prompt, response_format=AnswerVerification)
 
     if hasattr(verification_result, "true_false"):
-        return verification_result.true_false
+        return finish(verification_result.true_false)
     else:
         print("verification_result:", verification_result)
         ## judger output parsing
@@ -253,14 +279,14 @@ Required JSON structure:
 
         ## failed to load then it is forced to False.
         if judger_response is None:
-            return False
+            return finish(False, valid=False)
         
         if "true_false" in judger_response.keys():
             final_response = judger_response["true_false"]
             # print("final_response:", final_response)
-            return final_response
+            return finish(final_response)
 
-        return False
+        return finish(False, valid=False)
         
     
 

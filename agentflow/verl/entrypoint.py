@@ -2,8 +2,10 @@ import hydra
 import ray
 import os
 import traceback
+from dataclasses import asdict
 from pathlib import Path
 
+from agentflow.trace.credit import TraceConfig
 from .dataset import AgentDataset
 from .trainer import AgentFlowTrainer
 from verl.trainer.ppo.reward import load_reward_manager
@@ -29,6 +31,10 @@ def _search_cache_env_vars():
 
 
 def run_ppo(config) -> None:
+    worker_env = _search_cache_env_vars()
+    # Explicit propagation also covers an already initialized/external Ray cluster.
+    if "ALFWORLD_TRACE_GOALS" in os.environ:
+        worker_env["ALFWORLD_TRACE_GOALS"] = os.environ["ALFWORLD_TRACE_GOALS"]
     if not ray.is_initialized():
         # this is for local ray cluster
         env_vars = {"ASCEND_RT_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}
@@ -40,7 +46,7 @@ def run_ppo(config) -> None:
         ):
             if name in os.environ:
                 env_vars[name] = os.environ[name]
-        env_vars.update(_search_cache_env_vars())
+        env_vars.update(worker_env)
         ray.init(
             runtime_env={"env_vars": env_vars}
             # runtime_env={
@@ -52,7 +58,7 @@ def run_ppo(config) -> None:
 
     # Covers an already initialized/external Ray cluster as well as local init.
     runner = TaskRunner.options(
-        runtime_env={"env_vars": _search_cache_env_vars()}
+        runtime_env={"env_vars": worker_env}
     ).remote()
 
 
@@ -96,8 +102,13 @@ class TaskRunner:
 
         from verl.utils.fs import copy_to_local
 
-        pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
         OmegaConf.resolve(config)
+        # Validate before loading models or collecting the first rollout, and
+        # pass only effective TRACE settings to all downstream consumers.
+        trace_config = config.data.get("trace", {})
+        if "slic" in str(config.data.get("algorithm", "")).split("+") and trace_config.get("enabled", False):
+            config.data.trace = OmegaConf.create(asdict(TraceConfig.from_mapping(trace_config)))
+        pprint(OmegaConf.to_container(config, resolve=True))
 
         # download the checkpoint from hdfs
         local_path = copy_to_local(config.actor_rollout_ref.model.path)
@@ -167,7 +178,13 @@ class TaskRunner:
             mapping[Role.RewardModel] = global_pool_id
 
         # use reference model
-        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+        trace_enabled = (
+            "slic" in str(config.data.get("algorithm", "")).split("+")
+            and config.data.get("trace", {}).get("enabled", False)
+        )
+        if trace_enabled and config.actor_rollout_ref.actor.strategy not in ("fsdp", "fsdp2"):
+            raise ValueError("TRACE GT scoring currently requires the FSDP/FSDP2 worker")
+        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss or trace_enabled:
             role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
             mapping[Role.RefPolicy] = global_pool_id
 

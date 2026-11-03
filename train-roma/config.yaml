@@ -18,6 +18,33 @@ env:
   REPLAY_BUFFER_SIZE: ${env:REPLAY_BUFFER_SIZE,512}
   REPLAY_COLLECTION: ${env:REPLAY_COLLECTION,uid-turn}    # uid-turn(fast) | cross(slow) | turn(medium)
 
+  # ----- TRACE 状态价值与 SLIC 配对（仅算法包含 slic 时生效） -----
+  TRACE_ENABLED: ${env:TRACE_ENABLED,true}
+  # Optional legacy SQLite/Probe goals; prepared training Parquet embeds GT in result.
+  ALFWORLD_TRACE_GOALS: ${env:ALFWORLD_TRACE_GOALS,}
+  TRACE_EPSILON: ${env:TRACE_EPSILON,0.1}
+  TRACE_K: ${env:TRACE_K,3}
+  TRACE_GAMMA: ${env:TRACE_GAMMA,0.8}
+  TRACE_TERMINAL_FILL_ENABLED: ${env:TRACE_TERMINAL_FILL_ENABLED,true}
+  TRACE_TERMINAL_FILL_SCALE: ${env:TRACE_TERMINAL_FILL_SCALE,2.0}  # Non-QA only; ignored by QA dynamic scaling.
+  TRACE_OUTCOME_MATCH_VALUE: ${env:TRACE_OUTCOME_MATCH_VALUE,false}
+  TRACE_OUTCOME_SUCCESS_THRESHOLD: ${env:TRACE_OUTCOME_SUCCESS_THRESHOLD,0.5}
+  TRACE_MATCH_EPSILON: ${env:TRACE_MATCH_EPSILON,0.05}
+  TRACE_POSITIVE_THRESHOLD: ${env:TRACE_POSITIVE_THRESHOLD,0.01}
+  TRACE_NEGATIVE_THRESHOLD: ${env:TRACE_NEGATIVE_THRESHOLD,0.01}
+  TRACE_GAP_EPSILON: ${env:TRACE_GAP_EPSILON,0.02}
+  TRACE_LENGTH_RATIO_MAX: ${env:TRACE_LENGTH_RATIO_MAX,1.8}
+  TRACE_K_PAIRS_PER_GROUP: ${env:TRACE_K_PAIRS_PER_GROUP,2}  # Positive int: same-turn cap; None/null: cross-turn, no group cap.
+  TRACE_MAX_PAIRS_PER_STEP: ${env:TRACE_MAX_PAIRS_PER_STEP,256}
+  TRACE_MAX_GT_TOKENS: ${env:TRACE_MAX_GT_TOKENS,256}
+  TRACE_GT_ALIAS_STRATEGY: ${env:TRACE_GT_ALIAS_STRATEGY,first}
+  TRACE_ANSWER_INSTRUCTION: ${env:TRACE_ANSWER_INSTRUCTION,Answer the question directly and concisely.}
+  # Frozen-reference GT scoring only; actor/rollout forward paths are unchanged.
+  TRACE_SHARED_PREFIX_SCORING: ${env:TRACE_SHARED_PREFIX_SCORING,true}
+  TRACE_SHARED_PREFIX_MAX_TOKENS: ${env:TRACE_SHARED_PREFIX_MAX_TOKENS,8192}
+  TRACE_SHARED_PREFIX_MAX_MASK_MIB: ${env:TRACE_SHARED_PREFIX_MAX_MASK_MIB,256}
+  TRACE_SHARED_PREFIX_VERIFY: ${env:TRACE_SHARED_PREFIX_VERIFY,true}
+
   # ----- 评分模型 (Reward Model) -----
   SCORE_MODEL_NAME: "Qwen3-30B-A3B-Instruct-2507"
   SCORE_MODEL_URL: "http://127.0.0.1:19998/v1"
@@ -122,6 +149,30 @@ python_args:
   +data.algorithm: '${ALGORITHM}'
   +data.replay_buffer_size: '${REPLAY_BUFFER_SIZE}'
   +data.replay_collection: '${REPLAY_COLLECTION}'
+
+  # data.trace 已在 agentflow/verl/config.yaml 声明，无需 + 前缀。
+  data.trace.enabled: '${TRACE_ENABLED}'
+  data.trace.epsilon: '${TRACE_EPSILON}'
+  data.trace.k: '${TRACE_K}'
+  data.trace.gamma: '${TRACE_GAMMA}'
+  data.trace.terminal_fill_enabled: '${TRACE_TERMINAL_FILL_ENABLED}'
+  data.trace.terminal_fill_scale: '${TRACE_TERMINAL_FILL_SCALE}'
+  data.trace.outcome_match_value: '${TRACE_OUTCOME_MATCH_VALUE}'
+  data.trace.outcome_success_threshold: '${TRACE_OUTCOME_SUCCESS_THRESHOLD}'
+  data.trace.match_epsilon: '${TRACE_MATCH_EPSILON}'
+  data.trace.positive_threshold: '${TRACE_POSITIVE_THRESHOLD}'
+  data.trace.negative_threshold: '${TRACE_NEGATIVE_THRESHOLD}'
+  data.trace.gap_epsilon: '${TRACE_GAP_EPSILON}'
+  data.trace.length_ratio_max: '${TRACE_LENGTH_RATIO_MAX}'
+  data.trace.k_pairs_per_group: '${TRACE_K_PAIRS_PER_GROUP}'
+  data.trace.max_pairs_per_step: '${TRACE_MAX_PAIRS_PER_STEP}'
+  data.trace.max_gt_tokens: '${TRACE_MAX_GT_TOKENS}'
+  data.trace.gt_alias_strategy: '${TRACE_GT_ALIAS_STRATEGY}'
+  data.trace.answer_instruction: '"${TRACE_ANSWER_INSTRUCTION}"'
+  data.trace.shared_prefix_scoring: '${TRACE_SHARED_PREFIX_SCORING}'
+  data.trace.shared_prefix_max_tokens: '${TRACE_SHARED_PREFIX_MAX_TOKENS}'
+  data.trace.shared_prefix_max_mask_mib: '${TRACE_SHARED_PREFIX_MAX_MASK_MIB}'
+  data.trace.shared_prefix_verify: '${TRACE_SHARED_PREFIX_VERIFY}'
 
   # --------------------------------------------------------------------------
   # Trainer 配置

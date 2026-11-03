@@ -24,7 +24,7 @@ license-files = ["LICEN[CS]E*"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agentflow"]
+include = ["agentflow", "agentflow.trace"]
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}

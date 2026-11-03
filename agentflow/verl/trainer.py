@@ -30,6 +30,19 @@ from verl.utils.tracking import Tracking
 
 from .daemon import AgentModeDaemon
 from agentflow.rollout_timing import PHASES, profiling_enabled, write_validation_report
+from agentflow.trace.credit import (
+    TraceConfig,
+    annotate_rollout_credits,
+    annotate_environment_credits,
+    build_score_tensors,
+    encode_state_requests,
+    mean_gt_logps,
+    pair_group_key,
+    scale_outcome_advantages,
+    select_pairs,
+    state_values,
+)
+from agentflow.trace.metrics import summarize_selected_pairs, summarize_states
 
 import os
 import json
@@ -196,6 +209,13 @@ class AgentFlowTrainer(RayPPOTrainer):
             print(f"Validation proceeding with {valid_count} valid rollouts ({valid_count/completed_count:.1%} of completed)")
 
         test_metrics = self.agent_mode_daemon.get_test_metrics()
+        test_metrics.update({
+            "val/queued_rollouts": original_count,
+            "val/completed_rollouts": completed_count,
+            "val/valid_rollouts": valid_count,
+            "val/completion_rate": completion_rate,
+            "val/valid_rollout_rate": valid_count / original_count if original_count else 0.0,
+        })
 
         self.agent_mode_daemon.clear_data_and_server()
         self.async_rollout_manager.sleep()
@@ -224,6 +244,531 @@ class AgentFlowTrainer(RayPPOTrainer):
         return SequenceMatcher(None, a, b).ratio() >= thresh
 
 
+    def _actor_input_view(self, batch):
+        """Keep driver-only TRACE text out of model RPCs without changing rows."""
+        non_tensor_keys = [key for key in batch.non_tensor_batch if not key.startswith("trace_")]
+        if len(non_tensor_keys) == len(batch.non_tensor_batch):
+            return batch
+        return batch.select(batch_keys=list(batch.batch.keys()), non_tensor_batch_keys=non_tensor_keys)
+
+
+    def _needs_action_ref_log_prob(self):
+        """A frozen GT scorer does not itself require reference action scores."""
+        if not self.use_reference_policy:
+            return False
+        parts = set(str(getattr(self, "algorithm", self.config.data.get("algorithm", ""))).split("+"))
+        # Keep the previous behavior for other losses and for non-TRACE runs.
+        # SLiC uses its group baseline, while GRPO/GiGPO only consume action
+        # reference LogP when a KL objective is explicitly enabled.
+        if (not self.config.data.get("trace", {}).get("enabled", False)
+                or "slic" not in parts or not parts <= {"grpo", "gigpo", "slic"}):
+            return True
+        algorithm_cfg = getattr(self.config, "algorithm", None)
+        rollout_cfg = getattr(self.config, "actor_rollout_ref", None)
+        if algorithm_cfg is None or rollout_cfg is None:
+            return True
+        actor_cfg = (rollout_cfg.get("actor") if hasattr(rollout_cfg, "get")
+                     else getattr(rollout_cfg, "actor", None))
+        if actor_cfg is None:
+            return True
+        return bool(algorithm_cfg.get("use_kl_in_reward", True)
+                    or actor_cfg.get("use_kl_loss", True))
+
+
+    def _annotate_trace_credits(self, batch):
+        """Score actual turn contexts with the frozen reference, then difference neighbors."""
+        trace_start = time.perf_counter()
+        cfg = TraceConfig.from_mapping(self.config.data.get("trace", {}))
+        if not self.use_reference_policy:
+            raise RuntimeError("TRACE-SLIC requires a frozen reference policy")
+        contexts = batch.non_tensor_batch.get("trace_state_context")
+        ground_truths = batch.non_tensor_batch.get("trace_gt")
+        if contexts is None or ground_truths is None:
+            raise RuntimeError("TRACE metadata is missing; use a TRACE-aware rollout worker")
+        non = batch.non_tensor_batch
+        size = len(contexts)
+        # A parquet row index is not a stable identity for an os.walk result.
+        # Never compare credit or compute terminal advantages across different
+        # actual games that happened to share the same original data uid.
+        tasks = non.get("trace_task", [None] * size)
+        provenance = non.get("trace_goal_metadata", [None] * size)
+        game_by_uid = {}
+        for row, task in enumerate(tasks):
+            if task != "alfworld":
+                continue
+            if (str(non["trace_turn_type"][row]) != "tool_plan"
+                    or bool(non.get("trace_is_final", [False] * size)[row])):
+                raise ValueError("ALFWorld TRACE requires uniform environment-action metadata; refresh old rollout caches")
+            item = provenance[row]
+            fingerprint = (item.get("goal_spec_hash") or (item.get("source_sha256") or {}).get("gamefile")) if isinstance(item, dict) else None
+            if not fingerprint:
+                raise ValueError("ALFWorld TRACE is missing actual-game goal provenance")
+            key = str(non["uid"][row])
+            if key in game_by_uid and game_by_uid[key] != fingerprint:
+                raise ValueError("ALFWorld TRACE uid contains different actual games or goal templates")
+            game_by_uid[key] = fingerprint
+        # Full-state facts are diagnostic inputs to the reference only. Invalid
+        # simulator/verifier states must never become valid scoring requests,
+        # even if metadata reaches the trainer without the daemon adapter.
+        scoring_valid = np.asarray(non.get("trace_scoring_valid", np.ones(size)), dtype=bool)
+        goal_valid = non.get("trace_goal_check_valid", [None] * size)
+        views = non.get("trace_state_view", [None] * size)
+        contexts = list(contexts)
+        next_contexts = list(non.get("trace_next_state_context", [None] * size))
+        next_scoring_valid = np.asarray(non.get("trace_next_scoring_valid", np.zeros(size)), dtype=bool).copy()
+        alfworld_rows = [row for row, task in enumerate(tasks) if task == "alfworld"]
+        for row, task in enumerate(tasks):
+            if task == "alfworld":
+                if views[row] != "full_state":
+                    raise ValueError("ALFWorld TRACE requires the explicit full_state scoring view")
+                if not scoring_valid[row] or not bool(goal_valid[row]):
+                    contexts[row] = None
+                if (not next_scoring_valid[row] or not bool(goal_valid[row])
+                        or not isinstance(next_contexts[row], str) or not next_contexts[row].strip()):
+                    next_contexts[row] = None
+                    next_scoring_valid[row] = False
+        # Adjacent actions must describe the same observed boundary state.
+        # Turn numbering alone cannot certify that a real transition was kept.
+        environment_rows = defaultdict(list)
+        original_turns = non.get("trace_original_turn", non["turn_index_list"])
+        for row in alfworld_rows:
+            environment_rows[(str(non["uid"][row]), str(non["rollout_id_list"][row]))].append(row)
+        for rows in environment_rows.values():
+            rows.sort(key=lambda row: int(original_turns[row]))
+            for left, right in zip(rows, rows[1:]):
+                if (int(original_turns[right]) == int(original_turns[left]) + 1
+                        and next_scoring_valid[left] and contexts[right] is not None
+                        and next_contexts[left] != contexts[right]):
+                    raise ValueError("ALFWorld adjacent action post-state and next pre-state disagree")
+        # A post-state is a scoring request, never an additional actor row.
+        # Encoding all requests together deduplicates s_(t+1) against the next
+        # action's pre-state while preserving the native T-action batch.
+        score_contexts = contexts + [next_contexts[row] for row in alfworld_rows]
+        score_targets = list(ground_truths) + [ground_truths[row] for row in alfworld_rows]
+        instructions = non.get("trace_answer_instruction")
+        score_instructions = (None if instructions is None else
+                              list(instructions) + [instructions[row] for row in alfworld_rows])
+        encoding_start = time.perf_counter()
+        requests, row_requests, counters = encode_state_requests(
+            score_contexts, score_targets, self.tokenizer,
+            max_prompt_length=self.config.data.max_prompt_length,
+            max_gt_tokens=cfg.max_gt_tokens,
+            answer_instruction=cfg.answer_instruction,
+            answer_instructions=score_instructions,
+        )
+        encoding_seconds = time.perf_counter() - encoding_start
+        row_logps = np.full(size, np.nan, dtype=np.float64)
+        next_logps = np.full(size, np.nan, dtype=np.float64)
+        scoring_seconds = 0.0
+        prepare_seconds = postprocess_seconds = 0.0
+        prefix_metrics = {"trace/prefix_requested": int(cfg.shared_prefix_scoring)}
+        if requests:
+            prepare_start = time.perf_counter()
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is None:
+                pad_id = self.tokenizer.eos_token_id
+            if pad_id is None:
+                raise ValueError("TRACE tokenizer needs a pad or EOS token")
+            probes = DataProto.from_dict(
+                tensors=build_score_tensors(requests, pad_id),
+                meta_info={"trace_gt_scoring": True, "temperature": 1.0},
+            )
+            if cfg.shared_prefix_scoring:
+                probes.meta_info.update({
+                    "trace_prefix_max_tokens": cfg.shared_prefix_max_tokens,
+                    "trace_prefix_max_mask_bytes": cfg.shared_prefix_max_mask_mib * 1024 * 1024,
+                    "trace_prefix_verify": cfg.shared_prefix_verify,
+                })
+            scorer = self.actor_rollout_wg if self.ref_in_actor else self.ref_policy_wg
+            probes, probe_padding = pad_dataproto_to_divisor(probes, scorer.world_size)
+            prepare_seconds = time.perf_counter() - prepare_start
+            scoring_start = time.perf_counter()
+            if cfg.shared_prefix_scoring:
+                if not hasattr(scorer, "compute_ref_prefix_log_prob"):
+                    raise RuntimeError("Shared-prefix GT scoring requires updated reference workers; restart training after updating code")
+                scored = scorer.compute_ref_prefix_log_prob(probes)
+                prefix_metrics.update(scored.meta_info.get("trace_prefix_metrics", {}))
+            else:
+                scored = scorer.compute_ref_log_prob(probes)
+            scoring_seconds = time.perf_counter() - scoring_start
+            postprocess_start = time.perf_counter()
+            scored = unpad_dataproto(scored, pad_size=probe_padding)
+            probes = unpad_dataproto(probes, pad_size=probe_padding)
+            logps = np.asarray(mean_gt_logps(
+                scored.batch["ref_log_prob"], probes.batch["response_mask"]), dtype=np.float64)
+            request_indices = np.fromiter(
+                (-1 if index is None else index for index in row_requests),
+                dtype=np.int64, count=len(row_requests),
+            )
+            mapped = np.full(len(row_requests), np.nan, dtype=np.float64)
+            valid_requests = request_indices >= 0
+            mapped[valid_requests] = logps[request_indices[valid_requests]]
+            row_logps[:] = mapped[:size]
+            next_logps[np.asarray(alfworld_rows, dtype=np.int64)] = mapped[size:]
+            postprocess_seconds = time.perf_counter() - postprocess_start
+
+        credit_start = time.perf_counter()
+        values = np.full(size, np.nan, dtype=np.float64)
+        next_values = np.full(size, np.nan, dtype=np.float64)
+        credits = np.full(size, np.nan, dtype=np.float64)
+        local_credits = np.full(size, np.nan, dtype=np.float64)
+        terminal_fills = np.full(size, np.nan, dtype=np.float64)
+        terminal_discounts = np.full(size, np.nan, dtype=np.float64)
+        scaled_outcome_advantages = np.full(size, np.nan, dtype=np.float64)
+        blocked = np.zeros(size, dtype=bool)
+        external_blocked = np.zeros(size, dtype=bool)
+        reached = np.zeros(size, dtype=bool)
+        expected_credit = np.zeros(size, dtype=bool)
+        groups = defaultdict(list)
+        turns = non.get("trace_original_turn", non["turn_index_list"])
+        uids = non["uid"]
+        rollouts = non["rollout_id_list"]
+        types = non["trace_turn_type"]
+        external = np.asarray(non.get("trace_external_error", np.zeros(size)), dtype=bool)
+        final_flags = np.asarray(non.get("trace_is_final", np.zeros(size)), dtype=bool)
+        terminal_flags = np.asarray(non.get("trace_is_terminal", np.zeros(size)), dtype=bool)
+        raw_valid = np.asarray(non.get("trace_outcome_valid", np.zeros(size)), dtype=bool)
+        raw_success = non.get("trace_outcome_success", [None] * size)
+        raw_rewards = non.get("trace_outcome_reward", non.get("reward_list"))
+        if raw_rewards is None:
+            raw_rewards = batch.batch["token_level_scores"].sum(dim=-1).float().cpu().tolist()
+        outcome_valid = np.zeros(size, dtype=bool)
+        outcome_success = np.empty(size, dtype=object)
+        outcome_success[:] = None
+        outcome_rewards = np.asarray(raw_rewards, dtype=np.float64)
+        outcome_advantages = np.full(size, np.nan, dtype=np.float64)
+        within_prefix = np.ones(size, dtype=bool)
+        label_sources = np.full(size, "none", dtype=object)
+        for row, (uid, rollout) in enumerate(zip(uids, rollouts)):
+            groups[(str(uid), str(rollout))].append(row)
+        reliable = defaultdict(list)
+        for key, rows in groups.items():
+            rows.sort(key=lambda row: int(turns[row]))
+            is_environment = all(tasks[row] == "alfworld" for row in rows)
+            if any(tasks[row] == "alfworld" for row in rows) and not is_environment:
+                raise ValueError("TRACE rollout mixes environment and answer-based decisions")
+            boundaries = terminal_flags if is_environment else final_flags
+            finals = [row for row in rows if boundaries[row]
+                      and (is_environment or str(types[row]) in ("final_answer", "direct", "base"))]
+            if len(finals) == 1 and int(boundaries[rows].sum()) == 1:
+                final = finals[0]
+                for row in rows:
+                    within_prefix[row] = int(turns[row]) <= int(turns[final])
+                prefix = [row for row in rows if within_prefix[row]]
+                reward = outcome_rewards[final]
+                trustworthy = (all(raw_valid[row] for row in prefix)
+                               and all(tasks[row] != "alfworld" or
+                                       (scoring_valid[row] and bool(goal_valid[row])
+                                        and next_scoring_valid[row]) for row in prefix)
+                               and np.isfinite(reward)
+                               and np.isfinite(outcome_rewards[prefix]).all()
+                               and np.allclose(outcome_rewards[prefix], reward, rtol=0, atol=1e-8))
+                success = raw_success[final]
+                if trustworthy:
+                    if isinstance(success, (bool, np.bool_)):
+                        success = bool(success)
+                    elif success is None:
+                        # Only an explicitly valid scalar verifier may use this
+                        # fallback. Missing/failed verification never becomes 0.
+                        success = bool(reward > cfg.outcome_success_threshold)
+                    else:
+                        trustworthy = False
+                if trustworthy:
+                    outcome_valid[prefix] = True
+                    outcome_success[prefix] = success
+                    reliable[key[0]].append((key, float(reward)))
+            for offset, row in enumerate(rows):
+                if is_environment:
+                    label_sources[row] = "trace"
+                    expected_credit[row] = within_prefix[row]
+                elif str(types[row]) == "analysis":
+                    label_sources[row] = "outcome"
+                elif final_flags[row] and str(types[row]) in ("final_answer", "direct", "base"):
+                    label_sources[row] = "outcome"
+                elif str(types[row]) == "tool_plan":
+                    label_sources[row] = "trace"
+                    expected_credit[row] = offset < len(rows) - 1 and within_prefix[row]
+
+        algorithm_cfg = getattr(self.config, "algorithm", {})
+        norm_by_std = algorithm_cfg.get("norm_adv_by_std_in_grpo", True)
+        for observations in reliable.values():
+            rewards = np.asarray([reward for _, reward in observations], dtype=np.float64)
+            # Match agent-aware GRPO's one-observation special case and sample
+            # standard deviation, without changing its actual training rewards.
+            mean = float(rewards.mean()) if len(rewards) > 1 else 0.0
+            std = float(rewards.std(ddof=1)) if len(rewards) > 1 else 1.0
+            for key, reward in observations:
+                advantage = (reward - mean) / (std + 1e-6) if norm_by_std else reward - mean
+                for row in groups[key]:
+                    if outcome_valid[row]:
+                        outcome_advantages[row] = advantage
+
+        qa_groups = defaultdict(list)
+        for key, rows in groups.items():
+            # An absent initial turn cannot be silently replaced by a later baseline.
+            rollout_values = (state_values(row_logps[rows], epsilon=cfg.epsilon)
+                              if int(turns[rows[0]]) == 0 else [float("nan")] * len(rows))
+            trusted_rows = [row for row in rows if outcome_valid[row]]
+            outcome_options = dict(
+                outcome_valid=bool(trusted_rows),
+                outcome_advantage=float(outcome_advantages[trusted_rows[0]]) if trusted_rows else float("nan"),
+                config=cfg,
+            )
+            if all(tasks[row] == "alfworld" for row in rows):
+                # The initial pre-state is the shared baseline for both ends
+                # of every real transition, including the terminal post-state.
+                rollout_next_values = (state_values([row_logps[rows[0]], *next_logps[rows]],
+                                                    epsilon=cfg.epsilon)[1:]
+                                       if int(turns[rows[0]]) == 0 else [float("nan")] * len(rows))
+                annotated = annotate_environment_credits(
+                    rollout_values, rollout_next_values, [int(turns[row]) for row in rows],
+                    external[rows].tolist(), terminal_flags[rows].tolist(), **outcome_options,
+                )
+                next_values[rows] = rollout_next_values
+            else:
+                is_qa = (self.config.data.get("task", "qa") == "qa"
+                         and all(tasks[row] in (None, "qa") for row in rows))
+                # QA filling needs all local tool credits for this question.
+                # First collect the unchanged K-step credit and eligible discount.
+                annotated = annotate_rollout_credits(
+                    rollout_values, [int(turns[row]) for row in rows],
+                    [str(types[row]) for row in rows], external[rows].tolist(), final_flags[rows].tolist(),
+                    defer_terminal_fill=is_qa, **outcome_options,
+                )
+                if is_qa:
+                    qa_groups[key[0]].append(key)
+                    terminal_discounts[rows] = annotated["terminal_discount"]
+            values[rows] = rollout_values
+            local_credits[rows] = annotated["local_credit"]
+            terminal_fills[rows] = annotated["terminal_fill"]
+            credits[rows] = annotated["effective_credit"]
+            blocked[rows] = annotated["window_blocked"]
+            external_blocked[rows] = annotated["external_error_blocked"]
+            reached[rows] = annotated["terminal_reached"]
+
+        # Range population uses all valid QA tools, before sign/matching/pair
+        # filters, including windows that do not reach a trusted terminal answer.
+        # Never filter the state sequence before computing its K-step windows.
+        range_valid = (
+            np.asarray(non.get("trace_valid", np.zeros(size)), dtype=bool)
+            & ~np.asarray(non.get("trace_dup", np.zeros(size)), dtype=bool)
+            & ~external & within_prefix & ~blocked & np.isfinite(local_credits)
+            & (np.asarray(types) == "tool_plan")
+            & (batch.batch["response_mask"].sum(dim=-1).cpu().numpy() > 0)
+        )
+        drop = batch.batch.get("is_drop_mask")
+        if drop is not None:
+            range_valid &= ~drop.bool().cpu().numpy()
+        for uid, keys in qa_groups.items():
+            question_rows = [row for key in keys for row in groups[key]]
+            local_population = [local_credits[row] for row in question_rows if range_valid[row]]
+            # reliable already contains exactly one trusted outcome per rollout.
+            trusted_keys = [key for key, _ in reliable[uid] if key in keys]
+            advantages = [outcome_advantages[next(row for row in groups[key] if outcome_valid[row])]
+                          for key in trusted_keys]
+            scaled = scale_outcome_advantages(local_population, advantages)
+            for key, advantage in zip(trusted_keys, scaled):
+                for row in groups[key]:
+                    if not outcome_valid[row]:
+                        continue
+                    scaled_outcome_advantages[row] = advantage
+                    if terminal_discounts[row] > 0:
+                        fill = terminal_discounts[row] * advantage
+                        effective = local_credits[row] + fill
+                        if not (np.isfinite(fill) and np.isfinite(effective)):
+                            terminal_fills[row] = credits[row] = np.nan
+                            blocked[row] = True
+                            continue
+                        terminal_fills[row] = fill
+                        credits[row] = effective
+        non.update({
+            "trace_gt_logp": row_logps, "trace_value": values, "trace_credit": credits,
+            "trace_next_gt_logp": next_logps, "trace_next_value": next_values,
+            "trace_is_terminal": terminal_flags,
+            "trace_local_credit": local_credits, "trace_terminal_fill": terminal_fills,
+            "trace_credit_window_blocked": blocked, "trace_terminal_reached": reached,
+            "trace_external_window_blocked": external_blocked,
+            "trace_external_error": external, "trace_is_final": final_flags,
+            "trace_outcome_valid": outcome_valid, "trace_outcome_success": outcome_success,
+            "trace_outcome_reward": outcome_rewards, "trace_outcome_advantage": outcome_advantages,
+            "trace_scaled_outcome_advantage": scaled_outcome_advantages,
+            "trace_within_final_prefix": within_prefix, "trace_label_source": label_sources,
+        })
+        metrics = {"trace/" + key: value for key, value in counters.items()}
+        metrics.update(prefix_metrics)
+        for name in ("positive_threshold", "negative_threshold", "gap_epsilon", "match_epsilon"):
+            metrics["trace/config/" + name] = getattr(cfg, name)
+        metrics.update(summarize_states(
+            row_logps, values, credits, types,
+            [(str(uid), str(rollout)) for uid, rollout in zip(uids, rollouts)], turns, cfg,
+            local_credits=local_credits, terminal_fills=terminal_fills, window_blocked=external_blocked,
+            external_errors=external, outcome_valid=outcome_valid, label_sources=label_sources,
+            credit_expected_mask=expected_credit,
+        ))
+        metrics["trace/terminal_reached_turns"] = int(reached.sum())
+        metrics["trace/credit_windows_blocked"] = int(blocked.sum())
+        metrics["trace/post_final_turns"] = int((~within_prefix).sum())
+        metrics["trace/scoring_seconds"] = scoring_seconds
+        metrics["trace/validation_seconds"] = encoding_start - trace_start
+        metrics["trace/encoding_seconds"] = encoding_seconds
+        metrics["trace/scoring_prepare_seconds"] = prepare_seconds
+        metrics["trace/scoring_postprocess_seconds"] = postprocess_seconds
+        metrics["trace/scoring_invalid_result_turns"] = sum(
+            index is not None and not np.isfinite(row_logps[row])
+            for row, index in enumerate(row_requests[:size])
+        )
+        metrics["trace/scoring_invalid_next_result_turns"] = sum(
+            index is not None and not np.isfinite(next_logps[row])
+            for row, index in zip(alfworld_rows, row_requests[size:])
+        )
+        metrics["trace/credit_seconds"] = time.perf_counter() - credit_start
+        return metrics
+
+    def _trans_to_trace_batch(self, history_batch_list):
+        """Keep the existing SLiC loss inputs, replacing only preference selection."""
+        cfg = TraceConfig.from_mapping(self.config.data.get("trace", {}))
+        split_keys = ["input_ids", "attention_mask", "old_log_probs", "position_ids",
+                      "prompts", "response_mask", "responses", "token_level_scores"]
+        if self._needs_action_ref_log_prob():
+            split_keys.append("ref_log_prob")
+        common_keys = ["data_id_list", "uid", "traj_id_list", "traj_uid"]
+        side_keys = ["turn_index_list", "rollout_id_list", "trace_turn_type",
+                     "trace_gt_logp", "trace_value", "trace_credit",
+                     "trace_local_credit", "trace_terminal_fill", "trace_label_source",
+                     "trace_outcome_valid", "trace_outcome_success", "trace_outcome_reward",
+                     "trace_outcome_advantage", "trace_is_final", "trace_external_error"]
+        proto_list = []
+        pair_metrics = defaultdict(int)
+        diagnostic_rows, diagnostic_pairs = [], []
+        selected_per_group = defaultdict(int)
+        for history in history_batch_list:
+            non = history.non_tensor_batch
+            missing = set(side_keys) - set(non)
+            if missing:
+                raise RuntimeError(f"TRACE scoring metadata missing: {sorted(missing)}")
+            masks = history.batch["response_mask"]
+            lengths = masks.sum(dim=-1).cpu().tolist()
+            means = ((history.batch["old_log_probs"] * masks).sum(dim=-1)
+                     / masks.sum(dim=-1).clamp(min=1)).float().cpu().tolist()
+            outcomes = non["trace_outcome_reward"]
+            drop = history.batch.get("is_drop_mask")
+            valid = non.get("trace_valid", np.zeros(len(lengths), dtype=bool))
+            # TRACE dedup excludes failed attempts from its seen set. Legacy
+            # response dedup would incorrectly drop a successful identical retry.
+            dup = non.get("trace_dup", np.zeros(len(lengths), dtype=bool))
+            action_keys = non.get("trace_action_key")
+            rows = []
+            original_turns = non.get("trace_original_turn", non["turn_index_list"])
+            for i, length in enumerate(lengths):
+                # The native response IDs supply a stable fallback action identity.
+                response = history.batch["responses"][i][masks[i].bool()].cpu().tolist()
+                rows.append({
+                    "index": i, "uid": str(non["uid"][i]),
+                    "turn_type": str(non["trace_turn_type"][i]),
+                    "rollout_id": str(non["rollout_id_list"][i]),
+                    "turn_index": (original_turns[i] if non["trace_label_source"][i] == "trace"
+                                   else non["turn_index_list"][i]),
+                    "value": float(non["trace_value"][i]),
+                    "credit": float(non["trace_credit"][i]),
+                    "valid": bool(valid[i]) and not bool(dup[i])
+                             and not bool(non["trace_external_error"][i])
+                             and bool(non["trace_within_final_prefix"][i])
+                             and (drop is None or not bool(drop[i].item())),
+                    "length": int(length), "old_per_token": means[i],
+                    "outcome_reward": outcomes[i],
+                    "outcome_valid": bool(non["trace_outcome_valid"][i]),
+                    "outcome_success": non["trace_outcome_success"][i],
+                    "label_source": str(non["trace_label_source"][i]),
+                    "is_final": bool(non["trace_is_final"][i]),
+                    "external_error": bool(non["trace_external_error"][i]),
+                    "action_key": action_keys[i] if action_keys is not None and action_keys[i] is not None else tuple(response),
+                })
+                pair_metrics["trace/invalid_action_turns"] += int(not bool(valid[i]))
+                pair_metrics["trace/duplicate_turns"] += int(bool(dup[i]))
+                pair_metrics["trace/dropped_prompt_turns"] += int(drop is not None and bool(drop[i].item()))
+            offset = len(diagnostic_rows)
+            diagnostic_rows.extend(dict(row, index=row["index"] + offset) for row in rows)
+            selection_metrics = {}
+            selected_pairs = select_pairs(rows, cfg, metrics=selection_metrics)
+            # A configured task/turn quota applies across all history batches.
+            accepted_pairs = []
+            for chosen, rejected in selected_pairs:
+                group = pair_group_key(rows[chosen], cfg)
+                if group[2] == "trace" and cfg.k_pairs_per_group is not None:
+                    if selected_per_group[group] >= cfg.k_pairs_per_group:
+                        selection_metrics["rejected_group_cap"] += 1
+                        selection_metrics["selected_unique"] -= 1
+                        continue
+                    selected_per_group[group] += 1
+                accepted_pairs.append((chosen, rejected))
+            selected_pairs = accepted_pairs
+            for key, value in selection_metrics.items():
+                pair_metrics["trace/pair/" + key] += value
+            diagnostic_pairs.extend((chosen + offset, rejected + offset) for chosen, rejected in selected_pairs)
+            for chosen, rejected in selected_pairs:
+                # Preserve the old group-mean per-token baseline convention in
+                # the configured task/type/(optional turn) progress neighborhood.
+                chosen_group = pair_group_key(rows[chosen], cfg)
+                peers = [r for r in rows if r["valid"] and r["length"] > 0
+                         and pair_group_key(r, cfg) == chosen_group
+                         and np.isfinite(r["old_per_token"])
+                         and (r["label_source"] == "trace" or r["outcome_valid"])
+                         and ((r["label_source"] == "outcome" and not cfg.outcome_match_value)
+                              or (np.isfinite(r["value"]) and np.isfinite(rows[chosen]["value"])
+                                  and abs(r["value"] - rows[chosen]["value"]) <= cfg.match_epsilon))]
+                baseline = float(np.mean([r["old_per_token"] for r in peers]))
+                payload = {key + "_a": history.batch[key][chosen:chosen + 1] for key in split_keys}
+                payload.update({key + "_b": history.batch[key][rejected:rejected + 1] for key in split_keys})
+                payload.update({key: non[key][chosen:chosen + 1] for key in common_keys})
+                payload.update({key + "_a": non[key][chosen:chosen + 1] for key in side_keys})
+                payload.update({key + "_b": non[key][rejected:rejected + 1] for key in side_keys})
+                # Pair identities use original turn IDs, not compacted trace rows.
+                if rows[chosen]["label_source"] == "trace":
+                    payload["turn_index_list_a"] = np.array([rows[chosen]["turn_index"]], dtype=np.int64)
+                    payload["turn_index_list_b"] = np.array([rows[rejected]["turn_index"]], dtype=np.int64)
+                for key in ("trace_task", "trace_gt", "trace_goal_metadata", "trace_state_view",
+                            "trace_is_terminal", "trace_next_gt_logp", "trace_next_value"):
+                    if key in non:
+                        payload[key + "_a"] = non[key][chosen:chosen + 1]
+                        payload[key + "_b"] = non[key][rejected:rejected + 1]
+                proto = DataProto.from_single_dict(payload)
+                proto.non_tensor_batch["group_baseline"] = np.array([baseline], dtype=np.float32)
+                proto.non_tensor_batch["group_size"] = np.array([len(peers)], dtype=np.int32)
+                proto.non_tensor_batch["born_step"] = np.array([self.global_steps], dtype=np.int64)
+                proto.non_tensor_batch["pair_turn"] = np.array([rows[chosen]["turn_index"]], dtype=np.int32)
+                proto.meta_info["temperature"] = history.meta_info.get("temperature", 0.7)
+                proto_list.append(proto)
+        # Cap unique pairs before the required distributed padding.
+        extra_pairs = max(0, len(proto_list) - cfg.max_pairs_per_step)
+        pair_metrics["trace/pair/rejected_global_cap"] += extra_pairs
+        proto_list = proto_list[:cfg.max_pairs_per_step]
+        diagnostic_pairs = diagnostic_pairs[:cfg.max_pairs_per_step]
+        pair_metrics.update(summarize_selected_pairs(diagnostic_rows, diagnostic_pairs))
+        # These counts only supply the two diagnostic denominators. Publishing
+        # both the counts and rates would duplicate the same funnel information.
+        eligible_groups = pair_metrics.pop("trace/pair/groups_eligible", 0)
+        both_sign_groups = pair_metrics.pop("trace/pair/groups_both_signs", 0)
+        pair_metrics["trace/pair/both_sign_group_rate"] = both_sign_groups / eligible_groups if eligible_groups else 0.0
+        tool_candidates = pair_metrics.pop("trace/pair/trace_candidates_sign", 0)
+        tool_matched = pair_metrics.pop("trace/pair/trace_after_value_match", 0)
+        pair_metrics["trace/pair/tool_value_match_rate"] = (
+            tool_matched / tool_candidates if tool_candidates else 0.0)
+        pair_metrics["trace/pair/padding_duplicates"] = 0
+        by_index = {row["index"]: row for row in diagnostic_rows}
+        for turn_type in sorted({row["turn_type"] for row in diagnostic_rows}):
+            pair_metrics[f"trace/pair/{turn_type}/selected_unique"] = sum(
+                by_index[chosen]["turn_type"] == turn_type for chosen, _ in diagnostic_pairs
+            )
+        self._trace_pair_metrics = dict(pair_metrics)
+        if not proto_list:
+            return None
+        partitions = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+        remainder = len(proto_list) % partitions
+        if remainder:
+            proto_list.extend(random.choices(proto_list, k=partitions - remainder))
+            self._trace_pair_metrics["trace/pair/padding_duplicates"] = partitions - remainder
+        return proto_list
+
     ## score=0, score=1, classify(统一划分)
     def _trans_to_dpo_batch(self, history_batch_list: list):
         """
@@ -244,6 +789,10 @@ class AgentFlowTrainer(RayPPOTrainer):
             print("## No DPO data with history")
             return None
 
+        if ("slic" in str(getattr(self, "algorithm", self.config.data.get("algorithm", ""))).split("+")
+                and self.config.data.get("trace", {}).get("enabled", False)):
+            return self._trans_to_trace_batch(history_batch_list)
+
         k_partitions = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
         split_select_keys = [
             "input_ids", "attention_mask", "old_log_probs", "position_ids",
@@ -257,6 +806,14 @@ class AgentFlowTrainer(RayPPOTrainer):
 
         cfg = self.config.data.get("replay_filter", {})
         K_PAIRS_PER_GROUP   = cfg.get("k_pairs_per_group", None)
+        is_slic = "slic" in str(getattr(self, "algorithm", self.config.data.get("algorithm", ""))).split("+")
+        slic_turn_cap = cfg.get("k_pairs_per_group", 2)
+        if slic_turn_cap is None:
+            slic_turn_cap = 2
+        if (is_slic and str(self.config.data.get("task", "")).lower() in ("qa", "alfworld")
+                and (type(slic_turn_cap) is not int or slic_turn_cap < 1)):
+            raise ValueError("SLIC k_pairs_per_group must be a positive integer")
+        slic_turn_counts = defaultdict(int)
         LENGTH_RATIO_MAX    = cfg.get("length_ratio_max", 1.8)
         ANCHOR_SIM_THRESH   = cfg.get("anchor_sim_thresh", 0.95)
         REQUIRE_REWARD_GAP  = cfg.get("require_reward_gap", True)
@@ -269,7 +826,10 @@ class AgentFlowTrainer(RayPPOTrainer):
         for history_batch in history_batch_list:
             uids           = history_batch.non_tensor_batch["uid"]
             traj_uids      = history_batch.non_tensor_batch["traj_uid"]
-            turn_indices   = history_batch.non_tensor_batch["turn_index_list"]
+            native_turn_indices = history_batch.non_tensor_batch["turn_index_list"]
+            turn_indices = native_turn_indices
+            if is_slic and str(self.config.data.get("task", "")).lower() in ("qa", "alfworld"):
+                turn_indices = history_batch.non_tensor_batch.get("trace_original_turn", turn_indices)
             anchors        = history_batch.non_tensor_batch["anchor_list"]
             responses      = history_batch.batch["responses"]
             response_mask  = history_batch.batch["response_mask"]
@@ -285,12 +845,13 @@ class AgentFlowTrainer(RayPPOTrainer):
             bsz = scores.shape[0]
 
             task = str(self.config.data.get("task", "")).lower()
+            restrict_action_turns = is_slic and task in ("qa", "alfworld")
             rollout_last_turn = {}
             if task == "qa":
                 rollout_ids = history_batch.non_tensor_batch["rollout_id_list"]
                 for i in range(bsz):
                     rollout_id = str(rollout_ids[i])
-                    turn = int(turn_indices[i])
+                    turn = int(native_turn_indices[i])
                     rollout_last_turn[rollout_id] = max(
                         rollout_last_turn.get(rollout_id, -1), turn
                     )
@@ -301,19 +862,26 @@ class AgentFlowTrainer(RayPPOTrainer):
                 for i in range(bsz):
                     rlen = int(lengths[i].item())
                     resp_ids = responses[i, :rlen].detach().cpu().tolist() if rlen > 0 else []
+                    anchor = anchors[i] if isinstance(anchors[i], str) else str(anchors[i])
+                    action_turn = restrict_action_turns and not (
+                        task == "qa" and anchor.partition("\n")[0] in ("analysis", "final"))
+                    original_turn = turn_indices[i] if action_turn else native_turn_indices[i]
+                    if action_turn and pair_group_key({"uid": str(uids[i]), "turn_type": "tool_plan",
+                                                       "turn_index": original_turn}) is None:
+                        continue
                     rows.append({
                         "row":    i,
                         "uid":    str(uids[i]),
                         "traj":   str(traj_uids[i]),
-                        "turn":   int(turn_indices[i]),
-                        "anchor": anchors[i] if isinstance(anchors[i], str) else str(anchors[i]),
+                        "turn":   int(original_turn),
+                        "anchor": anchor,
                         "score":  float(scores[i].item()),
                         "length": max(rlen, 1),
                         "logP":   float(seq_logP[i].item()),
                         "resp":   tuple(resp_ids),
                         "valid":  bool(valid_flags[i]) if valid_flags is not None else True,
                         "dup":    bool(dup_flags[i])   if dup_flags   is not None else False,
-                        "is_last": int(turn_indices[i]) == rollout_last_turn[str(rollout_ids[i])] if task == "qa" else None,
+                        "is_last": int(native_turn_indices[i]) == rollout_last_turn[str(rollout_ids[i])] if task == "qa" else None,
                     })
 
             uid2trajs = defaultdict(lambda: defaultdict(list))
@@ -340,7 +908,14 @@ class AgentFlowTrainer(RayPPOTrainer):
                             turn_type = r["anchor"].partition("\n")[0]
                             if turn_type not in ("analysis", "tool", "final"):
                                 turn_type = ""
-                            turn2rows[(r["is_last"], turn_type)].append(r)
+                            # Preserve QA analysis/final outcome groups. Tools
+                            # additionally require the same original action turn.
+                            if restrict_action_turns and turn_type not in ("analysis", "final"):
+                                turn2rows[(r["is_last"], turn_type, r["turn"])].append(r)
+                            else:
+                                turn2rows[(r["is_last"], turn_type)].append(r)
+                        elif restrict_action_turns:
+                            turn2rows[r["turn"]].append(r)
                         else:
                             turn2rows["cross_turn"].append(r)
 
@@ -408,7 +983,25 @@ class AgentFlowTrainer(RayPPOTrainer):
                             candidates.append((hardness, chosen, rejected, len(uniq), baseline, turn))
 
                 candidates.sort(key=lambda x: x[0])
-                for hardness, chosen, rejected, cluster_size, baseline, turn in candidates[:K_PAIRS_PER_GROUP]:
+                if restrict_action_turns:
+                    selected = []
+                    outcome_candidates = []
+                    for candidate in candidates:
+                        chosen = candidate[1]
+                        qa_outcome = task == "qa" and chosen["anchor"].partition("\n")[0] in ("analysis", "final")
+                        if qa_outcome:
+                            outcome_candidates.append(candidate)
+                            continue
+                        quota_key = uid, chosen["turn"]
+                        if slic_turn_counts[quota_key] < slic_turn_cap:
+                            slic_turn_counts[quota_key] += 1
+                            selected.append(candidate)
+                    # Keep QA's existing outcome cap, including its no-cap default.
+                    selected.extend(outcome_candidates[:K_PAIRS_PER_GROUP])
+                    selected.sort(key=lambda x: x[0])
+                else:
+                    selected = candidates[:K_PAIRS_PER_GROUP]
+                for hardness, chosen, rejected, cluster_size, baseline, turn in selected:
                     p_idx, n_idx = chosen["row"], rejected["row"]
                     proto = DataProto.from_single_dict(
                         {key + "_a": history_batch.batch[key][p_idx: p_idx + 1, :] for key in split_select_keys}
@@ -417,6 +1010,9 @@ class AgentFlowTrainer(RayPPOTrainer):
                         | {key + "_a": history_batch.non_tensor_batch[key][p_idx: p_idx + 1] for key in non_tensor_split_select_keys}
                         | {key + "_b": history_batch.non_tensor_batch[key][n_idx: n_idx + 1] for key in non_tensor_split_select_keys}
                     )
+                    if restrict_action_turns:
+                        proto.non_tensor_batch["turn_index_list_a"] = np.array([chosen["turn"]], dtype=np.int64)
+                        proto.non_tensor_batch["turn_index_list_b"] = np.array([rejected["turn"]], dtype=np.int64)
                     proto.non_tensor_batch["group_baseline"] = np.array([baseline], dtype=np.float32)
                     proto.non_tensor_batch["group_size"]     = np.array([cluster_size], dtype=np.int32)
                     proto.non_tensor_batch["born_step"]      = np.array([self.global_steps], dtype=np.int64)
@@ -450,6 +1046,8 @@ class AgentFlowTrainer(RayPPOTrainer):
            只在需要训练 DPO 时才做一次 concat，避免每 step 全量拷贝。
         """
         n_size = len(dpo_queue)
+        self._trace_replay_metrics = {"trace/replay/sampled_pairs": 0,
+                                      "trace/replay/sample_unique_pair_rate": 0.0}
         if n_size == 0:
             return None
 
@@ -469,6 +1067,22 @@ class AgentFlowTrainer(RayPPOTrainer):
             np.random.shuffle(indices)
 
         selected = [dpo_queue[i] for i in indices]
+        if ("slic" in str(getattr(self, "algorithm", "")).split("+")
+                and self.config.data.get("trace", {}).get("enabled", False)):
+            identity_keys = ("uid", "rollout_id_list_a", "turn_index_list_a",
+                             "rollout_id_list_b", "turn_index_list_b", "born_step")
+            identities = [
+                tuple(str(proto.non_tensor_batch[key][0]) for key in identity_keys)
+                if all(key in proto.non_tensor_batch for key in identity_keys) else ("queue_index", i)
+                for i, proto in enumerate(dpo_queue)
+            ]
+            unique_sampled = len({identities[int(i)] for i in indices})
+            sampled_ages = ages[indices]
+            self._trace_replay_metrics = {
+                "trace/replay/sampled_pairs": len(selected),
+                "trace/replay/sample_unique_pair_rate": unique_sampled / len(selected),
+                "trace/replay/sample_age_p90": float(np.quantile(sampled_ages, 0.9)),
+            }
         return DataProto.concat(selected)
 
 
@@ -482,6 +1096,10 @@ class AgentFlowTrainer(RayPPOTrainer):
 
         algorithm = self.algorithm
         dpo_types = ["abpo", "slic", "simpo", "hspo"]
+        if "slic" in algorithm.split("+") and self.config.data.get("trace", {}).get("enabled", False):
+            metrics.update({"trace/replay/sampled_pairs": 0,
+                            "trace/replay/sample_unique_pair_rate": 0.0,
+                            "trace/replay/slic_updated": 0})
 
         if "+" in algorithm:
             parts = algorithm.split("+")
@@ -574,7 +1192,7 @@ class AgentFlowTrainer(RayPPOTrainer):
 
             # recompute old_log_probs
             with _timer("old_log_prob", timing_raw), torch.no_grad():
-                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                old_log_prob = self.actor_rollout_wg.compute_log_prob(self._actor_input_view(batch))
                 entropys = old_log_prob.batch["entropys"]
                 response_masks = batch.batch["response_mask"]
                 loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -584,13 +1202,20 @@ class AgentFlowTrainer(RayPPOTrainer):
                 old_log_prob.batch.pop("entropys")
                 batch = batch.union(old_log_prob)
 
-            if self.use_reference_policy:
+            needs_action_ref_log_prob = self._needs_action_ref_log_prob()
+            metrics["perf/action_ref_log_prob_skipped"] = int(
+                self.use_reference_policy and not needs_action_ref_log_prob)
+            if needs_action_ref_log_prob:
                 print(f"use_reference_policy: {self.use_reference_policy}")
                 # compute reference log_prob
                 with _timer("ref", timing_raw), torch.no_grad():
-                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                    ref_worker = self.actor_rollout_wg if self.ref_in_actor else self.ref_policy_wg
+                    ref_log_prob = ref_worker.compute_ref_log_prob(self._actor_input_view(batch))
                     print("ref_log_prob:", ref_log_prob)
                     batch = batch.union(ref_log_prob)
+            elif self.use_reference_policy:
+                timing_raw["ref"] = 0.0
+                print("Skipping unused action reference LogP; frozen TRACE GT scoring remains enabled.")
 
             # compute values
             if self.use_critic:
@@ -601,6 +1226,10 @@ class AgentFlowTrainer(RayPPOTrainer):
             # for agent mode, unpad to calculate adv
             # it is important, as adv should be based on the raw traces
             batch = unpad_dataproto(batch, pad_size=pad_size)
+            if ("slic" in algorithm.split("+")
+                    and self.config.data.get("trace", {}).get("enabled", False)):
+                with _timer("trace", timing_raw), torch.no_grad():
+                    metrics.update(self._annotate_trace_credits(batch))
             found = any(k in algorithm for k in dpo_types)
             if found:
                 ## add stale data memory
@@ -611,6 +1240,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                     self._dpo_ring_buffer = deque(maxlen=replay_buffer_size)
 
                 new_dpo_pairs = self._trans_to_dpo_batch([batch])
+                if "slic" in algorithm.split("+") and self.config.data.get("trace", {}).get("enabled", False):
+                    metrics.update(self._trace_pair_metrics)
                 if new_dpo_pairs is not None:
                     # uid 全局配额：同一 uid 在 buffer 中最多 M 对（防多轮相邻 turn 冗余）
                     if not hasattr(self, '_uid_pair_count'):
@@ -737,7 +1368,9 @@ class AgentFlowTrainer(RayPPOTrainer):
                     with _timer("update_actor", timing_raw):
                         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                         batch.meta_info["max_response_length"] = self.config.data.max_response_length
-                        actor_output = self.actor_rollout_wg.update_actor(batch)
+                        metrics["perf/actor_rpc_trace_fields_omitted"] = sum(
+                            key.startswith("trace_") for key in batch.non_tensor_batch)
+                        actor_output = self.actor_rollout_wg.update_actor(self._actor_input_view(batch))
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
                     print(f"{time.strftime('%Y-%m-%d %H-%M-%S')}: >>> End GRPO")
@@ -775,6 +1408,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                             
                             print(f"## update dpo ({n_batch}) bs from ({history_length})")
                             sample_batch = self._sample_dpo_data(self._dpo_ring_buffer, bs=n_batch)
+                            if "slic" in algorithm.split("+") and self.config.data.get("trace", {}).get("enabled", False):
+                                metrics.update(self._trace_replay_metrics)
                             
                             if sample_batch is not None and len(sample_batch) > 0:
                                 print(f"{time.strftime('%Y-%m-%d %H-%M-%S')}: >>> Middle-2 DPO")
@@ -783,7 +1418,9 @@ class AgentFlowTrainer(RayPPOTrainer):
                                 
                                 # 建议：在DPO前也做长度检查，过滤极端长短样本
                                 # 可在 update_actor_by_dpo 内部或这里加
-                                dpo_output = self.actor_rollout_wg.update_actor_by_dpo(sample_batch)
+                                dpo_output = self.actor_rollout_wg.update_actor_by_dpo(self._actor_input_view(sample_batch))
+                                if "slic" in algorithm.split("+") and self.config.data.get("trace", {}).get("enabled", False):
+                                    metrics["trace/replay/slic_updated"] = 1
                                 dpo_output_metrics = reduce_metrics(dpo_output.meta_info["metrics"])
                                 metrics.update(dpo_output_metrics)
                             else:
@@ -798,6 +1435,8 @@ class AgentFlowTrainer(RayPPOTrainer):
         # compute training metrics
         metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+        if "trace" in timing_raw:
+            metrics["trace/step_time_fraction"] = timing_raw["trace"] / timing_raw["step"] if timing_raw.get("step", 0) else 0.0
 
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))

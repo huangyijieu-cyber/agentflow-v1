@@ -15,6 +15,7 @@ from agentflow.models.memory import Memory
 from agentflow.models.executor import Executor
 from agentflow.models.utils import make_json_serializable_truncated
 from agentflow.rollout_timing import RolloutTiming, is_search_tool, profiling_enabled
+from agentflow.trace.execution import classify_tool_result, annotate_alfworld_step
 
 
 def log_info(message):
@@ -26,6 +27,11 @@ def _serialize_qa_anchor(state):
     # Normalize JSON object keys before sorting, without changing stored tool results.
     state = json.loads(json.dumps(state, ensure_ascii=False))
     return json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _trace_tool_result_failed(result):
+    """Recognize final execution failures without scanning retrieved prose."""
+    return classify_tool_result(result)["failed"]
 
 
 class Solver:
@@ -210,6 +216,19 @@ class Solver:
                             log_info(f"[Result]:\n{json.dumps(result, indent=4)}")
                             log_info(f"[Time]: {round(time.time() - local_start_time, 2)}s")
                     
+                    # Attach execution quality to the exact planner decision that
+                    # produced it. This does not change execution or state history.
+                    action_log = self.planner.logs[-1]
+                    execution_status = classify_tool_result(result)
+                    action_log["trace_tool_failed"] = execution_status["failed"]
+                    action_log["trace_external_error"] = execution_status["external_error"]
+                    action_log["trace_error_type"] = execution_status["error_type"]
+                    action_log["trace_error_source"] = execution_status["error_source"]
+                    action_log["trace_action_key"] = json.dumps(
+                        [tool_name, command.strip() if isinstance(command, str) else command],
+                        ensure_ascii=False, sort_keys=True,
+                    )
+
                     # Track execution time for the current step
                     execution_time_step = round(time.time() - step_start_time, 2)
                     action_times.append(execution_time_step)
@@ -333,9 +352,36 @@ class Solver:
                 while True:
                     step_count += 1
                     # print(f"Query:\n{question}")
+                    trace_alfworld = self.task == "alfworld" and getattr(self.env, "trace_enabled", False)
+                    if trace_alfworld:
+                        state_context = self.env.trace_state_context
+                        goal_metadata = {
+                            "trace_state_context": state_context,
+                            "trace_gt": self.env.trace_gt,
+                            "trace_answer_instruction": self.env.trace_answer_instruction,
+                            "trace_goal_metadata": deepcopy(self.env.trace_goal_metadata),
+                            "trace_state_view": "full_state",
+                            "trace_goal_check_before": self.env.trace_goal_check,
+                            "trace_goal_check_valid_before": self.env.trace_goal_check_valid,
+                            "trace_scoring_valid": self.env.trace_scoring_valid,
+                        }
                     base_response = self.planner.generate_base_response(question, image_path, self.max_tokens)
                     print(f"Action:\n{base_response}")
-                    question, reward, done, info = self.env.step(base_response)
+                    if trace_alfworld:
+                        self.planner.logs[-1].update(goal_metadata)
+                    try:
+                        question, reward, done, info = self.env.step(base_response)
+                    except Exception as error:
+                        if trace_alfworld:
+                            annotate_alfworld_step(
+                                self.planner.logs[-1], state_context, True,
+                                {"env_error": True, "env_error_type": type(error).__name__,
+                                 "terminated": False, "truncated": False,
+                                 "trace_goal_check_valid": False, "trace_scoring_valid": False},
+                            )
+                        raise
+                    if trace_alfworld:
+                        annotate_alfworld_step(self.planner.logs[-1], state_context, done, info)
                     print(f'Reward = {reward}, Done = {done}')
                     if info["anchor"] is not None:
                         json_data["anchor"].append(info["anchor"])
@@ -506,6 +552,7 @@ def construct_solver(llm_engine_name : str = "gpt-4o",
                      task: str = "qa"
                      ):
 
+    task = str(task).strip().lower()
     # Parse model_engine configuration
     # Format: [planner_main, planner_fixed, verifier, executor]
     # "trainable" means use llm_engine_name (the trainable model)
@@ -517,14 +564,21 @@ def construct_solver(llm_engine_name : str = "gpt-4o",
     verifier_is_train = True if model_engine[2] == "trainable" else False
     executor_is_train = True if model_engine[3] == "trainable" else False
 
-    # Instantiate Initializer
-    initializer = Initializer(
-        enabled_tools=enabled_tools,
-        tool_engine=tool_engine,
-        model_string=llm_engine_name,
-        verbose=verbose,
-        vllm_config_path=vllm_config_path,
-    )
+    # Environment tasks act through their own env, not the QA search toolbox.
+    # Avoid importing/constructing search clients and their network settings.
+    if task in ("alfworld", "webshop", "rule"):
+        toolbox_metadata, available_tools, tool_instances_cache = {}, [], {}
+    else:
+        initializer = Initializer(
+            enabled_tools=enabled_tools,
+            tool_engine=tool_engine,
+            model_string=llm_engine_name,
+            verbose=verbose,
+            vllm_config_path=vllm_config_path,
+        )
+        toolbox_metadata = initializer.toolbox_metadata
+        available_tools = initializer.available_tools
+        tool_instances_cache = initializer.tool_instances_cache
     
     print("llm_engine_name:", llm_engine_name)
     print("planner_main_engine:", planner_main_engine)
@@ -536,8 +590,8 @@ def construct_solver(llm_engine_name : str = "gpt-4o",
     planner = Planner(
         llm_engine_name=planner_main_engine,
         llm_engine_fixed_name=planner_fixed_engine,
-        toolbox_metadata=initializer.toolbox_metadata,
-        available_tools=initializer.available_tools,
+        toolbox_metadata=toolbox_metadata,
+        available_tools=available_tools,
         verbose=verbose,
         base_url=base_url,
         temperature=temperature
@@ -548,8 +602,8 @@ def construct_solver(llm_engine_name : str = "gpt-4o",
     verifier = Verifier(
         llm_engine_name=verifier_engine,
         llm_engine_fixed_name=planner_fixed_engine,
-        toolbox_metadata=initializer.toolbox_metadata,
-        available_tools=initializer.available_tools,
+        toolbox_metadata=toolbox_metadata,
+        available_tools=available_tools,
         verbose=verbose,
         base_url=base_url if verifier_engine == llm_engine_name else None,
         temperature=temperature if verifier_is_train else 0.0
@@ -565,7 +619,7 @@ def construct_solver(llm_engine_name : str = "gpt-4o",
         verbose=verbose,
         base_url=base_url if executor_engine == llm_engine_name else None,  # Only use base_url for trainable model
         temperature=temperature if executor_is_train else 0.0,
-        tool_instances_cache=initializer.tool_instances_cache  # Pass the cached tool instances
+        tool_instances_cache=tool_instances_cache
     )
 
     # Instantiate Solver

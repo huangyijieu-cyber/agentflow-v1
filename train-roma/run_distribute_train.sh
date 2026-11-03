@@ -1,7 +1,124 @@
 #!/bin/bash
-source "train-roma/enable_search_proxy.sh"
-
 set -e
+
+# Resolve the repository from this file, independently of the caller's cwd.
+ROOT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+export ROOT_PATH
+cd "${ROOT_PATH}"
+
+# Select the task before proxy setup, dependency installation or Ray.
+# ModelArts starts this script before the training dependencies are installed,
+# so this small YAML env.TASK reader uses ONLY Python's standard library.
+# The full YAML configuration is loaded by the training code later.
+TASK_CONFIG="${ROOT_PATH}/train-roma/config.yaml"
+if ! RESOLVED_TASK="$("${AGENTFLOW_TASK_PYTHON:-python3}" - "${TASK_CONFIG}" <<'PYTASK'
+import os
+import re
+import sys
+from pathlib import Path
+
+config_file = Path(sys.argv[1])
+
+
+def fail(reason):
+    # Do not echo YAML lines, parser internals or any other config values.
+    print(f"[network] {reason}: {config_file}", file=sys.stderr)
+    sys.exit(2)
+
+
+try:
+    lines = config_file.read_text(encoding="utf-8-sig").splitlines()
+except OSError:
+    fail("Cannot read task configuration")
+
+
+def scalar(raw):
+    """Read the simple YAML scalar used by env.TASK, not the whole YAML file."""
+    raw = raw.strip()
+    if raw.startswith(("'", '"')):
+        quote = raw[0]
+        # A task name/default expression has no YAML escape sequences.
+        # Reject complex scalars rather than guessing a task value.
+        match = re.fullmatch(r"'([^']*)'\s*(?:#.*)?" if quote == "'"
+                             else r'"([^"\\]*)"\s*(?:#.*)?', raw)
+        if match is None:
+            fail("Invalid env.TASK scalar")
+        return match.group(1)
+    raw = re.split(r"\s+#", raw, maxsplit=1)[0].strip()
+    # Unquoted YAML booleans/null are not string task names.
+    if raw.lower() in {"true", "false", "null", "~", "yes", "no", "on", "off"}:
+        fail("Invalid env.TASK scalar")
+    return raw
+
+
+found_env = False
+in_env = False
+configured_task = "qa"
+found_task = False
+for line in lines:
+    if not line.strip() or line.lstrip().startswith("#"):
+        continue
+    if not line[0].isspace():
+        in_env = False
+        if re.match(r"^env\s*:", line):
+            if found_env:
+                fail("Duplicate env configuration")
+            found_env = True
+            rest = line.split(":", 1)[1].strip()
+            if rest and not rest.startswith("#"):
+                fail("Invalid env configuration; expected a mapping")
+            in_env = True
+    elif in_env:
+        if line[0] == "\t":
+            fail("Invalid env indentation")
+        match = re.match(r"^ +TASK\s*:\s*(.*)$", line)
+        if match:
+            if found_task:
+                fail("Duplicate env.TASK")
+            found_task = True
+            configured_task = scalar(match.group(1))
+
+if not found_env:
+    fail("Missing env configuration")
+
+# Explicit TASK takes precedence, including when YAML uses a literal task.
+value = os.environ["TASK"] if "TASK" in os.environ else configured_task
+if "TASK" not in os.environ:
+    expression = re.fullmatch(r"\$\{env:([A-Za-z_][A-Za-z0-9_]*),(.*?)\}", value.strip())
+    if expression:
+        name, fallback = expression.groups()
+        value = os.environ.get(name, fallback)
+
+value = value.strip().lower()
+if not re.fullmatch(r"[a-z][a-z0-9_-]*", value):
+    print("[network] Invalid TASK: expected a nonempty name with letters, digits, '_' or '-'", file=sys.stderr)
+    sys.exit(2)
+print(value)
+PYTASK
+)"; then
+    exit 2
+fi
+export TASK="${RESOLVED_TASK}"
+unset RESOLVED_TASK TASK_CONFIG
+
+case "${TASK}" in
+    alfworld|webshop|rule)
+        NEED_SEARCH_NETWORK=0
+        ;;
+    *)
+        NEED_SEARCH_NETWORK=1
+        ;;
+esac
+
+if [[ "${NEED_SEARCH_NETWORK}" == 1 ]]; then
+    source "${ROOT_PATH}/train-roma/enable_search_proxy.sh"
+else
+    export SEARCH_CACHE_ENABLED=0
+    export SEARCH_PROXY_ENABLED=0
+    export SEARCH_CACHE_AUTO_START=0
+    export SEARCH_CACHE_AUTO_TUNNEL=0
+    echo "[network] TASK=${TASK}: 跳过搜索代理、缓存和 SSH 隧道"
+fi
 
 #source train-roma/con_to_web.sh
 
@@ -56,6 +173,11 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64/driver/:$LD_LIBRARY_PATH
 source /usr/local/Ascend/cann/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/cann/nnal/atb/set_env.sh
 
+# Keep HCCL host ports outside the server's ephemeral range (32768-60999).
+# Set this on every node before Ray starts so its workers inherit the value.
+export HCCL_IF_BASE_PORT="${HCCL_IF_BASE_PORT:-20000}"
+echo "[HCCL] HCCL_IF_BASE_PORT=${HCCL_IF_BASE_PORT}, HCCL_HOST_SOCKET_PORT_RANGE=${HCCL_HOST_SOCKET_PORT_RANGE:-<unset>}"
+
 export MY_IP=$(hostname -I | awk '{print $1}')
 echo "MyIP: ${MY_IP}"
 export no_proxy="${MY_IP},${no_proxy}"
@@ -85,9 +207,15 @@ cd "${ROOT_PATH}/agentflow"
 python -m pip install --user --no-deps -e . --no-build-isolation
 cd ..
 
-# Enable before Ray starts on each node so tools inherit the shared service.
-if [[ "${SEARCH_CACHE_ENABLED:-}" =~ ^(1|true|True|TRUE|yes|YES|on|ON)$ ]] || { [[ -z "${SEARCH_CACHE_ENABLED+x}" ]] && [[ -n "${SEARCH_CACHE_ENV_FILE:-}" || -f "${ROOT_PATH}/train-roma/search-cache.local.env" ]]; }; then
-    source "${ROOT_PATH}/train-roma/enable_search_cache.sh" || exit 1
+# Enable the shared search service only for tasks that need external search.
+# Every node reaches this gate before starting Ray.
+if [[ "${NEED_SEARCH_NETWORK}" == 1 ]]; then
+    if [[ "${SEARCH_CACHE_ENABLED:-}" =~ ^(1|true|True|TRUE|yes|YES|on|ON)$ ]] ||
+       { [[ -z "${SEARCH_CACHE_ENABLED+x}" ]] &&
+         [[ -n "${SEARCH_CACHE_ENV_FILE:-}" ||
+            -f "${ROOT_PATH}/train-roma/search-cache.local.env" ]]; }; then
+        source "${ROOT_PATH}/train-roma/enable_search_cache.sh" || exit 1
+    fi
 fi
 
 # ==========================================
