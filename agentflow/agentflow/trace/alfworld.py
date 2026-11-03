@@ -668,7 +668,11 @@ def format_facts(facts, *, aliases=None) -> str:
 
 def render_full_state(spec, facts, *, observation=None, action_history=None,
                       history=None, initial_facts=None) -> str:
-    """Render the selected privileged/full-state diagnostic scoring view."""
+    """Render verified facts without cumulative action/observation history.
+
+    History arguments remain accepted for existing training and Probe callers;
+    persistent goal-relevant flags are already represented in the current facts.
+    """
     current = _checked_facts(facts, spec["objects"])
     initial = _checked_facts(spec["initial_facts"] if initial_facts is None else initial_facts, spec["objects"])
     aliases = spec.get("entity_aliases", {})
@@ -684,9 +688,6 @@ def render_full_state(spec, facts, *, observation=None, action_history=None,
     ]
     if observation is not None:
         lines.append("Current observation (additional textual evidence):\n" + str(observation))
-    selected_history = action_history if action_history is not None else history
-    if selected_history:
-        lines.append("Recorded environment action history:\n" + (selected_history if isinstance(selected_history, str) else json.dumps(selected_history, ensure_ascii=False, sort_keys=True)))
     lines.append("The desired goal is not an observed achievement. A true initial flag does not prove an action happened during this episode.")
     return "\n\n".join(lines)
 

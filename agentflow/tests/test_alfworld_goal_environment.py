@@ -227,6 +227,83 @@ class EnvironmentTests(unittest.TestCase):
                 self.reset(env, question_id=0)
             env._init_env.assert_not_called()
 
+    def test_real_fact_renderer_omits_history_after_steps_and_invalid_actions(self):
+        import test_alfworld_goal_conversion as fixtures
+        store_path = ROOT / "agentflow/agentflow/trace/alfworld_goal_store.py"
+        module_spec = importlib.util.spec_from_file_location("history_free_environment_store", store_path)
+        store = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(store)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            builder = fixtures.GoalTests()
+            builder.root = root / "games"
+            builder.root.mkdir()
+            gamefile = builder.create()
+            output = root / "goals.sqlite"
+            store.build_goal_store(builder.root, output)
+            saved_bytes = output.read_bytes()
+            saved_spec = store.read_goal_spec(output, gamefile)
+            self.scope["_saved_goal_tools"] = lambda: store
+            self.scope["_goal_tools"] = lambda: fixtures.converter
+
+            class SavedSimulator(Simulator):
+                turns = 0
+
+                def reset(self):
+                    observations, info = super().reset()
+                    info.update({"extra.gamefile": [str(gamefile)],
+                                 "admissible_commands": [["take mug", "look"]],
+                                 "facts": [fixtures.INITIAL], "extra.trace_raw_facts": [fixtures.INITIAL]})
+                    return observations, info
+
+                def step(self, action):
+                    self.turns += 1
+                    facts = [fact for fact in fixtures.INITIAL if fact != "(inreceptacle mug0 cabinet0)"]
+                    facts.append("(holds agent0 mug0)")
+                    observation = "HISTORY_ONLY_OBSERVATION" if self.turns == 1 else "The mug is currently held."
+                    last_action = "HISTORY_ONLY_EXECUTION" if self.turns == 1 else "inspect-mug"
+                    return [observation], [0.], [False], {
+                        "extra.gamefile": [str(gamefile)], "admissible_commands": [["take mug", "look"]],
+                        "won": [False], "facts": [facts], "extra.trace_raw_facts": [facts],
+                        "last_action": [last_action],
+                    }
+
+            simulator = SavedSimulator()
+            env, _ = self.env(simulator)
+            env.trace_goals_path = str(output)
+            self.reset(env, question_id=0)
+            self.step(env, "<action>take mug</action>")
+            actor, reward, done, info = self.step(env, "<action>look</action>")
+            self.assertFalse(done)
+            self.assertEqual(reward, 0.)
+            self.assertIn("HISTORY_ONLY_OBSERVATION", actor)
+            self.assertIn("take mug", actor)
+            self.assertEqual(len(env.trace_action_history), 2)
+            self.assertEqual(env.trace_action_history[0]["environment_last_action"], "HISTORY_ONLY_EXECUTION")
+            self.assertIn("holds: (agent0,mug0)", env.trace_state_context)
+            self.assertIn("The mug is currently held.", env.trace_state_context)
+            self.assertTrue(info["trace_goal_check_valid"])
+            before_facts = copy.deepcopy(env.trace_facts)
+            contexts = [env.trace_state_context]
+            _, _, done, info = self.step(env, "<action>fly to moon</action>")
+            self.assertTrue(done)
+            self.assertTrue(info["invalid_action"])
+            self.assertEqual(simulator.turns, 2)  # The failed action never reached the simulator.
+            self.assertEqual(env.trace_facts, before_facts)
+            self.assertEqual(len(env.trace_action_history), 3)
+            self.assertFalse(env.trace_action_history[-1]["executed"])
+            contexts.append(env.trace_state_context)
+            for context in contexts:
+                self.assertNotIn("Recorded environment action history:", context)
+                self.assertNotIn("HISTORY_ONLY_OBSERVATION", context)
+                self.assertNotIn("HISTORY_ONLY_EXECUTION", context)
+                self.assertIn(saved_spec["rules_context"], context)
+                self.assertIn("Initial state (before this episode's first action):", context)
+                self.assertIn("holds: (agent0,mug0)", context)
+            self.assertEqual(env.trace_gt, saved_spec["goal_response"])
+            self.assertEqual(env.trace_answer_instruction, saved_spec["answer_instruction"])
+            self.assertEqual(output.read_bytes(), saved_bytes)
+
     def test_prepared_row_result_loads_without_sqlite_or_actor_gt_injection(self):
         selected = Path("/saved/alfworld-data/json_2.1.1/train/row-game/game.tw-pddl")
         row = {"question": "train_all_alfworld_0", "result": "A clean mug is in a cabinet.",

@@ -5,8 +5,8 @@
 # 训练机 -> EC2 -> Windows -> 公司代理 -> Internet
 # ==============================
 
-PROXY_TOKEN="${PROXY_TOKEN:?Please set PROXY_TOKEN in the environment}"
-PROXY_HOST="${PROXY_HOST:?Please set PROXY_HOST in the environment}"
+PROXY_TOKEN="tEc3gNapEHePEOg9AZAHaYVZciZHhaWW8GnVeAOTpk9GYWvA_rKz7M-7rlER7lWB"
+PROXY_HOST="7.150.10.123"
 PROXY_PORT="18090"
 
 # ---------- HTTP/HTTPS Proxy ----------

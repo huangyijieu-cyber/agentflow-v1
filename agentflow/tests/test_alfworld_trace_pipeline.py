@@ -319,11 +319,15 @@ class AlfworldPipelineTests(unittest.TestCase):
                     counts[left] = counts.get(left, 0) + 1
                 self.assertEqual(counts, {1: 2, 2: 2, 3: 2})
                 cross_turn_pairs = unlimited_trainer._trans_to_trace_batch([unlimited])
-                self.assertEqual(len(cross_turn_pairs), 36)
-                self.assertTrue(any(pair.non_tensor_batch["turn_index_list_a"][0]
-                                    != pair.non_tensor_batch["turn_index_list_b"][0]
-                                    for pair in cross_turn_pairs))
-                self.assertEqual(unlimited_trainer._trace_pair_metrics["trace/pair/selected_unique"], 36)
+                self.assertEqual(len(cross_turn_pairs), 6)  # One attempt per positive action.
+                identities = [(pair.non_tensor_batch["rollout_id_list_a"][0],
+                               pair.non_tensor_batch["turn_index_list_a"][0]) for pair in cross_turn_pairs]
+                self.assertEqual(len(identities), len(set(identities)))
+                # These symmetric trajectories rank corresponding turns alike,
+                # while their baseline still sees the full cross-turn group.
+                self.assertEqual({int(pair.non_tensor_batch["group_size"][0]) for pair in same_turn_pairs}, {4})
+                self.assertEqual({int(pair.non_tensor_batch["group_size"][0]) for pair in cross_turn_pairs}, {16})
+                self.assertEqual(unlimited_trainer._trace_pair_metrics["trace/pair/selected_unique"], 6)
                 for pair in cross_turn_pairs:
                     self.assertEqual(pair.non_tensor_batch["trace_task_a"].tolist(), ["alfworld"])
                     self.assertEqual(pair.non_tensor_batch["trace_label_source_a"].tolist(), ["trace"])

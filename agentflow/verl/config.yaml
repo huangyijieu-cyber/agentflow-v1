@@ -26,7 +26,7 @@ data:
     negative_threshold: 0.01
     gap_epsilon: 0.02
     length_ratio_max: 1.8
-    k_pairs_per_group: null  # Positive int: same-turn cap; null: cross-turn, no group cap.
+    k_pairs_per_group: 2  # Positive int: same-turn cap; null: cross-turn, no group cap.
     max_pairs_per_step: 256
     max_gt_tokens: 256
     gt_alias_strategy: first

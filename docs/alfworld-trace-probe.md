@@ -168,7 +168,7 @@ user content 使用评分模型 tokenizer 的 chat template；只计算 assistan
 
 Prompt 支持 {goal}、{goal_response}、{remaining_steps}、{turn_index} 占位符。Response 支持 {goal}、{goal_response}，确保同一题、不同 Turn 的评分目标一致；其他普通大括号保持原样，方便直接写 JSON 或自然语言。
 
-默认 Response 为 {goal_response}，在每道题中替换为实际 PDDL 确定性转换并保存的完整成功状态描述。Prompt 根据完整规则、初始状态、当前状态和动作历史，要求描述当前状态。Response 表达目标状态，不作为当前已成功的证据。也可切换到手写固定 Response（例如原来的 The episode will end in success.）作为对照；比较时应记录 state_view。文本似然未自动做双候选归一化或成功率校准。
+默认 Response 为 {goal_response}，在每道题中替换为实际 PDDL 确定性转换并保存的完整成功状态描述。full-state Prompt 根据完整规则、初始事实、当前状态增删和当前观察，要求描述当前状态；不再附加累计动作/观察历史，原始历史仍保存。旧缓存包含完整事实时，可用 `enrich --work-dir ...` 重渲染评分上下文而无需重新采样。Response 表达目标状态，不作为当前已成功的证据。也可切换到手写固定 Response（例如原来的 The episode will end in success.）作为对照；比较时应记录 state_view。文本似然未自动做双候选归一化或成功率校准。
 
 ## TRACE 计算口径
 

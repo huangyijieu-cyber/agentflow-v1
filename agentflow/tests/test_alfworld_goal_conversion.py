@@ -318,8 +318,36 @@ class GoalTests(unittest.TestCase):
         self.assertIn("pre-action", context)
         self.assertIn("A set flag may already be true initially", context)
         self.assertIn("The lamp is off.", context)
-        self.assertIn("use lamp", context)
+        self.assertNotIn("Recorded environment action history", context)
+        self.assertNotIn("use lamp", context)
         self.assertNotIn(spec["goal_response"], context)
+
+    def test_full_state_prompt_depends_on_facts_and_observation_not_action_history(self):
+        spec = converter.load_goal_spec(self.create("look_at_obj_in_light"))
+        saved = copy.deepcopy(spec)
+        current = [x for x in INITIAL if x != "(ison lamp0)"] + ["(istoggled lamp0)"]
+        observation = "The lamp is off."
+        context = converter.render_full_state(spec, current, observation=observation)
+        earlier_observation = "UNIQUE_PAST_OBSERVATION_NOT_CURRENT"
+        histories = [
+            {"action_history": [{"action": "use lamp", "observation": earlier_observation,
+                                 "environment_last_action": "toggleobject"}]},
+            {"action_history": [{"action": "take mug"}, {"action": "use lamp"}]},
+            {"history": "legacy caller's complete trajectory"},
+        ]
+        for history in histories:
+            with self.subTest(history=history):
+                self.assertEqual(converter.render_full_state(
+                    spec, current, observation=observation, **history), context)
+        self.assertNotIn(earlier_observation, context)
+        self.assertEqual(spec, saved)  # Existing GT, instruction and saved provenance remain valid.
+        self.assertIn(spec["rules_context"], context)
+        self.assertIn(spec["initial_context"], context)
+        self.assertIn("Currently true facts added to the initial state:\nistoggled: (lamp0)", context)
+        self.assertIn("Initial facts that are now false:\nison: (lamp0)", context)
+        self.assertIn(observation, context)
+        self.assertNotEqual(converter.render_full_state(spec, INITIAL, observation=observation), context)
+        self.assertNotEqual(converter.render_full_state(spec, current, observation="A different current observation."), context)
 
     def test_slice_metadata_and_actual_goal_must_agree(self):
         params = {"object_target": "Mug", "parent_target": "Cabinet", "object_sliced": True}
