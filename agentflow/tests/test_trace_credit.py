@@ -355,15 +355,84 @@ class TracePairTests(unittest.TestCase):
         self.assertEqual(select_pairs(list(reversed(rows)), {"max_pairs_per_step": 2}), [(0, 3), (1, 3)])
         self.assertEqual(select_pairs(rows, {"k_pairs_per_group": 1}), [(0, 3), (4, 5)])
 
-    def test_failed_value_match_skips_chosen_without_trying_other_negatives(self):
+    def test_value_neighborhood_is_filtered_before_negative_assignment(self):
         rows = [row(0, .1), row(1, -.1),
                 row(2, -.4, value=.28), row(3, -.8, value=.4)]
         config = {"k_pairs_per_group": 1, "match_epsilon": .1}
         for ordered in (rows, list(reversed(rows))):
             metrics = {}
-            self.assertEqual(select_pairs(ordered, config, metrics), [])
+            self.assertEqual(select_pairs(ordered, config, metrics), [(0, 2)])
             self.assertEqual(metrics["candidates_sign"], 1)
-            self.assertEqual(metrics["rejected_value_match"], 1)
+            self.assertEqual(metrics["rejected_value_match"], 0)
+            self.assertEqual(metrics["trace_after_value_match"], 1)
+
+    def test_exact_value_pools_recover_pairs_missed_by_global_round_robin(self):
+        for task in ("qa", "alfworld"):
+            rows = [row(0, .4, value=.1, turn_type="tool_plan", task=task),
+                    row(1, .3, value=.2, turn_type="tool_plan", task=task),
+                    row(2, -.4, value=.2, turn_type="tool_plan", task=task),
+                    row(3, -.3, value=.1, turn_type="tool_plan", task=task)]
+            for cap in (None, 2):
+                for ordered in (rows, list(reversed(rows))):
+                    with self.subTest(task=task, cap=cap, reverse=ordered is not rows):
+                        metrics = {}
+                        selected = select_pairs(ordered, {"k_pairs_per_group": cap,
+                                                        "match_epsilon": 0}, metrics)
+                        self.assertEqual(selected, [(0, 3), (1, 2)])
+                        self.assertEqual(metrics["candidates_sign"], 2)
+                        self.assertEqual(metrics["rejected_value_match"], 0)
+                        self.assertEqual(metrics["trace_after_value_match"], 2)
+            rows[1]["turn_index"], rows[2]["turn_index"] = 1, 2
+            self.assertEqual(select_pairs(rows, {"k_pairs_per_group": None,
+                                                "match_epsilon": 0}), [(0, 3), (1, 2)])
+            self.assertEqual(select_pairs(rows, {"k_pairs_per_group": 2,
+                                                "match_epsilon": 0}), [(0, 3)])
+            self.assertEqual(select_pairs(rows, {"k_pairs_per_group": None,
+                                                "match_epsilon": 0,
+                                                "max_pairs_per_step": 1}), [(0, 3)])
+
+    def test_exact_value_pools_cycle_independently_after_exhaustion(self):
+        rows = [row(i, credit, value=value) for i, (credit, value) in enumerate(
+            ((.8, .1), (.7, .2), (.6, .1), (.5, .2), (.4, .1), (.3, .2),
+             (-.4, .1), (-.3, .2), (-.2, .1), (-.1, .2)))]
+        expected = {0: 6, 1: 7, 2: 8, 3: 9, 4: 6, 5: 7}
+        for ordered in (rows, list(reversed(rows))):
+            self.assertEqual(dict(select_pairs(ordered, {"k_pairs_per_group": None,
+                                                        "match_epsilon": 0})), expected)
+
+    def test_zero_value_tolerance_does_not_round_neighboring_floats(self):
+        rows = [row(0, .3, value=.2),
+                row(1, -.4, value=math.nextafter(.2, math.inf)),
+                row(2, -.1, value=.2)]
+        config = {"k_pairs_per_group": None, "match_epsilon": 0}
+        self.assertEqual(select_pairs(rows, config), [(0, 2)])
+        metrics = {}
+        self.assertEqual(select_pairs(rows[:2], config, metrics), [])
+        self.assertEqual(metrics["rejected_value_match"], 1)
+        self.assertEqual(select_pairs([row(0, value=0.), row(1, -.1, value=-0.)],
+                                      config), [(0, 1)])
+
+    def test_overlapping_value_neighborhoods_do_not_merge_transitively(self):
+        rows = [row(0, .6, value=0.), row(1, .5, value=.04), row(2, .4, value=.08),
+                row(3, -.4, value=0.), row(4, -.3, value=.08), row(5, -.2, value=.16)]
+        config = {"k_pairs_per_group": None, "match_epsilon": .05}
+        for ordered in (rows, list(reversed(rows))):
+            selected = select_pairs(ordered, config)
+            self.assertEqual(selected, [(0, 3), (1, 4), (2, 4)])
+            self.assertTrue(all(abs(rows[a]["value"] - rows[b]["value"]) <= .05
+                                for a, b in selected))
+
+    def test_failed_quality_filter_consumes_assignment_without_replacement(self):
+        for bad_negative in ({"action_key": "same"}, {"length": 19}):
+            rows = [row(0, .3, action_key="same"), row(1, .2, action_key="other"),
+                    row(2, -.3, **bad_negative), row(3, -.2, action_key="different")]
+            metrics = {}
+            selected = select_pairs(rows, {"k_pairs_per_group": None,
+                                           "match_epsilon": 0}, metrics)
+            self.assertEqual(selected, [(1, 3)])
+            self.assertEqual(metrics["rejected_same_action"] + metrics["rejected_length"], 1)
+            self.assertEqual(metrics["selected_unique"], 1)
+            self.assertEqual(metrics["candidates_sign"], 2)
 
     def test_equal_credit_gaps_prefer_closer_states(self):
         rows = [row(0, .1, value=.24), row(1, .1, value=.21), row(2, -.2)]
@@ -407,7 +476,7 @@ class TracePairTests(unittest.TestCase):
                 row(2, -.1, turn_type="tool_plan", turn_index=9)]
         self.assertEqual(select_pairs(rows, {"k_pairs_per_group": None}), [])
 
-    def test_cache_style_outcome_assignment_keeps_strict_value_matching(self):
+    def test_outcome_assignment_prefilters_the_configured_value_neighborhood(self):
         for kind in ("analysis", "final_answer", "direct", "base"):
             config = {"k_pairs_per_group": None, "outcome_match_value": True}
             rows = [self.outcome_row(0, 1, turn_type=kind, value=0., is_final=True),
@@ -415,11 +484,26 @@ class TracePairTests(unittest.TestCase):
                     self.outcome_row(2, 0, turn_type=kind, value=.04, is_final=True)]
             with self.subTest(kind=kind):
                 metrics = {}
-                self.assertEqual(select_pairs(rows, config, metrics), [])
+                self.assertEqual(select_pairs(rows, config, metrics), [(0, 2)])
                 self.assertEqual(metrics["candidates_sign"], 1)
+                self.assertEqual(metrics["rejected_value_match"], 0)
+                rows[2]["value"] = .07
+                self.assertEqual(select_pairs(rows, config, metrics), [])
                 self.assertEqual(metrics["rejected_value_match"], 1)
                 rows[1]["value"] = .05
                 self.assertEqual(select_pairs(rows, config), [(0, 1)])
+
+    def test_outcome_exact_value_pools_recover_crossed_reward_ordering(self):
+        for kind in ("analysis", "final_answer", "direct", "base"):
+            rows = [self.outcome_row(0, 1, turn_type=kind, value=0., is_final=True),
+                    self.outcome_row(1, 1, turn_type=kind, value=1., is_final=True),
+                    self.outcome_row(2, 0, turn_type=kind, value=1., is_final=True),
+                    self.outcome_row(3, 0, turn_type=kind, value=0., is_final=True)]
+            config = {"k_pairs_per_group": None, "outcome_match_value": True,
+                      "match_epsilon": 0}
+            with self.subTest(kind=kind):
+                self.assertEqual(select_pairs(rows, config), [(0, 3), (1, 2)])
+                self.assertEqual(select_pairs(list(reversed(rows)), config), [(0, 3), (1, 2)])
 
     def test_outcome_chosen_is_unique_and_negative_pool_can_cycle(self):
         rows = [self.outcome_row(0, 1), self.outcome_row(1, 1), self.outcome_row(2, 1),
