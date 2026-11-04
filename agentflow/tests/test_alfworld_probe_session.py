@@ -18,6 +18,7 @@ SCRIPTS = ROOT / "train-roma"
 sys.path.insert(0, str(SCRIPTS))
 import alfworld_trace_probe as probe
 import alfworld_trace_probe_scoring as scoring
+GOAL_TOOLS = probe._goal_module()
 
 
 class FakeEnv:
@@ -151,8 +152,9 @@ class SessionTests(unittest.TestCase):
         expected = [{"action": "act", "observation": f"stage={i}",
                      "environment_last_action": f"executed-{i}"} for i in range(3, 7)]
         self.assertEqual(states[-1]["trace_recent_action_history"], expected)
+        self.assertEqual(len(states[-1]["trace_full_action_history"]), 6)
         self.assertEqual({state["scoring_context_version"] for state in states},
-                         {probe.RECENT_ACTION_HISTORY_SCORING_VERSION})
+                         {probe.ACTION_HISTORY_SCORING_VERSION})
 
     def test_snapshot_uses_post_action_info_history_instead_of_native_or_guessed_history(self):
         env = FakeEnv({"history_length": 4})
@@ -282,6 +284,59 @@ class SessionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fixed across turns"):
             self.experiment.save_probe({"response": "success at {turn_index}"})
 
+    def test_history_setting_rescores_saved_actions_without_sampling(self):
+        policy = mock.Mock(return_value={"response": "<action>act</action>", "finish_reason": "stop"})
+        snapshot = self.sample(policy)
+        for trajectory in snapshot["trajectories"]:
+            for state in trajectory["states"]:
+                state["facts"] = [f"s{state['state_index']}"]
+        tools, _ = self.goal_tools()
+        with mock.patch.object(probe, "_goal_module", return_value=tools), mock.patch.object(
+                probe, "_goal_store_module", return_value=tools):
+            complete = probe.enrich_snapshot(snapshot)
+        for trajectory in complete["trajectories"]:
+            for state in trajectory["states"]:
+                state.pop("trace_full_action_history", None)
+                state.pop("trace_history_length", None)
+                state["scoring_context_version"] = probe.RECENT_ACTION_HISTORY_SCORING_VERSION
+        path = Path(self.temp.name) / "trajectories.json"
+        probe.atomic_json(path, complete)
+        original, calls = path.read_bytes(), policy.call_count
+        with mock.patch.object(probe, "_goal_module", return_value=tools), mock.patch.object(
+                scoring, "_get_scorer", return_value=FakeScorer()), mock.patch.object(
+                probe, "make_environment", side_effect=AssertionError("do not replay or sample")):
+            for window in (0, None, 1, 4):
+                self.experiment.save_probe({"state_view": "full_state", "history_length": window})
+                result = self.experiment.score(scorer=scoring.score_snapshots)
+                state = result["trajectories"][0]["states"][-1]
+                self.assertEqual(len(state["trace_recent_action_history"]), 2 if window is None else min(2, window))
+                self.assertEqual(result["probe"]["history_length"], window)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(policy.call_count, calls)
+        self.assertEqual(self.experiment.config["sampling"]["history_length"], 4)
+
+    def test_history_setting_normalizes_none_and_rejects_invalid_values(self):
+        for value, expected in ((None, None), ("None", None), ("null", None), ("0", 0), (8, 8)):
+            self.experiment.save_probe({"history_length": value})
+            self.assertEqual(self.experiment.config["probe"]["history_length"], expected)
+        for value in (True, -1, 1.5, "", "1.0"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.experiment.save_probe({"history_length": value})
+
+    def test_small_window_sidecar_preserves_a_longer_original_suffix(self):
+        from test_alfworld_probe_scoring import ScoringTests
+        snapshot, records = ScoringTests().history_cache(legacy=True)
+        snapshot["trajectories"][0]["states"] = snapshot["trajectories"][0]["states"][-1:]
+        for window in (0, 1):
+            with self.subTest(window=window):
+                selected = scoring.prepare_history_contexts(snapshot, window)
+                payload = probe._enrichment_payload(snapshot, selected, "same-source")
+                merged = probe._merge_enrichment(snapshot, payload, "same-source")
+                restored = scoring.prepare_history_contexts(merged, 4)
+                self.assertEqual(restored["trajectories"][0]["states"][0]["trace_recent_action_history"], records[-4:])
+                with self.assertRaisesRegex(ValueError, "not fully cached"):
+                    scoring.prepare_history_contexts(merged, None)
+
     def goal_tools(self):
         spec = {"goal_response": "A clean cup is on the table.", "goal_spec_hash": "same-goal",
                 "goal_source": "traj_data.json", "goal_task_type": "pick_clean_then_place_in_recep",
@@ -290,6 +345,9 @@ class SessionTests(unittest.TestCase):
         return SimpleNamespace(
             RECENT_ACTION_HISTORY_SCORING_VERSION=probe.RECENT_ACTION_HISTORY_SCORING_VERSION,
             RECENT_ACTION_HISTORY_LENGTH=4,
+            ACTION_HISTORY_SCORING_VERSION=probe.ACTION_HISTORY_SCORING_VERSION,
+            parse_scoring_history_length=GOAL_TOOLS.parse_scoring_history_length,
+            select_action_history=GOAL_TOOLS.select_action_history,
             normalize_gamefile=lambda value: Path(value[0] if isinstance(value, list) else value),
             load_goal_spec=mock.Mock(side_effect=AssertionError("runtime must not convert")),
             read_goal_spec=mock.Mock(return_value=spec),
@@ -397,7 +455,7 @@ class SessionTests(unittest.TestCase):
             prepared = self.experiment._prepare_scoring_snapshot(snapshot, self.experiment.config["probe"])
         current = prepared["trajectories"][0]["states"][1]
         self.assertIn(json.dumps(current["trace_recent_action_history"], sort_keys=True), current["state_context"])
-        self.assertEqual(current["scoring_context_version"], probe.RECENT_ACTION_HISTORY_SCORING_VERSION)
+        self.assertEqual(current["scoring_context_version"], probe.ACTION_HISTORY_SCORING_VERSION)
         self.assertEqual(path.read_bytes(), original)
 
     def test_saved_view_keeps_legacy_literal_context_without_post_action_history(self):
@@ -527,7 +585,8 @@ class SessionTests(unittest.TestCase):
                 probe.importlib, "import_module", return_value=runtime):
             self.assertEqual(probe.make_environment(sampling), "fake environment")
         runtime.AlfWorldEnv.assert_called_once_with(history_length=4, max_step=3,
-                                                   trace_enabled=True, trace_goals_path=str(self.store_path))
+                                                   trace_enabled=True, trace_goals_path=str(self.store_path),
+                                                   trace_history_length=4)
 
     def test_store_change_invalidates_persistent_worker_identity(self):
         sampling = self.experiment.config["sampling"]

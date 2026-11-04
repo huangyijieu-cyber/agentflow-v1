@@ -33,8 +33,9 @@ def _search_cache_env_vars():
 def run_ppo(config) -> None:
     worker_env = _search_cache_env_vars()
     # Explicit propagation also covers an already initialized/external Ray cluster.
-    if "ALFWORLD_TRACE_GOALS" in os.environ:
-        worker_env["ALFWORLD_TRACE_GOALS"] = os.environ["ALFWORLD_TRACE_GOALS"]
+    for name in ("ALFWORLD_TRACE_GOALS", "ALFWORLD_TRACE_HISTORY_LENGTH"):
+        if name in os.environ:
+            worker_env[name] = os.environ[name]
     if not ray.is_initialized():
         # this is for local ray cluster
         env_vars = {"ASCEND_RT_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}

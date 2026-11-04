@@ -2,7 +2,7 @@
 
 入口：train-roma/alfworld_trace_probe.py。
 
-最近已归档实验为 **ALFWorld v2_e**，标签 `alfworld/v2_e`，使用 actor 原生最近历史窗口。当前分支按用户要求，将评分历史改为原累计 `trace_action_history` 最后 4 条，保留动作＋执行后观察的旧格式，固定 4 条、不跟随 actor 的 `history_length`；既有标签不移动，也未另命名实验版本。沿用 v2_a 的成功状态 Response，使用“离线实际 PDDL → 保存的固定英文 GT → 完整环境状态及最近动作日志评分”，所有环境动作统一进行 TRACE 配对，并使用真实终局结果回填。用户已确认 v2_d/v2_e 均为 `pair_round_robin=false` 全组合，当前配置保持该设置、K_PAIRS=None 和全步默认 256 对，其余过滤不变。库默认 true 及 websearch 配置保持原样。转换来源、正式训练接入及配置见 [alfworld-trace-goals.md](alfworld-trace-goals.md)。
+最近已归档实验为 **ALFWorld v2_e**，标签 `alfworld/v2_e`，使用 actor 原生最近历史窗口。当前分支按用户要求，将评分历史改为原累计 `trace_action_history` 的可配置窗口，保留动作＋执行后观察的旧格式，默认 4 条、`None` 全部、`0` 为空，不跟随 actor 的 `history_length`；既有标签不移动，也未另命名实验版本。沿用 v2_a 的成功状态 Response，使用“离线实际 PDDL → 保存的固定英文 GT → 完整环境状态及最近动作日志评分”，所有环境动作统一进行 TRACE 配对，并使用真实终局结果回填。用户已确认 v2_d/v2_e 均为 `pair_round_robin=false` 全组合，当前配置保持该设置、K_PAIRS=None 和全步默认 256 对，其余过滤不变。库默认 true 及 websearch 配置保持原样。转换来源、正式训练接入及配置见 [alfworld-trace-goals.md](alfworld-trace-goals.md)。
 
 默认选 data/train/alfworld/train_all_alfworld_3305.parquet 第 0 行，即 train_all_alfworld_0；从 question 解析环境编号 0，而不是使用该行的 id=1。同一题采样 4 条轨迹，每条最多 50 个动作，策略 temperature=0.7、history_length=4。
 
@@ -135,7 +135,7 @@ score 模式从不自动采样，也不导入 ALFWorld；缓存缺失或尚未�
 
 已有 trajectories.json 时继续使用同一 work-dir。窗口支持多个样本时，先切换到目标样本再补齐；命令行的 --work-dir 应指向实际包含该 trajectories.json 的目录（新样本通常是工作区下的 samples/<sample-id>/）。旧配置中的手写 Response 会保留；在窗口中将 Response 改为 `{goal_response}`，选择完整状态。
 
-若轨迹已保存完整 facts 以及本次契约的最近动作日志快照和版本，可直接离线补齐；仅有 facts 不足以重建原累计日志的最后 4 条：
+若轨迹已保存完整 facts 和原动作日志，或旧 v1 连续快照可经重叠校验恢复所需历史，可直接离线补齐；仅有 facts 不足以重建动作历史：
 
 ```bash
 python train-roma/alfworld_trace_probe.py enrich \
@@ -153,7 +153,7 @@ python train-roma/alfworld_trace_probe.py enrich --replay \
   --alfworld-data /path/to/alfworld-master/json_data
 ```
 
-也可点击窗口中的旧缓存补齐按钮。该操作不调用策略模型，不生成新动作；原 trajectories.json 字节保持不变，补齐内容写入 goal_metadata.json。使用缓存中实际 gamefile，逐步核对环境观察、终局结果及原 actor Prompt，从实际重放生成的 `trace_action_history` 恢复最后 4 条日志；重放不一致会报错。旧 sidecar 不能冒充新 full-state 契约。若路径已迁移，应在相同相对数据布局下恢复原路径（例如软链接），不能换成按编号重新扫描的另一个游戏。随后只运行 score 或点击重新评分。
+也可点击窗口中的旧缓存补齐按钮。该操作不调用策略模型，不生成新动作；原 trajectories.json 字节保持不变，补齐内容写入 goal_metadata.json。使用缓存中实际 gamefile，逐步核对环境观察、终局结果及原 actor Prompt，从实际重放生成的 `trace_action_history` 恢复完整日志；重放不一致会报错。旧 sidecar 不能冒充新 full-state 契约。若路径已迁移，应在相同相对数据布局下恢复原路径（例如软链接），不能换成按编号重新扫描的另一个游戏。随后只运行 score 或点击重新评分。
 
 ## 可修改的评分文本
 
@@ -168,7 +168,7 @@ user content 使用评分模型 tokenizer 的 chat template；只计算 assistan
 
 Prompt 支持 {goal}、{goal_response}、{remaining_steps}、{turn_index} 占位符。Response 支持 {goal}、{goal_response}，确保同一题、不同 Turn 的评分目标一致；其他普通大括号保持原样，方便直接写 JSON 或自然语言。
 
-默认 Response 为 {goal_response}，在每道题中替换为实际 PDDL 确定性转换并保存的完整成功状态描述。若原 work-dir 曾用于 v2b，自定义 config.json 会保留旧值，应将 Response 恢复为 {goal_response}，将 Prompt 恢复为描述当前状态的指令，并按当前缓存契约重建评分上下文；直接重评分旧 v2b 的 state_context 会混用评分版本。full-state Prompt 根据完整规则、初始事实、当前状态增删、当前观察及原累计动作日志最后 4 条，要求描述当前状态。窗口为 `trace_action_history[-4:]`，使用旧标题 `Recorded environment action history:` 和旧 JSON 格式，每条包含动作、执行后 observation 及原日志其它字段；固定 4 条，不跟随 actor 的 `history_length`。初始状态为空，不足 4 条时保留全部，失败动作按原日志规则进入窗口。新缓存保存 `trace_recent_action_history` 及 `scoring_context_version=alfworld-post-action-recent-history-v1`，旧缓存缺新快照时用 `enrich --replay --work-dir ...` 重放已存动作核验 actor Prompt，不重新采样；旧 actor 原生窗口不能直接替代新日志快照。`state_view="saved"` 的自定义原样上下文实验保留，不自动改成新的 full-state。此次在已归档 v2_e 后调整历史来源，原标签不移动。Response 表达目标状态，不作为当前已成功的证据。也可切换到手写固定 Response（例如原来的 The episode will end in success.）作为对照；比较时应记录 state_view。文本似然未自动做双候选归一化或成功率校准。
+默认 Response 为 {goal_response}，在每道题中替换为实际 PDDL 确定性转换并保存的完整成功状态描述。若原 work-dir 曾用于 v2b，自定义 config.json 会保留旧值，应将 Response 恢复为 {goal_response}，将 Prompt 恢复为描述当前状态的指令，并按当前缓存契约重建评分上下文；直接重评分旧 v2b 的 state_context 会混用评分版本。full-state Prompt 根据完整规则、初始事实、当前状态增删、当前观察及所选动作日志窗口，要求描述当前状态。`probe.history_length` 默认 4，`null`（或字符串 `None`）为全部，0 为无历史，N>0 为 `trace_action_history[-N:]`；使用旧标题 `Recorded environment action history:` 和旧 JSON 格式，每条包含动作、执行后 observation 及原日志其它字段；评分窗口独立于 `sampling.history_length` 的 actor 窗口。初始状态为空，不足 N 条时保留全部，失败动作按原日志规则进入窗口。新缓存保存完整 `trace_full_action_history`、选中 `trace_recent_action_history` 及 `scoring_context_version=alfworld-post-action-history-v2`。修改窗口直接重评分，不调用采样模型；旧 v1 连续快照通过索引与重叠校验恢复所需记录，不足时用 `enrich --replay --work-dir ...` 重放已存动作核验 actor Prompt，不重新采样；旧 actor 原生窗口不能直接替代新日志快照。`state_view="saved"` 的自定义原样上下文实验保留，历史窗口参数不应用到该模式，报告会明确记录。此次在已归档 v2_e 后调整历史来源，原标签不移动。Response 表达目标状态，不作为当前已成功的证据。也可切换到手写固定 Response（例如原来的 The episode will end in success.）作为对照；比较时应记录 state_view。文本似然未自动做双候选归一化或成功率校准。
 
 ## TRACE 计算口径
 

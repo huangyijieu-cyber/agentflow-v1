@@ -174,7 +174,8 @@ def set_gamefile(info, gamefile):
 
 
 class AlfWorldEnv:
-    def __init__(self, history_length=4, max_step=50, trace_enabled=None, trace_goals_path=None):
+    def __init__(self, history_length=4, max_step=50, trace_enabled=None, trace_goals_path=None,
+                 trace_history_length=...):
         # ====== 延迟导入：确保 JVM 只在 worker 进程内启动 ======
         self.env = None
         self.seed = 44
@@ -199,6 +200,11 @@ class AlfWorldEnv:
                 and os.environ.get("TRACE_ENABLED", "true").lower() not in ("0", "false", "no")
             )
         self.trace_enabled = bool(trace_enabled)
+        self.trace_history_length = 4
+        if self.trace_enabled:
+            configured_history = (os.environ.get("ALFWORLD_TRACE_HISTORY_LENGTH", "4")
+                                  if trace_history_length is ... else trace_history_length)
+            self.trace_history_length = _goal_tools().parse_scoring_history_length(configured_history)
         configured_goals = os.environ.get("ALFWORLD_TRACE_GOALS", "") if trace_goals_path is None else trace_goals_path
         self.trace_goals_path = os.fspath(configured_goals) if configured_goals else ""
         self.trace_task = None
@@ -284,6 +290,7 @@ class AlfWorldEnv:
         self.trace_state_context = f"Task: {self.task}\n\n" + tools.render_full_state(
             self.trace_goal_spec, self.trace_facts,
             observation=observation, action_history=self.trace_action_history,
+            history_length=self.trace_history_length,
         )
         self._write_trace_info(info)
         if not self.trace_goal_check_valid:
@@ -293,10 +300,14 @@ class AlfWorldEnv:
             )
 
     def _write_trace_info(self, info):
+        tools = _goal_tools()
         info.update({
             "trace_full_facts": deepcopy(self.trace_facts),
             "trace_recent_action_history": deepcopy(
-                self.trace_action_history[-_goal_tools().RECENT_ACTION_HISTORY_LENGTH:]),
+                tools.select_action_history(self.trace_action_history, self.trace_history_length)),
+            "trace_full_action_history": deepcopy(self.trace_action_history),
+            "trace_history_length": self.trace_history_length,
+            "scoring_context_version": tools.ACTION_HISTORY_SCORING_VERSION,
             "trace_actor_history": self.trace_actor_history,
             "trace_actor_history_steps": self.trace_actor_history_steps,
             "trace_actor_history_length": self.history_length,
@@ -334,6 +345,7 @@ class AlfWorldEnv:
             self.trace_state_context = f"Task: {self.task}\n\n" + _goal_tools().render_full_state(
                 self.trace_goal_spec, self.trace_facts,
                 observation=observation, action_history=self.trace_action_history,
+                history_length=self.trace_history_length,
             )
         self._write_trace_info(info)
         return info

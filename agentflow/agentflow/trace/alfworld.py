@@ -20,6 +20,7 @@ TEMPLATE_VERSION = "alfworld-pddl-controlled-english-v1"
 ACTOR_HISTORY_SCORING_VERSION = "alfworld-actor-recent-history-v1"
 RECENT_ACTION_HISTORY_SCORING_VERSION = "alfworld-post-action-recent-history-v1"
 RECENT_ACTION_HISTORY_LENGTH = 4
+ACTION_HISTORY_SCORING_VERSION = "alfworld-post-action-history-v2"
 DEFAULT_ANSWER_INSTRUCTION = (
     "Based on the applicable environment rules, the initial state, and the "
     "current full environment state above, describe the current state in "
@@ -52,6 +53,34 @@ STATE_MARKERS = {"isclean", "ishot", "iscool"}
 
 class GoalConversionError(ValueError):
     """A source cannot be faithfully represented by the supported converter."""
+
+
+def parse_scoring_history_length(value):
+    """Normalize a scoring-only history limit; None keeps every past action."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lower() in ("none", "null"):
+            return None
+        if re.fullmatch(r"\+?[0-9]+", text):
+            return int(text)
+    elif type(value) is int and value >= 0:
+        return value
+    raise GoalConversionError(
+        "ALFWORLD_TRACE_HISTORY_LENGTH / scoring history_length must be None or a nonnegative integer")
+
+
+def select_action_history(history, history_length=RECENT_ACTION_HISTORY_LENGTH):
+    """Select original post-action records without rewriting or inferring them."""
+    length = parse_scoring_history_length(history_length)
+    if history is None:
+        return []
+    if not isinstance(history, (list, tuple)):
+        raise GoalConversionError("action_history must be a list or tuple of environment action records")
+    if length is None:
+        return history
+    return history[-length:] if length else []
 
 
 def normalize_gamefile(value: Any) -> Path:
@@ -670,15 +699,16 @@ def format_facts(facts, *, aliases=None) -> str:
 
 
 def render_full_state(spec, facts, *, observation=None, action_history=None,
-                      history=None, initial_facts=None, actor_history=None) -> str:
-    """Render verified facts and the last four original environment log records.
+                      history=None, initial_facts=None, actor_history=None,
+                      history_length=RECENT_ACTION_HISTORY_LENGTH) -> str:
+    """Render verified facts and a configurable window of original action logs.
 
     Each record retains its action and post-action observation unchanged.
+    None selects all past records; zero omits history; the default keeps four.
     The actor's pre-action history is kept as a legacy argument but not scored.
     """
-    selected_history = action_history if action_history is not None else history
-    if selected_history is not None and not isinstance(selected_history, (list, tuple)):
-        raise GoalConversionError("action_history must be a list or tuple of environment action records")
+    selected_history = select_action_history(
+        action_history if action_history is not None else history, history_length)
     current = _checked_facts(facts, spec["objects"])
     initial = _checked_facts(spec["initial_facts"] if initial_facts is None else initial_facts, spec["objects"])
     aliases = spec.get("entity_aliases", {})
@@ -696,7 +726,7 @@ def render_full_state(spec, facts, *, observation=None, action_history=None,
         lines.append("Current observation (additional textual evidence):\n" + str(observation))
     if selected_history:
         lines.append("Recorded environment action history:\n" + json.dumps(
-            selected_history[-RECENT_ACTION_HISTORY_LENGTH:], ensure_ascii=False, sort_keys=True))
+            selected_history, ensure_ascii=False, sort_keys=True))
     lines.append("The desired goal is not an observed achievement. A true initial flag does not prove an action happened during this episode.")
     return "\n\n".join(lines)
 

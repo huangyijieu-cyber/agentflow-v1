@@ -22,6 +22,7 @@ env:
   TRACE_ENABLED: ${env:TRACE_ENABLED,true}
   # Optional legacy SQLite/Probe goals; prepared training Parquet embeds GT in result.
   ALFWORLD_TRACE_GOALS: ${env:ALFWORLD_TRACE_GOALS,}
+  ALFWORLD_TRACE_HISTORY_LENGTH: ${env:ALFWORLD_TRACE_HISTORY_LENGTH,4}  # Scorer only: None=all, 0=none, N=last N post-action records.
   TRACE_EPSILON: ${env:TRACE_EPSILON,0.1}
   TRACE_K: ${env:TRACE_K,3}
   TRACE_GAMMA: ${env:TRACE_GAMMA,0.8}

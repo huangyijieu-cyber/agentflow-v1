@@ -50,6 +50,17 @@ class Memory:
 
 class Tools:
     RECENT_ACTION_HISTORY_LENGTH = 4
+    ACTION_HISTORY_SCORING_VERSION = "alfworld-post-action-history-v2"
+
+    @staticmethod
+    def parse_scoring_history_length(value):
+        from test_alfworld_goal_conversion import converter
+        return converter.parse_scoring_history_length(value)
+
+    @staticmethod
+    def select_action_history(history, history_length=4):
+        from test_alfworld_goal_conversion import converter
+        return converter.select_action_history(history, history_length)
 
     @staticmethod
     def read_dataset_gamefile(store_path, data_type, task_type, question_id, games_root):
@@ -86,8 +97,9 @@ class Tools:
         return "(inreceptacle mug0 cabinet0)" in facts
 
     @staticmethod
-    def render_full_state(spec, facts, *, observation=None, action_history=None, actor_history=None):
-        return f"Full-state rules and initial facts.\nCurrent facts: {facts}\nObservation: {observation}\nHistory: {(action_history or [])[-4:]}"
+    def render_full_state(spec, facts, *, observation=None, action_history=None, actor_history=None,
+                          history_length=4):
+        return f"Full-state rules and initial facts.\nCurrent facts: {facts}\nObservation: {observation}\nHistory: {Tools.select_action_history(action_history, history_length)}"
 
 
 class Simulator:
@@ -130,9 +142,10 @@ class EnvironmentTests(unittest.TestCase):
             extract(ENV_PATH, name, self.scope)
         self.cls = extract(ENV_PATH, "AlfWorldEnv", self.scope)
 
-    def env(self, simulator=None, *, trace=True, max_step=50):
+    def env(self, simulator=None, *, trace=True, max_step=50, trace_history_length=...):
         simulator = simulator or Simulator()
-        env = self.cls(trace_enabled=trace, max_step=max_step, trace_goals_path="/saved/goals.sqlite")
+        env = self.cls(trace_enabled=trace, max_step=max_step, trace_goals_path="/saved/goals.sqlite",
+                       trace_history_length=trace_history_length)
         base = NS(game_files=["indexed/game.tw-pddl"], init_env=mock.Mock(return_value=simulator))
         env._env_instances[("train", "all")] = base
         env._env_gamefiles[("train", "all")] = list(base.game_files)
@@ -218,6 +231,71 @@ class EnvironmentTests(unittest.TestCase):
                 self.assertEqual(len(env.trace_action_history), 6)
                 self.assertEqual(len(info["trace_recent_action_history"]), 4)
                 self.assertEqual(info["trace_recent_action_history"], env.trace_action_history[-4:])
+
+    def test_configurable_scoring_window_never_changes_actor_or_full_saved_history(self):
+        self.use_native_memory()
+        for length in (None, 0, 1, 3, 20):
+            with self.subTest(length=length):
+                simulator = Simulator(endless=True)
+                env, _ = self.env(simulator, trace_history_length=length)
+                actor, initial = self.reset(env, question_id=0)
+                baseline, _ = self.env(Simulator(endless=True), trace=False)
+                original_actor, _ = self.reset(baseline, question_id=0)
+                self.assertEqual(actor, original_actor)
+                self.assertEqual(initial["trace_full_action_history"], [])
+                for _ in range(6):
+                    actor, reward, done, info = self.step(env, "<action>place mug</action>")
+                    original_actor, original_reward, original_done, _ = self.step(
+                        baseline, "<action>place mug</action>")
+                    self.assertEqual((actor, reward, done), (original_actor, original_reward, original_done))
+                expected = env.trace_action_history if length is None else (
+                    env.trace_action_history[-length:] if length else [])
+                self.assertEqual(info["trace_recent_action_history"], expected)
+                self.assertEqual(info["trace_full_action_history"], env.trace_action_history)
+                self.assertEqual(len(info["trace_full_action_history"]), 6)
+                self.assertEqual(info["trace_history_length"], length)
+                self.assertEqual(info["scoring_context_version"], Tools.ACTION_HISTORY_SCORING_VERSION)
+                self.assertIn(f"History: {expected}", env.trace_state_context)
+                self.assertEqual(env.history_length, 4)
+                info["trace_full_action_history"][0]["action"] = "changed exported full snapshot"
+                self.assertEqual(env.trace_action_history[0]["action"], "place mug")
+                self.scope["_create_trace_environment"] = mock.Mock(return_value=simulator)
+                _, reset_info = self.reset(env, question_id=0)
+                self.assertEqual(reset_info["trace_full_action_history"], [])
+                self.assertEqual(reset_info["trace_recent_action_history"], [])
+
+    def test_scoring_history_env_default_and_explicit_none_override(self):
+        for raw, expected in (("None", None), (" null ", None), ("0", 0), ("7", 7)):
+            with self.subTest(raw=raw), mock.patch.dict(os.environ, {"ALFWORLD_TRACE_HISTORY_LENGTH": raw}):
+                self.assertEqual(self.cls(trace_enabled=True).trace_history_length, expected)
+                self.assertIsNone(self.cls(trace_enabled=True, trace_history_length=None).trace_history_length)
+                self.assertEqual(self.cls(trace_enabled=True, trace_history_length=2).trace_history_length, 2)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self.cls(trace_enabled=True).trace_history_length, 4)
+        for value in (-1, True, 2.0, "1.5", "bad"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "nonnegative integer"):
+                self.cls(trace_enabled=True, trace_history_length=value)
+        with mock.patch.dict(os.environ, {"ALFWORLD_TRACE_HISTORY_LENGTH": "bad"}):
+            # Ordinary GRPO never consults this TRACE-only configuration.
+            with mock.patch.dict(self.scope, {"_goal_tools": mock.Mock(side_effect=AssertionError("TRACE disabled"))}):
+                self.cls(trace_enabled=False)
+
+    def test_failed_action_records_obey_scoring_window_without_changing_actor_memory(self):
+        for length in (None, 0, 1):
+            with self.subTest(length=length):
+                env, _ = self.env(Simulator(endless=True), trace_history_length=length)
+                self.reset(env, question_id=0)
+                self.step(env, "<action>place mug</action>")
+                previous = copy.deepcopy(env.memory[0])
+                _, _, done, info = self.step(env, "<action>fly to moon</action>")
+                self.assertTrue(done)
+                self.assertEqual(env.memory[0], previous)
+                full = info["trace_full_action_history"]
+                self.assertEqual(len(full), 2)
+                self.assertFalse(full[-1]["executed"])
+                expected = full if length is None else full[-1:] if length else []
+                self.assertEqual(info["trace_recent_action_history"], expected)
+                self.assertIn(f"History: {expected}", env.trace_state_context)
 
     def test_disabled_actor_history_never_fetches_or_leaks_an_old_window(self):
         self.use_native_memory()

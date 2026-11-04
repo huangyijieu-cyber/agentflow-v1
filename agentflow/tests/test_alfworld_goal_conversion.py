@@ -375,6 +375,46 @@ class GoalTests(unittest.TestCase):
                 with self.assertRaisesRegex(converter.GoalConversionError, "environment action records"):
                     converter.render_full_state(spec, INITIAL, action_history=invalid)
 
+    def test_history_length_parser_accepts_all_recent_and_disabled_windows(self):
+        for value, expected in ((None, None), ("None", None), (" NULL ", None), (0, 0),
+                                (4, 4), (" 7 ", 7), ("+2", 2), ("00", 0)):
+            with self.subTest(value=value):
+                self.assertEqual(converter.parse_scoring_history_length(value), expected)
+        for invalid in (True, False, -1, 4.0, 0.5, float("nan"), float("inf"),
+                        "-1", "4.0", "1e2", "", "all", [], {}):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                    converter.GoalConversionError, "nonnegative integer"):
+                converter.parse_scoring_history_length(invalid)
+
+    def test_history_window_selects_original_records_and_default_is_byte_identical(self):
+        spec = converter.load_goal_spec(self.create("look_at_obj_in_light"))
+        records = [{"action": f"act {i}", "observation": f"post {i}\n原观察",
+                    "executed": i != 2, "environment_last_action": None} for i in range(7)]
+        original = copy.deepcopy(records)
+        base = converter.render_full_state(spec, INITIAL, observation="Now.")
+        for length, expected in ((None, records), (0, []), (1, records[-1:]),
+                                  (4, records[-4:]), (20, records)):
+            with self.subTest(length=length):
+                rendered = converter.render_full_state(
+                    spec, INITIAL, observation="Now.", action_history=records, history_length=length)
+                if expected:
+                    history_section = "Recorded environment action history:\n" + json.dumps(
+                        expected, ensure_ascii=False, sort_keys=True) + "\n\n"
+                    self.assertIn(history_section, rendered)
+                    self.assertEqual(rendered.replace(history_section, ""), base)
+                else:
+                    self.assertEqual(rendered, base)
+        default = converter.render_full_state(spec, INITIAL, observation="Now.", action_history=records)
+        self.assertEqual(default, converter.render_full_state(
+            spec, INITIAL, observation="Now.", action_history=records[-4:], history_length=None))
+        self.assertEqual(converter.select_action_history(None, None), [])
+        self.assertEqual(converter.select_action_history(tuple(records), 1), tuple(records[-1:]))
+        self.assertEqual(records, original)
+        for invalid in ("rendered history", {}, 5):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                    converter.GoalConversionError, "environment action records"):
+                converter.select_action_history(invalid, 0)
+
     def test_slice_metadata_and_actual_goal_must_agree(self):
         params = {"object_target": "Mug", "parent_target": "Cabinet", "object_sliced": True}
         with self.assertRaisesRegex(converter.GoalConversionError, "Slice condition"):

@@ -89,6 +89,80 @@ class ScoringTests(unittest.TestCase):
             )
         return result, scorer
 
+    def history_cache(self, *, legacy=False):
+        snapshot = saved(6)
+        trajectory = snapshot["trajectories"][0]
+        spec = {"objects": {}, "initial_facts": [], "rules_context": "Applicable rules."}
+        trajectory["goal_spec"] = spec
+        module = scoring._goal_module()
+        records = [{"action": f"act {i}", "observation": f"after {i}", "executed": True}
+                   for i in range(6)]
+        for state in trajectory["states"]:
+            index = state["state_index"]
+            state.update(facts=[], observation=f"visible {index}", state_view="full_state",
+                         scoring_valid=True, goal_check_valid=True, goal_check=index == 6,
+                         trace_recent_action_history=records[:index][-4:])
+            state["state_context"] = f"Task: {trajectory['goal']}\n\n" + module.render_full_state(
+                spec, [], observation=state["observation"], action_history=records[:index])
+            state["scoring_context_version"] = (module.RECENT_ACTION_HISTORY_SCORING_VERSION if legacy
+                                                 else module.ACTION_HISTORY_SCORING_VERSION)
+            if not legacy:
+                state.update(trace_full_action_history=records[:index], trace_history_length=4)
+        return snapshot, records
+
+    def test_direct_full_state_rescore_switches_history_windows_without_mutating_cache(self):
+        snapshot, records = self.history_cache()
+        original = json.dumps(snapshot, sort_keys=True)
+        for window in (None, 0, 1, 6, 20, 4):
+            with self.subTest(window=window):
+                backend = SimpleNamespace(tokenizer=FakeTokenizer(), score=mock.Mock(return_value=[-2., -2.]))
+                result, _ = self.run_score(snapshot, scorer=backend,
+                                          probe={"state_view": "full_state", "history_length": window})
+                terminal = result["trajectories"][0]["states"][-1]
+                expected = records if window is None else records[-window:] if window else []
+                self.assertEqual(terminal["trace_recent_action_history"], expected)
+                self.assertEqual(terminal["trace_full_action_history"], records)
+                if expected:
+                    self.assertIn(json.dumps(expected, sort_keys=True), terminal["scoring_prompt"])
+                else:
+                    self.assertNotIn("Recorded environment action history:", terminal["scoring_prompt"])
+                self.assertEqual(result["formula"]["history_length"], window)
+                self.assertTrue(result["formula"]["history_window_applied"])
+                self.assertEqual(json.dumps(snapshot, sort_keys=True), original)
+
+    def test_legacy_overlapping_windows_recover_all_history_and_reject_conflicts(self):
+        snapshot, records = self.history_cache(legacy=True)
+        restored = scoring.prepare_history_contexts(snapshot, None)
+        terminal = restored["trajectories"][0]["states"][-1]
+        self.assertEqual(terminal["trace_full_action_history"], records)
+        self.assertEqual(terminal["trace_recent_action_history"], records)
+        # Deep-copy before corrupting a record that overlaps a previous state.
+        corrupt = json.loads(json.dumps(snapshot))
+        corrupt["trajectories"][0]["states"][4]["trace_recent_action_history"][0]["action"] = "different"
+        with self.assertRaisesRegex(ValueError, "Conflicting.*enrich --replay"):
+            scoring.prepare_history_contexts(corrupt, None)
+        missing = json.loads(json.dumps(snapshot))
+        missing["trajectories"][0]["states"] = missing["trajectories"][0]["states"][-1:]
+        with self.assertRaisesRegex(ValueError, "not fully cached.*enrich --replay"):
+            scoring.prepare_history_contexts(missing, None)
+        short = scoring.prepare_history_contexts(missing, 2)
+        self.assertEqual(short["trajectories"][0]["states"][0]["trace_recent_action_history"], records[-2:])
+
+    def test_zero_history_needs_no_saved_records_and_saved_view_keeps_literal_context(self):
+        snapshot, _ = self.history_cache()
+        for state in snapshot["trajectories"][0]["states"]:
+            for key in ("trace_full_action_history", "trace_recent_action_history", "trace_history_length",
+                        "scoring_context_version"):
+                state.pop(key, None)
+        empty = scoring.prepare_history_contexts(snapshot, 0)
+        self.assertTrue(all("Recorded environment action history:" not in state["state_context"]
+                            for state in empty["trajectories"][0]["states"]))
+        backend = SimpleNamespace(tokenizer=FakeTokenizer(), score=mock.Mock(return_value=[-2., -2.]))
+        result, _ = self.run_score(snapshot, scorer=backend, probe={"state_view": "saved", "history_length": None})
+        self.assertFalse(result["formula"]["history_window_applied"])
+        for original, actual in zip(snapshot["trajectories"][0]["states"], result["trajectories"][0]["states"]):
+            self.assertEqual(actual["state_context"], original["state_context"])
+
     def test_trace_nll_formula_response_only_and_last_action(self):
         result, backend = self.run_score()
         trajectory = result["trajectories"][0]
@@ -226,7 +300,8 @@ class ScoringTests(unittest.TestCase):
         for state in trajectory["states"]:
             state.update(state_view="full_state", goal_check_valid=True, scoring_valid=True,
                          goal_check=state["state_index"] == 3,
-                         trace_recent_action_history=[],
+                         trace_recent_action_history=[{"action": f"action {i}", "observation": f"observed {i}"}
+                                                      for i in range(state["state_index"])][-4:],
                          scoring_context_version=scoring._recent_action_history_version())
         return snapshot
 

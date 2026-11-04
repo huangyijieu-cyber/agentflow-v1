@@ -2,11 +2,11 @@
 
 转换与训练已分开：只转换训练 Parquet 选中的题，将固定英文 GT 写入 `result`，同时在该 Parquet 中保存规则和游戏映射。训练直接读取该行 `result`，不在 reset 或 turn 中转换，也不依赖单独的 SQLite 文件。
 
-最近已归档实验为 **ALFWorld v2_e**，标签 `alfworld/v2_e`，功能逻辑基于 `7152e73`，记录提交另固化三份 ALFWorld 训练配置 `pair_round_robin=false`。v2_d/v2_e 均沿用 v2_a 成功状态 Response、false 全组合，v2_e 相对 v2_d 仅在 full-state 评分新增 actor 原生最近历史窗口。当前分支在 v2_e 后按用户要求，将窗口改为旧累计动作日志最后 4 条，保留动作及执行后观察；未另命名实验版本，也不移动旧标签。其它过滤、K_PAIRS=None 跨 turn/无组内 cap、全步默认 256 对不变。v2_d 的精确源码/标签未固定；库默认 true 和 websearch 配置不变。历史 v2_a/v2_b 实际代码已含旧轮转，用户实验口径 None 与旧标签默认 2 的差异见 [版本归档](../ALFWORLD_VERSIONS.md)。
+最近已归档实验为 **ALFWorld v2_e**，标签 `alfworld/v2_e`，功能逻辑基于 `7152e73`，记录提交另固化三份 ALFWorld 训练配置 `pair_round_robin=false`。v2_d/v2_e 均沿用 v2_a 成功状态 Response、false 全组合，v2_e 相对 v2_d 仅在 full-state 评分新增 actor 原生最近历史窗口。当前分支在 v2_e 后按用户要求，将窗口改为旧累计动作后日志，并支持评分窗口参数，默认最近 4 条；未另命名实验版本，也不移动旧标签。其它过滤、K_PAIRS=None 跨 turn/无组内 cap、全步默认 256 对不变。v2_d 的精确源码/标签未固定；库默认 true 和 websearch 配置不变。历史 v2_a/v2_b 实际代码已含旧轮转，用户实验口径 None 与旧标签默认 2 的差异见 [版本归档](../ALFWORLD_VERSIONS.md)。
 
 此实现使用完整环境状态进行参考模型评分（privileged/full-state）。策略模型继续接收原来的可见观察和有限历史。完整状态只进入评分上下文；固定 Response 描述成功条件，每道题的所有状态复用同一文本。
 
-当前评分 Prompt 保留任务、环境规则、事实解释、初始事实、当前新增/删除事实、当前观察和固定评分指令，并在旧标题 `Recorded environment action history:` 下追加 `trace_action_history[-4:]`。每条原样保留 `action`、执行后的 `observation` 以及 `environment_last_action`、`executed`、`external_error` 等已有字段，使用原 JSON 格式。窗口固定 4 条，不跟随 actor 的 `history_length`；初始化为空，不足 4 条时保留全部。失败动作按旧日志规则进入窗口，动作效果仍由实际环境事实决定；外部异常后的未知事实仍不可评分。actor Prompt、memory 规则、窗口配置及环境初始化不变，QA / websearch 评分保持原样。已归档 v2_e 的 actor 原生窗口定义保留；当前分支使用新缓存契约 `alfworld-post-action-recent-history-v1`。
+当前评分 Prompt 保留任务、环境规则、事实解释、初始事实、当前新增/删除事实、当前观察和固定评分指令，并在旧标题 `Recorded environment action history:` 下按 `ALFWORLD_TRACE_HISTORY_LENGTH` 追加原动作日志：默认最近 4 条，`None`/`null` 为全部，`0` 不追加历史，N>0 为最近 N 条。每条原样保留 `action`、执行后的 `observation` 以及 `environment_last_action`、`executed`、`external_error` 等已有字段，使用原 JSON 格式。评分窗口不跟随 actor 的 `history_length`；初始化为空，不足 N 条时保留全部。失败动作按旧日志规则进入窗口，动作效果仍由实际环境事实决定；外部异常后的未知事实仍不可评分。actor Prompt、memory 规则、窗口配置及环境初始化不变，QA / websearch 评分保持原样。已归档 v2_e 的 actor 原生窗口定义保留；当前分支使用新缓存契约 `alfworld-post-action-history-v2`，保存完整原动作日志以便重新选择窗口。
 
 GT Response/result、信用公式、轮转开关及额度不变，已有 GT Parquet 无需重新转换。更新后重启训练/rollout 进程，不混用旧评分信用。新 Probe 缓存保存最近动作日志快照及新版本；旧缓存缺新快照时，即使含完整事实或 actor 原生窗口也需 `enrich --replay --work-dir ...` 重放已存动作并核验原 actor Prompt，重建 sidecar 后再评分，不重新采样。旧 sidecar 不可作为新 full-state 契约；`saved` 自定义实验保留原样。
 
@@ -87,6 +87,14 @@ ALFWorld 环境、solver、两个 rollout 入口、daemon 和 trainer 均传递�
 | GT token 上限 | 256，超长判无效，不截断 |
 | GRPO、SLIC loss、Replay | 沿用现有 QA 实现 |
 
+评分历史窗口在两份训练 YAML 的 `env` 中配置：
+
+```yaml
+ALFWORLD_TRACE_HISTORY_LENGTH: ${env:ALFWORLD_TRACE_HISTORY_LENGTH,4}
+```
+
+启动前可用 `export ALFWORLD_TRACE_HISTORY_LENGTH=None` 输入全部原动作后历史，设为 `8` 则取最近 8 条，`0` 则省略历史区段。默认 4；`null` 等同 `None`，负数、浮点和布尔值会报错。该值只影响冻结评分模型，actor 的 `history_length` 保持原配置。全历史仍受评分上下文长度限制，超长沿用原来的无效状态处理，不悄悄截断。修改后重启 rollout worker；无需重新转换 GT。Probe 对应 `probe.history_length`，可在界面或 `config.json` 修改后直接重新评分。
+
 首轮、中间轮和最后一轮都标为 `tool_plan`，按动作前 V 接近及严格正/负有效信用配对。当前默认 None 允许同题跨原始 turn id，无组内额度；设为 2 则恢复同题同 turn、每 turn 最多 2 对。末动作不单独划入 `base` / outcome，遵循相同环境动作筛选条件。T 个动作对应 T+1 个真实状态，最后动作后的终止状态参与最后一步 `V_next - V`，但不新增模型回答或训练 turn。`trace_is_terminal` 只表示已完成的环境终止动作，用于截断信用窗口与终局回填；ALFWorld 的 `trace_is_final` 恒为 false。可信的步数预算耗尽属于终局失败；外部崩溃和无法核验的状态不作为失败奖励。
 
 固定 Response 的平均 token LogP 为 ell，`V_t = log((-ell_0 + epsilon) / (-ell_t + epsilon))`。pre-state 与 post-state 统一用该轨迹初始 ell_0 作基线。每个动作的真实转移为 `delta_t = V_(t+1) - V_t`，局部信用是最多 K 个连续真实动作 delta 的 gamma 加权平均，遇到环境终止动作则纳入该动作的 delta 后结束。缺失任何所需状态、编号缺口或外部故障均阻断窗口，不编造末状态或回退到 outcome 配对。
@@ -157,7 +165,7 @@ GRPO 的 `dp_actor.py` forward/backward/optimizer 以及 actor 的默认 SP、mi
 
 若实验意图仅为严格正负及至少 0.005 的信用差，可显式将 `TRACE_POSITIVE_THRESHOLD=0`、`TRACE_NEGATIVE_THRESHOLD=0` 和 `TRACE_GAP_EPSILON=0.005` 一起设置；这是候选门槛调整，代码不会自动应用，也不保证通过状态价值或相同动作过滤。当前配对范围由 `TRACE_K_PAIRS_PER_GROUP` 控制，默认 None 允许跨 turn；门槛调整不改变该设置。新增 `trace/config/{positive_threshold,negative_threshold,gap_epsilon,match_epsilon}` 指标打印实际采用的四个值。
 
-正式入口 `train-roma/train_agent.py` 读取 `train-roma/config.yaml`，同名环境变量优先于 YAML 默认值，命令行 Hydra 覆盖最后生效。仅修改 `config_grpo+slic.yaml` 或 `igpo_gap_epsilon` 不保证这个入口的 TRACE gap 发生变化。策略最近 4 步的上下文相同，也不等于 GT 评分上下文相同，后者包含规则、完整状态和当前观察；此差别可能影响 V 匹配。评分文本不输入累计全历史，但含原动作日志最后 4 条，当前观察也可携带动作反馈；因此相同完整事实并不保证评分 Prompt 完全一致。
+正式入口 `train-roma/train_agent.py` 读取 `train-roma/config.yaml`，同名环境变量优先于 YAML 默认值，命令行 Hydra 覆盖最后生效。仅修改 `config_grpo+slic.yaml` 或 `igpo_gap_epsilon` 不保证这个入口的 TRACE gap 发生变化。策略最近 4 步的上下文相同，也不等于 GT 评分上下文相同，后者包含规则、完整状态和当前观察；此差别可能影响 V 匹配。评分文本默认包含原动作日志最后 4 条，设 `ALFWORLD_TRACE_HISTORY_LENGTH=None` 则包含全部历史，当前观察也可携带动作反馈；因此相同完整事实并不保证评分 Prompt 完全一致。
 
 ## HCCL 端口故障定位
 

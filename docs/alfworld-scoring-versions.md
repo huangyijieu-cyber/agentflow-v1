@@ -1,6 +1,6 @@
 # ALFWorld 评分版本
 
-最近归档实验为 **v2_e**，标签 `alfworld/v2_e`。v2_d/v2_e 均使用 v2_a 的 Parquet `result` 成功状态 Response、`pair_round_robin=false` 全组合；v2_e 相对 v2_d 仅增加 actor 原生最近历史窗口（默认 4 条）。当前工作分支在 v2_e 后，按用户要求改为截取原累计 `trace_action_history` 最后 4 条，保留动作及执行后观察的旧日志格式；固定 4 条，不跟随 actor 的 `history_length`。未另命名实验版本，既有标签保留原位置。K_PAIRS 默认 None，其它过滤及总额度不变。库默认 true 保留，可显式启用先 V 匹配后的池内严格取模轮转。此次仅更新 ALFWorld，QA/websearch 评分保持原样，新缓存契约为 `alfworld-post-action-recent-history-v1`。
+最近归档实验为 **v2_e**，标签 `alfworld/v2_e`。v2_d/v2_e 均使用 v2_a 的 Parquet `result` 成功状态 Response、`pair_round_robin=false` 全组合；v2_e 相对 v2_d 仅增加 actor 原生最近历史窗口（默认 4 条）。当前工作分支在 v2_e 后，按用户要求改为截取原累计 `trace_action_history` 的可配置窗口，保留动作及执行后观察的旧日志格式；默认 4 条，`None` 为全部、`0` 为空，不跟随 actor 的 `history_length`。未另命名实验版本，既有标签保留原位置。K_PAIRS 默认 None，其它过滤及总额度不变。库默认 true 保留，可显式启用先 V 匹配后的池内严格取模轮转。此次仅更新 ALFWorld，QA/websearch 评分保持原样，新缓存契约为 `alfworld-post-action-history-v2`。
 
 各版本及中间未命名改动见 [版本归档](../ALFWORLD_VERSIONS.md)，配对开关和额度见 [SLIC 配对](trace-slic.md)。原 v2_a/v2_b 标签保留原代码；用户实验口径 K_PAIRS=None 与旧标签默认 2 的差异须区分。历史代码已含旧轮转，不能记作无轮转实现。v2_d 已确认评分沿用 v2_a、无最近 4 步历史、`pair_round_robin=false`，其它过滤及 K 分组/总 cap 不变；该实验尚未固定精确提交或标签，v2_c 仍未定义。
 
@@ -15,24 +15,24 @@
 
 ## 当前分支评分格式
 
-Prompt 包含任务、环境规则及谓词语义、完整初始事实、当前事实相对初始事实的新增/删除、当前观察，并追加原累计动作日志最后 4 条，最后附加以下指令；不输入累计全历史或 v2b 的剩余动作预算：
+Prompt 包含任务、环境规则及谓词语义、完整初始事实、当前事实相对初始事实的新增/删除、当前观察，并按 `ALFWORLD_TRACE_HISTORY_LENGTH` 追加原动作日志窗口（默认最近 4 条，`None` 为全部），最后附加以下指令；不输入 v2b 的剩余动作预算：
 
 ```text
 Based on the applicable environment rules, the initial state, and the current full environment state above, describe the current state in relation to the task goal. Desired goal conditions are not evidence that they currently hold.
 ```
 
-窗口直接截取 `trace_action_history[-4:]`，每条保留动作、执行后 observation 和旧日志的其它字段，仍按原来的 JSON 格式渲染，例如：
+窗口为 `trace_action_history[-N:]`（N>0）；`None` 使用完整列表，`0` 省略历史区段。每条保留动作、执行后 observation 和旧日志的其它字段，仍按原来的 JSON 格式渲染，例如：
 
 ```text
 Recorded environment action history:
 [{"action": "{action 12}", "environment_last_action": "{environment action 12}", "observation": "{observation after action 12}"}, {"action": "{action 13}", "environment_last_action": "{environment action 13}", "observation": "{observation after action 13}"}]
 ```
 
-初始状态没有历史段；不足 4 条时保留全部已有记录。该固定窗口独立于 actor 的 `history_length`，包括 `history_length<=0` 的情况。格式/命令校验失败等记录按旧日志规则进入窗口，保留 `executed`、`external_error` 等已有字段，不推断动作成功。外部异常后的未知事实仍不可评分。actor Prompt、memory 写入及环境初始化均保持原样。
+初始状态没有历史段；不足 N 条时保留全部已有记录。该评分窗口独立于 actor 的 `history_length`，包括 `history_length<=0` 的情况。格式/命令校验失败等记录按旧日志规则进入窗口，保留 `executed`、`external_error` 等已有字段，不推断动作成功。外部异常后的未知事实仍不可评分。actor Prompt、memory 写入及环境初始化均保持原样。
 
 固定 Response 直接读取本题的 Parquet `result`，即确定性转换的完整 PDDL 成功状态陈述。同题全部状态使用同一 Response，仅平均其 tokens 的 teacher-forcing LogP；不将目标原文作为 v2b 的 Success conditions 区块提前放进 Prompt。共享前缀与原 reference fallback 继续使用相同输入和目标。
 
-已有 GT Parquet 无需重新转换。更新后重启训练与 rollout 进程，使用新评分契约的 rollout/replay，避免混入旧信用。新 Probe 缓存保存最近动作日志快照和 `alfworld-post-action-recent-history-v1` 版本；旧缓存缺该快照时需 `enrich --replay` 重放保存动作并核验原 actor Prompt，不重新采样。旧 actor 原生快照和旧 sidecar 不会自动视为新 full-state；`saved` 自定义实验保留原样。若原自定义 Prompt/Response 来自 v2b，应恢复 `{goal_response}` 和上述当前状态指令。
+已有 GT Parquet 无需重新转换。更新后重启训练与 rollout 进程，使用新评分契约的 rollout/replay，避免混入旧信用。新 Probe 缓存保存完整动作日志、所选窗口和 `alfworld-post-action-history-v2` 版本；`probe.history_length` 修改后按缓存重建评分上下文。旧 v1 连续窗口可通过索引和重叠校验恢复历史，缺少所需记录时须 `enrich --replay` 重放保存动作并核验原 actor Prompt，不重新采样。旧 actor 原生快照和旧 sidecar 不会自动视为新 full-state；`saved` 自定义实验保留原样。若原自定义 Prompt/Response 来自 v2b，应恢复 `{goal_response}` 和上述当前状态指令。
 
 已归档 v2_e 标签仍使用 actor 原生 `SimpleMemory.fetch(history_length)` 的动作前 observation＋action 窗口，默认 4 条；当前分支替换了这一历史区段，固定 GT 和 LogP → V → K-step 局部信用公式保持不变。之后 ALFWorld 终局回填另改为复用 QA 的同题正负范围动态缩放，保留末三个真实动作的回填位置及距离折扣，忽略固定 scale；该算法改动不修改评分 Prompt/Response，也不移动历史标签。
 

@@ -44,6 +44,22 @@ class ArtifactRuntimeEnvTests(unittest.TestCase):
             _, task_runner = self.runner.run_ppo_with_fake_ray(True)
         task_runner.options.assert_called_once_with(runtime_env={"env_vars": env})
 
+    def test_scoring_history_setting_reaches_new_and_existing_ray_clusters(self):
+        for initialized in (False, True):
+            for value in ("None", "null", "0", "8"):
+                with self.subTest(initialized=initialized, value=value), mock.patch.dict(
+                    os.environ, {"ALFWORLD_TRACE_HISTORY_LENGTH": value}, clear=True
+                ):
+                    ray, task_runner = self.runner.run_ppo_with_fake_ray(initialized)
+                expected = {"SEARCH_CACHE_ENABLED": "0", "ALFWORLD_TRACE_HISTORY_LENGTH": value}
+                task_runner.options.assert_called_once_with(runtime_env={"env_vars": expected})
+                if initialized:
+                    ray.init.assert_not_called()
+                else:
+                    self.assertEqual(ray.init.call_args.kwargs["runtime_env"]["env_vars"], {
+                        "ASCEND_RT_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7", **expected,
+                    })
+
     def test_missing_goal_setting_does_not_add_a_requirement_to_qa(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             _, task_runner = self.runner.run_ppo_with_fake_ray(True)
@@ -67,6 +83,23 @@ class ArtifactRuntimeEnvTests(unittest.TestCase):
                     self.assertEqual(config["env"]["TRACE_K"], "3")
                     self.assertEqual(config["env"]["TRACE_GAMMA"], "0.8")
                     self.assertEqual(config["env"]["TRACE_TERMINAL_FILL_SCALE"], "2.0")
+
+    def test_training_configs_default_to_four_and_preserve_history_overrides(self):
+        path = ROOT / "train-roma/utils.py"
+        tree = ast.parse(path.read_text())
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "load_and_set_env_from_yaml")
+        scope = {"os": os, "yaml": yaml, "sys": sys}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
+        for filename in ("config.yaml", "config_grpo+slic.yaml"):
+            for override in (None, "None", "null", "0", "8"):
+                env = {} if override is None else {"ALFWORLD_TRACE_HISTORY_LENGTH": override}
+                with self.subTest(config=filename, override=override), \
+                     mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()):
+                    config = scope[node.name](str(ROOT / "train-roma" / filename))
+                    expected = "4" if override is None else override
+                    self.assertEqual(config["env"]["ALFWORLD_TRACE_HISTORY_LENGTH"], expected)
+                    self.assertEqual(os.environ["ALFWORLD_TRACE_HISTORY_LENGTH"], expected)
 
 
 if __name__ == "__main__":

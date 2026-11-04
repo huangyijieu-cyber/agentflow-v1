@@ -78,6 +78,7 @@
     <div class="parameter-row">
       <div class="parameters">
         <div class="parameter"><label for="stateView">评分视图</label><select id="stateView" disabled><option value="full_state">完整环境状态（含先验）</option><option value="saved">缓存视图 / 旧版对照</option></select></div>
+        <div class="parameter"><label for="historyLength">评分历史步数</label><input id="historyLength" type="text" value="4" placeholder="None 或非负整数" disabled></div>
         <div class="parameter"><label for="terminalFill">终局回填</label><input id="terminalFill" type="checkbox" checked disabled></div>
         <div class="parameter"><label for="epsilon">ε · NLL offset</label><input id="epsilon" type="number" value="0.1" min="0.000001" step="0.01" disabled></div>
         <div class="parameter"><label for="k">K · 动作窗口</label><input id="k" type="number" value="3" min="1" step="1" disabled></div>
@@ -86,7 +87,7 @@
       <div class="row"><button id="saveButton" type="button" disabled>保存探针</button><button id="scoreButton" class="primary" type="button" disabled>保存并重新评分</button></div>
     </div>
     <div class="formula">state + Prompt → 固定 Response 的平均 LogP ℓ → Vₜ = log[(-ℓ₀ + ε) / (-ℓₜ + ε)] → Δₜ = Vₜ₊₁ − Vₜ → K-step 折扣平均</div>
-    <p class="small-text muted" style="margin-top:9px">默认 Response 使用 {goal_response}，从预先保存的 GT 文件读取，同题所有状态保持固定。完整状态包含环境先验和隐藏事实，仅评分模型可见。全部环境动作统一按 TRACE Credit 配对，包括最后动作；末状态参与最后一步 ΔV，但不增加回答 turn。K 表示真实动作数，K=3 时最多向最后三个动作回填；默认终局回填开启，按同题局部信用的正负范围动态缩放，再应用距离折扣，与 QA 一致，旧固定系数不再生效。旧缓存补全读取保存的 GT 并重放已有动作，不调用采样模型；已完整保存的缓存可直接重新评分。</p>
+    <p class="small-text muted" style="margin-top:9px">默认 Response 使用 {goal_response}，从预先保存的 GT 文件读取，同题所有状态保持固定。完整状态包含环境先验和隐藏事实，仅评分模型可见。全部环境动作统一按 TRACE Credit 配对，包括最后动作；末状态参与最后一步 ΔV，但不增加回答 turn。K 表示真实动作数，K=3 时最多向最后三个动作回填；默认终局回填开启，按同题局部信用的正负范围动态缩放，再应用距离折扣，与 QA 一致，旧固定系数不再生效。评分历史步数默认 4；None 使用全部历史，0 不提供历史。仅完整环境状态视图应用此窗口，缓存视图保留原文。新缓存保存完整原日志，修改窗口直接重评分；旧缓存可由连续末 4 条快照恢复，不足时只需重放原动作，不调用采样模型。</p>
   </section>
 
   <section class="card" aria-labelledby="resultHeading">
@@ -113,7 +114,7 @@ let state = null, connected = false, dirty = false, editorLoaded = false, pendin
 let selectedRunId = '', selectedCompareId = '', followLatest = true, renderKey = '', noticeTimer = null;
 let activeRun = null, comparisonRun = null, activeSampleId = null, sampleEditorReady = false;
 let snapshotCache = null, snapshotCacheKey = '';
-const editorIds = ['probePrompt', 'probeResponse', 'epsilon', 'k', 'gamma', 'stateView', 'terminalFill'];
+const editorIds = ['probePrompt', 'probeResponse', 'epsilon', 'k', 'gamma', 'stateView', 'terminalFill', 'historyLength'];
 const toText = value => typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value, null, 2);
 const first = (...values) => values.find(value => value !== undefined && value !== null);
 const validNumber = value => typeof value === 'number' && Number.isFinite(value);
@@ -138,6 +139,9 @@ async function api(path, body) {
 }
 function getProbe() {
   const probe = {prompt:$('probePrompt').value, response:$('probeResponse').value, epsilon:Number($('epsilon').value), k:Number($('k').value), gamma:Number($('gamma').value), state_view:$('stateView').value, terminal_fill_enabled:$('terminalFill').checked};
+  const history = $('historyLength').value.trim();
+  probe.history_length = /^(none|null)$/i.test(history) ? null : /^\d+$/.test(history) ? Number(history) : NaN;
+  if (probe.history_length !== null && (!Number.isSafeInteger(probe.history_length) || probe.history_length < 0)) throw new Error('评分历史步数须为 None（全部）、0（无历史）或正整数。');
   if (!probe.response.trim()) throw new Error('Response 不能为空；它是每个状态要评分的固定文本。');
   if (!Number.isFinite(probe.epsilon) || probe.epsilon <= 0) throw new Error('ε 必须大于 0。');
   if (!Number.isInteger(probe.k) || probe.k < 1) throw new Error('K 必须为正整数。');
@@ -167,6 +171,7 @@ function applyEditor(probe) {
   $('probePrompt').value = toText(probe.prompt); $('probeResponse').value = toText(probe.response);
   $('epsilon').value = first(probe.epsilon, 0.1); $('k').value = first(probe.k, 3); $('gamma').value = first(probe.gamma, 0.8);
   $('stateView').value = first(probe.state_view, 'saved'); $('terminalFill').checked = first(probe.terminal_fill_enabled, true); editorLoaded = true;
+  $('historyLength').value = probe.history_length === null ? 'None' : first(probe.history_length, 4);
 }
 const sampleStatuses = {running:'运行中',error:'出错',corrupt:'轨迹文件损坏',complete:'已完成',partial:'可继续',not_started:'尚未采样'};
 function updateSampleSelector() {
