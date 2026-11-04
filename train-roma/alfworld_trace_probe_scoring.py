@@ -42,7 +42,7 @@ def _trace_module():
     return sys.modules[name]
 
 
-def _actor_history_version():
+def _recent_action_history_version():
     name = "_alfworld_probe_goal_conversion"
     if name not in sys.modules:
         path = Path(__file__).resolve().parents[1] / "agentflow/agentflow/trace/alfworld.py"
@@ -50,19 +50,18 @@ def _actor_history_version():
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
-    return sys.modules[name].ACTOR_HISTORY_SCORING_VERSION
+    return sys.modules[name].RECENT_ACTION_HISTORY_SCORING_VERSION
 
 
-def _validate_actor_history(state, expected_length):
-    history = state.get("trace_actor_history")
-    steps, length = state.get("trace_actor_history_steps"), state.get("trace_actor_history_length")
-    valid = (isinstance(history, str) and type(steps) is int and type(length) is int
-             and 0 <= steps <= length and (bool(history.strip()) if steps else history == ""))
-    if expected_length is not None:
-        valid = valid and type(expected_length) is int and length == expected_length
-    if not valid or state.get("scoring_context_version") != _actor_history_version():
+def _validate_recent_action_history(state):
+    history = state.get("trace_recent_action_history")
+    valid = (isinstance(history, list) and len(history) <= 4
+             and all(isinstance(record, dict)
+                     and isinstance(record.get("action"), str)
+                     and isinstance(record.get("observation"), str) for record in history))
+    if not valid or state.get("scoring_context_version") != _recent_action_history_version():
         raise ValueError(
-            "Full-state actor history is missing, stale, or inconsistent with the saved memory window. "
+            "Full-state recent action history is missing, stale, or malformed. "
             "Run enrich --replay without sampling new actions.")
 
 
@@ -337,7 +336,7 @@ def score_snapshots(snapshot: dict, probe: dict, scorer_config: dict, *, progres
         if state_view == "full_state":
             for state in trajectory.get("states", []):
                 if state.get("scoring_valid") is not False:
-                    _validate_actor_history(state, (snapshot.get("sampling") or {}).get("history_length"))
+                    _validate_recent_action_history(state)
     if "{goal_response}" in response_template:
         hashes = {trajectory.get("goal_spec_hash") for trajectory in trajectories}
         if None in hashes or len(hashes) != 1:

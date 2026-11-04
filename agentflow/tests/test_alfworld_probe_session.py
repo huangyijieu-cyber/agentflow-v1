@@ -32,6 +32,7 @@ class FakeEnv:
         self.trace_actor_history = ""
         self.trace_actor_history_steps = 0
         self._history = []
+        self.trace_action_history = []
 
     def _remember(self):
         self._history.append({"observation": self.prev_text_obs, "action": "act"})
@@ -49,6 +50,7 @@ class FakeEnv:
         self.trace_actor_history = ""
         self.trace_actor_history_steps = 0
         self._history = []
+        self.trace_action_history = []
         return "action prompt 0", {"anchor": "stage=0", "admissible_commands": [["act"]],
                                    "extra.gamefile": ["same-game"], "won": [False]}
 
@@ -57,6 +59,10 @@ class FakeEnv:
         self.index += 1
         self.trace_state_context = f"stage={self.index}"
         self.prev_text_obs = self.trace_state_context
+        self.trace_action_history.append({
+            "action": "act", "observation": self.prev_text_obs,
+            "environment_last_action": f"executed-{self.index}",
+        })
         done = self.index == 2
         return f"action prompt {self.index}", float(done), done, {
             "anchor": self.trace_state_context, "admissible_commands": [["act"]],
@@ -129,62 +135,66 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.sample(bad, bad), snapshot)
         bad.assert_not_called()
 
-    def test_capture_saves_native_bounded_history_and_terminal_actor_prompt(self):
+    def test_capture_saves_last_four_post_action_records_and_terminal_actor_prompt(self):
         class LongEnv(FakeEnv):
             def step(self, response):
                 prompt, _, _, info = super().step(response)
                 done = self.index == 6
                 info.update(won=[done], terminated=done)
                 return prompt, float(done), done, info
-        self.experiment.config["sampling"]["max_steps"] = 6
+        self.experiment.config["sampling"].update(max_steps=6, history_length=1)
         snapshot = self.sample(env_factory=LongEnv)
         states = snapshot["trajectories"][0]["states"]
         self.assertEqual(len(states), 7)
-        self.assertEqual(states[0]["trace_actor_history"], "")
-        self.assertEqual(states[0]["trace_actor_history_steps"], 0)
+        self.assertEqual(states[0]["trace_recent_action_history"], [])
         self.assertEqual(states[-1]["actor_prompt"], "action prompt 6")
-        expected = "\n".join(f"[Observation {i}: 'stage={i - 1}', Action {i}: 'act']"
-                             for i in range(3, 7))
-        self.assertEqual(states[-1]["trace_actor_history"], expected)
-        self.assertEqual(states[-1]["trace_actor_history_steps"], 4)
-        self.assertEqual({state["trace_actor_history_length"] for state in states}, {4})
+        expected = [{"action": "act", "observation": f"stage={i}",
+                     "environment_last_action": f"executed-{i}"} for i in range(3, 7)]
+        self.assertEqual(states[-1]["trace_recent_action_history"], expected)
         self.assertEqual({state["scoring_context_version"] for state in states},
-                         {probe.ACTOR_HISTORY_SCORING_VERSION})
+                         {probe.RECENT_ACTION_HISTORY_SCORING_VERSION})
 
-    def test_snapshot_uses_native_info_history_instead_of_slicing_saved_turns(self):
+    def test_snapshot_uses_post_action_info_history_instead_of_native_or_guessed_history(self):
         env = FakeEnv({"history_length": 4})
-        native = "[Observation 9: 'native observation', Action 9: 'native action']"
+        recent = [{"action": "actual action", "observation": "resulting observation",
+                   "environment_last_action": "original metadata"}]
         state = probe.state_snapshot(env, "actor input", {
-            "anchor": "now", "trace_actor_history": native, "trace_actor_history_steps": 1,
-            "trace_actor_history_length": 4,
+            "anchor": "now", "trace_recent_action_history": recent,
+            "trace_actor_history": "wrong native pre-action history",
         }, 9, self.experiment.config["sampling"],
             prior_turns=[{"action": "guessed action", "observation_before": "guessed observation"}] * 20)
-        self.assertEqual(state["trace_actor_history"], native)
-        self.assertNotIn("guessed", state["trace_actor_history"])
+        self.assertEqual(state["trace_recent_action_history"], recent)
+        self.assertNotIn("guessed", str(state["trace_recent_action_history"]))
+        self.assertNotIn("wrong native", str(state["trace_recent_action_history"]))
+        recent[0]["action"] = "mutated after snapshot"
+        self.assertEqual(state["trace_recent_action_history"][0]["action"], "actual action")
 
     def test_missing_full_state_context_is_rendered_from_rules_or_rejected(self):
         tools, spec = self.goal_tools()
         env = FakeEnv({"history_length": 4})
         env.trace_state_context = ""
         env.trace_facts, env.trace_goal_spec = ["s0"], spec
-        env.trace_actor_history = "[Observation 1: 'native obs', Action 1: 'act']"
-        env.trace_actor_history_steps = 1
+        env.trace_action_history = [{"action": "act", "observation": "post-action obs"}]
         info = {"anchor": "now", "trace_goal_check_valid": True, "trace_scoring_valid": True}
         with mock.patch.object(probe, "_goal_module", return_value=tools):
             state = probe.state_snapshot(env, "visible input", info, 1, self.experiment.config["sampling"])
             self.assertEqual(state["state_view"], "full_state")
             self.assertIn("full facts s0", state["state_context"])
-            self.assertIn(env.trace_actor_history, state["state_context"])
+            self.assertIn("post-action obs", state["state_context"])
             self.assertNotIn("Actor-visible prompt", state["state_context"])
             del env.trace_goal_spec
             with self.assertRaisesRegex(ValueError, "context and saved rules are missing"):
                 probe.state_snapshot(env, "visible input", info, 1, self.experiment.config["sampling"])
 
-    def test_rejected_action_does_not_enter_the_native_memory_snapshot(self):
+    def test_rejected_action_enters_post_action_scoring_history(self):
         class Rejected(FakeEnv):
             def step(self, response):
                 if self.index == 0:
                     return super().step(response)
+                self.trace_action_history.append({
+                    "action": "not stored in memory", "observation": "Rejected action feedback",
+                    "executed": False, "external_error": False,
+                })
                 return "Rejected action feedback", 0., True, {
                     "anchor": "[INVALID_ACTION]", "observation_text": "Rejected action feedback",
                     "won": [False], "terminated": True, "invalid_action": True,
@@ -192,9 +202,12 @@ class SessionTests(unittest.TestCase):
                 }
         snapshot = self.sample(env_factory=Rejected)
         states = snapshot["trajectories"][0]["states"]
-        self.assertEqual(states[-1]["trace_actor_history"], states[-2]["trace_actor_history"])
-        self.assertEqual(states[-1]["trace_actor_history_steps"], 1)
-        self.assertNotIn("not stored", states[-1]["trace_actor_history"])
+        self.assertEqual(len(states[-2]["trace_recent_action_history"]), 1)
+        self.assertEqual(len(states[-1]["trace_recent_action_history"]), 2)
+        self.assertEqual(states[-1]["trace_recent_action_history"][-1], {
+            "action": "not stored in memory", "observation": "Rejected action feedback",
+            "executed": False, "external_error": False,
+        })
 
     def test_resume_replays_saved_actions_and_only_generates_missing_suffix(self):
         initial_calls = []
@@ -275,26 +288,27 @@ class SessionTests(unittest.TestCase):
                 "goal_store_path": str(self.store_path), "goal_store_id": "persisted-store-v1",
                 "goal_store_entry": "train/example/game.tw-pddl", "goal_store_spec_sha256": "saved-payload"}
         return SimpleNamespace(
-            ACTOR_HISTORY_SCORING_VERSION=probe.ACTOR_HISTORY_SCORING_VERSION,
+            RECENT_ACTION_HISTORY_SCORING_VERSION=probe.RECENT_ACTION_HISTORY_SCORING_VERSION,
+            RECENT_ACTION_HISTORY_LENGTH=4,
             normalize_gamefile=lambda value: Path(value[0] if isinstance(value, list) else value),
             load_goal_spec=mock.Mock(side_effect=AssertionError("runtime must not convert")),
             read_goal_spec=mock.Mock(return_value=spec),
             normalize_facts=lambda facts: sorted(facts),
             evaluate_goal=lambda spec, facts: "s2" in facts,
             render_full_state=lambda spec, facts, **kwargs: "full facts " + " ".join(facts)
-            + "\n" + kwargs.get("actor_history", "")), spec
+            + "\n" + json.dumps(kwargs.get("action_history", []), ensure_ascii=False, sort_keys=True)), spec
 
-    def test_old_full_facts_cache_without_native_history_requires_replay(self):
+    def test_old_full_facts_cache_without_post_action_history_requires_replay(self):
         snapshot = self.sample()
         for trajectory in snapshot["trajectories"]:
             for state in trajectory["states"]:
                 state["facts"] = [f"s{state['state_index']}"]
-                for key in (*probe._ACTOR_HISTORY_FIELDS, "scoring_context_version"):
+                for key in (*probe._RECENT_ACTION_HISTORY_FIELDS, "scoring_context_version"):
                     state.pop(key, None)
         tools, _ = self.goal_tools()
         with mock.patch.object(probe, "_goal_module", return_value=tools), mock.patch.object(
                 probe, "_goal_store_module", return_value=tools):
-            with self.assertRaisesRegex(ValueError, "actor history.*enrich --replay"):
+            with self.assertRaisesRegex(ValueError, "recent action history.*enrich --replay"):
                 probe.enrich_snapshot(snapshot)
 
     def test_replay_verifies_saved_actor_prompt_before_replaying_actions(self):
@@ -370,8 +384,8 @@ class SessionTests(unittest.TestCase):
         payload = probe._enrichment_payload(snapshot, converted, source_hash)
         for trajectory in payload["trajectories"]:
             for state in trajectory["states"]:
-                state["state_context"] = "Old context without native history"
-                for key in (*probe._ACTOR_HISTORY_FIELDS, "scoring_context_version"):
+                state["state_context"] = "Old context without post-action history"
+                for key in (*probe._RECENT_ACTION_HISTORY_FIELDS, "scoring_context_version"):
                     state.pop(key, None)
         probe.atomic_json(Path(self.temp.name) / "goal_metadata.json", payload)
         merged = probe._merge_enrichment(snapshot, payload, source_hash)
@@ -382,18 +396,18 @@ class SessionTests(unittest.TestCase):
                 probe, "make_environment", side_effect=AssertionError("must not replay")):
             prepared = self.experiment._prepare_scoring_snapshot(snapshot, self.experiment.config["probe"])
         current = prepared["trajectories"][0]["states"][1]
-        self.assertIn(current["trace_actor_history"], current["state_context"])
-        self.assertEqual(current["scoring_context_version"], probe.ACTOR_HISTORY_SCORING_VERSION)
+        self.assertIn(json.dumps(current["trace_recent_action_history"], sort_keys=True), current["state_context"])
+        self.assertEqual(current["scoring_context_version"], probe.RECENT_ACTION_HISTORY_SCORING_VERSION)
         self.assertEqual(path.read_bytes(), original)
 
-    def test_saved_view_keeps_legacy_literal_context_without_native_history(self):
+    def test_saved_view_keeps_legacy_literal_context_without_post_action_history(self):
         snapshot = self.sample()
         for trajectory in snapshot["trajectories"]:
             trajectory.update(goal_response="Saved goal.", goal_spec_hash="one-goal")
             for state in trajectory["states"]:
                 state.update(state_context="Manually saved scoring context", state_view="full_state",
                              scoring_valid=True, goal_check_valid=True)
-                for key in (*probe._ACTOR_HISTORY_FIELDS, "scoring_context_version"):
+                for key in (*probe._RECENT_ACTION_HISTORY_FIELDS, "scoring_context_version"):
                     state.pop(key, None)
         path = Path(self.temp.name) / "trajectories.json"
         probe.atomic_json(path, snapshot)
@@ -443,7 +457,7 @@ class SessionTests(unittest.TestCase):
         legacy = probe.read_json(path)
         for trajectory in legacy["trajectories"]:
             for state in trajectory["states"]:
-                for key in (*probe._ACTOR_HISTORY_FIELDS, "scoring_context_version", "actor_prompt"):
+                for key in (*probe._RECENT_ACTION_HISTORY_FIELDS, "scoring_context_version", "actor_prompt"):
                     state.pop(key, None)
         probe.atomic_json(path, legacy)
         original = path.read_bytes()
@@ -473,7 +487,7 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), original)
         self.assertTrue(all(state["state_view"] == "full_state" for t in converted["trajectories"] for state in t["states"]))
         self.assertEqual(converted["trajectories"][0]["states"][-1]["actor_prompt"], "action prompt 2")
-        self.assertEqual(converted["trajectories"][0]["states"][-1]["trace_actor_history_steps"], 2)
+        self.assertEqual(len(converted["trajectories"][0]["states"][-1]["trace_recent_action_history"]), 2)
         self.experiment.save_probe({"response": "{goal_response}", "state_view": "full_state"})
         self.store_path.unlink()  # A complete immutable sidecar is sufficient for future scoring.
         fake = FakeScorer()

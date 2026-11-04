@@ -1,6 +1,8 @@
 # ALFWorld 实验版本归档
 
-当前实验为 **v2_e**，复现标签 `alfworld/v2_e`。用户已确认 v2_d、v2_e 均为 `pair_round_robin=false` 全组合，v2_e 相对 v2_d 仅增加 actor 原生最近历史窗口（默认 4 条）。功能逻辑基于 `7152e73`，标签记录提交由该功能代码、固化为 false 的三份 ALFWorld 训练配置及补充文档构成。库 `TraceConfig()` 的默认 true、websearch 配置及缓存内部版本常量保持原样。
+最近已归档实验为 **v2_e**，复现标签 `alfworld/v2_e`。用户已确认 v2_d、v2_e 均为 `pair_round_robin=false` 全组合，v2_e 相对 v2_d 仅增加 actor 原生最近历史窗口（默认 4 条）。功能逻辑基于 `7152e73`，标签记录提交由该功能代码、固化为 false 的三份 ALFWorld 训练配置及补充文档构成。
+
+当前工作分支在 v2_e 后按用户要求，将评分历史改为原累计 `trace_action_history` 的最后 4 条，保留“动作＋执行后观察”的旧日志格式。固定 4 条，不跟随 actor 的 `history_length`；其余评分内容、Response、信用公式和配对配置不变。本次未另命名实验版本，也不移动既有 `alfworld/v2_e` 标签。新评分缓存契约为 `alfworld-post-action-recent-history-v1`。
 
 ## 版本汇总
 
@@ -46,4 +48,4 @@ export TRACE_PAIR_ROUND_ROBIN=false  # v2_d / v2_e：全组合，仅比较历史
 
 固定复现 v2_e 可检出 `alfworld/v2_e`；v2_d 只记录已确认实验配置，不伪造精确源码或标签。注意启动脚本或 shell 的环境变量会覆盖代码默认配置。GT/result、信用公式、基础 GRPO/GiGPO 及配对额度不变，已有 GT Parquet 无需重新转换；更新后重启训练/rollout，使用新评分契约的数据，不混用旧信用。
 
-新 Probe 缓存保存原生历史快照和版本。旧缓存即使有完整事实，缺快照时仍需 `enrich --replay` 重放已存动作并核验原 actor Prompt，再重评分，不重新采样；旧 sidecar 不能冒充新 full-state，`saved` 自定义上下文保留原样。版本命名不改变已有缓存契约的内部版本常量。
+当前分支的新 Probe 缓存保存最后 4 条执行后观察日志及 `alfworld-post-action-recent-history-v1` 版本。历史记录原样保留 `action`、`observation` 及已有的 `environment_last_action`、`executed`、`external_error` 等字段；初始状态的历史为空，失败动作按原日志规则进入窗口。旧 actor 原生快照不能直接作为该窗口使用；缺新快照时需 `enrich --replay` 重放已存动作并核验原 actor Prompt，再重评分，不重新采样。旧 sidecar 不能冒充新 full-state，`saved` 自定义上下文保留原样。

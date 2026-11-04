@@ -338,33 +338,36 @@ def _goal_module():
     return sys.modules[name]
 
 
-ACTOR_HISTORY_SCORING_VERSION = _goal_module().ACTOR_HISTORY_SCORING_VERSION
-_ACTOR_HISTORY_FIELDS = ("trace_actor_history", "trace_actor_history_steps", "trace_actor_history_length")
+RECENT_ACTION_HISTORY_SCORING_VERSION = _goal_module().RECENT_ACTION_HISTORY_SCORING_VERSION
+RECENT_ACTION_HISTORY_LENGTH = _goal_module().RECENT_ACTION_HISTORY_LENGTH
+_RECENT_ACTION_HISTORY_FIELDS = ("trace_recent_action_history",)
 
 
-def _validate_actor_history(state, expected_length=None, *, require_version=False):
-    history, steps, length = (state.get(key) for key in _ACTOR_HISTORY_FIELDS)
-    valid = (isinstance(history, str) and type(steps) is int and type(length) is int
-             and 0 <= steps <= length and (bool(history.strip()) if steps else history == ""))
-    if expected_length is not None:
-        valid = valid and type(expected_length) is int and length == expected_length
+def _validate_recent_action_history(state, *, require_version=False):
+    history = state.get("trace_recent_action_history")
+    valid = (isinstance(history, list) and len(history) <= RECENT_ACTION_HISTORY_LENGTH
+             and all(isinstance(record, dict)
+                     and isinstance(record.get("action"), str)
+                     and isinstance(record.get("observation"), str) for record in history))
     if require_version:
-        valid = valid and state.get("scoring_context_version") == ACTOR_HISTORY_SCORING_VERSION
+        valid = valid and state.get("scoring_context_version") == RECENT_ACTION_HISTORY_SCORING_VERSION
     if not valid:
         raise ValueError(
-            "Full-state actor history is missing, stale, or inconsistent with the saved memory window. "
-            "Run enrich --replay to recover the native history without sampling new actions.")
+            "Full-state recent action history is missing, stale, or malformed. "
+            "Run enrich --replay to recover the last four post-action records without sampling new actions.")
     return history
 
 
-def _actor_history_snapshot(env, info, sampling):
-    values = {key: info.get(key, getattr(env, key, None)) for key in _ACTOR_HISTORY_FIELDS}
-    if values["trace_actor_history_length"] is None:
-        values["trace_actor_history_length"] = getattr(env, "history_length", None)
-    if any(value is None for value in values.values()):
-        return {}
-    _validate_actor_history(values, sampling.get("history_length"))
-    return {**values, "scoring_context_version": ACTOR_HISTORY_SCORING_VERSION}
+def _recent_action_history_snapshot(env, info):
+    history = info.get("trace_recent_action_history")
+    if history is None:
+        cumulative = getattr(env, "trace_action_history", None)
+        if cumulative is None:
+            return {}
+        history = cumulative[-RECENT_ACTION_HISTORY_LENGTH:]
+    values = {"trace_recent_action_history": copy.deepcopy(history)}
+    _validate_recent_action_history(values)
+    return {**values, "scoring_context_version": RECENT_ACTION_HISTORY_SCORING_VERSION}
 
 
 def _goal_store_module():
@@ -408,9 +411,9 @@ def state_snapshot(env, actor_prompt, info, index, sampling, *, prior_turns=(), 
     facts = _full_facts(env, raw_info)
     if flag(raw_info.get("env_error")) is True:
         facts = None
-    actor_history = _actor_history_snapshot(env, raw_info, sampling)
-    if facts is not None and not actor_history:
-        _validate_actor_history({}, sampling.get("history_length"))
+    recent_history = _recent_action_history_snapshot(env, raw_info)
+    if facts is not None and not recent_history:
+        _validate_recent_action_history({})
     info = jsonable(raw_info)
     observation = scalar(info.get("anchor"))
     if not isinstance(observation, str) or observation.startswith("["):
@@ -431,7 +434,7 @@ def state_snapshot(env, actor_prompt, info, index, sampling, *, prior_turns=(), 
         if not isinstance(spec, dict):
             raise ValueError("Full-state context and saved rules are missing. Run enrich --replay.")
         context = f"Task: {getattr(env, 'task', '')}\n\n" + _goal_module().render_full_state(
-            spec, facts, observation=observation, actor_history=actor_history["trace_actor_history"])
+            spec, facts, observation=observation, action_history=recent_history["trace_recent_action_history"])
     if not isinstance(context, str) or not context.strip():
         context = (f"Task: {getattr(env, 'task', '')}\n\nActor-visible prompt:\n{actor_prompt}"
                    f"\n\nCurrent observation: {observation}"
@@ -439,7 +442,7 @@ def state_snapshot(env, actor_prompt, info, index, sampling, *, prior_turns=(), 
                    f"Task: {getattr(env, 'task', '')}\n\nCurrent observation: {observation}\n\n"
                    f"Available actions: {json.dumps(actions, ensure_ascii=False)}")
     return {"state_index": index, "state_context": context, "observation": observation,
-            "actor_prompt": actor_prompt if isinstance(actor_prompt, str) else None, **actor_history,
+            "actor_prompt": actor_prompt if isinstance(actor_prompt, str) else None, **recent_history,
             "available_actions": actions, "remaining_steps": max(0, sampling["max_steps"] - index),
             "is_post_state": index > 0, "is_terminal_state": bool(done),
             "env_info": compact_env_info(info), "facts": facts,
@@ -857,7 +860,7 @@ def enrich_snapshot(snapshot, *, replay=False, env_factory=make_environment, pro
                     if turn.get("external_error"):
                         failed = copy.deepcopy(trajectory["states"][index + 1])
                         failed.update({"facts": None, "state_view": "full_state", "scoring_valid": False})
-                        failed.update(_actor_history_snapshot(env, {}, converted["sampling"]))
+                        failed.update(_recent_action_history_snapshot(env, {}))
                         new_states.append(failed)
                         if index != len(trajectory["turns"]) - 1:
                             raise ValueError("Cannot enrich states beyond an unresolved external failure")
@@ -888,15 +891,15 @@ def enrich_snapshot(snapshot, *, replay=False, env_factory=make_environment, pro
                     "Saved observations do not contain full environment facts. "
                     "Run enrich --replay to replay the saved actions without sampling new ones.")
             facts = module.normalize_facts(facts)
-            history = _validate_actor_history(state, sampling.get("history_length"))
+            history = _validate_recent_action_history(state)
             check = module.evaluate_goal(spec, facts)
             won = flag((state.get("env_info") or {}).get("won"))
             check_valid = won is not None and check is won
             state.update({"facts": facts, "state_view": "full_state",
                           "state_context": f"Task: {trajectory.get('goal', '')}\n\n" +
                           module.render_full_state(spec, facts,
-                              observation=state.get("observation"), actor_history=history),
-                          "scoring_context_version": ACTOR_HISTORY_SCORING_VERSION,
+                              observation=state.get("observation"), action_history=history),
+                          "scoring_context_version": RECENT_ACTION_HISTORY_SCORING_VERSION,
                           "goal_check": check, "goal_check_valid": check_valid,
                           "scoring_valid": check_valid and flag((state.get("env_info") or {}).get("env_error")) is not True})
         if trajectory.get("outcome", {}).get("valid") and trajectory["states"]:
@@ -909,16 +912,15 @@ def enrich_snapshot(snapshot, *, replay=False, env_factory=make_environment, pro
     return converted
 
 
-def _prepare_actor_history_contexts(snapshot):
-    """Upgrade saved full-state text using verified native snapshots, without replay."""
+def _prepare_recent_action_history_contexts(snapshot):
+    """Upgrade full-state text using saved post-action records, without replay."""
     converted = copy.deepcopy(snapshot)
-    expected_length = (snapshot.get("sampling") or {}).get("history_length")
     for trajectory in converted.get("trajectories", []):
         for state in trajectory.get("states", []):
             if state.get("scoring_valid") is False:
                 continue
-            history = _validate_actor_history(state, expected_length)
-            if state.get("scoring_context_version") == ACTOR_HISTORY_SCORING_VERSION:
+            history = _validate_recent_action_history(state)
+            if state.get("scoring_context_version") == RECENT_ACTION_HISTORY_SCORING_VERSION:
                 continue
             spec, facts = trajectory.get("goal_spec"), state.get("facts")
             if not isinstance(spec, dict) or facts is None:
@@ -926,8 +928,8 @@ def _prepare_actor_history_contexts(snapshot):
                     "Saved full-state rules/facts are incomplete. Run enrich --replay without sampling new actions.")
             module = _goal_module()
             state["state_context"] = f"Task: {trajectory.get('goal', '')}\n\n" + module.render_full_state(
-                spec, facts, observation=state.get("observation"), actor_history=history)
-            state["scoring_context_version"] = ACTOR_HISTORY_SCORING_VERSION
+                spec, facts, observation=state.get("observation"), action_history=history)
+            state["scoring_context_version"] = RECENT_ACTION_HISTORY_SCORING_VERSION
     return converted
 
 
@@ -937,7 +939,7 @@ def _enrichment_payload(original, converted, source_hash):
               "goal_spec_hash", "state_view")
     state_fields = ("state_index", "state_context", "facts", "state_view", "scoring_valid",
                     "goal_check", "goal_check_valid", "actor_prompt", "scoring_context_version",
-                    *_ACTOR_HISTORY_FIELDS)
+                    *_RECENT_ACTION_HISTORY_FIELDS)
     for trajectory in converted["trajectories"]:
         trajectories.append({"trajectory_id": trajectory["trajectory_id"],
                              **{key: trajectory.get(key) for key in fields},
@@ -1162,7 +1164,7 @@ class Experiment:
             converted = enrich_snapshot(snapshot, replay=False, progress=self.progress,
                                         trace_goals_path=self.config["sampling"].get("trace_goals_path"))
         if probe.get("state_view") == "full_state":
-            converted = _prepare_actor_history_contexts(converted)
+            converted = _prepare_recent_action_history_contexts(converted)
         if converted == snapshot:
             return snapshot
         payload = _enrichment_payload(snapshot, converted, source_hash)

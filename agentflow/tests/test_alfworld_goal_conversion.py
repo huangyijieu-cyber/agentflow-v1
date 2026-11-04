@@ -311,7 +311,7 @@ class GoalTests(unittest.TestCase):
     def test_full_state_explicitly_separates_initial_current_and_rules(self):
         spec = converter.load_goal_spec(self.create("look_at_obj_in_light"))
         current = [x for x in INITIAL if x != "(ison lamp0)"] + ["(istoggled lamp0)"]
-        context = converter.render_full_state(spec, current, observation="The lamp is off.", history=["use lamp"])
+        context = converter.render_full_state(spec, current, observation="The lamp is off.")
         self.assertIn("privileged prior", context)
         self.assertIn("Initial state", context)
         self.assertIn("Current full environment state", context)
@@ -322,23 +322,25 @@ class GoalTests(unittest.TestCase):
         self.assertNotIn("use lamp", context)
         self.assertNotIn(spec["goal_response"], context)
 
-    def test_full_state_prompt_depends_on_facts_and_observation_not_action_history(self):
+    def test_full_state_prompt_depends_on_facts_observation_and_only_recent_action_history(self):
         spec = converter.load_goal_spec(self.create("look_at_obj_in_light"))
         saved = copy.deepcopy(spec)
         current = [x for x in INITIAL if x != "(ison lamp0)"] + ["(istoggled lamp0)"]
         observation = "The lamp is off."
         context = converter.render_full_state(spec, current, observation=observation)
         earlier_observation = "UNIQUE_PAST_OBSERVATION_NOT_CURRENT"
-        histories = [
-            {"action_history": [{"action": "use lamp", "observation": earlier_observation,
-                                 "environment_last_action": "toggleobject"}]},
-            {"action_history": [{"action": "take mug"}, {"action": "use lamp"}]},
-            {"history": "legacy caller's complete trajectory"},
-        ]
-        for history in histories:
-            with self.subTest(history=history):
-                self.assertEqual(converter.render_full_state(
-                    spec, current, observation=observation, **history), context)
+        recent = [{"action": f"action_{i}", "observation": f"post_action_observation_{i}"}
+                  for i in range(4)]
+        earlier = {"action": "use lamp", "observation": earlier_observation,
+                   "environment_last_action": "toggleobject"}
+        with_history = converter.render_full_state(
+            spec, current, observation=observation, action_history=[earlier, *recent])
+        suffix = "Recorded environment action history:\n" + json.dumps(recent, ensure_ascii=False, sort_keys=True)
+        self.assertIn(suffix, with_history)
+        self.assertNotIn(earlier_observation, with_history)
+        self.assertEqual(with_history.replace(suffix + "\n\n", ""), context)
+        self.assertEqual(with_history, converter.render_full_state(
+            spec, current, observation=observation, history=recent))
         self.assertNotIn(earlier_observation, context)
         self.assertEqual(spec, saved)  # Existing GT, instruction and saved provenance remain valid.
         self.assertIn(spec["rules_context"], context)
@@ -349,23 +351,29 @@ class GoalTests(unittest.TestCase):
         self.assertNotEqual(converter.render_full_state(spec, INITIAL, observation=observation), context)
         self.assertNotEqual(converter.render_full_state(spec, current, observation="A different current observation."), context)
 
-    def test_full_state_includes_only_the_explicit_actor_history_snapshot_verbatim(self):
+    def test_full_state_uses_original_post_action_records_instead_of_actor_history(self):
         spec = converter.load_goal_spec(self.create("look_at_obj_in_light"))
         history = "[Observation 3: 'A quote: \' and a newline\nkept as-is', Action 3: 'use lamp']"
         original = copy.deepcopy(spec)
+        records = [{"action": "use lamp", "observation": "灯已关闭\nAfter the action.",
+                    "environment_last_action": "toggleobject"},
+                   {"action": "fly", "observation": "Invalid action.",
+                    "executed": False, "external_error": False}]
         context = converter.render_full_state(spec, INITIAL, observation="Now.", actor_history=history,
-                                              action_history=["UNBOUNDED_CUMULATIVE_HISTORY"])
-        self.assertIn("Recent observations and actions (same history window as the actor):\n" + history,
-                      context)
-        self.assertNotIn("UNBOUNDED_CUMULATIVE_HISTORY", context)
+                                              action_history=records)
+        self.assertIn("Recorded environment action history:\n" + json.dumps(
+            records, ensure_ascii=False, sort_keys=True), context)
+        self.assertNotIn(history, context)
         self.assertNotIn(spec["goal_response"], context)
         self.assertEqual(spec, original)
         self.assertEqual(converter.render_full_state(spec, INITIAL, actor_history=""),
                          converter.render_full_state(spec, INITIAL))
-        for invalid in ([], {}, 4):
+        self.assertEqual(converter.render_full_state(spec, INITIAL, actor_history=history),
+                         converter.render_full_state(spec, INITIAL))
+        for invalid in ("already rendered history", {}, 4):
             with self.subTest(invalid=invalid):
-                with self.assertRaisesRegex(converter.GoalConversionError, "formatted history string"):
-                    converter.render_full_state(spec, INITIAL, actor_history=invalid)
+                with self.assertRaisesRegex(converter.GoalConversionError, "environment action records"):
+                    converter.render_full_state(spec, INITIAL, action_history=invalid)
 
     def test_slice_metadata_and_actual_goal_must_agree(self):
         params = {"object_target": "Mug", "parent_target": "Cabinet", "object_sliced": True}

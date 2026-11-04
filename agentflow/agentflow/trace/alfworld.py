@@ -18,6 +18,8 @@ from typing import Any
 
 TEMPLATE_VERSION = "alfworld-pddl-controlled-english-v1"
 ACTOR_HISTORY_SCORING_VERSION = "alfworld-actor-recent-history-v1"
+RECENT_ACTION_HISTORY_SCORING_VERSION = "alfworld-post-action-recent-history-v1"
+RECENT_ACTION_HISTORY_LENGTH = 4
 DEFAULT_ANSWER_INSTRUCTION = (
     "Based on the applicable environment rules, the initial state, and the "
     "current full environment state above, describe the current state in "
@@ -669,13 +671,14 @@ def format_facts(facts, *, aliases=None) -> str:
 
 def render_full_state(spec, facts, *, observation=None, action_history=None,
                       history=None, initial_facts=None, actor_history=None) -> str:
-    """Render verified facts and the actor's actual bounded history snapshot.
+    """Render verified facts and the last four original environment log records.
 
-    Legacy cumulative history arguments remain ignored. Only the explicit
-    formatted actor snapshot is included, without reconstructing its records.
+    Each record retains its action and post-action observation unchanged.
+    The actor's pre-action history is kept as a legacy argument but not scored.
     """
-    if actor_history is not None and not isinstance(actor_history, str):
-        raise GoalConversionError("actor_history must be the actor's formatted history string")
+    selected_history = action_history if action_history is not None else history
+    if selected_history is not None and not isinstance(selected_history, (list, tuple)):
+        raise GoalConversionError("action_history must be a list or tuple of environment action records")
     current = _checked_facts(facts, spec["objects"])
     initial = _checked_facts(spec["initial_facts"] if initial_facts is None else initial_facts, spec["objects"])
     aliases = spec.get("entity_aliases", {})
@@ -691,8 +694,9 @@ def render_full_state(spec, facts, *, observation=None, action_history=None,
     ]
     if observation is not None:
         lines.append("Current observation (additional textual evidence):\n" + str(observation))
-    if actor_history:
-        lines.append("Recent observations and actions (same history window as the actor):\n" + actor_history)
+    if selected_history:
+        lines.append("Recorded environment action history:\n" + json.dumps(
+            selected_history[-RECENT_ACTION_HISTORY_LENGTH:], ensure_ascii=False, sort_keys=True))
     lines.append("The desired goal is not an observed achievement. A true initial flag does not prove an action happened during this episode.")
     return "\n\n".join(lines)
 

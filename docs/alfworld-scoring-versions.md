@@ -1,10 +1,10 @@
-# ALFWorld 评分版本（当前 v2_e）
+# ALFWorld 评分版本
 
-当前实验为 **v2_e**，标签 `alfworld/v2_e`。v2_d/v2_e 均使用 v2_a 的 Parquet `result` 成功状态 Response、`pair_round_robin=false` 全组合；v2_e 相对 v2_d 仅增加 actor 原生最近历史窗口（默认 4 条）。功能逻辑基于 `7152e73`，本次记录提交另外包含固化为 false 的三份 ALFWorld 训练配置和版本文档。K_PAIRS 默认 None，其它过滤及总额度不变。库默认 true 保留，可显式启用先 V 匹配后的池内严格取模轮转。本次窗口适配仅更新 ALFWorld，QA/websearch 评分保持原样，内部缓存契约版本常量不因实验命名而变化。
+最近归档实验为 **v2_e**，标签 `alfworld/v2_e`。v2_d/v2_e 均使用 v2_a 的 Parquet `result` 成功状态 Response、`pair_round_robin=false` 全组合；v2_e 相对 v2_d 仅增加 actor 原生最近历史窗口（默认 4 条）。当前工作分支在 v2_e 后，按用户要求改为截取原累计 `trace_action_history` 最后 4 条，保留动作及执行后观察的旧日志格式；固定 4 条，不跟随 actor 的 `history_length`。未另命名实验版本，既有标签保留原位置。K_PAIRS 默认 None，其它过滤及总额度不变。库默认 true 保留，可显式启用先 V 匹配后的池内严格取模轮转。此次仅更新 ALFWorld，QA/websearch 评分保持原样，新缓存契约为 `alfworld-post-action-recent-history-v1`。
 
 各版本及中间未命名改动见 [版本归档](../ALFWORLD_VERSIONS.md)，配对开关和额度见 [SLIC 配对](trace-slic.md)。原 v2_a/v2_b 标签保留原代码；用户实验口径 K_PAIRS=None 与旧标签默认 2 的差异须区分。历史代码已含旧轮转，不能记作无轮转实现。v2_d 已确认评分沿用 v2_a、无最近 4 步历史、`pair_round_robin=false`，其它过滤及 K 分组/总 cap 不变；该实验尚未固定精确提交或标签，v2_c 仍未定义。
 
-| 项目 | 历史 v2_a | 历史 v2_b | 当前 v2_e |
+| 项目 | 历史 v2_a | 历史 v2_b | 已归档 v2_e |
 | --- | --- | --- | --- |
 | `result` | 原 PDDL 成功条件 | 复用原值和哈希 | 复用原值和哈希，无需重转 |
 | 目标位置 | 固定 Response | Prompt 的 requirements 区域 | 固定 Response |
@@ -13,27 +13,28 @@
 | 剩余预算 | 未显式输入 | 显式输入 | 未显式输入 |
 | 配对代码 | 先轮转再检查 V | 沿用旧轮转 | 实验 false 全组合，与 v2_d 相同；仍可显式开启 true |
 
-## v2_e 评分格式
+## 当前分支评分格式
 
-Prompt 包含任务、环境规则及谓词语义、完整初始事实、当前事实相对初始事实的新增/删除、当前观察，并追加 actor 实际收到的原生最近历史窗口，最后附加以下指令；不输入累计全历史或 v2b 的剩余动作预算：
+Prompt 包含任务、环境规则及谓词语义、完整初始事实、当前事实相对初始事实的新增/删除、当前观察，并追加原累计动作日志最后 4 条，最后附加以下指令；不输入累计全历史或 v2b 的剩余动作预算：
 
 ```text
 Based on the applicable environment rules, the initial state, and the current full environment state above, describe the current state in relation to the task goal. Desired goal conditions are not evidence that they currently hold.
 ```
 
-原生窗口直接复用 `_build_prompt()` 中 `SimpleMemory.fetch(history_length)` 的文本，默认最近 4 条已存记录，自定义窗口则跟随实际设置。每条保存动作前 observation 和解析后的 action，保留原绝对编号及换行，例如：
+窗口直接截取 `trace_action_history[-4:]`，每条保留动作、执行后 observation 和旧日志的其它字段，仍按原来的 JSON 格式渲染，例如：
 
 ```text
-Recent observations and actions (same history window as the actor):
-[Observation 12: '{observation before action 12}', Action 12: '{parsed action 12}']
-[Observation 13: '{observation before action 13}', Action 13: '{parsed action 13}']
+Recorded environment action history:
+[{"action": "{action 12}", "environment_last_action": "{environment action 12}", "observation": "{observation after action 12}"}, {"action": "{action 13}", "environment_last_action": "{environment action 13}", "observation": "{observation after action 13}"}]
 ```
 
-初始化或 history_length<=0 时没有历史段。格式/命令校验失败和外部异常未存 memory 时沿用原窗口，模拟器正常返回但动作无效的记录仍遵循原有写入逻辑。这里不是取 `trace_action_history` 的最后 4 条；后者记录动作后的 observation，与原生窗口的时序不同。actor Prompt、memory 写入及环境初始化均保持原样。
+初始状态没有历史段；不足 4 条时保留全部已有记录。该固定窗口独立于 actor 的 `history_length`，包括 `history_length<=0` 的情况。格式/命令校验失败等记录按旧日志规则进入窗口，保留 `executed`、`external_error` 等已有字段，不推断动作成功。外部异常后的未知事实仍不可评分。actor Prompt、memory 写入及环境初始化均保持原样。
 
 固定 Response 直接读取本题的 Parquet `result`，即确定性转换的完整 PDDL 成功状态陈述。同题全部状态使用同一 Response，仅平均其 tokens 的 teacher-forcing LogP；不将目标原文作为 v2b 的 Success conditions 区块提前放进 Prompt。共享前缀与原 reference fallback 继续使用相同输入和目标。
 
-已有 GT Parquet 无需重新转换。更新后重启训练与 rollout 进程，使用新评分契约的 rollout/replay，避免混入旧信用。新 Probe 缓存保存原生快照和版本；旧缓存缺快照时，只有完整事实仍不足以恢复 actor 实际窗口，需 `enrich --replay` 重放保存动作并核验原 actor Prompt，不重新采样。旧 sidecar 不会自动视为新 full-state；`saved` 自定义实验保留原样。若原自定义 Prompt/Response 来自 v2b，应恢复 `{goal_response}` 和上述当前状态指令。
+已有 GT Parquet 无需重新转换。更新后重启训练与 rollout 进程，使用新评分契约的 rollout/replay，避免混入旧信用。新 Probe 缓存保存最近动作日志快照和 `alfworld-post-action-recent-history-v1` 版本；旧缓存缺该快照时需 `enrich --replay` 重放保存动作并核验原 actor Prompt，不重新采样。旧 actor 原生快照和旧 sidecar 不会自动视为新 full-state；`saved` 自定义实验保留原样。若原自定义 Prompt/Response 来自 v2b，应恢复 `{goal_response}` 和上述当前状态指令。
+
+已归档 v2_e 标签仍使用 actor 原生 `SimpleMemory.fetch(history_length)` 的动作前 observation＋action 窗口，默认 4 条；当前分支只替换这一历史区段，固定 GT 和 LogP → V → K-step Credit／终局回填公式保持不变。
 
 ## 历史 v2b 评分格式
 

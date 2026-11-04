@@ -283,7 +283,7 @@ class AlfWorldEnv:
         self.trace_scoring_valid = self.trace_goal_check_valid
         self.trace_state_context = f"Task: {self.task}\n\n" + tools.render_full_state(
             self.trace_goal_spec, self.trace_facts,
-            observation=observation, actor_history=self.trace_actor_history,
+            observation=observation, action_history=self.trace_action_history,
         )
         self._write_trace_info(info)
         if not self.trace_goal_check_valid:
@@ -295,6 +295,8 @@ class AlfWorldEnv:
     def _write_trace_info(self, info):
         info.update({
             "trace_full_facts": deepcopy(self.trace_facts),
+            "trace_recent_action_history": deepcopy(
+                self.trace_action_history[-_goal_tools().RECENT_ACTION_HISTORY_LENGTH:]),
             "trace_actor_history": self.trace_actor_history,
             "trace_actor_history_steps": self.trace_actor_history_steps,
             "trace_actor_history_length": self.history_length,
@@ -331,7 +333,7 @@ class AlfWorldEnv:
             # its last verified facts remain the actual unchanged state.
             self.trace_state_context = f"Task: {self.task}\n\n" + _goal_tools().render_full_state(
                 self.trace_goal_spec, self.trace_facts,
-                observation=observation, actor_history=self.trace_actor_history,
+                observation=observation, action_history=self.trace_action_history,
             )
         self._write_trace_info(info)
         return info

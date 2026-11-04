@@ -49,6 +49,8 @@ class Memory:
 
 
 class Tools:
+    RECENT_ACTION_HISTORY_LENGTH = 4
+
     @staticmethod
     def read_dataset_gamefile(store_path, data_type, task_type, question_id, games_root):
         return None
@@ -85,7 +87,7 @@ class Tools:
 
     @staticmethod
     def render_full_state(spec, facts, *, observation=None, action_history=None, actor_history=None):
-        return f"Full-state rules and initial facts.\nCurrent facts: {facts}\nObservation: {observation}\nHistory: {actor_history}"
+        return f"Full-state rules and initial facts.\nCurrent facts: {facts}\nObservation: {observation}\nHistory: {(action_history or [])[-4:]}"
 
 
 class Simulator:
@@ -150,7 +152,7 @@ class EnvironmentTests(unittest.TestCase):
         self.scope["SimpleMemory"] = extract(
             ROOT / "agentflow/agentflow/envs/memory/memory.py", "SimpleMemory", scope)
 
-    def test_scoring_reuses_the_actor_native_window_and_keeps_actor_prompts_identical(self):
+    def test_scoring_takes_last_four_post_action_records_and_keeps_actor_prompts_identical(self):
         self.use_native_memory()
 
         class RollingSimulator(Simulator):
@@ -172,6 +174,7 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(initial["trace_actor_history"], "")
         self.assertEqual(initial["trace_actor_history_steps"], 0)
         self.assertEqual(initial["trace_actor_history_length"], 4)
+        self.assertEqual(initial["trace_recent_action_history"], [])
         for index in range(6):
             response = "A thought before acting.\n<action>place mug</action>"
             actor, reward, done, info = self.step(env, response)
@@ -182,17 +185,39 @@ class EnvironmentTests(unittest.TestCase):
             self.assertEqual(info["trace_actor_history"], expected)
             self.assertEqual(info["trace_actor_history_steps"], min(index + 1, 4))
             self.assertIn(expected, actor)
-            self.assertIn(expected, env.trace_state_context)
+            recent = env.trace_action_history[-4:]
+            self.assertEqual(info["trace_recent_action_history"], recent)
+            self.assertEqual(recent[-1]["observation"], env.prev_text_obs)
+            self.assertIn(str(recent), env.trace_state_context)
+            self.assertNotIn(expected, env.trace_state_context)
             self.assertNotIn("<action>", expected)
         self.assertIn("[Observation 3:", expected)
         self.assertIn("[Observation 6:", expected)
         self.assertNotIn("[Observation 1:", expected)
         self.assertNotIn("[Observation 2:", expected)
         self.assertIn("a 'quoted' line\nand another line.", expected)
+        self.assertNotIn("Observation_2:", env.trace_state_context)
+        self.assertIn("Observation_3:", env.trace_state_context)
+        self.assertIn("Observation_6:", env.trace_state_context)
+        info["trace_recent_action_history"][0]["action"] = "mutated exported snapshot"
+        self.assertNotEqual(env.trace_action_history[-4]["action"], "mutated exported snapshot")
         self.scope["_create_trace_environment"] = mock.Mock(return_value=simulator)
         _, info = self.reset(env, question_id=0)
         self.assertEqual(env.trace_actor_history, "")
         self.assertEqual(info["trace_actor_history_steps"], 0)
+        self.assertEqual(info["trace_recent_action_history"], [])
+
+    def test_scoring_window_stays_four_when_actor_history_length_differs(self):
+        for length in (0, 2, 8):
+            with self.subTest(length=length):
+                env, _ = self.env(Simulator(endless=True))
+                env.history_length = length
+                self.reset(env, question_id=0)
+                for _ in range(6):
+                    _, _, _, info = self.step(env, "<action>place mug</action>")
+                self.assertEqual(len(env.trace_action_history), 6)
+                self.assertEqual(len(info["trace_recent_action_history"]), 4)
+                self.assertEqual(info["trace_recent_action_history"], env.trace_action_history[-4:])
 
     def test_disabled_actor_history_never_fetches_or_leaks_an_old_window(self):
         self.use_native_memory()
@@ -207,6 +232,7 @@ class EnvironmentTests(unittest.TestCase):
                     actor, _, _, info = self.step(env, "<action>place mug</action>")
                 self.assertEqual(info["trace_actor_history"], "")
                 self.assertEqual(info["trace_actor_history_steps"], 0)
+                self.assertEqual(info["trace_recent_action_history"], env.trace_action_history[-4:])
                 self.assertNotIn("stale episode history", actor + env.trace_state_context)
 
     def test_nonstored_failures_keep_the_actor_window_instead_of_appending_trace_history(self):
@@ -229,6 +255,8 @@ class EnvironmentTests(unittest.TestCase):
                 self.assertEqual(info["trace_actor_history"], previous)
                 self.assertEqual(info["trace_actor_history_steps"], 1)
                 self.assertEqual(len(env.trace_action_history), 2)
+                self.assertEqual(info["trace_recent_action_history"], env.trace_action_history)
+                self.assertFalse(info["trace_recent_action_history"][-1]["executed"])
 
     def test_hidden_facts_only_enter_scoring_context_and_gt_stays_fixed(self):
         env, _ = self.env()
@@ -312,7 +340,7 @@ class EnvironmentTests(unittest.TestCase):
                 self.reset(env, question_id=0)
             env._init_env.assert_not_called()
 
-    def test_real_fact_renderer_reuses_actor_window_after_steps_and_invalid_actions(self):
+    def test_real_fact_renderer_keeps_original_post_action_log_after_steps_and_invalid_actions(self):
         import test_alfworld_goal_conversion as fixtures
         store_path = ROOT / "agentflow/agentflow/trace/alfworld_goal_store.py"
         module_spec = importlib.util.spec_from_file_location("history_free_environment_store", store_path)
@@ -364,7 +392,7 @@ class EnvironmentTests(unittest.TestCase):
             self.assertIn("HISTORY_ONLY_OBSERVATION", actor)
             self.assertIn("take mug", actor)
             self.assertIn(env.trace_actor_history, actor)
-            self.assertIn(env.trace_actor_history, env.trace_state_context)
+            self.assertNotIn(env.trace_actor_history, env.trace_state_context)
             self.assertEqual(len(env.trace_action_history), 2)
             self.assertEqual(env.trace_action_history[0]["environment_last_action"], "HISTORY_ONLY_EXECUTION")
             self.assertIn("holds: (agent0,mug0)", env.trace_state_context)
@@ -381,9 +409,9 @@ class EnvironmentTests(unittest.TestCase):
             self.assertFalse(env.trace_action_history[-1]["executed"])
             contexts.append(env.trace_state_context)
             for context in contexts:
-                self.assertNotIn("Recorded environment action history:", context)
+                self.assertIn("Recorded environment action history:", context)
                 self.assertIn("HISTORY_ONLY_OBSERVATION", context)
-                self.assertNotIn("HISTORY_ONLY_EXECUTION", context)
+                self.assertIn("HISTORY_ONLY_EXECUTION", context)
                 self.assertIn(saved_spec["rules_context"], context)
                 self.assertIn("Initial state (before this episode's first action):", context)
                 self.assertIn("holds: (agent0,mug0)", context)

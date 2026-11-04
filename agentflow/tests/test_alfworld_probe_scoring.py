@@ -210,29 +210,30 @@ class ScoringTests(unittest.TestCase):
         for state in trajectory["states"]:
             state.update(state_view="full_state", goal_check_valid=True, scoring_valid=True,
                          goal_check=state["state_index"] == 3,
-                         trace_actor_history="", trace_actor_history_steps=0,
-                         trace_actor_history_length=4,
-                         scoring_context_version=scoring._actor_history_version())
+                         trace_recent_action_history=[],
+                         scoring_context_version=scoring._recent_action_history_version())
         return snapshot
 
-    def test_full_state_rejects_old_or_malformed_actor_history_before_scoring(self):
-        for change in ({"trace_actor_history": None}, {"trace_actor_history": []},
-                       {"trace_actor_history_steps": True}, {"trace_actor_history_steps": 1},
-                       {"trace_actor_history_length": 5}, {"trace_actor_history_length": -1},
+    def test_full_state_rejects_old_or_malformed_post_action_history_before_scoring(self):
+        valid_record = {"action": "act", "observation": "result"}
+        for change in ({"trace_recent_action_history": None}, {"trace_recent_action_history": "native pre-action text"},
+                       {"trace_recent_action_history": [valid_record] * 5},
+                       {"trace_recent_action_history": [{"action": "act"}]},
+                       {"trace_recent_action_history": [{"action": 4, "observation": "result"}]},
+                       {"scoring_context_version": "alfworld-actor-recent-history-v1"},
                        {"scoring_context_version": "old-no-history"}):
             with self.subTest(change=change):
                 snapshot = self.full_state_saved()
                 snapshot["trajectories"][0]["states"][0].update(change)
                 backend = FakeScorer()
-                with self.assertRaisesRegex(ValueError, "actor history.*enrich --replay"):
+                with self.assertRaisesRegex(ValueError, "recent action history.*enrich --replay"):
                     self.run_score(snapshot, probe={"state_view": "full_state"}, scorer=backend)
                 self.assertEqual(backend.calls, [])
 
     def test_saved_view_can_score_legacy_literal_full_state_context(self):
         snapshot = self.full_state_saved()
         for state in snapshot["trajectories"][0]["states"]:
-            for key in ("trace_actor_history", "trace_actor_history_steps", "trace_actor_history_length",
-                        "scoring_context_version"):
+            for key in ("trace_recent_action_history", "scoring_context_version"):
                 state.pop(key)
         result, backend = self.run_score(snapshot, probe={"state_view": "saved"})
         self.assertEqual(len(backend.calls), 4)
@@ -242,7 +243,7 @@ class ScoringTests(unittest.TestCase):
         snapshot = self.full_state_saved()
         tail = snapshot["trajectories"][0]["states"][-1]
         tail.update(state_view="legacy_observed", scoring_valid=False,
-                    env_info={"env_error": True}, trace_actor_history=None,
+                    env_info={"env_error": True}, trace_recent_action_history=None,
                     scoring_context_version=None)
         result, backend = self.run_score(snapshot, probe={"state_view": "full_state"})
         states = result["trajectories"][0]["states"]
