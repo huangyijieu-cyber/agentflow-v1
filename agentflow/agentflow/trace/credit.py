@@ -30,7 +30,7 @@ class TraceConfig:
     k: int = 3
     gamma: float = 0.8
     terminal_fill_enabled: bool = True
-    # Retained for non-QA tasks; QA uses per-question ranges.
+    # Legacy fallback only; QA and ALFWorld callers use per-question ranges.
     terminal_fill_scale: float = 2.0
     outcome_match_value: bool = False
     outcome_success_threshold: float = 0.5
@@ -394,6 +394,7 @@ def annotate_environment_credits(
     *,
     outcome_valid: bool,
     outcome_advantage: Optional[float],
+    defer_terminal_fill: bool = False,
     config=None,
 ):
     """Credit every environment action, including its real final transition.
@@ -408,6 +409,11 @@ def annotate_environment_credits(
     Missing states, discontinuous turns and external failures invalidate every
     window that needs them. A verified terminal flag only closes a window;
     the outcome must separately be trusted before reward fill is applied.
+
+    Training and Probe defer filling until all rollouts' local credits for the
+    question are available, reusing QA's signed range scaling. The returned
+    terminal_discount retains the environment's real terminal-action distance.
+    Non-deferred callers retain the legacy fixed-scale behavior.
     """
     cfg = TraceConfig.from_mapping(config)
     size = len(values)
@@ -415,7 +421,7 @@ def annotate_environment_credits(
            (next_values, turn_indices, external_errors, terminal_flags)):
         raise ValueError("TRACE environment credit inputs must have the same length")
     result = {key: [math.nan] * size
-              for key in ("local_credit", "terminal_fill", "effective_credit")}
+              for key in ("local_credit", "terminal_fill", "effective_credit", "terminal_discount")}
     result.update({key: [False] * size
                    for key in ("window_blocked", "external_error_blocked", "terminal_reached")})
     terminals = [index for index, flag in enumerate(terminal_flags) if bool(flag)]
@@ -462,14 +468,21 @@ def annotate_environment_credits(
             result["window_blocked"][start] = True
             continue
         local = weighted_sum / weight_sum
+        if not _finite(local):
+            result["window_blocked"][start] = True
+            continue
+        discount = 0.0
+        if cfg.terminal_fill_enabled and reached and outcome_valid:
+            distance = int(turn_indices[terminal]) - first_turn
+            discount = cfg.gamma**distance
+        result["terminal_discount"][start] = discount
         fill = 0.0
-        if (cfg.terminal_fill_enabled and cfg.terminal_fill_scale > 0
+        if (not defer_terminal_fill and cfg.terminal_fill_enabled and cfg.terminal_fill_scale > 0
                 and reached and outcome_valid):
             if not _finite(outcome_advantage):
                 result["window_blocked"][start] = True
                 continue
-            distance = int(turn_indices[terminal]) - first_turn
-            fill = cfg.terminal_fill_scale * cfg.gamma**distance * float(outcome_advantage)
+            fill = cfg.terminal_fill_scale * discount * float(outcome_advantage)
         if not (_finite(local) and _finite(fill) and _finite(local + fill)):
             result["window_blocked"][start] = True
             continue

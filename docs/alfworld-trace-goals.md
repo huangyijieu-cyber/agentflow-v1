@@ -79,7 +79,7 @@ ALFWorld 环境、solver、两个 rollout 入口、daemon 和 trainer 均传递�
 | 项目 | 默认值/行为 |
 | --- | --- |
 | epsilon / K / gamma | 0.1 / 3 / 0.8 |
-| terminal fill | 开启，scale=2.0 |
+| terminal fill | 开启，复用 QA 的同题正负局部信用范围动态缩放；忽略固定 scale |
 | value match epsilon | 0.05 |
 | 正/负信用阈值、信用差阈值 | 0.01 / 0.01 / 0.02 |
 | length ratio / 组内 pair 上限 / 每步 pair | 1.8 / None（无组内上限，允许跨 turn） / 256 |
@@ -91,7 +91,9 @@ ALFWorld 环境、solver、两个 rollout 入口、daemon 和 trainer 均传递�
 
 固定 Response 的平均 token LogP 为 ell，`V_t = log((-ell_0 + epsilon) / (-ell_t + epsilon))`。pre-state 与 post-state 统一用该轨迹初始 ell_0 作基线。每个动作的真实转移为 `delta_t = V_(t+1) - V_t`，局部信用是最多 K 个连续真实动作 delta 的 gamma 加权平均，遇到环境终止动作则纳入该动作的 delta 后结束。缺失任何所需状态、编号缺口或外部故障均阻断窗口，不编造末状态或回退到 outcome 配对。
 
-窗口包含可信终止动作时，再加 `terminal_fill_scale * gamma ** (terminal_turn - start_turn) * outcome_advantage`。K=3 时最多给末三个真实动作回填，包含最后动作本身；末动作距离为 0，因此获得 `scale * outcome_advantage` 的回填。真实环境结果用于这项回填，不改变冻结参考模型的 LogP/V。QA 原来的最终答案路由及其信用函数保持不变。
+训练和 Probe 先汇总同题所有轨迹的有效局部信用，复用 QA 的 `scale_outcome_advantages`：终局正优势按比例映射到最大正局部信用，负优势按比例映射到最负局部信用，零保持零；缺少某方向的局部信用则该侧映射为零。范围在信用阈值、V 匹配和配对筛选前统计，排除无效、重复、被丢弃、无响应或被阻断的动作；终局不可信轨迹中的有效局部窗口仍可贡献范围，但这些轨迹不进入终局奖励均值，也不获得回填。
+
+窗口包含可信终止动作时，再加 `gamma ** (terminal_turn - start_turn) * scaled_outcome_advantage`。K=3 时最多给末三个真实动作回填，包含最后动作本身；末动作距离为 0，获得完整的缩放后优势。`TRACE_TERMINAL_FILL_SCALE` 对 ALFWorld 与 QA 均不再生效；使用 `TRACE_TERMINAL_FILL_ENABLED=false` 关闭回填。真实环境结果用于这项回填，不改变冻结参考模型的 LogP/V、原始奖励或 GRPO/GiGPO 优势。QA 原来的最终答案路由保持不变。旧实验标签仍保留固定系数实现，已有 GT Parquet 无需重转；切换时重启训练，避免复用旧回填生成的 replay pairs。
 
 ## 服务器适配
 

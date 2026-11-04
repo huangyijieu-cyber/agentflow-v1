@@ -4,6 +4,8 @@
 
 当前工作分支在 v2_e 后按用户要求，将评分历史改为原累计 `trace_action_history` 的最后 4 条，保留“动作＋执行后观察”的旧日志格式。固定 4 条，不跟随 actor 的 `history_length`；其余评分内容、Response、信用公式和配对配置不变。本次未另命名实验版本，也不移动既有 `alfworld/v2_e` 标签。新评分缓存契约为 `alfworld-post-action-recent-history-v1`。
 
+随后工作分支将 ALFWorld 终局回填改为复用 QA 的同题正负局部信用范围动态缩放，替代训练/Probe 中固定系数 2。保留 K=3 最后三个真实动作的回填位置及 gamma 距离折扣，Prompt/Response、局部信用、配对和基础训练算法保持不变。`TRACE_TERMINAL_FILL_SCALE` 对 ALFWorld 忽略，关闭回填使用 `TRACE_TERMINAL_FILL_ENABLED=false`。该改动尚未另命名实验版本，以下历史标签不变。
+
 ## 版本汇总
 
 | 版本 | 复现标签 | 主要变化 |

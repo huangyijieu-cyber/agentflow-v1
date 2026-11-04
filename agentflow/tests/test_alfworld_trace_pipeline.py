@@ -116,10 +116,20 @@ class AlfworldPipelineTests(unittest.TestCase):
                     expected = training.CREDIT.annotate_environment_credits(
                         non["trace_value"][start:start + 4], non["trace_next_value"][start:start + 4],
                         [0, 1, 2, 3], [False] * 4, [False] * 3 + [True],
-                        outcome_valid=True, outcome_advantage=.5 if start == 0 else -.5, config=cfg)
-                    np.testing.assert_allclose(non["trace_credit"][start:start + 4], expected["effective_credit"], equal_nan=True)
+                        outcome_valid=True, outcome_advantage=.5 if start == 0 else -.5, config=cfg,
+                        defer_terminal_fill=True)
+                    np.testing.assert_allclose(non["trace_local_credit"][start:start + 4], expected["local_credit"], equal_nan=True)
                 self.assertEqual(non["trace_terminal_reached"].tolist(), [False, True, True, True] * 2)
-                np.testing.assert_allclose(non["trace_terminal_fill"][:4], [0., .64, .8, 1.])
+                positive_range = max(non["trace_local_credit"])
+                negative_range = min(non["trace_local_credit"])
+                np.testing.assert_allclose(non["trace_scaled_outcome_advantage"],
+                                           [positive_range] * 4 + [negative_range] * 4)
+                discounts = np.array([0., .64, .8, 1.])
+                np.testing.assert_allclose(non["trace_terminal_fill"],
+                                           np.concatenate([discounts * positive_range,
+                                                           discounts * negative_range]))
+                np.testing.assert_allclose(non["trace_credit"],
+                                           non["trace_local_credit"] + non["trace_terminal_fill"])
                 np.testing.assert_allclose(non["trace_next_value"][:3], non["trace_value"][1:4])
                 expected_last = np.log(4.1 / .6) - np.log(4.1 / 1.1)
                 self.assertAlmostEqual(non["trace_local_credit"][3], expected_last)
@@ -360,7 +370,7 @@ class AlfworldPipelineTests(unittest.TestCase):
                 self.assertTrue(np.isfinite(non["trace_credit"]).all())
                 np.testing.assert_allclose(non["trace_value"], [0., 0.])
                 np.testing.assert_allclose(non["trace_local_credit"], [np.log(4.1 / 3.1), np.log(4.1 / 5.1)])
-                np.testing.assert_allclose(non["trace_terminal_fill"], [1., -1.])
+                np.testing.assert_allclose(non["trace_terminal_fill"], non["trace_local_credit"])
                 self.assertEqual(non["trace_label_source"].tolist(), ["trace", "trace"])
                 pairs = trainer._trans_to_trace_batch([history])
                 self.assertTrue(pairs)
@@ -411,6 +421,115 @@ class AlfworldPipelineTests(unittest.TestCase):
         logs = self.logs("A", external=1)
         self.assertFalse(any(log["trace_outcome_valid"] for log in logs))
         self.assertTrue(logs[1]["trace_external_error"])
+
+
+class DynamicEnvironmentFillTests(unittest.TestCase):
+    def fixture(self, fixtures, **config):
+        """Use constant real action deltas so signed local ranges are known."""
+        rows, scores, next_contexts, terminals, provenance = [], {}, [], [], []
+        for uid, rollout, delta, reward, trusted, count in fixtures:
+            contexts = [f"{uid}/{rollout}/{turn}" for turn in range(count + 1)]
+            for turn, context in enumerate(contexts):
+                scores[context] = .1 - 4.1 * np.exp(-delta * turn)
+            for turn in range(count):
+                rows.append(training.make_row(contexts[turn], rollout, turn, uid=uid,
+                                               gt=GOAL, reward=reward, outcome_valid=trusted,
+                                               outcome_success=reward > .5))
+                next_contexts.append(contexts[turn + 1])
+                terminals.append(turn == count - 1)
+                provenance.append({"goal_spec_hash": "game-" + uid})
+        history = training.make_batch(rows)
+        non, size = history.non_tensor_batch, len(rows)
+        non.update({
+            "trace_task": np.full(size, "alfworld", dtype=object),
+            "trace_goal_metadata": np.array(provenance, dtype=object),
+            "trace_state_view": np.full(size, "full_state", dtype=object),
+            "trace_goal_check_valid": np.ones(size, dtype=bool),
+            "trace_scoring_valid": np.ones(size, dtype=bool),
+            "trace_next_scoring_valid": np.ones(size, dtype=bool),
+            "trace_next_state_context": np.array(next_contexts, dtype=object),
+            "trace_is_terminal": np.array(terminals, dtype=bool),
+            "trace_dup": np.zeros(size, dtype=bool),
+        })
+        trainer = training.make_trainer(scores, {"k": 3, "gamma": .8,
+                                                "terminal_fill_enabled": True, **config})
+        trainer.config.data["task"] = "alfworld"
+        return history, trainer
+
+    def test_signed_range_fill_preserves_terminal_action_and_ignores_fixed_scale(self):
+        fixtures = [("q", "a", .03, 1., True, 4), ("q", "b", -.02, 0., True, 4)]
+        for scale in (0., 2., 100.):
+            for normalize in (False, True):
+                with self.subTest(scale=scale, normalize=normalize):
+                    history, trainer = self.fixture(fixtures, terminal_fill_scale=scale)
+                    trainer.config.algorithm["norm_adv_by_std_in_grpo"] = normalize
+                    before = {key: value.clone() for key, value in history.batch.items()}
+                    trainer._annotate_trace_credits(history)
+                    non = history.non_tensor_batch
+                    np.testing.assert_allclose(non["trace_local_credit"], [.03] * 4 + [-.02] * 4, atol=1e-7)
+                    np.testing.assert_allclose(non["trace_scaled_outcome_advantage"],
+                                               [.03] * 4 + [-.02] * 4, atol=1e-7)
+                    np.testing.assert_allclose(non["trace_terminal_fill"],
+                                               [0., .0192, .024, .03, 0., -.0128, -.016, -.02], atol=1e-7)
+                    np.testing.assert_allclose(non["trace_credit"],
+                                               non["trace_local_credit"] + non["trace_terminal_fill"])
+                    for key, value in before.items():
+                        torch.testing.assert_close(history.batch[key], value)
+
+    def test_ranges_pool_same_question_and_include_valid_untrusted_local_windows(self):
+        fixtures = [("q", "a", .03, 1., True, 2), ("q", "b", -.02, 0., True, 2),
+                    ("q", "weak", .01, 1., True, 2), ("q", "untrusted", .08, 100., False, 2),
+                    ("other", "a", .2, 1., True, 2), ("other", "b", -.1, 0., True, 2)]
+        history, trainer = self.fixture(fixtures)
+        trainer._annotate_trace_credits(history)
+        non = history.non_tensor_batch
+        # The untrusted outcome cannot affect reward centering or receive fill,
+        # but its valid local credit contributes to the same question's range.
+        np.testing.assert_allclose(non["trace_outcome_advantage"][[0, 2, 4]], [1/3, -2/3, 1/3])
+        np.testing.assert_allclose(non["trace_scaled_outcome_advantage"][[0, 2, 4, 8, 10]],
+                                   [.08, -.02, .08, .2, -.1], atol=1e-6)
+        self.assertTrue(np.isnan(non["trace_scaled_outcome_advantage"][[6, 7]]).all())
+        np.testing.assert_allclose(non["trace_terminal_fill"][[1, 3, 5, 6, 7, 9, 11]],
+                                   [.08, -.02, .08, 0., 0., .2, -.1], atol=1e-6)
+
+    def test_excluded_action_extrema_do_not_set_dynamic_range(self):
+        fixtures = [("q", "a", .03, 1., True, 1), ("q", "b", -.02, 0., True, 1),
+                    ("q", "bad", .8, 1., True, 1)]
+        for excluded in ("invalid", "duplicate", "drop", "empty", "external", "pre_state", "post_state"):
+            with self.subTest(excluded=excluded):
+                history, trainer = self.fixture(fixtures)
+                non = history.non_tensor_batch
+                if excluded == "invalid":
+                    non["trace_valid"][2] = False
+                elif excluded == "duplicate":
+                    non["trace_dup"][2] = True
+                elif excluded == "drop":
+                    history.batch["is_drop_mask"][2] = True
+                elif excluded == "empty":
+                    history.batch["response_mask"][2] = 0
+                elif excluded == "external":
+                    non["trace_external_error"][2] = True
+                elif excluded == "pre_state":
+                    non["trace_scoring_valid"][2] = False
+                else:
+                    non["trace_next_scoring_valid"][2] = False
+                trainer._annotate_trace_credits(history)
+                np.testing.assert_allclose(non["trace_scaled_outcome_advantage"][:2], [.03, -.02], atol=1e-7)
+                np.testing.assert_allclose(non["trace_terminal_fill"][:2], [.03, -.02], atol=1e-7)
+
+    def test_absent_sign_zero_range_disabled_fill_and_zero_gamma(self):
+        for positive, negative, enabled, gamma, expected in (
+            (.03, .01, True, .8, [0., .0192, .024, .03, 0., 0., 0., 0.]),
+            (0., 0., True, .8, [0.] * 8),
+            (.03, -.02, False, .8, [0.] * 8),
+            (.03, -.02, True, 0., [0., 0., 0., .03, 0., 0., 0., -.02]),
+        ):
+            with self.subTest(positive=positive, negative=negative, enabled=enabled, gamma=gamma):
+                history, trainer = self.fixture(
+                    [("q", "a", positive, 1., True, 4), ("q", "b", negative, 0., True, 4)],
+                    terminal_fill_enabled=enabled, gamma=gamma)
+                trainer._annotate_trace_credits(history)
+                np.testing.assert_allclose(history.non_tensor_batch["trace_terminal_fill"], expected, atol=1e-7)
 
 
 class ValidationScopeTests(unittest.TestCase):

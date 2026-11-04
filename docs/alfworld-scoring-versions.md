@@ -34,7 +34,7 @@ Recorded environment action history:
 
 已有 GT Parquet 无需重新转换。更新后重启训练与 rollout 进程，使用新评分契约的 rollout/replay，避免混入旧信用。新 Probe 缓存保存最近动作日志快照和 `alfworld-post-action-recent-history-v1` 版本；旧缓存缺该快照时需 `enrich --replay` 重放保存动作并核验原 actor Prompt，不重新采样。旧 actor 原生快照和旧 sidecar 不会自动视为新 full-state；`saved` 自定义实验保留原样。若原自定义 Prompt/Response 来自 v2b，应恢复 `{goal_response}` 和上述当前状态指令。
 
-已归档 v2_e 标签仍使用 actor 原生 `SimpleMemory.fetch(history_length)` 的动作前 observation＋action 窗口，默认 4 条；当前分支只替换这一历史区段，固定 GT 和 LogP → V → K-step Credit／终局回填公式保持不变。
+已归档 v2_e 标签仍使用 actor 原生 `SimpleMemory.fetch(history_length)` 的动作前 observation＋action 窗口，默认 4 条；当前分支替换了这一历史区段，固定 GT 和 LogP → V → K-step 局部信用公式保持不变。之后 ALFWorld 终局回填另改为复用 QA 的同题正负范围动态缩放，保留末三个真实动作的回填位置及距离折扣，忽略固定 scale；该算法改动不修改评分 Prompt/Response，也不移动历史标签。
 
 ## 历史 v2b 评分格式
 

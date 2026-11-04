@@ -65,6 +65,20 @@ def saved(count=3):
     }
 
 
+def value_snapshot(fixtures):
+    """Construct exact V paths without relying on terminal-fill implementation."""
+    snapshot, means = {"snapshot_id": "controlled-values", "trajectories": []}, []
+    for uid, identity, values, reward, trusted in fixtures:
+        trajectory = saved(len(values) - 1)["trajectories"][0]
+        trajectory.update(uid=uid, trajectory_id=identity)
+        trajectory["outcome"].update(reward=reward, success=reward > .5, valid=trusted)
+        for state, value in zip(trajectory["states"], values):
+            state["state_context"] = f"s{len(means)}"
+            means.append(-(4.1 * math.exp(-value) - .1))
+        snapshot["trajectories"].append(trajectory)
+    return snapshot, FakeScorer(means)
+
+
 class ScoringTests(unittest.TestCase):
     def run_score(self, snapshot=None, probe=None, config=None, scorer=None):
         scorer = scorer or FakeScorer()
@@ -81,9 +95,11 @@ class ScoringTests(unittest.TestCase):
         values = [math.log(4.1) - math.log(-mean + 0.1) for mean in (-4.0, -2.0, -1.0, -3.0)]
         deltas = [values[i + 1] - values[i] for i in range(3)]
         # K=3 includes all three real transitions, including the terminal post-state.
-        expected = (deltas[0] + .8 * deltas[1] + .8 ** 2 * deltas[2]) / (1 + .8 + .8 ** 2) + 2 * .8 ** 2
-        self.assertAlmostEqual(trajectory["turns"][0]["credit"], expected)
-        self.assertAlmostEqual(trajectory["turns"][-1]["credit"], deltas[-1] + 2)
+        local = [(deltas[0] + .8 * deltas[1] + .8 ** 2 * deltas[2]) / (1 + .8 + .8 ** 2),
+                 (deltas[1] + .8 * deltas[2]) / 1.8, deltas[-1]]
+        scaled = max(0, *local)  # One trusted success maps to the question's positive extent.
+        self.assertAlmostEqual(trajectory["turns"][0]["credit"], local[0] + scaled * .8 ** 2)
+        self.assertAlmostEqual(trajectory["turns"][-1]["credit"], deltas[-1] + scaled)
         self.assertEqual(trajectory["turns"][-1]["label_source"], "trace")
         self.assertAlmostEqual(trajectory["turns"][-1]["delta"], deltas[-1])
         self.assertAlmostEqual(trajectory["turns"][-1]["diagnostic_post_delta"], deltas[-1])
@@ -259,7 +275,8 @@ class ScoringTests(unittest.TestCase):
                          {"A cleaned mug is on a table."})
         self.assertEqual(trajectory["turns"][-1]["trace_turn_type"], "tool_plan")
         self.assertTrue(trajectory["turns"][-1]["outcome_valid"])
-        self.assertEqual(trajectory["turns"][0]["terminal_fill"], 2 * .8 ** 2)
+        positive_extent = max(0, *(turn["local_credit"] for turn in trajectory["turns"]))
+        self.assertAlmostEqual(trajectory["turns"][0]["terminal_fill"], positive_extent * .8 ** 2)
 
     def test_invalid_terminal_poststate_keeps_action_type_and_blocks_credit_and_fill(self):
         snapshot = self.full_state_saved()
@@ -286,11 +303,13 @@ class ScoringTests(unittest.TestCase):
         success, failed = [t["turns"] for t in result["trajectories"]]
         self.assertEqual(success[-1]["outcome_advantage"], .5)
         self.assertEqual(failed[-1]["outcome_advantage"], -.5)
-        self.assertAlmostEqual(success[0]["terminal_fill"], .8 ** 2)
-        self.assertAlmostEqual(failed[0]["terminal_fill"], -.8 ** 2)
+        positive_extent = max(0, *(turn["local_credit"] for turn in success))
+        negative_extent = min(0, *(turn["local_credit"] for turn in success))
+        self.assertAlmostEqual(success[0]["terminal_fill"], positive_extent * .8 ** 2)
+        self.assertAlmostEqual(failed[0]["terminal_fill"], negative_extent * .8 ** 2)
         self.assertEqual(failed[-1]["label_source"], "trace")
-        self.assertAlmostEqual(success[-1]["terminal_fill"], 1)
-        self.assertAlmostEqual(failed[-1]["terminal_fill"], -1)
+        self.assertAlmostEqual(success[-1]["terminal_fill"], positive_extent)
+        self.assertAlmostEqual(failed[-1]["terminal_fill"], negative_extent)
 
     def test_model_length_stop_has_environment_boundary_without_trusted_terminal_fill(self):
         snapshot = self.full_state_saved()
@@ -314,8 +333,8 @@ class ScoringTests(unittest.TestCase):
         delta = math.log(4.1) - math.log(2.1)
         self.assertAlmostEqual(turn["delta"], delta)
         self.assertAlmostEqual(turn["local_credit"], delta)
-        self.assertAlmostEqual(turn["terminal_fill"], 2)
-        self.assertAlmostEqual(turn["credit"], delta + 2)
+        self.assertAlmostEqual(turn["terminal_fill"], delta)
+        self.assertAlmostEqual(turn["credit"], 2 * delta)
         self.assertTrue(turn["is_terminal"])
         self.assertFalse(turn["is_final"])
         self.assertEqual(turn["trace_turn_type"], "tool_plan")
@@ -327,8 +346,9 @@ class ScoringTests(unittest.TestCase):
         result, _ = self.run_score(saved(count=4))
         turns = result["trajectories"][0]["turns"]
         self.assertEqual([t["terminal_reached"] for t in turns], [False, True, True, True])
-        for turn, expected in zip(turns, (0, 2 * .8 ** 2, 2 * .8, 2)):
-            self.assertAlmostEqual(turn["terminal_fill"], expected)
+        positive_extent = max(0, *(turn["local_credit"] for turn in turns))
+        for turn, discount in zip(turns, (0, .8 ** 2, .8, 1)):
+            self.assertAlmostEqual(turn["terminal_fill"], positive_extent * discount)
         self.assertTrue(all(t["label_source"] == "trace" for t in turns))
 
     def test_missing_terminal_poststate_never_fabricates_delta_or_credit(self):
@@ -341,6 +361,77 @@ class ScoringTests(unittest.TestCase):
         self.assertTrue(all(t["terminal_fill"] is None for t in turns))
         self.assertIsNone(turns[-1]["delta"])
         self.assertEqual(turns[-1]["label_source"], "trace")
+
+    def test_dynamic_fill_matches_question_ranges_and_ignores_old_scale(self):
+        fixtures = [("q", "a", [0, .2], 1., True), ("q", "b", [0, .1], 1., True),
+                    ("q", "c", [0, .05], 1., True), ("q", "d", [0, -.08], 0., True)]
+        for scale in (0, 2, 100):
+            for normalize in (False, True):
+                with self.subTest(scale=scale, normalize=normalize):
+                    snapshot, backend = value_snapshot(fixtures)
+                    original = json.dumps(snapshot, sort_keys=True)
+                    result, _ = self.run_score(snapshot, scorer=backend,
+                                              probe={"terminal_fill_scale": scale,
+                                                     "norm_adv_by_std_in_grpo": normalize})
+                    for trajectory, expected in zip(result["trajectories"], (.2, .2, .2, -.08)):
+                        turn = trajectory["turns"][0]
+                        self.assertAlmostEqual(turn["scaled_outcome_advantage"], expected)
+                        self.assertAlmostEqual(turn["terminal_fill"], expected)
+                    self.assertEqual(json.dumps(snapshot, sort_keys=True), original)
+                    self.assertEqual(result["credit_mode"], "alfworld-environment-dynamic-terminal-fill-v1")
+                    self.assertIn("terminal_fill_scale_ignored", result["formula"])
+
+    def test_dynamic_ranges_include_untrusted_local_windows_and_isolate_questions(self):
+        snapshot, backend = value_snapshot([
+            ("q", "a", [0, .1], 1., True), ("q", "b", [0, -.08], 0., True),
+            ("q", "prefix", [0, .8], 100., False),
+            ("other", "c", [0, 2.], 1., True), ("other", "d", [0, -1.], 0., True)])
+        result, _ = self.run_score(snapshot, scorer=backend)
+        turns = [trajectory["turns"][0] for trajectory in result["trajectories"]]
+        for turn, expected in zip(turns, (.8, -.08, 0, 2, -1)):
+            self.assertAlmostEqual(turn["terminal_fill"], expected)
+        self.assertIsNone(turns[2]["scaled_outcome_advantage"])
+        self.assertTrue(turns[2]["range_eligible"])
+        self.assertEqual([turns[0]["outcome_advantage"], turns[1]["outcome_advantage"]], [.5, -.5])
+
+    def test_invalid_actions_do_not_set_dynamic_credit_range(self):
+        for field, value in (("format_error", True), ("invalid_action", True),
+                             ("external_error", True), ("finish_reason", "length"),
+                             ("trace_valid", False), ("trace_dup", True),
+                             ("is_drop_mask", True), ("response_token_ids", []),
+                             ("action_response", "")):
+            with self.subTest(field=field):
+                snapshot, backend = value_snapshot([
+                    ("q", "a", [0, .2], 1., True), ("q", "b", [0, -.08], 0., True),
+                    ("q", "bad", [0, 1.5], 1., True)])
+                snapshot["trajectories"][2]["turns"][0][field] = value
+                result, _ = self.run_score(snapshot, scorer=backend)
+                turns = [trajectory["turns"][0] for trajectory in result["trajectories"]]
+                self.assertAlmostEqual(turns[0]["terminal_fill"], .2)
+                self.assertAlmostEqual(turns[1]["terminal_fill"], -.08)
+                self.assertFalse(turns[2]["range_eligible"])
+
+    def test_same_context_action_duplicates_cannot_set_dynamic_range(self):
+        snapshot, backend = value_snapshot([
+            ("q", "a", [0, .2, 0, 1.], 1., True), ("q", "b", [0, -.1], 0., True)])
+        repeated = snapshot["trajectories"][0]
+        repeated["states"][2]["state_context"] = repeated["states"][0]["state_context"]
+        repeated["turns"][2]["action_response"] = repeated["turns"][0]["action_response"]
+        result, _ = self.run_score(snapshot, scorer=backend, probe={"k": 1})
+        positive, negative = result["trajectories"]
+        self.assertFalse(positive["turns"][2]["range_eligible"])
+        self.assertAlmostEqual(positive["turns"][2]["local_credit"], 1.)
+        self.assertAlmostEqual(positive["turns"][2]["terminal_fill"], .2)
+        self.assertAlmostEqual(negative["turns"][0]["terminal_fill"], -.2)
+
+    def test_missing_credit_sign_and_disabled_fill_add_zero(self):
+        for enabled in (True, False):
+            snapshot, backend = value_snapshot([
+                ("q", "a", [0, .2], 1., True), ("q", "b", [0, .1], 0., True)])
+            result, _ = self.run_score(snapshot, scorer=backend, probe={"terminal_fill_enabled": enabled})
+            turns = [trajectory["turns"][0] for trajectory in result["trajectories"]]
+            self.assertAlmostEqual(turns[0]["terminal_fill"], .2 if enabled else 0)
+            self.assertEqual(turns[1]["terminal_fill"], 0)
 
     def test_terminal_actions_form_the_same_credit_pairs_as_other_actions(self):
         snapshot = saved(count=1)

@@ -16,7 +16,8 @@ SPEC.loader.exec_module(EXECUTION)
 
 class EnvironmentCreditTests(unittest.TestCase):
     def annotate(self, values=None, next_values=None, indices=None, errors=None,
-                 terminals=None, outcome_valid=True, advantage=.5, config=None):
+                 terminals=None, outcome_valid=True, advantage=.5, config=None,
+                 defer_terminal_fill=False):
         values = [0., 1., 3., 6.] if values is None else values
         next_values = [1., 3., 6., 10.] if next_values is None else next_values
         size = len(values)
@@ -24,7 +25,8 @@ class EnvironmentCreditTests(unittest.TestCase):
             values, next_values, list(range(size)) if indices is None else indices,
             [False] * size if errors is None else errors,
             [False] * (size - 1) + [True] if terminals is None else terminals,
-            outcome_valid=outcome_valid, outcome_advantage=advantage, config=config)
+            outcome_valid=outcome_valid, outcome_advantage=advantage, config=config,
+            defer_terminal_fill=defer_terminal_fill)
 
     def test_single_terminal_action_uses_its_post_state_and_distance_zero_fill(self):
         result = self.annotate(values=[0.], next_values=[2.])
@@ -99,6 +101,32 @@ class EnvironmentCreditTests(unittest.TestCase):
         zero = self.annotate(config={"gamma": 0})
         self.assertEqual(zero["local_credit"], [1., 2., 3., 4.])
         self.assertEqual(zero["terminal_fill"], [0., 0., 0., 1.])
+
+    def test_deferred_fill_preserves_last_three_action_discounts_without_fixed_scale(self):
+        for scale in (0., 2., 100.):
+            with self.subTest(scale=scale):
+                result = self.annotate(defer_terminal_fill=True, advantage=None,
+                                       config={"terminal_fill_scale": scale})
+                for actual, expected in zip(result["terminal_discount"], [0., .64, .8, 1.]):
+                    self.assertAlmostEqual(actual, expected)
+                self.assertEqual(result["terminal_fill"], [0.] * 4)
+                self.assertEqual(result["effective_credit"], result["local_credit"])
+                self.assertEqual(result["local_credit"][-1], 4.)
+
+    def test_deferred_fill_does_not_open_invalid_or_untrusted_windows(self):
+        for options in ({"terminals": [False] * 4}, {"outcome_valid": False},
+                        {"config": {"terminal_fill_enabled": False}}):
+            with self.subTest(options=options):
+                result = self.annotate(defer_terminal_fill=True, **options)
+                self.assertEqual(result["terminal_discount"], [0.] * 4)
+                self.assertEqual(result["effective_credit"], result["local_credit"])
+        blocked = self.annotate(defer_terminal_fill=True, next_values=[1., 3., 6., None])
+        self.assertEqual(blocked["terminal_discount"][0], 0.)
+        for index in (1, 2, 3):
+            self.assertTrue(math.isnan(blocked["terminal_discount"][index]))
+            self.assertTrue(math.isnan(blocked["effective_credit"][index]))
+        zero = self.annotate(defer_terminal_fill=True, config={"gamma": 0.})
+        self.assertEqual(zero["terminal_discount"], [0., 0., 0., 1.])
 
     def test_input_lengths_are_validated(self):
         with self.assertRaisesRegex(ValueError, "same length"):

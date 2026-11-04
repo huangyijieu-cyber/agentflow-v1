@@ -26,7 +26,7 @@ class ProbeScoringError(RuntimeError):
 
 
 _SCORERS: dict[str, Any] = {}
-_CREDIT_MODE = "alfworld-environment-transitions-v1"
+_CREDIT_MODE = "alfworld-environment-dynamic-terminal-fill-v1"
 
 
 def _trace_module():
@@ -270,6 +270,50 @@ def _verified_terminal(trajectory):
     return completed if valid else None
 
 
+def _question_key(trajectory):
+    return str(trajectory.get("uid", trajectory.get("goal_spec_hash", trajectory.get("goal", ""))))
+
+
+def _range_eligible_turns(trajectory):
+    """Reconstruct training quality/duplicate flags from the saved actor outputs.
+
+    These flags select the local-credit population only; they do not discard
+    states, alter action windows, or change the saved actor responses.
+    """
+    seen_responses, seen_actions = set(), set()
+    result = []
+    states = trajectory["states"]
+    for i, turn in enumerate(trajectory["turns"]):
+        response = (turn.get("action_response") or "").strip()
+        match = re.search(r"<action>(.*?)</action>", response, re.DOTALL)
+        pair = states[i:i + 2]
+        verified = not any(state.get("state_view") == "full_state" for state in pair) or all(
+            state.get("scoring_valid") is True and state.get("goal_check_valid") is True
+            for state in pair)
+        quality = bool(match and match.group(1).strip() and verified
+                       and turn.get("trace_valid", True) is not False
+                       and turn.get("extraction_valid", True) is not False
+                       and not any(turn.get(key, False) for key in
+                                   ("format_error", "invalid_action", "external_error", "trace_tool_failed")))
+        context = states[i].get("state_context")
+        response_key = (context, response)
+        action = turn.get("action", match.group(1).strip() if match else None)
+        action_key = json.dumps([context, action], ensure_ascii=False, sort_keys=True)
+        duplicate = (bool(turn.get("trace_dup", False)) or response_key in seen_responses
+                     or action_key in seen_actions)
+        # As in rollout._compute_turn_flags, normally valid attempts enter the
+        # seen sets before daemon.finish_reason filtering is applied.
+        if quality:
+            seen_responses.add(response_key)
+            seen_actions.add(action_key)
+        token_ids = turn.get("response_token_ids")
+        nonempty = bool(token_ids) if token_ids is not None else bool(response)
+        result.append(quality and not duplicate and nonempty
+                      and not turn.get("is_drop_mask", False)
+                      and turn.get("finish_reason") in ("stop", "eos", "end_turn"))
+    return result
+
+
 def _outcome_advantages(trajectories, norm_by_std):
     """One trustworthy result per rollout, matching GRPO's population rules."""
     groups = {}
@@ -280,7 +324,7 @@ def _outcome_advantages(trajectories, norm_by_std):
             raise ValueError("Saved trajectory IDs must be nonempty and unique")
         seen.add(identity)
         if _verified_terminal(trajectory) is not None:
-            key = str(trajectory.get("uid", trajectory.get("goal_spec_hash", trajectory.get("goal", ""))))
+            key = _question_key(trajectory)
             groups.setdefault(key, []).append((identity, float(trajectory["outcome"]["reward"])))
     advantages = {}
     for population in groups.values():
@@ -428,7 +472,9 @@ def score_snapshots(snapshot: dict, probe: dict, scorer_config: dict, *, progres
         annotated = trace.annotate_environment_credits(
             decision_values, next_values, turn_indices,
             [bool(turn.get("external_error", False)) for turn in turns], terminals,
-            outcome_valid=outcome_valid, outcome_advantage=advantage, config=cfg)
+            outcome_valid=outcome_valid, outcome_advantage=advantage,
+            defer_terminal_fill=True, config=cfg)
+        range_eligible = _range_eligible_turns(trajectory)
         scored_turns = []
         for i, turn in enumerate(turns):
             current, following = scored_states[i:i + 2]
@@ -449,8 +495,6 @@ def score_snapshots(snapshot: dict, probe: dict, scorer_config: dict, *, progres
                 reason = None
             if i == terminal:
                 counters["terminal_actions"] += 1
-            if fill is not None and fill != 0:
-                counters["terminal_fill_turns"] += 1
             scored_turns.append({
                 **turn, "scoring_prompt": current["scoring_prompt"], "response": response,
                 "mean_logp": current["mean_logp"], "token_logps": current["token_logps"],
@@ -462,6 +506,9 @@ def score_snapshots(snapshot: dict, probe: dict, scorer_config: dict, *, progres
                 "is_final": False, "is_terminal": i == terminal,
                 "environment_terminal": i == boundary, "outcome_valid": outcome_valid,
                 "outcome_advantage": _number_or_none(advantage),
+                "scaled_outcome_advantage": None,
+                "terminal_discount": _number_or_none(annotated["terminal_discount"][i]),
+                "range_eligible": bool(range_eligible[i] and local is not None),
                 "terminal_reached": bool(annotated["terminal_reached"][i]),
             })
         counters["states"] += len(scored_states)
@@ -471,6 +518,33 @@ def score_snapshots(snapshot: dict, probe: dict, scorer_config: dict, *, progres
         counters["valid_credit_turns"] += sum(turn["credit_valid"] for turn in scored_turns)
         result_trajectories.append({**trajectory, "resolved_response": response,
                                     "states": scored_states, "turns": scored_turns})
+    # Collect the same question's entire pre-pair local-credit population before
+    # scaling any rollout. A trustworthy outcome is required for fill, not for
+    # a valid local window to contribute to the signed range.
+    question_groups = {}
+    for trajectory in result_trajectories:
+        question_groups.setdefault(_question_key(trajectory), []).append(trajectory)
+    for question_trajectories in question_groups.values():
+        local_population = [turn["local_credit"] for trajectory in question_trajectories
+                            for turn in trajectory["turns"] if turn["range_eligible"]]
+        trusted = [trajectory for trajectory in question_trajectories
+                   if str(trajectory["trajectory_id"]) in advantages]
+        scaled = trace.scale_outcome_advantages(
+            local_population, [advantages[str(trajectory["trajectory_id"])] for trajectory in trusted])
+        for trajectory, advantage in zip(trusted, scaled):
+            for turn in trajectory["turns"]:
+                turn["scaled_outcome_advantage"] = _number_or_none(advantage)
+                if turn["terminal_discount"] is not None and turn["terminal_discount"] > 0:
+                    fill = turn["terminal_discount"] * advantage
+                    effective = turn["local_credit"] + fill
+                    turn.update(terminal_fill=_number_or_none(fill), credit=_number_or_none(effective),
+                                effective_credit=_number_or_none(effective), credit_valid=_finite(effective))
+                    if not turn["credit_valid"]:
+                        turn["credit_error"] = "nonfinite_terminal_fill"
+    counters["valid_credit_turns"] = sum(turn["credit_valid"] for trajectory in result_trajectories
+                                        for turn in trajectory["turns"])
+    counters["terminal_fill_turns"] = sum(_finite(turn["terminal_fill"]) and turn["terminal_fill"] != 0
+                                         for trajectory in result_trajectories for turn in trajectory["turns"])
     counters.update({"trajectories": len(result_trajectories), "unique_scoring_requests": len(cache),
                      "scoring_seconds": time.monotonic() - started})
     goal_fingerprints = [{"trajectory_id": t.get("trajectory_id"), "goal_response": t.get("goal_response"),
@@ -487,10 +561,11 @@ def score_snapshots(snapshot: dict, probe: dict, scorer_config: dict, *, progres
             "formula": {"mean_logp": "mean fixed Response token LogP at temperature=1",
                         "value": "log((-mean_logp_initial + epsilon) / (-mean_logp_state + epsilon))",
                         "delta": "Real post-action V minus pre-action V, including the last action",
-                        "credit": "annotate_environment_credits: normalized K-action delta window plus terminal fill",
+                        "credit": "normalized K-action delta window + gamma**distance * signed-range-scaled outcome advantage",
                         "epsilon": cfg.epsilon, "k": cfg.k, "gamma": cfg.gamma,
                         "terminal_fill_enabled": cfg.terminal_fill_enabled,
-                        "terminal_fill_scale": cfg.terminal_fill_scale,
+                        "terminal_fill_mode": "per-question signed local-credit ranges (same as QA)",
+                        "terminal_fill_scale_ignored": cfg.terminal_fill_scale,
                         "norm_adv_by_std_in_grpo": norm_by_std,
                         "terminal_state": "Real terminal post-state scores the last action; it is not an extra turn",
                         "state_view": state_view,

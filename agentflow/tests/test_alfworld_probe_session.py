@@ -600,8 +600,9 @@ class SessionTests(unittest.TestCase):
 
     def test_ui_exposes_qa_fill_fixed_gt_and_replay(self):
         ui = (SCRIPTS / "alfworld_trace_probe.html").read_text()
-        for text in ("{goal_response}", "/api/enrich", "terminalFill", "terminalScale", "Local credit", "Effective credit"):
+        for text in ("{goal_response}", "/api/enrich", "terminalFill", "正负范围动态缩放", "Local credit", "Effective credit"):
             self.assertIn(text, ui)
+        self.assertNotIn('id="terminalScale"', ui)
         self.assertNotIn("不添加终局优势回填", ui)
 
     def test_multisample_enrichment_isolated_and_lazy_snapshot_version_changes(self):

@@ -503,7 +503,7 @@ class AgentFlowTrainer(RayPPOTrainer):
                     if outcome_valid[row]:
                         outcome_advantages[row] = advantage
 
-        qa_groups = defaultdict(list)
+        range_scaled_groups = defaultdict(list)
         for key, rows in groups.items():
             # An absent initial turn cannot be silently replaced by a later baseline.
             rollout_values = (state_values(row_logps[rows], epsilon=cfg.epsilon)
@@ -522,9 +522,12 @@ class AgentFlowTrainer(RayPPOTrainer):
                                        if int(turns[rows[0]]) == 0 else [float("nan")] * len(rows))
                 annotated = annotate_environment_credits(
                     rollout_values, rollout_next_values, [int(turns[row]) for row in rows],
-                    external[rows].tolist(), terminal_flags[rows].tolist(), **outcome_options,
+                    external[rows].tolist(), terminal_flags[rows].tolist(),
+                    defer_terminal_fill=True, **outcome_options,
                 )
                 next_values[rows] = rollout_next_values
+                range_scaled_groups[key[0]].append(key)
+                terminal_discounts[rows] = annotated["terminal_discount"]
             else:
                 is_qa = (self.config.data.get("task", "qa") == "qa"
                          and all(tasks[row] in (None, "qa") for row in rows))
@@ -536,7 +539,7 @@ class AgentFlowTrainer(RayPPOTrainer):
                     defer_terminal_fill=is_qa, **outcome_options,
                 )
                 if is_qa:
-                    qa_groups[key[0]].append(key)
+                    range_scaled_groups[key[0]].append(key)
                     terminal_discounts[rows] = annotated["terminal_discount"]
             values[rows] = rollout_values
             local_credits[rows] = annotated["local_credit"]
@@ -546,7 +549,8 @@ class AgentFlowTrainer(RayPPOTrainer):
             external_blocked[rows] = annotated["external_error_blocked"]
             reached[rows] = annotated["terminal_reached"]
 
-        # Range population uses all valid QA tools, before sign/matching/pair
+        # QA and ALFWorld share the same per-question signed range scaling.
+        # Range population uses all valid tools/actions, before sign/matching/pair
         # filters, including windows that do not reach a trusted terminal answer.
         # Never filter the state sequence before computing its K-step windows.
         range_valid = (
@@ -559,7 +563,7 @@ class AgentFlowTrainer(RayPPOTrainer):
         drop = batch.batch.get("is_drop_mask")
         if drop is not None:
             range_valid &= ~drop.bool().cpu().numpy()
-        for uid, keys in qa_groups.items():
+        for uid, keys in range_scaled_groups.items():
             question_rows = [row for key in keys for row in groups[key]]
             local_population = [local_credits[row] for row in question_rows if range_valid[row]]
             # reliable already contains exactly one trusted outcome per rollout.

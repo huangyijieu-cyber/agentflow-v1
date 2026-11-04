@@ -58,7 +58,7 @@ c_t^{(K)}=\frac{\sum_{u\in\mathcal W_t^{\mathrm{tool}}}\gamma^{u-t}\delta_u}
 \mathcal W_t=[t,\min(t+K-1,\text{末可见 Turn})].
 $$
 
-final 的执行结果单独用于终局项，不作为 GT delta 混入局部平均。QA 按当前 batch 同题（同 `uid`）所有有效工具 Turn 的回填前局部信用，以及所有可信 Rollout 的终局优势，分别统计正负范围：
+final 的执行结果单独用于终局项，不作为 GT delta 混入局部平均。QA 和 ALFWorld 按当前 batch 同题（同 `uid`）所有有效工具/环境动作 Turn 的回填前局部信用，以及所有可信 Rollout 的终局优势，分别统计正负范围：
 
 $$
 C_x^+=\max_{g,t}\max(c_{g,t}^{(K)},0),\quad
@@ -99,6 +99,8 @@ $$
 | C | C、final | 是，`gamma * A_hat` |
 
 因此本项目的 K=3 最多向 final 前两个工具 Turn 回填。这是明确包含 final 的总 Turn 窗口约定；与 TRACE 论文按工具转移计 K 的约定不同，不能同时声称回填最后三个工具 Turn。
+
+ALFWorld 复用上述同题正负范围缩放，但保留环境动作边界：最后一个动作具有真实后继状态，其 delta 参与局部信用，K=3 最多回填最后三个动作，距离分别为 2、1、0。其全部动作均走 TRACE 标签，不新增 QA 的 final/analysis 路由。固定 `terminal_fill_scale` 对这两类任务均忽略，关闭回填统一使用 `terminal_fill_enabled=false`。
 
 ## 外部故障与窗口隔离
 
@@ -152,7 +154,7 @@ Pair 两侧保留各自原始生成 Prompt、响应及原生 token IDs。仍使�
 | `k` | `3` | 包含当前 Turn 和可能的 final 的总窗口大小 |
 | `gamma` | `0.8` | 窗口和终局回填折扣 |
 | `terminal_fill_enabled` | `true` | 启用可信终局优势回填 |
-| `terminal_fill_scale` | `2.0` | 仅保留非 QA 任务原回填系数；QA 忽略此值，使用同题动态范围 |
+| `terminal_fill_scale` | `2.0` | 仅保留其它旧任务的回填系数；QA/ALFWorld 忽略此值，使用同题动态范围 |
 | `outcome_match_value` | `false` | analysis／final 是否额外要求 GT 价值匹配 |
 | `outcome_success_threshold` | `0.5` | 兼容数值奖励时的成功阈值；明确 verifier 布尔值优先 |
 | `match_epsilon` | `0.05` | 工具执行前价值差上限；同初态时平滑 NLL 比不超过 `exp(0.05)≈1.051` |

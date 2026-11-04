@@ -65,7 +65,8 @@ DEFAULT_CONFIG = {
         ),
         "response": "{goal_response}", "state_view": "full_state",
         "epsilon": 0.1, "k": 3, "gamma": 0.8, "max_response_tokens": 256,
-        "terminal_fill_enabled": True, "terminal_fill_scale": 2.0,
+        "terminal_fill_enabled": True,
+        "terminal_fill_scale": 2.0,  # Legacy setting; dynamic QA-style scaling ignores it.
         "norm_adv_by_std_in_grpo": False, "outcome_success_threshold": 0.5,
         "outcome_match_value": False, "match_epsilon": 0.05,
         "positive_threshold": 0.01, "negative_threshold": 0.01,
@@ -977,6 +978,7 @@ def export_csv(result):
     buffer = io.StringIO()
     fields = ["trajectory_id", "turn_index", "mean_logp", "value", "next_value", "delta",
               "credit", "local_credit", "terminal_fill", "label_source", "outcome_advantage",
+              "scaled_outcome_advantage", "terminal_discount", "range_eligible",
               "credit_valid", "credit_error", "action", "action_prompt",
               "action_response", "scoring_prompt", "response"]
     writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
