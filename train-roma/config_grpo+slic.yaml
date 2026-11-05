@@ -46,6 +46,7 @@ env:
   TRACE_SHARED_PREFIX_MAX_TOKENS: ${env:TRACE_SHARED_PREFIX_MAX_TOKENS,8192}
   TRACE_SHARED_PREFIX_MAX_MASK_MIB: ${env:TRACE_SHARED_PREFIX_MAX_MASK_MIB,256}
   TRACE_SHARED_PREFIX_VERIFY: ${env:TRACE_SHARED_PREFIX_VERIFY,true}
+  TRACE_REFERENCE_UPDATE_INTERVAL: ${env:TRACE_REFERENCE_UPDATE_INTERVAL,0}  # 0=fixed; None=every step; N=every N steps.
 
   # ----- 评分模型 (Reward Model) -----
   SCORE_MODEL_NAME: "Qwen3-30B-A3B-Instruct-2507"
@@ -176,6 +177,7 @@ python_args:
   data.trace.shared_prefix_max_tokens: '${TRACE_SHARED_PREFIX_MAX_TOKENS}'
   data.trace.shared_prefix_max_mask_mib: '${TRACE_SHARED_PREFIX_MAX_MASK_MIB}'
   data.trace.shared_prefix_verify: '${TRACE_SHARED_PREFIX_VERIFY}'
+  data.trace.reference_update_interval: '${TRACE_REFERENCE_UPDATE_INTERVAL}'
 
 
   # --------------------------------------------------------------------------

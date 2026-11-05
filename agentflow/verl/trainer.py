@@ -29,6 +29,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.tracking import Tracking
 
 from .daemon import AgentModeDaemon
+from .trace_reference import TraceReferenceLifecycle
 from agentflow.rollout_timing import PHASES, profiling_enabled, write_validation_report
 from agentflow.trace.credit import (
     TraceConfig,
@@ -89,7 +90,7 @@ def npu_safe_step(func):
     return wrapper
 
 
-class AgentFlowTrainer(RayPPOTrainer):
+class AgentFlowTrainer(TraceReferenceLifecycle, RayPPOTrainer):
     """
     Specialized PPO trainer for agent-based reinforcement learning.
 
@@ -1433,6 +1434,10 @@ class AgentFlowTrainer(RayPPOTrainer):
                             print("## DPO skipped: ring buffer empty.")
                             
                     print(f"{time.strftime('%Y-%m-%d %H-%M-%S')}: >>> END DPO")
+
+            if "slic" in algorithm.split("+") and self.config.data.get("trace", {}).get("enabled", False):
+                with _timer("reference_refresh", timing_raw):
+                    metrics.update(self._refresh_trace_reference_after_step())
 
             
 

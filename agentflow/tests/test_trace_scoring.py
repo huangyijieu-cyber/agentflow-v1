@@ -277,7 +277,9 @@ class TraceStartupTests(unittest.TestCase):
             __getattr__ = dict.__getitem__
             __setattr__ = dict.__setitem__
         config = SimpleNamespace(data=ConfigDict(algorithm=algorithm, trace=dict(trace_config)),
-                                 actor_rollout_ref=SimpleNamespace(model=SimpleNamespace(path="model")))
+                                 actor_rollout_ref=SimpleNamespace(
+                                     model=ConfigDict(path="model", lora_rank=0),
+                                     actor=SimpleNamespace(strategy="fsdp")))
         copy_model = Mock(side_effect=RuntimeError("model loading reached"))
         scope = {"TraceConfig": scoring.TraceConfig, "asdict": asdict,
                  "copy_to_local": copy_model, "pprint": Mock(),
@@ -306,6 +308,26 @@ class TraceStartupTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     run()
                 copy_model.assert_not_called()
+
+    def test_moving_reference_rejects_unsupported_workers_before_model_load(self):
+        for strategy, lora_rank in (("megatron", 0), ("fsdp", 8), ("fsdp2", 8)):
+            run, config, copy_model = self.make_runner("gigpo+slic", {
+                "enabled": True, "reference_update_interval": None})
+            config.actor_rollout_ref.actor.strategy = strategy
+            config.actor_rollout_ref.model.lora_rank = lora_rank
+            with self.assertRaisesRegex(ValueError, "reference refresh"):
+                run()
+            copy_model.assert_not_called()
+
+    def test_moving_reference_accepts_full_model_fsdp_and_fsdp2(self):
+        for strategy in ("fsdp", "fsdp2"):
+            run, config, copy_model = self.make_runner("grpo+slic", {
+                "enabled": True, "reference_update_interval": "None"})
+            config.actor_rollout_ref.actor.strategy = strategy
+            with self.assertRaisesRegex(RuntimeError, "model loading reached"):
+                run()
+            self.assertIsNone(config.data.trace["reference_update_interval"])
+            copy_model.assert_called_once()
 
     def test_inactive_trace_settings_remain_untouched(self):
         for algorithm, enabled in (("grpo", True), ("grpo+slic", False)):
