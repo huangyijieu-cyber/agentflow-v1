@@ -54,106 +54,85 @@ def _goal_module():
     return sys.modules[name]
 
 
-def _recent_action_history_version():
-    return _goal_module().RECENT_ACTION_HISTORY_SCORING_VERSION
-
-
-def _validate_recent_action_history(state, *, require_version=True):
+def _validate_actor_history(state, *, require_version=True):
+    """Validate a native SimpleMemory snapshot, never a post-action log."""
     module = _goal_module()
-    history = state.get("trace_recent_action_history")
     version = state.get("scoring_context_version")
-    window = module.parse_scoring_history_length(state.get("trace_history_length", 4))
-    valid = (isinstance(history, list) and (window is None or len(history) <= window)
-             and all(isinstance(record, dict)
-                     and isinstance(record.get("action"), str)
-                     and isinstance(record.get("observation"), str) for record in history))
+    if "trace_scoring_history" in state:
+        history = state.get("trace_scoring_history")
+        steps = state.get("trace_scoring_history_steps")
+        length = module.parse_scoring_history_length(state.get("trace_history_length", 4))
+    else:
+        history = state.get("trace_actor_history")
+        steps = state.get("trace_actor_history_steps")
+        length = module.parse_scoring_history_length(state.get("trace_actor_history_length", 4))
+    valid = (isinstance(history, str) and type(steps) is int and steps >= 0
+             and (length is None or steps <= length)
+             and (bool(history.strip()) if steps else history == ""))
     if (not valid or (require_version and version not in
-                     (module.RECENT_ACTION_HISTORY_SCORING_VERSION, module.ACTION_HISTORY_SCORING_VERSION))
-            or (version == module.ACTION_HISTORY_SCORING_VERSION and "trace_history_length" not in state)):
-        raise ValueError(
-            "Full-state recent action history is missing, stale, or malformed. "
-            "Run enrich --replay without sampling new actions.")
-    if version == module.RECENT_ACTION_HISTORY_SCORING_VERSION and window != 4:
-        raise ValueError("Inconsistent legacy recent action history window. Run enrich --replay.")
-    return history
+                     (module.ACTOR_HISTORY_SCORING_VERSION, module.ACTOR_MEMORY_HISTORY_SCORING_VERSION))):
+        raise ValueError("Native actor history is missing, stale, or malformed. "
+                         "Run enrich --replay without sampling new actions.")
+    return history, steps, length
+
+
+def _selected_actor_history(state, window):
+    module = _goal_module()
+    full = state.get("trace_full_actor_history")
+    if full is not None:
+        try:
+            text = module.format_actor_history(full, window)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ValueError("Malformed full native actor history. Run enrich --replay.") from exc
+        steps = len(full) if window is None else min(len(full), window)
+        return text, steps
+    if window == 0:
+        return "", 0
+    # Formal v2_e saved native text may contain arbitrary embedded newlines or
+    # quotes. Reuse the exact saved window; never parse it into guessed records.
+    for keys in (("trace_scoring_history", "trace_scoring_history_steps", "trace_history_length"),
+                 ("trace_actor_history", "trace_actor_history_steps", "trace_actor_history_length")):
+        text, steps, length = (state.get(key) for key in keys)
+        if text is None or keys[2] not in state:
+            continue
+        length = module.parse_scoring_history_length(length)
+        if (isinstance(text, str) and type(steps) is int and steps >= 0
+                and (length is None or steps <= length)
+                and (bool(text.strip()) if steps else text == "")
+                and (window == length or (length is not None and steps < length
+                                           and (window is None or window >= steps)))):
+            return text, steps
+    raise ValueError("Requested native actor history is not fully cached. "
+                     "Run enrich --replay; no new sampling is needed.")
 
 
 def prepare_history_contexts(snapshot, history_length=4, *, goal_module=None):
-    """Re-window genuine saved post-action records; never infer them from actor text."""
-    window = _goal_module().parse_scoring_history_length(history_length)
+    """Re-window native memory records without changing actor inputs or sampling."""
+    module = _goal_module()
+    window = module.parse_scoring_history_length(history_length)
     converted = copy.deepcopy(snapshot)
-    version = _goal_module().ACTION_HISTORY_SCORING_VERSION
+    version = module.ACTOR_MEMORY_HISTORY_SCORING_VERSION
     for trajectory in converted.get("trajectories", []):
-        records, available, can_recover = {}, {}, True
-        for position, state in enumerate(trajectory.get("states", [])):
+        for state in trajectory.get("states", []):
             if state.get("scoring_valid") is False:
-                can_recover = False
                 continue
-            index = state.get("state_index")
-            if type(index) is not int or index < 0:
-                raise ValueError("Invalid state_index for recent action history. Run enrich --replay.")
-            can_recover = can_recover and index == position
-            try:
-                recent = _validate_recent_action_history(state, require_version=False)
-            except ValueError:
-                if window != 0:
-                    raise
-                # No history is needed to render a zero window, but retain
-                # and recover genuine records whenever they are available.
-                available[position] = []
-                can_recover = False
-                continue
-            stored_window = state.get("trace_history_length", 4)
-            stored_window = _goal_module().parse_scoring_history_length(stored_window)
-            expected = index if stored_window is None else min(index, stored_window)
-            if len(recent) != expected:
-                if window == 0:
-                    available[position] = []
-                    can_recover = False
-                    continue
-                raise ValueError("Incomplete recent action history at saved state. Run enrich --replay.")
-            full = state.get("trace_full_action_history")
-            if full is not None:
-                if (not isinstance(full, list) or len(full) != index
-                        or not all(isinstance(item, dict) and isinstance(item.get("action"), str)
-                                   and isinstance(item.get("observation"), str) for item in full)
-                        or _goal_module().select_action_history(full, stored_window) != recent):
-                    raise ValueError("Malformed full/recent action history. Run enrich --replay.")
-            source = full if full is not None else recent
-            for action_index, record in enumerate(source, index - len(source)):
-                if action_index in records and records[action_index] != record:
-                    raise ValueError("Conflicting overlapping recent action history. Run enrich --replay.")
-                records[action_index] = record
-            if full is not None or (can_recover and all(i in records for i in range(index))):
-                full = [records[i] for i in range(index)]
-                state["trace_full_action_history"] = copy.deepcopy(full)
-            needed = index if window is None else min(index, window)
-            if full is not None:
-                selected = _goal_module().select_action_history(full, window)
-            elif window is not None and needed <= len(recent):
-                selected = _goal_module().select_action_history(recent, window)
-            else:
-                raise ValueError("Requested recent action history is not fully cached. Run enrich --replay; no new sampling is needed.")
-            available[position] = selected
-        for position, selected in available.items():
-            state = trajectory["states"][position]
+            history, steps = _selected_actor_history(state, window)
             old_version = state.get("scoring_context_version")
-            old_window = (state.get("trace_history_length") if old_version == version else 4)
-            matching = (old_version in (_recent_action_history_version(), version)
-                        and _goal_module().parse_scoring_history_length(old_window) == window)
+            old_window = (state.get("trace_history_length", 4) if old_version == version
+                          else state.get("trace_actor_history_length"))
+            matching = (old_version in (module.ACTOR_HISTORY_SCORING_VERSION, version)
+                        and module.parse_scoring_history_length(old_window) == window)
             spec, facts = trajectory.get("goal_spec"), state.get("facts")
-            # A matching saved contract already represents this exact window.
-            # Window changes must rebuild even when the version is unchanged.
             if not matching and isinstance(spec, dict) and facts is not None:
-                renderer = goal_module() if callable(goal_module) else goal_module or _goal_module()
+                renderer = goal_module() if callable(goal_module) else goal_module or module
                 state["state_context"] = f"Task: {trajectory.get('goal', '')}\n\n" + renderer.render_full_state(
-                    spec, facts, observation=state.get("observation"), action_history=selected,
+                    spec, facts, observation=state.get("observation"), actor_history=history,
                     history_length=window)
-                state.update(scoring_context_version=version, trace_history_length=window)
             elif not matching:
-                raise ValueError("Saved rules/facts for recent action history are incomplete. Run enrich --replay without sampling new actions.")
-            state["trace_recent_action_history"] = copy.deepcopy(selected)
-            state["trace_history_length"] = window
+                raise ValueError("Saved rules/facts for native actor history are incomplete. "
+                                 "Run enrich --replay without sampling new actions.")
+            state.update(scoring_context_version=version, trace_history_length=window,
+                         trace_scoring_history=history, trace_scoring_history_steps=steps)
     return converted
 
 
@@ -475,7 +454,7 @@ def score_snapshots(snapshot: dict, probe: dict, scorer_config: dict, *, progres
         if state_view == "full_state":
             for state in trajectory.get("states", []):
                 if state.get("scoring_valid") is not False:
-                    _validate_recent_action_history(state)
+                    _validate_actor_history(state)
     if "{goal_response}" in response_template:
         hashes = {trajectory.get("goal_spec_hash") for trajectory in trajectories}
         if None in hashes or len(hashes) != 1:

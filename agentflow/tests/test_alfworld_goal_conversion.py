@@ -322,25 +322,23 @@ class GoalTests(unittest.TestCase):
         self.assertNotIn("use lamp", context)
         self.assertNotIn(spec["goal_response"], context)
 
-    def test_full_state_prompt_depends_on_facts_observation_and_only_recent_action_history(self):
+    def test_full_state_prompt_depends_on_facts_and_observation_not_action_history(self):
         spec = converter.load_goal_spec(self.create("look_at_obj_in_light"))
         saved = copy.deepcopy(spec)
         current = [x for x in INITIAL if x != "(ison lamp0)"] + ["(istoggled lamp0)"]
         observation = "The lamp is off."
         context = converter.render_full_state(spec, current, observation=observation)
         earlier_observation = "UNIQUE_PAST_OBSERVATION_NOT_CURRENT"
-        recent = [{"action": f"action_{i}", "observation": f"post_action_observation_{i}"}
-                  for i in range(4)]
-        earlier = {"action": "use lamp", "observation": earlier_observation,
-                   "environment_last_action": "toggleobject"}
-        with_history = converter.render_full_state(
-            spec, current, observation=observation, action_history=[earlier, *recent])
-        suffix = "Recorded environment action history:\n" + json.dumps(recent, ensure_ascii=False, sort_keys=True)
-        self.assertIn(suffix, with_history)
-        self.assertNotIn(earlier_observation, with_history)
-        self.assertEqual(with_history.replace(suffix + "\n\n", ""), context)
-        self.assertEqual(with_history, converter.render_full_state(
-            spec, current, observation=observation, history=recent))
+        histories = [
+            {"action_history": [{"action": "use lamp", "observation": earlier_observation,
+                                 "environment_last_action": "toggleobject"}]},
+            {"action_history": [{"action": "take mug"}, {"action": "use lamp"}]},
+            {"history": "legacy caller's complete trajectory"},
+        ]
+        for history in histories:
+            with self.subTest(history=history):
+                self.assertEqual(converter.render_full_state(
+                    spec, current, observation=observation, **history), context)
         self.assertNotIn(earlier_observation, context)
         self.assertEqual(spec, saved)  # Existing GT, instruction and saved provenance remain valid.
         self.assertIn(spec["rules_context"], context)
@@ -351,29 +349,23 @@ class GoalTests(unittest.TestCase):
         self.assertNotEqual(converter.render_full_state(spec, INITIAL, observation=observation), context)
         self.assertNotEqual(converter.render_full_state(spec, current, observation="A different current observation."), context)
 
-    def test_full_state_uses_original_post_action_records_instead_of_actor_history(self):
+    def test_full_state_includes_only_the_explicit_actor_history_snapshot_verbatim(self):
         spec = converter.load_goal_spec(self.create("look_at_obj_in_light"))
         history = "[Observation 3: 'A quote: \' and a newline\nkept as-is', Action 3: 'use lamp']"
         original = copy.deepcopy(spec)
-        records = [{"action": "use lamp", "observation": "灯已关闭\nAfter the action.",
-                    "environment_last_action": "toggleobject"},
-                   {"action": "fly", "observation": "Invalid action.",
-                    "executed": False, "external_error": False}]
         context = converter.render_full_state(spec, INITIAL, observation="Now.", actor_history=history,
-                                              action_history=records)
-        self.assertIn("Recorded environment action history:\n" + json.dumps(
-            records, ensure_ascii=False, sort_keys=True), context)
-        self.assertNotIn(history, context)
+                                              action_history=["UNBOUNDED_CUMULATIVE_HISTORY"])
+        self.assertIn("Recent observations and actions (same history window as the actor):\n" + history,
+                      context)
+        self.assertNotIn("UNBOUNDED_CUMULATIVE_HISTORY", context)
         self.assertNotIn(spec["goal_response"], context)
         self.assertEqual(spec, original)
         self.assertEqual(converter.render_full_state(spec, INITIAL, actor_history=""),
                          converter.render_full_state(spec, INITIAL))
-        self.assertEqual(converter.render_full_state(spec, INITIAL, actor_history=history),
-                         converter.render_full_state(spec, INITIAL))
-        for invalid in ("already rendered history", {}, 4):
+        for invalid in ([], {}, 4):
             with self.subTest(invalid=invalid):
-                with self.assertRaisesRegex(converter.GoalConversionError, "environment action records"):
-                    converter.render_full_state(spec, INITIAL, action_history=invalid)
+                with self.assertRaisesRegex(converter.GoalConversionError, "formatted history string"):
+                    converter.render_full_state(spec, INITIAL, actor_history=invalid)
 
     def test_history_length_parser_accepts_all_recent_and_disabled_windows(self):
         for value, expected in ((None, None), ("None", None), (" NULL ", None), (0, 0),
@@ -386,30 +378,49 @@ class GoalTests(unittest.TestCase):
                     converter.GoalConversionError, "nonnegative integer"):
                 converter.parse_scoring_history_length(invalid)
 
-    def test_history_window_selects_original_records_and_default_is_byte_identical(self):
-        spec = converter.load_goal_spec(self.create("look_at_obj_in_light"))
-        records = [{"action": f"act {i}", "observation": f"post {i}\n原观察",
-                    "executed": i != 2, "environment_last_action": None} for i in range(7)]
+    def test_native_history_windows_match_simple_memory_and_keep_absolute_numbering(self):
+        import ast
+        memory_path = Path(__file__).resolve().parents[1] / "agentflow/envs/memory/memory.py"
+        node = next(node for node in ast.parse(memory_path.read_text()).body
+                    if isinstance(node, ast.ClassDef) and node.name == "SimpleMemory")
+        scope = {"BaseMemory": object, "List": list, "Dict": dict, "Any": object, "Tuple": tuple}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(memory_path), "exec"), scope)
+        memory = scope["SimpleMemory"]()
+        memory.reset(1)
+        for index in range(7):
+            memory.store({"text_obs": [f"Pre-action {index}: a 'quote'\n原观察"], "action": [f"act {index}"]})
+        records = memory[0]
         original = copy.deepcopy(records)
+        spec = converter.load_goal_spec(self.create("look_at_obj_in_light"))
         base = converter.render_full_state(spec, INITIAL, observation="Now.")
-        for length, expected in ((None, records), (0, []), (1, records[-1:]),
-                                  (4, records[-4:]), (20, records)):
+        for length in (None, 0, 1, 4, 20):
             with self.subTest(length=length):
+                expected = memory.fetch(length or len(records))[0][0] if length != 0 else ""
+                native = converter.format_actor_history(records, length)
+                self.assertEqual(native, expected)
                 rendered = converter.render_full_state(
-                    spec, INITIAL, observation="Now.", action_history=records, history_length=length)
-                if expected:
-                    history_section = "Recorded environment action history:\n" + json.dumps(
-                        expected, ensure_ascii=False, sort_keys=True) + "\n\n"
-                    self.assertIn(history_section, rendered)
-                    self.assertEqual(rendered.replace(history_section, ""), base)
+                    spec, INITIAL, observation="Now.", actor_history=native, history_length=length)
+                if native:
+                    section = "Recent observations and actions (same history window as the actor):\n" + native + "\n\n"
+                    self.assertIn(section, rendered)
+                    self.assertEqual(rendered.replace(section, ""), base)
                 else:
                     self.assertEqual(rendered, base)
-        default = converter.render_full_state(spec, INITIAL, observation="Now.", action_history=records)
-        self.assertEqual(default, converter.render_full_state(
-            spec, INITIAL, observation="Now.", action_history=records[-4:], history_length=None))
+        self.assertEqual(converter.format_actor_history(records), memory.fetch(4)[0][0])
+        self.assertIn("[Observation 4:", converter.format_actor_history(records))
+        self.assertNotIn("[Observation 3:", converter.format_actor_history(records))
+        self.assertEqual(records, original)
+        for invalid in (None, "rendered history", {}, [dict(action="look", observation="post")],
+                        [dict(action="look", text_obs=None)]):
+            with self.subTest(invalid=invalid), self.assertRaises(converter.GoalConversionError):
+                converter.format_actor_history(invalid)
+
+    def test_legacy_post_action_selector_remains_available_for_saved_diagnostics(self):
+        records = [{"action": f"act {i}", "observation": f"post {i}"} for i in range(7)]
+        for length, expected in ((None, records), (0, []), (1, records[-1:]), (4, records[-4:])):
+            self.assertEqual(converter.select_action_history(records, length), expected)
         self.assertEqual(converter.select_action_history(None, None), [])
         self.assertEqual(converter.select_action_history(tuple(records), 1), tuple(records[-1:]))
-        self.assertEqual(records, original)
         for invalid in ("rendered history", {}, 5):
             with self.subTest(invalid=invalid), self.assertRaisesRegex(
                     converter.GoalConversionError, "environment action records"):

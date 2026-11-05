@@ -95,19 +95,21 @@ class ScoringTests(unittest.TestCase):
         spec = {"objects": {}, "initial_facts": [], "rules_context": "Applicable rules."}
         trajectory["goal_spec"] = spec
         module = scoring._goal_module()
-        records = [{"action": f"act {i}", "observation": f"after {i}", "executed": True}
-                   for i in range(6)]
+        records = [{"action": f"act {i}", "text_obs": f"before {i}"} for i in range(6)]
         for state in trajectory["states"]:
             index = state["state_index"]
+            text = module.format_actor_history(records[:index], 4)
             state.update(facts=[], observation=f"visible {index}", state_view="full_state",
                          scoring_valid=True, goal_check_valid=True, goal_check=index == 6,
-                         trace_recent_action_history=records[:index][-4:])
+                         trace_actor_history=text, trace_actor_history_steps=min(index, 4),
+                         trace_actor_history_length=4)
             state["state_context"] = f"Task: {trajectory['goal']}\n\n" + module.render_full_state(
-                spec, [], observation=state["observation"], action_history=records[:index])
-            state["scoring_context_version"] = (module.RECENT_ACTION_HISTORY_SCORING_VERSION if legacy
-                                                 else module.ACTION_HISTORY_SCORING_VERSION)
+                spec, [], observation=state["observation"], actor_history=text)
+            state["scoring_context_version"] = (module.ACTOR_HISTORY_SCORING_VERSION if legacy
+                                                 else module.ACTOR_MEMORY_HISTORY_SCORING_VERSION)
             if not legacy:
-                state.update(trace_full_action_history=records[:index], trace_history_length=4)
+                state.update(trace_full_actor_history=records[:index], trace_history_length=4,
+                             trace_scoring_history=text, trace_scoring_history_steps=min(index, 4))
         return snapshot, records
 
     def test_direct_full_state_rescore_switches_history_windows_without_mutating_cache(self):
@@ -119,43 +121,48 @@ class ScoringTests(unittest.TestCase):
                 result, _ = self.run_score(snapshot, scorer=backend,
                                           probe={"state_view": "full_state", "history_length": window})
                 terminal = result["trajectories"][0]["states"][-1]
-                expected = records if window is None else records[-window:] if window else []
-                self.assertEqual(terminal["trace_recent_action_history"], expected)
-                self.assertEqual(terminal["trace_full_action_history"], records)
+                expected = scoring._goal_module().format_actor_history(records, window)
+                self.assertEqual(terminal["trace_scoring_history"], expected)
+                self.assertEqual(terminal["trace_full_actor_history"], records)
                 if expected:
-                    self.assertIn(json.dumps(expected, sort_keys=True), terminal["scoring_prompt"])
+                    self.assertIn(expected, terminal["scoring_prompt"])
                 else:
-                    self.assertNotIn("Recorded environment action history:", terminal["scoring_prompt"])
+                    self.assertNotIn("Recent observations and actions", terminal["scoring_prompt"])
                 self.assertEqual(result["formula"]["history_length"], window)
                 self.assertTrue(result["formula"]["history_window_applied"])
                 self.assertEqual(json.dumps(snapshot, sort_keys=True), original)
 
-    def test_legacy_overlapping_windows_recover_all_history_and_reject_conflicts(self):
+    def test_formal_v2e_cache_keeps_exact_native_window_and_requires_replay_to_expand(self):
         snapshot, records = self.history_cache(legacy=True)
-        restored = scoring.prepare_history_contexts(snapshot, None)
-        terminal = restored["trajectories"][0]["states"][-1]
-        self.assertEqual(terminal["trace_full_action_history"], records)
-        self.assertEqual(terminal["trace_recent_action_history"], records)
-        # Deep-copy before corrupting a record that overlaps a previous state.
-        corrupt = json.loads(json.dumps(snapshot))
-        corrupt["trajectories"][0]["states"][4]["trace_recent_action_history"][0]["action"] = "different"
-        with self.assertRaisesRegex(ValueError, "Conflicting.*enrich --replay"):
-            scoring.prepare_history_contexts(corrupt, None)
-        missing = json.loads(json.dumps(snapshot))
-        missing["trajectories"][0]["states"] = missing["trajectories"][0]["states"][-1:]
+        restored = scoring.prepare_history_contexts(snapshot, 4)
+        for old, new in zip(snapshot["trajectories"][0]["states"], restored["trajectories"][0]["states"]):
+            self.assertEqual(new["state_context"], old["state_context"])
+            self.assertEqual(new["trace_scoring_history"], old["trace_actor_history"])
         with self.assertRaisesRegex(ValueError, "not fully cached.*enrich --replay"):
-            scoring.prepare_history_contexts(missing, None)
-        short = scoring.prepare_history_contexts(missing, 2)
-        self.assertEqual(short["trajectories"][0]["states"][0]["trace_recent_action_history"], records[-2:])
+            scoring.prepare_history_contexts(snapshot, None)
+        # Post-action records cannot stand in for the native pre-action source.
+        for state in snapshot["trajectories"][0]["states"]:
+            for key in ("trace_actor_history", "trace_actor_history_steps", "trace_actor_history_length"):
+                state.pop(key)
+            state.update(trace_recent_action_history=[{"action": "act", "observation": "after"}],
+                         scoring_context_version="alfworld-post-action-history-v2")
+        with self.assertRaisesRegex(ValueError, "native actor history.*enrich --replay"):
+            scoring.prepare_history_contexts(snapshot, 4)
+
+    def test_malformed_full_native_memory_is_rejected(self):
+        snapshot, _ = self.history_cache()
+        snapshot["trajectories"][0]["states"][-1]["trace_full_actor_history"] = [{"action": "act", "observation": "after"}]
+        with self.assertRaisesRegex(ValueError, "Malformed full native actor history"):
+            scoring.prepare_history_contexts(snapshot, 4)
 
     def test_zero_history_needs_no_saved_records_and_saved_view_keeps_literal_context(self):
         snapshot, _ = self.history_cache()
         for state in snapshot["trajectories"][0]["states"]:
-            for key in ("trace_full_action_history", "trace_recent_action_history", "trace_history_length",
-                        "scoring_context_version"):
-                state.pop(key, None)
+            for key in tuple(state):
+                if key.startswith("trace_") or key == "scoring_context_version":
+                    state.pop(key)
         empty = scoring.prepare_history_contexts(snapshot, 0)
-        self.assertTrue(all("Recorded environment action history:" not in state["state_context"]
+        self.assertTrue(all("Recent observations and actions" not in state["state_context"]
                             for state in empty["trajectories"][0]["states"]))
         backend = SimpleNamespace(tokenizer=FakeTokenizer(), score=mock.Mock(return_value=[-2., -2.]))
         result, _ = self.run_score(snapshot, scorer=backend, probe={"state_view": "saved", "history_length": None})
@@ -300,31 +307,28 @@ class ScoringTests(unittest.TestCase):
         for state in trajectory["states"]:
             state.update(state_view="full_state", goal_check_valid=True, scoring_valid=True,
                          goal_check=state["state_index"] == 3,
-                         trace_recent_action_history=[{"action": f"action {i}", "observation": f"observed {i}"}
-                                                      for i in range(state["state_index"])][-4:],
-                         scoring_context_version=scoring._recent_action_history_version())
+                         trace_actor_history="" if not state["state_index"] else f"native history {state['state_index']}",
+                         trace_actor_history_steps=state["state_index"], trace_actor_history_length=4,
+                         scoring_context_version=scoring._goal_module().ACTOR_HISTORY_SCORING_VERSION)
         return snapshot
 
-    def test_full_state_rejects_old_or_malformed_post_action_history_before_scoring(self):
-        valid_record = {"action": "act", "observation": "result"}
-        for change in ({"trace_recent_action_history": None}, {"trace_recent_action_history": "native pre-action text"},
-                       {"trace_recent_action_history": [valid_record] * 5},
-                       {"trace_recent_action_history": [{"action": "act"}]},
-                       {"trace_recent_action_history": [{"action": 4, "observation": "result"}]},
-                       {"scoring_context_version": "alfworld-actor-recent-history-v1"},
+    def test_full_state_rejects_missing_or_malformed_native_history_before_scoring(self):
+        for change in ({"trace_actor_history": None}, {"trace_actor_history": []},
+                       {"trace_actor_history_steps": 5}, {"trace_actor_history_steps": True},
+                       {"trace_actor_history": "text with zero steps"},
                        {"scoring_context_version": "old-no-history"}):
             with self.subTest(change=change):
                 snapshot = self.full_state_saved()
                 snapshot["trajectories"][0]["states"][0].update(change)
                 backend = FakeScorer()
-                with self.assertRaisesRegex(ValueError, "recent action history.*enrich --replay"):
+                with self.assertRaisesRegex(ValueError, "native actor history.*enrich --replay"):
                     self.run_score(snapshot, probe={"state_view": "full_state"}, scorer=backend)
                 self.assertEqual(backend.calls, [])
 
     def test_saved_view_can_score_legacy_literal_full_state_context(self):
         snapshot = self.full_state_saved()
         for state in snapshot["trajectories"][0]["states"]:
-            for key in ("trace_recent_action_history", "scoring_context_version"):
+            for key in ("trace_actor_history", "scoring_context_version"):
                 state.pop(key)
         result, backend = self.run_score(snapshot, probe={"state_view": "saved"})
         self.assertEqual(len(backend.calls), 4)

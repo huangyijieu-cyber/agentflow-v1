@@ -339,35 +339,34 @@ def _goal_module():
     return sys.modules[name]
 
 
-RECENT_ACTION_HISTORY_SCORING_VERSION = _goal_module().RECENT_ACTION_HISTORY_SCORING_VERSION
-RECENT_ACTION_HISTORY_LENGTH = _goal_module().RECENT_ACTION_HISTORY_LENGTH
-ACTION_HISTORY_SCORING_VERSION = _goal_module().ACTION_HISTORY_SCORING_VERSION
-_RECENT_ACTION_HISTORY_FIELDS = ("trace_recent_action_history", "trace_full_action_history", "trace_history_length")
+ACTOR_HISTORY_SCORING_VERSION = _goal_module().ACTOR_HISTORY_SCORING_VERSION
+ACTOR_MEMORY_HISTORY_SCORING_VERSION = _goal_module().ACTOR_MEMORY_HISTORY_SCORING_VERSION
+_ACTOR_HISTORY_FIELDS = ("trace_actor_history", "trace_actor_history_steps", "trace_actor_history_length",
+                        "trace_full_actor_history", "trace_scoring_history", "trace_scoring_history_steps",
+                        "trace_history_length")
 
 
-def _validate_recent_action_history(state, *, require_version=False):
-    from alfworld_trace_probe_scoring import _validate_recent_action_history as validate
+def _validate_actor_history(state, *, require_version=False):
+    from alfworld_trace_probe_scoring import _validate_actor_history as validate
     return validate(state, require_version=require_version)
 
 
-def _recent_action_history_snapshot(env, info):
-    history = info.get("trace_recent_action_history")
-    length = info.get("trace_history_length", getattr(env, "trace_history_length", 4))
-    cumulative = info.get("trace_full_action_history", getattr(env, "trace_action_history", None))
-    if history is None and cumulative is None:
+def _actor_history_snapshot(env, info):
+    values = {key: copy.deepcopy(info.get(key, getattr(env, key, None)))
+              for key in _ACTOR_HISTORY_FIELDS if key in info or hasattr(env, key)}
+    if "trace_actor_history_length" not in values and hasattr(env, "history_length"):
+        values["trace_actor_history_length"] = env.history_length
+    if "trace_full_actor_history" not in values and getattr(env, "memory", None) is not None:
+        values["trace_full_actor_history"] = copy.deepcopy(env.memory[0])
+    length = _goal_module().parse_scoring_history_length(values.get("trace_history_length", 4))
+    from alfworld_trace_probe_scoring import _selected_actor_history
+    try:
+        history, steps = _selected_actor_history(values, length)
+    except ValueError:
         return {}
-    selected = _goal_module().select_action_history(cumulative, length) if cumulative is not None else None
-    if history is None:
-        history = selected
-    # Explicit environment snapshots are authoritative; never replace them
-    # with an incompatible reconstructed or actor-native history.
-    has_full = cumulative is not None and selected == history
-    values = {"trace_recent_action_history": copy.deepcopy(history), "trace_history_length": length,
-              "scoring_context_version": ACTION_HISTORY_SCORING_VERSION if has_full else
-              info.get("scoring_context_version", RECENT_ACTION_HISTORY_SCORING_VERSION)}
-    if has_full:
-        values["trace_full_action_history"] = copy.deepcopy(cumulative)
-    _validate_recent_action_history(values)
+    values.update(trace_scoring_history=history, trace_scoring_history_steps=steps,
+                  trace_history_length=length, scoring_context_version=ACTOR_MEMORY_HISTORY_SCORING_VERSION)
+    _validate_actor_history(values)
     return values
 
 
@@ -412,9 +411,9 @@ def state_snapshot(env, actor_prompt, info, index, sampling, *, prior_turns=(), 
     facts = _full_facts(env, raw_info)
     if flag(raw_info.get("env_error")) is True:
         facts = None
-    recent_history = _recent_action_history_snapshot(env, raw_info)
+    recent_history = _actor_history_snapshot(env, raw_info)
     if facts is not None and not recent_history:
-        _validate_recent_action_history({})
+        _validate_actor_history({})
     info = jsonable(raw_info)
     observation = scalar(info.get("anchor"))
     if not isinstance(observation, str) or observation.startswith("["):
@@ -435,7 +434,7 @@ def state_snapshot(env, actor_prompt, info, index, sampling, *, prior_turns=(), 
         if not isinstance(spec, dict):
             raise ValueError("Full-state context and saved rules are missing. Run enrich --replay.")
         context = f"Task: {getattr(env, 'task', '')}\n\n" + _goal_module().render_full_state(
-            spec, facts, observation=observation, action_history=recent_history["trace_recent_action_history"],
+            spec, facts, observation=observation, actor_history=recent_history["trace_scoring_history"],
             history_length=recent_history.get("trace_history_length", 4))
     if not isinstance(context, str) or not context.strip():
         context = (f"Task: {getattr(env, 'task', '')}\n\nActor-visible prompt:\n{actor_prompt}"
@@ -862,7 +861,7 @@ def enrich_snapshot(snapshot, *, replay=False, env_factory=make_environment, pro
                     if turn.get("external_error"):
                         failed = copy.deepcopy(trajectory["states"][index + 1])
                         failed.update({"facts": None, "state_view": "full_state", "scoring_valid": False})
-                        failed.update(_recent_action_history_snapshot(env, {}))
+                        failed.update(_actor_history_snapshot(env, {}))
                         new_states.append(failed)
                         if index != len(trajectory["turns"]) - 1:
                             raise ValueError("Cannot enrich states beyond an unresolved external failure")
@@ -893,17 +892,16 @@ def enrich_snapshot(snapshot, *, replay=False, env_factory=make_environment, pro
                     "Saved observations do not contain full environment facts. "
                     "Run enrich --replay to replay the saved actions without sampling new ones.")
             facts = module.normalize_facts(facts)
-            history = _validate_recent_action_history(state)
-            history_length = state.get("trace_history_length", 4)
+            history, _, history_length = _validate_actor_history(state)
             check = module.evaluate_goal(spec, facts)
             won = flag((state.get("env_info") or {}).get("won"))
             check_valid = won is not None and check is won
             state.update({"facts": facts, "state_view": "full_state",
                           "state_context": f"Task: {trajectory.get('goal', '')}\n\n" +
                           module.render_full_state(spec, facts,
-                              observation=state.get("observation"), action_history=history,
+                              observation=state.get("observation"), actor_history=history,
                               history_length=history_length),
-                          "scoring_context_version": ACTION_HISTORY_SCORING_VERSION,
+                          "scoring_context_version": ACTOR_MEMORY_HISTORY_SCORING_VERSION,
                           "trace_history_length": history_length,
                           "goal_check": check, "goal_check_valid": check_valid,
                           "scoring_valid": check_valid and flag((state.get("env_info") or {}).get("env_error")) is not True})
@@ -917,7 +915,7 @@ def enrich_snapshot(snapshot, *, replay=False, env_factory=make_environment, pro
     return converted
 
 
-def _prepare_recent_action_history_contexts(snapshot, history_length=4):
+def _prepare_actor_history_contexts(snapshot, history_length=4):
     """Rebuild scoring windows from saved records without sampling or replay."""
     from alfworld_trace_probe_scoring import prepare_history_contexts
     return prepare_history_contexts(snapshot, history_length, goal_module=_goal_module)
@@ -929,7 +927,7 @@ def _enrichment_payload(original, converted, source_hash):
               "goal_spec_hash", "state_view")
     state_fields = ("state_index", "state_context", "facts", "state_view", "scoring_valid",
                     "goal_check", "goal_check_valid", "actor_prompt", "scoring_context_version",
-                    *_RECENT_ACTION_HISTORY_FIELDS)
+                    *_ACTOR_HISTORY_FIELDS)
     for trajectory in converted["trajectories"]:
         trajectories.append({"trajectory_id": trajectory["trajectory_id"],
                              **{key: trajectory.get(key) for key in fields},
@@ -953,28 +951,13 @@ def _merge_enrichment(snapshot, metadata, source_hash):
         for state, update in zip(trajectory["states"], item["states"]):
             if state["state_index"] != update["state_index"]:
                 raise ValueError("Goal sidecar state indices differ from the raw cache")
-            raw_history = state.get("trace_recent_action_history")
-            raw_window = state.get("trace_history_length", 4)
-            updated_history = update.get("trace_recent_action_history")
-            retain_source = (state.get("trace_full_action_history") is None
-                             and update.get("trace_full_action_history") is None
-                             and isinstance(raw_history, list) and isinstance(updated_history, list)
-                             and len(raw_history) > len(updated_history))
             if "state_context" in update and "scoring_context_version" not in update:
-                # An old sidecar may replace a new raw context; it cannot
-                # inherit the raw cache's marker and masquerade as upgraded.
+                # An old sidecar cannot inherit a new raw context's marker.
                 state.pop("scoring_context_version", None)
-            if "trace_recent_action_history" in update and "trace_history_length" not in update:
-                # Historical sidecars stored a four-record suffix even when
-                # the raw cache was later captured with a different window.
-                state["trace_history_length"] = 4
-            state.update(update)
-            if retain_source:
-                # A smaller scoring view must not destroy the longer genuine
-                # suffix in the immutable cache. Re-render its context below.
-                state["trace_recent_action_history"] = raw_history
-                state["trace_history_length"] = raw_window
-                state.pop("scoring_context_version", None)
+            # Native full memory and actor-window snapshots are source data;
+            # window-specific sidecars must not erase them with absent values.
+            state.update({key: value for key, value in update.items()
+                          if value is not None or key not in _ACTOR_HISTORY_FIELDS or key == "trace_history_length"})
     converted["enrichment_sha256"] = hashlib.sha256(
         json.dumps(metadata, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     return converted
@@ -1173,7 +1156,7 @@ class Experiment:
             converted = enrich_snapshot(snapshot, replay=False, progress=self.progress,
                                         trace_goals_path=self.config["sampling"].get("trace_goals_path"))
         if probe.get("state_view") == "full_state":
-            converted = _prepare_recent_action_history_contexts(converted, probe.get("history_length", 4))
+            converted = _prepare_actor_history_contexts(converted, probe.get("history_length", 4))
         if converted == snapshot:
             return snapshot
         payload = _enrichment_payload(snapshot, converted, source_hash)

@@ -18,6 +18,7 @@ from typing import Any
 
 TEMPLATE_VERSION = "alfworld-pddl-controlled-english-v1"
 ACTOR_HISTORY_SCORING_VERSION = "alfworld-actor-recent-history-v1"
+ACTOR_MEMORY_HISTORY_SCORING_VERSION = "alfworld-actor-memory-history-v2"
 RECENT_ACTION_HISTORY_SCORING_VERSION = "alfworld-post-action-recent-history-v1"
 RECENT_ACTION_HISTORY_LENGTH = 4
 ACTION_HISTORY_SCORING_VERSION = "alfworld-post-action-history-v2"
@@ -81,6 +82,30 @@ def select_action_history(history, history_length=RECENT_ACTION_HISTORY_LENGTH):
     if length is None:
         return history
     return history[-length:] if length else []
+
+
+def format_actor_history(records, history_length=RECENT_ACTION_HISTORY_LENGTH):
+    """Format a scoring window from complete native SimpleMemory records.
+
+    Observations precede their actions, and numbering remains episode-global,
+    exactly as in SimpleMemory.fetch. Post-action logs cannot substitute for
+    this source. None keeps all records and zero suppresses the window.
+    """
+    length = parse_scoring_history_length(history_length)
+    if not isinstance(records, (list, tuple)):
+        raise GoalConversionError("actor history must contain native memory records")
+    for record in records:
+        if (not isinstance(record, dict)
+                or not isinstance(record.get("text_obs"), str)
+                or not isinstance(record.get("action"), str)):
+            raise GoalConversionError("actor history requires native text_obs and action strings")
+    recent = records if length is None else records[-length:] if length else []
+    start = len(records) - len(recent)
+    return "\n".join(
+        f"[Observation {start + index + 1}: '{record['text_obs']}', "
+        f"Action {start + index + 1}: '{record['action']}']"
+        for index, record in enumerate(recent)
+    )
 
 
 def normalize_gamefile(value: Any) -> Path:
@@ -701,14 +726,15 @@ def format_facts(facts, *, aliases=None) -> str:
 def render_full_state(spec, facts, *, observation=None, action_history=None,
                       history=None, initial_facts=None, actor_history=None,
                       history_length=RECENT_ACTION_HISTORY_LENGTH) -> str:
-    """Render verified facts and a configurable window of original action logs.
+    """Render v2_e facts and an explicitly selected native actor history.
 
-    Each record retains its action and post-action observation unchanged.
-    None selects all past records; zero omits history; the default keeps four.
-    The actor's pre-action history is kept as a legacy argument but not scored.
+    The caller selects the window from native memory before formatting it;
+    text cannot safely be split because observations may contain newlines.
+    Legacy post-action logs are ignored, as in formal v2_e.
     """
-    selected_history = select_action_history(
-        action_history if action_history is not None else history, history_length)
+    length = parse_scoring_history_length(history_length)
+    if actor_history is not None and not isinstance(actor_history, str):
+        raise GoalConversionError("actor_history must be the actor's formatted history string")
     current = _checked_facts(facts, spec["objects"])
     initial = _checked_facts(spec["initial_facts"] if initial_facts is None else initial_facts, spec["objects"])
     aliases = spec.get("entity_aliases", {})
@@ -724,9 +750,8 @@ def render_full_state(spec, facts, *, observation=None, action_history=None,
     ]
     if observation is not None:
         lines.append("Current observation (additional textual evidence):\n" + str(observation))
-    if selected_history:
-        lines.append("Recorded environment action history:\n" + json.dumps(
-            selected_history, ensure_ascii=False, sort_keys=True))
+    if actor_history and length != 0:
+        lines.append("Recent observations and actions (same history window as the actor):\n" + actor_history)
     lines.append("The desired goal is not an observed achievement. A true initial flag does not prove an action happened during this episode.")
     return "\n\n".join(lines)
 

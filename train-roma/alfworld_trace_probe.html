@@ -87,7 +87,7 @@
       <div class="row"><button id="saveButton" type="button" disabled>保存探针</button><button id="scoreButton" class="primary" type="button" disabled>保存并重新评分</button></div>
     </div>
     <div class="formula">state + Prompt → 固定 Response 的平均 LogP ℓ → Vₜ = log[(-ℓ₀ + ε) / (-ℓₜ + ε)] → Δₜ = Vₜ₊₁ − Vₜ → K-step 折扣平均</div>
-    <p class="small-text muted" style="margin-top:9px">默认 Response 使用 {goal_response}，从预先保存的 GT 文件读取，同题所有状态保持固定。完整状态包含环境先验和隐藏事实，仅评分模型可见。全部环境动作统一按 TRACE Credit 配对，包括最后动作；末状态参与最后一步 ΔV，但不增加回答 turn。K 表示真实动作数，K=3 时最多向最后三个动作回填；默认终局回填开启，按同题局部信用的正负范围动态缩放，再应用距离折扣，与 QA 一致，旧固定系数不再生效。评分历史步数默认 4；None 使用全部历史，0 不提供历史。仅完整环境状态视图应用此窗口，缓存视图保留原文。新缓存保存完整原日志，修改窗口直接重评分；旧缓存可由连续末 4 条快照恢复，不足时只需重放原动作，不调用采样模型。</p>
+    <p class="small-text muted" style="margin-top:9px">默认 Response 使用 {goal_response}，从预先保存的 GT 文件读取，同题所有状态保持固定。完整状态包含环境先验和隐藏事实，仅评分模型可见。全部环境动作统一按 TRACE Credit 配对，包括最后动作；末状态参与最后一步 ΔV，但不增加回答 turn。K 表示真实动作数，K=3 时最多向最后三个动作回填；默认终局回填开启，按同题局部信用的正负范围动态缩放，再应用距离折扣，与 QA 一致，旧固定系数不再生效。评分历史步数默认 4；None 使用全部历史，0 不提供历史。仅完整环境状态视图应用此窗口，缓存视图保留原文。新缓存保存完整原生记忆（动作前观察、解析后的动作及绝对步号），修改窗口直接重评分；旧缓存若缺少所需原生记忆，只需重放原动作补齐，不调用采样模型。</p>
   </section>
 
   <section class="card" aria-labelledby="resultHeading">

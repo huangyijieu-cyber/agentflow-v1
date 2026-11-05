@@ -220,6 +220,9 @@ class AlfWorldEnv:
         self.trace_action_history = []
         self.trace_actor_history = ""
         self.trace_actor_history_steps = 0
+        self.trace_full_actor_history = []
+        self.trace_scoring_history = ""
+        self.trace_scoring_history_steps = 0
         self.trace_scoring_valid = False
 
         # 对应集合
@@ -287,9 +290,11 @@ class AlfWorldEnv:
         won = _environment_flag(info.get("won"))
         self.trace_goal_check_valid = won is not None and won == self.trace_goal_check
         self.trace_scoring_valid = self.trace_goal_check_valid
+        self._refresh_trace_scoring_history()
         self.trace_state_context = f"Task: {self.task}\n\n" + tools.render_full_state(
             self.trace_goal_spec, self.trace_facts,
             observation=observation, action_history=self.trace_action_history,
+            actor_history=self.trace_scoring_history,
             history_length=self.trace_history_length,
         )
         self._write_trace_info(info)
@@ -299,6 +304,17 @@ class AlfWorldEnv:
                 "The state is retained for inspection but is invalid for scoring/pairing."
             )
 
+    def _refresh_trace_scoring_history(self):
+        # Read the same pre-action observations and parsed actions as the
+        # actor, without changing its independently configured history window.
+        tools = _goal_tools()
+        self.trace_full_actor_history = deepcopy(self.memory[0])
+        self.trace_scoring_history = tools.format_actor_history(
+            self.trace_full_actor_history, self.trace_history_length)
+        available = len(self.trace_full_actor_history)
+        self.trace_scoring_history_steps = (available if self.trace_history_length is None
+                                            else min(available, self.trace_history_length))
+
     def _write_trace_info(self, info):
         tools = _goal_tools()
         info.update({
@@ -307,7 +323,10 @@ class AlfWorldEnv:
                 tools.select_action_history(self.trace_action_history, self.trace_history_length)),
             "trace_full_action_history": deepcopy(self.trace_action_history),
             "trace_history_length": self.trace_history_length,
-            "scoring_context_version": tools.ACTION_HISTORY_SCORING_VERSION,
+            "scoring_context_version": tools.ACTOR_MEMORY_HISTORY_SCORING_VERSION,
+            "trace_full_actor_history": deepcopy(self.trace_full_actor_history),
+            "trace_scoring_history": self.trace_scoring_history,
+            "trace_scoring_history_steps": self.trace_scoring_history_steps,
             "trace_actor_history": self.trace_actor_history,
             "trace_actor_history_steps": self.trace_actor_history_steps,
             "trace_actor_history_length": self.history_length,
@@ -330,6 +349,7 @@ class AlfWorldEnv:
             "action": action, "observation": observation,
             "executed": False, "external_error": bool(external),
         })
+        self._refresh_trace_scoring_history()
         if external:
             self.trace_facts = None
             self.trace_goal_check = None
@@ -345,6 +365,7 @@ class AlfWorldEnv:
             self.trace_state_context = f"Task: {self.task}\n\n" + _goal_tools().render_full_state(
                 self.trace_goal_spec, self.trace_facts,
                 observation=observation, action_history=self.trace_action_history,
+                actor_history=self.trace_scoring_history,
                 history_length=self.trace_history_length,
             )
         self._write_trace_info(info)
