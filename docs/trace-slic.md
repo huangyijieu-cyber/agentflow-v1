@@ -18,7 +18,7 @@ QA 的状态、终局和回填语义见下文；ALFWorld 的真实后状态与�
 Answer the question directly and concisely.
 ```
 
-使用当前训练 step 内冻结的参考模型、温度 1，对固定 GT 做 teacher forcing，只平均 GT Token 的 LogP。默认固定初始权重；可通过 [参考模型更新间隔](trace-reference.md) 按 step 刷新：
+使用当前训练 step 内冻结的参考模型、温度 1，对固定 GT 做 teacher forcing，只平均 GT Token 的 LogP。默认固定初始权重；可通过 [参考模型更新间隔](#参考模型更新) 按 step 刷新：
 
 $$
 \bar\ell_{g,t}=\frac{1}{|y^*|}\sum_j\log\pi_{\mathrm{ref}}(y_j^*\mid S_{g,t},y_{<j}^*),
@@ -139,9 +139,75 @@ Pair 两侧保留各自原始生成 Prompt、响应及原生 token IDs。仍使�
 
 此次核对的远程代码基线为 `d010f3c`：启动配置默认 `REPLAY_BUFFER_SIZE=512`，trainer 未配置时的缺省值为 8192，采样目标为 `16 * round(enq_ema)`。用户确认的 **v3c、v3d** 实验设置均为容量 **512**、采样目标 `4 * round(enq_ema)`，再沿用存量限制和分布式对齐；EMA 为 40、存量充足且可整除时采样 160 对。本次仅记录实验设置，未修改基线训练代码。
 
+## 参考模型更新
+
+ALFWorld 和 QA 共用 `data.trace.reference_update_interval`，仅在算法包含
+`slic` 且 `data.trace.enabled=true` 时生效。支持 `grpo+slic`、`gigpo+slic`。
+
+在 `train-roma/config.yaml` 或 `train-roma/config_grpo+slic.yaml` 中配置：
+
+```yaml
+env:
+  TRACE_REFERENCE_UPDATE_INTERVAL: ${env:TRACE_REFERENCE_UPDATE_INTERVAL,0}
+```
+
+也可在原有启动命令前设置环境变量：
+
+```bash
+export TRACE_REFERENCE_UPDATE_INTERVAL=10    # 每完成 10 个训练 step 刷新
+# export TRACE_REFERENCE_UPDATE_INTERVAL=None  # 每完成一个训练 step 刷新
+# export TRACE_REFERENCE_UPDATE_INTERVAL=0     # 固定初始模型，默认值，保留原实验行为
+```
+
+直接使用 Hydra 参数时，写 `data.trace.reference_update_interval=null` 表示每步刷新。
+`None`/`null` 字符串也会正规化为空值；负数、布尔值和小数不合法。
+
+| 配置 | step 1 的参考 | step 2 的参考 | step 11 的参考 |
+| --- | --- | --- | --- |
+| `0` | 初始模型 | 初始模型 | 初始模型 |
+| `10` | 初始模型 | 初始模型 | step 10 更新后的 actor |
+| `None` / `null` / `1` | 初始模型 | step 1 更新后的 actor | step 10 更新后的 actor |
+
+“step” 是完成整个训练更新的 step，不是 turn、rollout、微批次或单次优化器更新。
+只有收集数据、因 stale 队列尚未满足条件提前返回时，不更新参考。
+一个 step 内的 GT LogP、初始状态 V 基准、局部信用和终局回填全部使用同一个参考版本。
+待 GRPO/GiGPO 和该步 SLIC 更新都完成后，才复制最终 actor 参数，供下一步使用。
+
+此处 checkpoint 指 actor 的内存权重快照，不依赖 `trainer.save_freq`。
+FSDP/FSDP2 的 actor 和 reference 同 rank 同进程时，直接复制已分片参数；不会经
+driver 收集整模型，不会每步写磁盘，不复制优化器、不改 actor 梯度。参考模型继续
+保持 eval 模式、评分温度 1。更新后清除共享前缀评分的验证状态，重新验证新权重。
+不兼容的模型分片布局会明确报错；目前不支持 LoRA/ref_in_actor 和 Megatron 刷新。
+
+刷新的是现有的独立 reference：TRACE GT 评分使用它；如果另行开启 KL reward 或
+KL loss，它们也使用该参考模型。默认两种 KL 都关闭。SLIC loss、配对阈值、配对
+方式、replay 采样与容量不变；已有 replay pair 保留其选入时的偏好标签，不重新评分。
+
+### 保存和恢复
+
+普通训练 checkpoint 开启时，会在 `global_step_N/trace_reference/` 一并保存参考模型
+分片和 `trace_reference.json`，记录更新间隔与参考来源 step。例如 interval=10、
+训练保存于 step 17 时，actor 是 step 17，参考仍是 step 10，恢复时分别加载。
+该参考存储随 actor 的 checkpoint 保留策略清理。
+
+恢复时必须使用相同 interval。旧 checkpoint 没有参考快照时，只有恰好处于更新边界
+才能从恢复后的 actor 重建参考；否则报错，避免把较新的 actor 冒充旧参考。`0` 模式
+沿用原恢复行为。远程 HDFS 恢复仍受原训练器的限制。
+
+### 指标
+
+- `trace/reference_step`：本 step 评分实际使用的权重来源，0 为初始模型。
+- `trace/reference_step_next`：本 step 完成后参考来源，供下一 step 使用。
+- `trace/reference_refreshed`：本 step 是否执行刷新。
+- `timing_s/reference_refresh`：刷新阶段耗时，计入 step 总耗时。
+
+在 `alfworld` 分支本次更新中，评分历史已恢复正式 v2_e（`ee5da31`）的原生 memory 格式，
+同时保留独立 `ALFWORLD_TRACE_HISTORY_LENGTH`（默认 4、None 全部、0 不包含历史）和
+同题局部信用范围内的动态终局回填。设置刷新间隔为 0 可隔离参考更新这一实验变量。
+
 ## 代码组织
 
-实现统一位于 `agentflow/agentflow/trace/` 子包：`credit.py` 包含原信用计算与 GT 评分，`execution.py` 负责故障和可信终局，`metrics.py` 负责指标，`__init__.py` 为轻量包入口。原 4 个平铺文件整理为 4 个包内文件，生产文件总数不变。该结构整理保持 `trace` 分支的公式、默认参数、筛选规则和训练行为不变。
+实现统一位于 `agentflow/agentflow/trace/` 子包：`credit.py` 包含原信用计算与 GT 评分，`execution.py` 负责故障和可信终局，`metrics.py` 负责指标，`__init__.py` 为轻量包入口。原 4 个平铺文件整理为 4 个包内文件，生产文件总数不变。该结构整理保持 `trace` 分支的公式、默认参数、筛选规则和训练行为不变。参考模型的更新调度与 checkpoint 保存/恢复直接放在现有 `agentflow/verl/trainer.py` 的 `AgentFlowTrainer` 中；同 rank 权重复制、分片校验和 worker RPC 放在现有 `agentflow/verl/diy/workers/fsdp_workers.py` 中，不再拆分额外生产模块。相关测试并入已有 trainer、worker 与分布式测试文件。
 
 ## 配置
 
@@ -168,6 +234,7 @@ Pair 两侧保留各自原始生成 Prompt、响应及原生 token IDs。仍使�
 | `max_gt_tokens` | `256` | GT token 上限，超长跳过 |
 | `gt_alias_strategy` | `first` | 固定第一个非空 GT 别名 |
 | `answer_instruction` | 上文统一指令 | 独立 GT 评分提示 |
+| `reference_update_interval` | `0` | `0` 固定初始参考；正整数 N 每完成 N 个训练 step 更新；`None`/`null` 每步使用最新 actor 快照 |
 
 TRACE 论文提供 epsilon=0.1、gamma=0.8、K-step 归一化、终局回填 scale=2 的参考设置；当前 QA 使用同题动态范围缩放，按类型配对、包含 final 的窗口计数和阈值也是项目设计，不能称为精确复现。[TRACE §3 与附录 A.1](https://arxiv.org/html/2607.13988v1)
 

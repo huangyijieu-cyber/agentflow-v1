@@ -22,6 +22,8 @@ import logging
 import os
 import warnings
 from dataclasses import asdict
+from pathlib import Path
+from weakref import WeakValueDictionary
 from typing import Any, Optional
 
 import numpy as np
@@ -128,6 +130,178 @@ def get_vl_model_vision_tower(vl_model_instance):
         # transformers < 4.52.0
         return vl_model_instance.visual
     return None
+
+
+# TRACE reference snapshots stay with the FSDP workers that own the weights.
+# No weights pass through the driver and no optimizer state is copied.
+_TRACE_ACTORS = WeakValueDictionary()
+
+
+def _trace_register_actor(worker):
+    """Workers for different roles share one process for each distributed rank."""
+    if getattr(worker, "_is_actor", False):
+        _TRACE_ACTORS[int(worker.rank)] = worker
+
+
+def _trace_colocated_actor(reference):
+    if not getattr(reference, "_is_ref", False) or getattr(reference, "_is_lora", False):
+        raise ValueError("Reference refresh requires a dedicated non-LoRA reference worker")
+    config = reference.config
+    model_path = config.model.path
+    separate_model = config.ref.get("model", None)
+    reference_path = model_path if separate_model is None else separate_model.get("path", model_path)
+    if str(model_path) != str(reference_path) and (
+            Path(str(model_path)).expanduser().resolve() != Path(str(reference_path)).expanduser().resolve()):
+        raise ValueError("Reference refresh requires the same initial actor/reference model path; "
+                         "a separately configured reference model may have incompatible model semantics")
+    actor = _TRACE_ACTORS.get(int(reference.rank))
+    if actor is None:
+        raise RuntimeError("Reference refresh requires actor and reference roles colocated on each rank")
+    if getattr(actor, "_is_lora", False):
+        raise ValueError("Reference refresh does not support LoRA/ref_in_actor")
+    if int(actor.world_size) != int(reference.world_size):
+        raise ValueError("Reference refresh requires matching actor/reference world sizes")
+    if _trace_mesh_signature(actor.device_mesh) != _trace_mesh_signature(reference.device_mesh):
+        raise ValueError("Reference refresh requires matching actor/reference device meshes")
+    return actor
+
+
+def _trace_mesh_signature(mesh):
+    return (tuple(mesh.mesh.shape), tuple(mesh.mesh.detach().cpu().reshape(-1).tolist()),
+            tuple(mesh.mesh_dim_names or ()), str(mesh.device_type))
+
+
+def _trace_local_tensor(tensor):
+    # DTensor.to_local() does not gather other ranks' shards.
+    return tensor.to_local() if hasattr(tensor, "placements") and hasattr(tensor, "to_local") else tensor
+
+
+def _trace_tensor_layout(tensor):
+    local = _trace_local_tensor(tensor)
+    layout = (tuple(tensor.shape), tuple(local.shape), tuple(local.stride()))
+    if hasattr(tensor, "placements"):
+        layout += (_trace_mesh_signature(tensor.device_mesh), tuple(str(p) for p in tensor.placements))
+    return layout
+
+
+def _trace_flat_layout(flat):
+    # Includes intra-flat offsets and padding (not only the flat shard length).
+    return tuple((key, repr(getattr(flat, key, None))) for key in (
+        "_fqns", "_shapes", "_numels", "_numels_with_padding", "_is_padding_mask",
+        "_shard_param_infos", "_sharded_size", "_unpadded_unsharded_size",
+    )) + (("shared", tuple(tuple(getattr(info, field) for field in (
+        "param_name", "module_name", "prim_param_name", "prim_module_name"))
+        for info in getattr(flat, "_shared_param_infos", ()))),)
+
+
+def _trace_fsdp1_handles(model):
+    return {name: module._handle for name, module in model.named_modules()
+            if getattr(module, "_handle", None) is not None
+            and hasattr(module._handle, "flat_param")}
+
+
+def _trace_assert_sharded(handle, name):
+    flat = handle.flat_param
+    local = getattr(flat, "_local_shard", flat)
+    expected = getattr(flat, "_sharded_size", flat.shape)
+    if tuple(flat.shape) != tuple(expected) or tuple(local.shape) != tuple(expected):
+        raise RuntimeError(f"Reference refresh requires a resharded model at a step boundary: {name}")
+    if flat.numel() and flat.data_ptr() != local.data_ptr():
+        raise RuntimeError(f"Reference refresh found detached local shard storage: {name}")
+
+
+def _trace_persistent_buffers(model):
+    result = {}
+    for module_name, module in model.named_modules():
+        for name, tensor in module._buffers.items():
+            if tensor is not None and name not in module._non_persistent_buffers_set:
+                result[f"{module_name}.{name}" if module_name else name] = tensor
+    return result
+
+
+def _trace_release_reference_full_params(model):
+    """Discard all FSDP all-gather caches before replacing their local shards."""
+    for handle in _trace_fsdp1_handles(model).values():
+        if hasattr(handle.flat_param, "_local_shard"):
+            handle.reshard(True)
+    try:
+        from torch.distributed.fsdp import FSDPModule
+    except ImportError:  # torch 2.4/2.5 expose FSDP2 under the composable API
+        from torch.distributed._composable.fsdp import FSDPModule
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            module.reshard()
+
+
+def _trace_prepare_local_copy(actor_model, reference_model):
+    """Validate every source/destination before returning a local-only copy plan."""
+    source_handles, target_handles = _trace_fsdp1_handles(actor_model), _trace_fsdp1_handles(reference_model)
+    if source_handles.keys() != target_handles.keys():
+        raise ValueError("Reference refresh requires identical FSDP wrapping")
+    for name, source_handle in source_handles.items():
+        target_handle = target_handles[name]
+        _trace_assert_sharded(source_handle, name)
+        _trace_assert_sharded(target_handle, name)
+        if _trace_flat_layout(source_handle.flat_param) != _trace_flat_layout(target_handle.flat_param):
+            raise ValueError(f"Reference refresh FSDP flat parameter layout mismatch: {name}")
+        if bool(source_handle._use_orig_params) != bool(target_handle._use_orig_params):
+            raise ValueError(f"Reference refresh use_orig_params mismatch: {name}")
+
+    # Flat parameters cover all original weights in FSDP1, including parameters
+    # whose local original view is empty under use_orig_params=True.
+    if source_handles:
+        source_params = {name: handle.flat_param for name, handle in source_handles.items()}
+        target_params = {name: handle.flat_param for name, handle in target_handles.items()}
+    else:
+        source_params, target_params = dict(actor_model.named_parameters()), dict(reference_model.named_parameters())
+    sources = {"parameter:" + name: value for name, value in source_params.items()}
+    targets = {"parameter:" + name: value for name, value in target_params.items()}
+    sources.update({"buffer:" + name: value for name, value in _trace_persistent_buffers(actor_model).items()})
+    targets.update({"buffer:" + name: value for name, value in _trace_persistent_buffers(reference_model).items()})
+    if sources.keys() != targets.keys():
+        raise ValueError("Reference refresh requires identical model parameters and persistent buffers")
+    plan, aliases = [], {}
+    for name, source in sources.items():
+        target = targets[name]
+        if _trace_tensor_layout(source) != _trace_tensor_layout(target):
+            raise ValueError(f"Reference refresh parameter/shard layout mismatch: {name}")
+        source, target = _trace_local_tensor(source).detach(), _trace_local_tensor(target).detach()
+        if source.is_meta or target.is_meta:
+            raise ValueError(f"Reference refresh cannot copy unmaterialized parameters: {name}")
+        if source.layout != target.layout:
+            raise ValueError(f"Reference refresh tensor layout mismatch: {name}")
+        # Deduplicate tied destinations, and ensure tied source aliases agree.
+        key = (str(target.device), target.data_ptr(), tuple(target.shape), tuple(target.stride()))
+        source_key = (str(source.device), source.data_ptr(), tuple(source.shape), tuple(source.stride()))
+        if target.numel() and key in aliases:
+            if aliases[key] != source_key:
+                raise ValueError(f"Reference refresh tied parameter mismatch: {name}")
+            continue
+        aliases[key] = source_key
+        plan.append((source, target))
+    return plan
+
+
+def _trace_invalidate_reference_cache(worker, completed_step):
+    for name in ("_trace_prefix_verified", "_trace_prefix_disabled", "_trace_prefix_output_dtype"):
+        if hasattr(worker, name):
+            delattr(worker, name)
+    worker._trace_reference_step = int(completed_step)
+    worker.ref_module_fsdp.eval()
+
+
+def _trace_copy_local_reference(actor, reference, completed_step):
+    """Copy weights with dtype conversion; keep actor gradients/storage intact."""
+    import torch
+
+    _trace_release_reference_full_params(reference.ref_module_fsdp)
+    plan = _trace_prepare_local_copy(actor.actor_module_fsdp, reference.ref_module_fsdp)
+    with torch.no_grad():
+        for source, target in plan:
+            target.copy_(source, non_blocking=False)
+    _trace_invalidate_reference_cache(reference, completed_step)
+    return {"reference_step": int(completed_step), "tensors": len(plan),
+            "numel": sum(target.numel() for _, target in plan)}
 
 
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -851,27 +1025,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Colocated actor/ref roles share a process on each rank. Keep only a
         # weak reference, allowing step-boundary refresh without Ray transfers.
         if self._is_actor:
-            from agentflow.trace.reference_refresh import register_actor
-
-            register_actor(self)
+            _trace_register_actor(self)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def validate_reference_refresh(self):
-        from agentflow.trace.reference_refresh import colocated_actor, prepare_local_copy
-
-        actor = colocated_actor(self)
-        prepare_local_copy(actor.actor_module_fsdp, self.ref_module_fsdp)
+        actor = _trace_colocated_actor(self)
+        _trace_prepare_local_copy(actor.actor_module_fsdp, self.ref_module_fsdp)
         return {"rank": self.rank, "reference_step": getattr(self, "_trace_reference_step", 0)}
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def refresh_reference_from_actor(self, completed_step):
         """Freeze the latest colocated actor weights until the next refresh."""
-        from agentflow.trace.reference_refresh import colocated_actor, copy_local_reference
 
         # VERL's actor CPU offload uses a non-blocking device-to-host transfer.
         # A subsequent CPU-to-CPU copy must wait for that transfer explicitly.
         get_torch_device().synchronize()
-        return copy_local_reference(colocated_actor(self), self, completed_step)
+        return _trace_copy_local_reference(_trace_colocated_actor(self), self, completed_step)
 
     def _reference_checkpoint_manager(self):
         if not self._is_ref or self._is_lora:
@@ -889,9 +1058,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_reference_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         """Persist the reference snapshot alongside ordinary training checkpoints."""
-        from agentflow.trace.reference_refresh import release_reference_full_params
 
-        release_reference_full_params(self.ref_module_fsdp)
+        _trace_release_reference_full_params(self.ref_module_fsdp)
         self._reference_checkpoint_manager().save_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step,
             max_ckpt_to_keep=max_ckpt_to_keep,
@@ -900,14 +1068,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_reference_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False, reference_step=0):
-        from agentflow.trace.reference_refresh import invalidate_reference_cache, release_reference_full_params
-
-        release_reference_full_params(self.ref_module_fsdp)
+        _trace_release_reference_full_params(self.ref_module_fsdp)
         self._reference_checkpoint_manager().load_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load,
         )
-        release_reference_full_params(self.ref_module_fsdp)
-        invalidate_reference_cache(self, reference_step)
+        _trace_release_reference_full_params(self.ref_module_fsdp)
+        _trace_invalidate_reference_cache(self, reference_step)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update_by_dpo")
