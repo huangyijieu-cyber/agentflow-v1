@@ -51,8 +51,15 @@ class TraceConfig:
     shared_prefix_max_tokens: int = 8192
     shared_prefix_max_mask_mib: int = 256
     shared_prefix_verify: bool = True
+    # 0 keeps the initial reference; None refreshes after every completed step.
+    reference_update_interval: Optional[int] = 0
 
     def __post_init__(self):
+        interval = self.reference_update_interval
+        if interval is not None and (
+            isinstance(interval, bool) or not isinstance(interval, int) or interval < 0
+        ):
+            raise ValueError("trace.reference_update_interval must be None or a nonnegative integer")
         for name in ("enabled", "terminal_fill_enabled", "outcome_match_value", "pair_round_robin",
                      "shared_prefix_scoring", "shared_prefix_verify"):
             if not isinstance(getattr(self, name), bool):
@@ -119,6 +126,9 @@ class TraceConfig:
         group_cap = values.get("k_pairs_per_group")
         if isinstance(group_cap, str) and group_cap.strip().lower() in ("none", "null"):
             values["k_pairs_per_group"] = None
+        interval = values.get("reference_update_interval")
+        if isinstance(interval, str) and interval.strip().lower() in ("none", "null"):
+            values["reference_update_interval"] = None
         result = cls(**values)
         if legacy_fields:
             warnings.warn(

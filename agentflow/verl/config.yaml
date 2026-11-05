@@ -36,6 +36,7 @@ data:
     shared_prefix_max_tokens: 8192
     shared_prefix_max_mask_mib: 256
     shared_prefix_verify: true
+    reference_update_interval: 0  # 0: fixed initial ref; null: every step; N: every N completed steps.
 
 actor_rollout_ref:
   rollout:

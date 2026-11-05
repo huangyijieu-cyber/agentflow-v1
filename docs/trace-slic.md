@@ -18,7 +18,7 @@ QA 的状态、终局和回填语义见下文；ALFWorld 的真实后状态与�
 Answer the question directly and concisely.
 ```
 
-使用冻结参考模型、温度 1，对固定 GT 做 teacher forcing，只平均 GT Token 的 LogP：
+使用当前训练 step 内冻结的参考模型、温度 1，对固定 GT 做 teacher forcing，只平均 GT Token 的 LogP。默认固定初始权重；可通过 [参考模型更新间隔](trace-reference.md) 按 step 刷新：
 
 $$
 \bar\ell_{g,t}=\frac{1}{|y^*|}\sum_j\log\pi_{\mathrm{ref}}(y_j^*\mid S_{g,t},y_{<j}^*),

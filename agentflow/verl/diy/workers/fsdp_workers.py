@@ -848,6 +848,67 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 checkpoint_config=checkpoint_contents,
             )
 
+        # Colocated actor/ref roles share a process on each rank. Keep only a
+        # weak reference, allowing step-boundary refresh without Ray transfers.
+        if self._is_actor:
+            from agentflow.trace.reference_refresh import register_actor
+
+            register_actor(self)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def validate_reference_refresh(self):
+        from agentflow.trace.reference_refresh import colocated_actor, prepare_local_copy
+
+        actor = colocated_actor(self)
+        prepare_local_copy(actor.actor_module_fsdp, self.ref_module_fsdp)
+        return {"rank": self.rank, "reference_step": getattr(self, "_trace_reference_step", 0)}
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def refresh_reference_from_actor(self, completed_step):
+        """Freeze the latest colocated actor weights until the next refresh."""
+        from agentflow.trace.reference_refresh import colocated_actor, copy_local_reference
+
+        # VERL's actor CPU offload uses a non-blocking device-to-host transfer.
+        # A subsequent CPU-to-CPU copy must wait for that transfer explicitly.
+        get_torch_device().synchronize()
+        return copy_local_reference(colocated_actor(self), self, completed_step)
+
+    def _reference_checkpoint_manager(self):
+        if not self._is_ref or self._is_lora:
+            raise ValueError("Reference checkpointing requires a dedicated non-LoRA reference")
+        if not hasattr(self, "_trace_reference_checkpoint_manager"):
+            self._trace_reference_checkpoint_manager = FSDPCheckpointManager(
+                model=self.ref_module_fsdp,
+                optimizer=None,
+                lr_scheduler=None,
+                processing_class=self.processor if self.processor is not None else self.tokenizer,
+                checkpoint_config=OmegaConf.create({"load_contents": ["model"], "save_contents": ["model"]}),
+            )
+        return self._trace_reference_checkpoint_manager
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_reference_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+        """Persist the reference snapshot alongside ordinary training checkpoints."""
+        from agentflow.trace.reference_refresh import release_reference_full_params
+
+        release_reference_full_params(self.ref_module_fsdp)
+        self._reference_checkpoint_manager().save_checkpoint(
+            local_path=local_path, hdfs_path=hdfs_path, global_step=global_step,
+            max_ckpt_to_keep=max_ckpt_to_keep,
+        )
+        dist.barrier()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_reference_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False, reference_step=0):
+        from agentflow.trace.reference_refresh import invalidate_reference_cache, release_reference_full_params
+
+        release_reference_full_params(self.ref_module_fsdp)
+        self._reference_checkpoint_manager().load_checkpoint(
+            local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load,
+        )
+        release_reference_full_params(self.ref_module_fsdp)
+        invalidate_reference_cache(self, reference_step)
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update_by_dpo")
     def update_actor_by_dpo(self, data: DataProto):

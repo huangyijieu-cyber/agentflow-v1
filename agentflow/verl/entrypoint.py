@@ -108,6 +108,11 @@ class TaskRunner:
         trace_config = config.data.get("trace", {})
         if "slic" in str(config.data.get("algorithm", "")).split("+") and trace_config.get("enabled", False):
             config.data.trace = OmegaConf.create(asdict(TraceConfig.from_mapping(trace_config)))
+            if config.data.trace.get("reference_update_interval", 0) != 0:
+                if config.actor_rollout_ref.actor.strategy not in ("fsdp", "fsdp2"):
+                    raise ValueError("TRACE reference refresh requires FSDP/FSDP2")
+                if config.actor_rollout_ref.model.get("lora_rank", 0) > 0:
+                    raise ValueError("TRACE reference refresh requires full-model training (LoRA is unsupported)")
         pprint(OmegaConf.to_container(config, resolve=True))
 
         # download the checkpoint from hdfs
