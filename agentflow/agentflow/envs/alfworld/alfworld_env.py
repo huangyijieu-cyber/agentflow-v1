@@ -93,8 +93,8 @@ def _saved_goal_tools():
 
 
 def _parquet_goal_tools():
-    from agentflow.trace import alfworld_parquet
-    return alfworld_parquet
+    from agentflow.trace import alfworld_goal_store
+    return alfworld_goal_store
 
 
 def _create_trace_environment(base_env, batch_size=1):
@@ -360,7 +360,7 @@ class AlfWorldEnv:
         if self.trace_enabled and gamefile is not None:
             if env_type != "AlfredTWEnv":
                 raise ValueError("Saved-game ALFWorld TRACE requires AlfredTWEnv")
-            from agentflow.envs.alfworld.selected_game_env import SelectedGameAlfredTWEnv
+            from agentflow.envs.alfworld.trace_wrapper import SelectedGameAlfredTWEnv
             return SelectedGameAlfredTWEnv(config, train_eval=data_type, gamefile=gamefile)
 
         base_env = get_environment(env_type)(config, train_eval=data_type)

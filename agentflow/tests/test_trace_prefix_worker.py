@@ -18,7 +18,7 @@ PACKAGE = "trace_prefix_worker_test_package"
 package = ModuleType(PACKAGE)
 package.__path__ = [str(ROOT / "agentflow/agentflow/trace")]
 sys.modules[PACKAGE] = package
-backend = importlib.import_module(PACKAGE + ".prefix_backend")
+backend = importlib.import_module(PACKAGE + ".prefix_scoring")
 scoring = importlib.import_module(PACKAGE + ".prefix_scoring")
 credit = importlib.import_module(PACKAGE + ".credit")
 

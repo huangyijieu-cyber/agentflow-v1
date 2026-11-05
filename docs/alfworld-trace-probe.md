@@ -2,7 +2,7 @@
 
 入口：train-roma/alfworld_trace_probe.py。
 
-当前默认使用 ALFWorld v2b：“离线实际 PDDL → 成功条件放入 Prompt → 完整事实与剩余预算 → 固定未来成功句 LogP”，所有环境动作统一进行 TRACE 配对，并使用真实终局结果回填。v2a 记录在 `alfworld-v2a`；模板与差异见 [评分版本](alfworld-scoring-versions.md)，正式训练接入见 [alfworld-trace-goals.md](alfworld-trace-goals.md)。
+当前默认使用 ALFWorld v2b：“离线实际 PDDL → 成功条件放入 Prompt → 完整事实与剩余预算 → 固定未来成功句 LogP”，所有环境动作统一进行 TRACE 配对，并使用真实终局结果回填。v2a 记录在 `alfworld-v2a`；模板与差异见 [评分版本](alfworld-trace-goals.md#scoring-versions)，正式训练接入见 [alfworld-trace-goals.md](alfworld-trace-goals.md)。
 
 默认选 data/train/alfworld/train_all_alfworld_3305.parquet 第 0 行，即 train_all_alfworld_0；从 question 解析环境编号 0，而不是使用该行的 id=1。同一题采样 4 条轨迹，每条最多 50 个动作，策略 temperature=0.7、history_length=4。
 
@@ -133,7 +133,7 @@ score 模式从不自动采样，也不导入 ALFWorld；缓存缺失或尚未�
 
 ## 旧轨迹补齐 GT 和完整状态（不重新采样）
 
-已有 trajectories.json 时继续使用同一 work-dir。窗口支持多个样本时，先切换到目标样本再补齐；命令行的 --work-dir 应指向实际包含该 trajectories.json 的目录（新样本通常是工作区下的 samples/<sample-id>/）。旧配置中的 Prompt/Response 保留。切到 v2b 时，将 Response 改成 `The agent will successfully complete the task within the remaining action budget.`，Prompt 改为 [版本说明](alfworld-scoring-versions.md) 中的预测指令，并选择 `full_state`。若已保存完整 Goal 规则、事实和经核验的实际剩余预算，重新评分会自动重渲染上下文并保存 sidecar，不需要采样或读取原始游戏。缺规则先 enrich；缺完整事实或实际预算依据时使用 `enrich --replay` 重放原动作确认，不生成新动作。旧缓存仅按 sampling.max_steps 记录的预算不会被当作已核验的环境预算。
+已有 trajectories.json 时继续使用同一 work-dir。窗口支持多个样本时，先切换到目标样本再补齐；命令行的 --work-dir 应指向实际包含该 trajectories.json 的目录（新样本通常是工作区下的 samples/<sample-id>/）。旧配置中的 Prompt/Response 保留。切到 v2b 时，将 Response 改成 `The agent will successfully complete the task within the remaining action budget.`，Prompt 改为 [版本说明](alfworld-trace-goals.md#scoring-versions) 中的预测指令，并选择 `full_state`。若已保存完整 Goal 规则、事实和经核验的实际剩余预算，重新评分会自动重渲染上下文并保存 sidecar，不需要采样或读取原始游戏。缺规则先 enrich；缺完整事实或实际预算依据时使用 `enrich --replay` 重放原动作确认，不生成新动作。旧缓存仅按 sampling.max_steps 记录的预算不会被当作已核验的环境预算。
 
 若旧轨迹已保存完整 facts，可直接离线补齐：
 

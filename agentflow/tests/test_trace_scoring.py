@@ -1,4 +1,5 @@
 """Exercise GT teacher forcing preparation without loading Ray or VERL."""
+
 import ast
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
@@ -9,8 +10,17 @@ from pathlib import Path
 from types import SimpleNamespace, MethodType
 import unittest
 from unittest.mock import Mock
-
 import torch
+import argparse
+import contextlib
+import io
+import os
+import subprocess
+import types
+from unittest import mock
+import re
+import warnings
+
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("trace_scoring_under_test", ROOT / "agentflow/agentflow/trace/credit.py")
@@ -337,6 +347,235 @@ class TraceStartupTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "model loading reached"):
                     run()
                 self.assertEqual(config.data.trace, settings)
+
+
+PAIRING_ROOT = Path(__file__).resolve().parents[2]
+PAIRING_SPEC = importlib.util.spec_from_file_location(
+    "trace_pairing_config_test_credit", PAIRING_ROOT / "agentflow/agentflow/trace/credit.py")
+PAIRING_CREDIT = importlib.util.module_from_spec(PAIRING_SPEC)
+sys.modules[PAIRING_SPEC.name] = PAIRING_CREDIT
+PAIRING_SPEC.loader.exec_module(PAIRING_CREDIT)
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+
+def load_pairing_function(path, name, scope):
+    tree = ast.parse(path.read_text())
+    node = next(item for item in tree.body
+                if isinstance(item, ast.FunctionDef) and item.name == name)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
+    return scope[name]
+
+
+@unittest.skipIf(yaml is None, "PyYAML is unavailable")
+class PairingSwitchLaunchTests(unittest.TestCase):
+    def launch_config(self, filename, environment=None, overrides=()):
+        # Execute the production environment loader and argument builder without
+        # importing their model clients or launching a distributed process.
+        loader = load_pairing_function(PAIRING_ROOT / "train-roma/utils.py", "load_and_set_env_from_yaml",
+                               {"os": os, "yaml": yaml, "sys": sys})
+        utils = types.ModuleType("utils")
+        utils.load_and_set_env_from_yaml = lambda _: loader(str(PAIRING_ROOT / "train-roma" / filename))
+        runner = mock.Mock()
+        main = load_pairing_function(PAIRING_ROOT / "train-roma/train_agent.py", "main", {
+            "os": os, "sys": sys, "argparse": argparse,
+            "subprocess": types.SimpleNamespace(run=runner,
+                                                CalledProcessError=subprocess.CalledProcessError),
+        })
+        with mock.patch.dict(os.environ, environment or {}, clear=True), \
+             mock.patch.dict(sys.modules, {"utils": utils}), \
+             mock.patch.object(sys, "argv", ["train_agent.py", *overrides]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            main()
+        runner.assert_called_once()
+        command = runner.call_args.args[0]
+        self.assertEqual(command[:3], ["python", "-m", "agentflow.verl"])
+        values = yaml.safe_load((PAIRING_ROOT / "agentflow/verl/config.yaml").read_text())["data"]["trace"]
+        # Hydra receives these scalar CLI literals. Preserve CLI ordering so a
+        # user override appended by train_agent.main wins over the YAML default.
+        for argument in command[3:]:
+            if argument.startswith("data.trace."):
+                key, literal = argument.split("=", 1)
+                values[key.removeprefix("data.trace.")] = yaml.safe_load(literal)
+        return PAIRING_CREDIT.TraceConfig.from_mapping(values), command
+
+    @staticmethod
+    def pairs(config):
+        rows = [dict(index=index, uid="question", turn_type="tool_plan", turn_index=0,
+                     rollout_id=f"rollout-{index}", value=.2, credit=credit,
+                     valid=True, length=10, old_per_token=-1., action_key=f"action-{index}")
+                for index, credit in enumerate((.4, -.1, -.2))]
+        return PAIRING_CREDIT.select_pairs(rows, config)
+
+    def test_package_default_enables_round_robin(self):
+        document = yaml.safe_load((PAIRING_ROOT / "agentflow/verl/config.yaml").read_text())
+        self.assertIs(document["data"]["trace"]["pair_round_robin"], True)
+        self.assertTrue(PAIRING_CREDIT.TraceConfig.from_mapping(document["data"]["trace"]).pair_round_robin)
+
+    def test_both_training_yaml_files_export_the_switch(self):
+        for filename in ("config.yaml", "config_grpo+slic.yaml"):
+            with self.subTest(filename=filename):
+                document = yaml.safe_load((PAIRING_ROOT / "train-roma" / filename).read_text())
+                self.assertEqual(document["env"]["TRACE_PAIR_ROUND_ROBIN"],
+                                 "${env:TRACE_PAIR_ROUND_ROBIN,true}")
+                self.assertEqual(document["python_args"]["data.trace.pair_round_robin"],
+                                 "${TRACE_PAIR_ROUND_ROBIN}")
+
+    def test_default_launch_preserves_round_robin_selection(self):
+        for filename in ("config.yaml", "config_grpo+slic.yaml"):
+            with self.subTest(filename=filename):
+                config, command = self.launch_config(filename)
+                self.assertTrue(config.pair_round_robin)
+                self.assertIn("data.trace.pair_round_robin=true", command)
+                self.assertEqual(self.pairs(config), [(0, 2)])
+
+    def test_env_switch_changes_selection_without_changing_other_controls(self):
+        for filename in ("config.yaml", "config_grpo+slic.yaml"):
+            with self.subTest(filename=filename):
+                enabled, enabled_command = self.launch_config(filename, {"TRACE_PAIR_ROUND_ROBIN": "true"})
+                disabled, disabled_command = self.launch_config(filename, {"TRACE_PAIR_ROUND_ROBIN": "false"})
+                self.assertTrue(enabled.pair_round_robin)
+                self.assertFalse(disabled.pair_round_robin)
+                self.assertIn("data.trace.pair_round_robin=true", enabled_command)
+                self.assertIn("data.trace.pair_round_robin=false", disabled_command)
+                self.assertEqual(self.pairs(enabled), [(0, 2)])
+                self.assertEqual(self.pairs(disabled), [(0, 2), (0, 1)])
+                self.assertEqual({key: value for key, value in asdict(enabled).items()
+                                  if key != "pair_round_robin"},
+                                 {key: value for key, value in asdict(disabled).items()
+                                  if key != "pair_round_robin"})
+
+    def test_explicit_cli_override_wins_over_opposite_env_value(self):
+        for filename in ("config.yaml", "config_grpo+slic.yaml"):
+            for env_value, override, expected_pairs in (
+                    ("true", "false", [(0, 2), (0, 1)]),
+                    ("false", "true", [(0, 2)])):
+                with self.subTest(filename=filename, override=override):
+                    config, command = self.launch_config(
+                        filename, {"TRACE_PAIR_ROUND_ROBIN": env_value},
+                        ["data.trace.pair_round_robin=" + override])
+                    self.assertEqual(command[-1], "data.trace.pair_round_robin=" + override)
+                    self.assertIs(config.pair_round_robin, override == "true")
+                    self.assertEqual(self.pairs(config), expected_pairs)
+
+
+PREFIX_ROOT = Path(__file__).resolve().parents[2]
+PREFIX_SPEC = importlib.util.spec_from_file_location(
+    "trace_prefix_config_test_credit", PREFIX_ROOT / "agentflow/agentflow/trace/credit.py")
+PREFIX_CREDIT = importlib.util.module_from_spec(PREFIX_SPEC)
+sys.modules[PREFIX_SPEC.name] = PREFIX_CREDIT
+PREFIX_SPEC.loader.exec_module(PREFIX_CREDIT)
+TraceConfig = PREFIX_CREDIT.TraceConfig
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+
+PREFIX_SETTINGS = {
+    "shared_prefix_scoring": ("TRACE_SHARED_PREFIX_SCORING", True),
+    "shared_prefix_max_tokens": ("TRACE_SHARED_PREFIX_MAX_TOKENS", 8192),
+    "shared_prefix_max_mask_mib": ("TRACE_SHARED_PREFIX_MAX_MASK_MIB", 256),
+    "shared_prefix_verify": ("TRACE_SHARED_PREFIX_VERIFY", True),
+}
+
+
+class SharedPrefixConfigTests(unittest.TestCase):
+    def test_library_default_keeps_original_scorer_and_normalizes_round_trip(self):
+        cfg = TraceConfig.from_mapping()
+        self.assertFalse(cfg.shared_prefix_scoring)
+        self.assertTrue(cfg.shared_prefix_verify)
+        self.assertEqual(cfg.shared_prefix_max_tokens, 8192)
+        self.assertEqual(cfg.shared_prefix_max_mask_mib, 256)
+        self.assertEqual(TraceConfig.from_mapping(asdict(cfg)), cfg)
+        self.assertIs(TraceConfig.from_mapping(cfg), cfg)
+
+    def test_enabled_and_explicitly_disabled_controls_are_independent_of_credit(self):
+        for enabled, verify in ((True, True), (True, False), (False, True), (False, False)):
+            with self.subTest(enabled=enabled, verify=verify):
+                cfg = TraceConfig.from_mapping({
+                    "shared_prefix_scoring": enabled,
+                    "shared_prefix_verify": verify,
+                    "shared_prefix_max_tokens": 4096,
+                    "shared_prefix_max_mask_mib": 64,
+                })
+                self.assertIs(cfg.shared_prefix_scoring, enabled)
+                self.assertIs(cfg.shared_prefix_verify, verify)
+                self.assertEqual(cfg.shared_prefix_max_tokens, 4096)
+                self.assertEqual(cfg.shared_prefix_max_mask_mib, 64)
+                base = TraceConfig()
+                for key, value in asdict(base).items():
+                    if key not in PREFIX_SETTINGS:
+                        self.assertEqual(getattr(cfg, key), value)
+
+    def test_prefix_boolean_flags_reject_strings_numbers_and_null(self):
+        for key in ("shared_prefix_scoring", "shared_prefix_verify"):
+            for value in ("true", "false", "1", 0, 1, None, [], {}):
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(
+                    ValueError, re.escape("trace." + key) + " must be a boolean"
+                ):
+                    TraceConfig.from_mapping({key: value})
+
+    def test_prefix_limits_require_positive_integers_even_when_disabled(self):
+        for key in ("shared_prefix_max_tokens", "shared_prefix_max_mask_mib"):
+            for value in (True, False, 0, -1, 2.5, "8192", None, float("inf")):
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(
+                    ValueError, re.escape("trace." + key) + " must be a positive integer"
+                ):
+                    TraceConfig.from_mapping({key: value, "shared_prefix_scoring": False})
+
+    def test_legacy_config_warning_and_unknown_field_rejection_are_preserved(self):
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            cfg = TraceConfig.from_mapping({"pair_score_mode": "igpo", "igpo_gamma": 1.,
+                                            "shared_prefix_scoring": True})
+        self.assertTrue(cfg.shared_prefix_scoring)
+        self.assertEqual(len(recorded), 1)
+        self.assertIn("does not enable IGPO", str(recorded[0].message))
+        with self.assertRaisesRegex(ValueError, "Unknown TRACE configuration fields"):
+            TraceConfig.from_mapping({"shared_prefix_scorng": True})
+
+
+@unittest.skipIf(yaml is None, "PyYAML is unavailable")
+class SharedPrefixYamlTests(unittest.TestCase):
+    def test_package_defaults_match_the_validated_library_defaults(self):
+        document = yaml.safe_load((PREFIX_ROOT / "agentflow/verl/config.yaml").read_text())
+        cfg = TraceConfig.from_mapping(document["data"]["trace"])
+        # Experiment pairing defaults are intentionally independent of the
+        # reusable library defaults; shared-prefix settings still match.
+        for field in PREFIX_SETTINGS:
+            self.assertEqual(getattr(cfg, field), getattr(TraceConfig(), field))
+
+    def test_training_entrypoints_enable_and_export_the_same_prefix_controls(self):
+        for filename in ("config.yaml", "config_grpo+slic.yaml"):
+            with self.subTest(filename=filename):
+                document = yaml.safe_load((PREFIX_ROOT / "train-roma" / filename).read_text())
+                for field, (variable, default) in PREFIX_SETTINGS.items():
+                    default_literal = str(default).lower() if isinstance(default, bool) else str(default)
+                    self.assertEqual(document["env"][variable], "${env:" + variable + "," + default_literal + "}")
+                    self.assertEqual(document["python_args"]["data.trace." + field], "${" + variable + "}")
+
+    def test_explicit_env_disable_reaches_the_original_scorer_switch(self):
+        for filename in ("config.yaml", "config_grpo+slic.yaml"):
+            with self.subTest(filename=filename):
+                document = yaml.safe_load((PREFIX_ROOT / "train-roma" / filename).read_text())
+                environment = {"TRACE_SHARED_PREFIX_SCORING": "false"}
+                values = {}
+                for field, (variable, _) in PREFIX_SETTINGS.items():
+                    expression = document["env"][variable]
+                    match = re.fullmatch(r"\$\{env:([A-Z_]+),([^}]+)\}", expression)
+                    self.assertIsNotNone(match)
+                    name, default = match.groups()
+                    values[field] = yaml.safe_load(environment.get(name, default))
+                cfg = TraceConfig.from_mapping(values)
+                self.assertFalse(cfg.shared_prefix_scoring)
+                self.assertTrue(cfg.shared_prefix_verify)
+                self.assertEqual(cfg.shared_prefix_max_tokens, 8192)
+                self.assertEqual(cfg.shared_prefix_max_mask_mib, 256)
 
 
 if __name__ == "__main__":

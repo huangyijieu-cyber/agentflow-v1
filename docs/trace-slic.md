@@ -203,7 +203,20 @@ KL loss，它们也使用该参考模型。默认两种 KL 都关闭。SLIC loss
 
 ## 代码组织
 
-实现统一位于 `agentflow/agentflow/trace/` 子包：`credit.py` 包含原信用计算与 GT 评分，`execution.py` 负责故障和可信终局，`metrics.py` 负责指标，`__init__.py` 为轻量包入口。原 4 个平铺文件整理为 4 个包内文件，生产文件总数不变。该结构整理保持 `trace` 分支的公式、默认参数、筛选规则和训练行为不变。参考模型的更新调度与 checkpoint 保存/恢复直接放在现有 `agentflow/verl/trainer.py` 的 `AgentFlowTrainer` 中；同 rank 权重复制、分片校验和 worker RPC 放在现有 `agentflow/verl/diy/workers/fsdp_workers.py` 中，不再拆分额外生产模块。相关测试并入已有 trainer、worker 与分布式测试文件。
+TRACE 核心统一位于 `agentflow/agentflow/trace/`，按职责组织：
+
+| 文件 | 职责 |
+| --- | --- |
+| `credit.py` | 配置、GT 评分输入、V、信用和 Pair 选择 |
+| `execution.py` | 执行状态、外部错误和可信终局判断 |
+| `metrics.py` | 训练诊断指标，不参与筛选或 Loss |
+| `prefix_scoring.py` | 精确前缀树、attention mask、参考模型执行与分布式一致性 |
+| `alfworld.py` | PDDL 规则转换、目标核验与评分状态渲染 |
+| `alfworld_goal_store.py` | 数据集游戏映射、SQLite/Parquet 离线准备与运行时读取 |
+
+参考模型更新调度及 checkpoint 保存/恢复保留在原 `agentflow/verl/trainer.py`；分片复制与 RPC 保留在原 `agentflow/verl/diy/workers/fsdp_workers.py`。ALFWorld 的两个轻量环境适配类统一放在 `envs/alfworld/trace_wrapper.py`，避免异步子进程导入带初始化副作用的主环境文件。
+
+Probe 的交互入口、评分后端和 HTML 各自保留；采样缓存和评分可独立使用。配置、执行、数据准备与 replay 测试归入相应已有测试文件。此整理只移动实现、更新内部引用，保留 CLI、配置值、数据格式、公式、筛选规则和训练行为。
 
 ## 配置
 
@@ -243,6 +256,193 @@ export TRACE_K_PAIRS_PER_GROUP=None  # null is also accepted; use 2 to restore s
 export TRACE_PAIR_ROUND_ROBIN=false  # true is the default.
 ```
 
-评分依赖冻结参考模型，可能增加显存与前向成本。状态来自实际角色可见输入，历史窗口与模板变化仍可能影响 GT 信用；本轮未重构评分视图。训练指标定义见 [指标说明](trace-slic-metrics.md)。
+评分依赖冻结参考模型，可能增加显存与前向成本。状态来自实际角色可见输入，历史窗口与模板变化仍可能影响 GT 信用；本轮未重构评分视图。训练指标定义见 [指标说明](trace-slic.md#training-metrics)。
 
 指标精简后，工具有效信用统一输出为 `trace/credit_*`，保留独立的 `local_credit_*` 与 `terminal_fill_*` 供比较；不再重复输出 `effective_credit_*` 或按类型拆分的工具信用。Pair 保留工具价值差、信用差、分来源数量与工具匹配率，奖励路线的定义恒定统计及混合来源比例已移除。该调整只精简日志，不改变信用、配对门槛、Loss、Replay 采样或配置；小价值距离与大信用差仍不能独立证明真实可比性。
+
+<a id="shared-prefix-scoring"></a>
+
+## 共享前缀 GT 评分
+
+本实现迁移 IGPO 论文 Figure 3 的计算方式：相同前缀只前向一次，多个 GT 分支通过自定义四维 attention mask 相互隔离。它不是把独立序列合并为普通 batch，也不将 TRACE 换成 IGPO 的奖励公式。
+
+参考代码固定到官方 [IGPO `64165e2` 的自定义注意力实现](https://github.com/GuoqingWang1/IGPO/blob/64165e2741ed8801f977948c8128080ce87b4101/scrl/llm_agent/vectorized_gt_logprob.py)。该仓库正式 generation 入口实际使用另一条普通批量评分路径；本次迁移的是论文中的共享计算机制。
+
+### 完整状态如何共享
+
+ALFWorld 每个 turn 的当前事实、观察及配置的历史窗口会变化，不能假设后一轮完整文本是前一轮的追加。本实现直接使用现有评分器已经生成的 `prompt_ids` 和 `target_ids` 构建精确 token 前缀树，既共享同题的规则与初始事实，也共享任何确实一致的更长前缀。分包只影响计算组织，不改文本、token、GT 长度检查或评分目标。
+
+每个物理节点保存 token、父节点和逻辑深度。对于 query 节点 q，只允许它关注自身及祖先节点；其它分支、未来状态和其它 GT 均不可见。RoPE 的 position ID 使用逻辑深度，而非节点在拼接数组中的物理位置。
+
+每个 GT token 从其逻辑父节点的 logits 取概率。特别是 GT 的第一个 token 使用对应上下文最后一个节点的 logits，不能使用数组中前一个分支末尾的 logits。这一处理避免官方示意实现中直接使用 `gt_start - 1` 的对齐风险。
+
+逐 token LogP 回填到原请求行后，继续使用原 `mean_gt_logps`、V、K-step credit、终局回填与配置指定的配对逻辑。完全相同的状态仍先使用原有去重。
+
+### 配置
+
+正式 `train-roma/config.yaml` 和 `config_grpo+slic.yaml` 默认请求共享评分。已有自定义配置若未设置新字段，仍采用原批量评分方式。对应环境变量为：
+
+```bash
+export TRACE_SHARED_PREFIX_SCORING=true
+export TRACE_SHARED_PREFIX_MAX_TOKENS=8192
+export TRACE_SHARED_PREFIX_MAX_MASK_MIB=256
+export TRACE_SHARED_PREFIX_VERIFY=true
+```
+
+设 `TRACE_SHARED_PREFIX_SCORING=false` 恢复原 GT 批量评分。四个字段位于 `data.trace.shared_prefix_*`；不需要重新生成 GT Parquet，不需要改变 GRPO、rollout 或 actor 的 SP/microbatch。
+
+token 数和 mask 预算共同限制每个树包的大小；超限不能截断输入或伪造评分。mask 预算仅覆盖四维 additive mask，不是整个模型峰值内存；eager attention 还需要与 head 数相关的中间张量。默认规划也限制树包的稠密 attention 规模，避免把几乎不共享前缀的长序列强行合并。
+
+### Reference 与分布式边界
+
+新入口仅用于冻结 reference 的 GT 评分，原 actor forward/backward、rollout、动作 LogP 和配对流程继续沿用原路径。树评分对现有 reference FSDP 模块临时选择支持任意 4D mask 的 eager attention，结束后恢复配置。首版支持纯文本 Qwen2/Qwen3 的标准 RoPE；不支持的模型、LoRA、fused forward 或其它不满足条件的配置会明确记录回退原因。
+
+启动时可以保留 SP=2；但树评分绕开原 remove-padding/SP 序列切片，SP 组内各 rank 对完整树重复前向，只有原收集 rank 的结果回传。它不意味着树评分仍享有 SP=2 的序列并行收益。actor 训练的 SP 行为不变。
+
+不同 rank 的树包数量可能不同。模型前向前统一协商计划与最大轮数，不足者执行不回填结果的 dummy 前向，确保 FSDP 参数通信顺序一致。规划或能力回退在所有相关 rank 上统一决策，不能让一个 rank 中途独自改走另一条通信路径。
+
+首次共享评分默认与原评分路径作逐 GT token 数值对照，因此第一次会额外执行原路径，可能暂时增加首步耗时。数值不匹配时统一使用原结果，并在后续停止重复尝试该共享路径。后续成功验证的共享评分无需每步再执行原评分。BF16 与不同 attention backend 不承诺逐 bit 相同；有效性判断与最终返回精度应遵循原评分口径。
+
+另一个原有性能因素是 reference 的 FSDP 包装会强制 CPU offload，即使 YAML 的 `ref.fsdp_config.param_offload=false`；因此之前 GT 评分的 113 秒也可能包含参数搬运。本次不改这项既有行为。共享评分减少前向次数时，也可能减少部分参数搬运。
+
+### 验证与性能解读
+
+新测试覆盖树路径、分支隔离、位置编码、首 GT token、不同 GT 长度、预算分包、配置路由和回退。真实小型 Qwen2/Qwen3 在 CPU 上逐 token 对照独立 teacher forcing；这不等于服务器 4B 模型、Ascend 或多机 HCCL 的完整训练验证。
+
+本地随机小型 Qwen3 合成基准中，16 条请求共享 256-token 前缀，原始 token 总数 4288，树节点数 448，节省约 89.6%；逐 GT token LogP 最大差为 0。该微基准不能推导生产环境加速倍数。稠密 4D attention 仍与树包长度平方相关，实际速度还受共享程度、分包、SP 重复前向、reference 参数搬运和内存影响。
+
+本地两进程 Gloo 测试也已通过：两端本地 pack 数不同，需要一端补 dummy 前向，仍能完成首批校验、后续免重复校验、跨 rank 一致回退，并返回一致的指标。它使用 CPU attention 模型模拟每次 FSDP 前向中的 collective，不代表真实 Ascend/HCCL/FSDP 已完成验证。可在服务器仓库中单独复现：
+
+```bash
+TRACE_TEST_PREFIX_DISTRIBUTED=1 python -m unittest discover \
+  -s agentflow/tests -p 'test_trace_prefix_distributed.py'
+```
+
+服务器应观察下面的指标，并比较第 2 步以后的 `trace/scoring_seconds`。不能只看到开关为 true 就认定已经共享计算。
+
+| 指标 | 含义 |
+| --- | --- |
+| `trace/prefix_requested` | trainer 是否请求新路径 |
+| `trace/prefix_used` | 本批是否真正使用树评分结果 |
+| `trace/prefix_saved_tokens` | 相对独立评分少算的 token 数，已排除 SP 复制计数 |
+| `trace/prefix_original_tokens` / `tree_tokens` | 独立输入总 token 数与树节点总数 |
+| `trace/prefix_forward_rounds` | 各 rank 对齐后的树前向轮数 |
+| `trace/prefix_dummy_forwards` | 为保持通信顺序而增加、不回填结果的前向 |
+| `trace/prefix_attention_cost_ratio` | 树包稠密 attention 格数与独立请求格数的比值 |
+| `trace/prefix_validation_checked` / `passed` / `max_diff` | 是否执行数值校验、是否通过、最大逐 token 差值 |
+| `trace/prefix_fallback_*` | 是否因模型、预算、无共享收益或数值校验等原因回退 |
+
+所有 fallback 指标在各 rank 上统一。`prefix_used=0` 时不能把该批耗时解释为共享前缀评分的性能；如果 `fallback_planning=1`，应先检查输入长度与两个包预算，不能通过截断完整状态来强行启用。
+
+<a id="training-metrics"></a>
+
+## 训练指标
+
+指标接入原训练 metrics 字典，默认 console logger 输出，无需额外开关。比例为 0–1。早期指标精简仅调整日志；候选生成可由 `pair_round_robin` 切换：默认先 V 匹配再排序轮转，关闭则枚举全部正负组合；两种计数口径见下文。
+
+`trace` 来源是工具局部信用加终局回填，`outcome` 来源是 analysis／实际最终回答的可信成功／失败标签。两种来源的 Pair 数分开观察；工具信用使用保留的 `credit_*` 名称，已移除与其完全相同的 `effective_credit_*`。
+
+### 优先观察
+
+| 指标 | 含义 | 如何判断 |
+| --- | --- | --- |
+| `val/reward`、`val/completion_rate`、`val/valid_rollout_rate` | 有效已完成轨迹的平均 reward，以及完成／有效轨迹占排队轨迹比例 | 完成率和有效率稳定时，reward 才便于比较；只有二值奖励时均值直接对应成功率 |
+| `trace/credit_coverage` | 有效信用工具 Turn 数 / 预期计算信用的工具 Turn 数 | 应结合评分缺失、故障窗口原因判断；analysis／final 不进入分母 |
+| `trace/local_credit_p10/p50/p90` | 未回填的 K-step 工具信用分布 | 观察纯局部信号；不要求正负各半 |
+| `trace/terminal_fill_p10/p50/p90` | 终局优势回填项分布 | 与局部信用一起看，判断回填是否主导 |
+| `trace/credit_p10/p50/p90` | 局部信用加回填后的有效工具信用 | 工具 Pair 使用此信号；幅度越大不等于效果越好 |
+| `trace/pair/trace_selected_unique`、`outcome_selected_unique` | 分布式补齐前的工具／奖励来源 Pair 数 | 区分两种监督构成；数量不作为质量目标 |
+| `trace/pair/tool_value_match_rate` | 轮转模式：有兼容负例池的工具 Chosen 比例；全组合模式：工具正负组合通过 V 的比例 | 两种模式的分母不同，不能直接横比 |
+| `trace/pair/value_gap_p90/max`、`credit_gap_min` | 选中工具 Pair 的状态价值差、有效信用差 | 应满足 `match_epsilon`、`gap_epsilon`；小价值差、大信用差仅为代理信号，不能证明状态可比或动作因果贡献 |
+| `trace/external_error_turns`、`credit_windows_blocked_external` | 外部故障 Turn 数及受影响信用窗口数 | 区分基础设施问题与模型退化 |
+| `trace/outcome_invalid_rollouts` | 没有可信终局结果的 Rollout 数 | 增长时检查实际 final、verifier 和外部中断；不能直接当作失败负样本 |
+| `trace/replay/sample_unique_pair_rate`、`sample_age_p90` | 采样多样性、采样 Pair 年龄的 90 分位数 | 观察过量重复抽样和旧数据占用 |
+| `trace/replay/slic_updated` | 本 step 是否实际完成 SLIC 更新 | 计划更新且有可靠数据时应为 1；无合格 Pair 时跳过符合设计 |
+
+### 状态评分与信用
+
+以下为当前保留的状态指标。`count` 仅计有效有限观测；没有观测时不生成假均值或分位数。
+
+| 指标 | 定义 |
+| --- | --- |
+| `trace/turns_total` | 本批全部保留 Turn 数 |
+| `trace/score_coverage` | 有效且不大于零的 GT LogP Turn 数 / 全部保留 Turn 数；奖励路线不要求 GT 评分 |
+| `trace/gt_logp_count`、`gt_logp_mean` | 有效 GT 平均 Token LogP 的数量、跨 Turn 均值 |
+| `trace/credit_expected_turns` | 预期计算信用的工具行数，排除 analysis／final |
+| `trace/credit_coverage` | 预期工具行中获得有效信用的比例；状态缺失和外部故障仍保留在分母 |
+| `trace/credit_{count,mean,p10,p50,p90}` | 有效工具信用，包含启用的终局回填 |
+| `trace/local_credit_{count,mean,p10,p50,p90}` | 未回填的 K-step 局部工具信用 |
+| `trace/terminal_fill_{count,mean,p10,p50,p90}` | 工具终局优势回填项，含未触发回填或优势为零的有限零值 |
+| `trace/positive_rate`、`negative_rate` | 全部有限工具信用超过严格正阈值、低于严格负阈值的比例；尚未做动作质量过滤。`credit_count>0` 时，中性比例可由 `1-positive_rate-negative_rate` 推得；无信用样本时两者均输出 0，不据此推断中性占比 |
+| `trace/terminal_reached_turns` | 信用窗口触及可信实际 final 的工具 Turn 数 |
+| `trace/terminal_fill_nonzero_turns` | 回填项非零且有限的工具 Turn 数；触及终局但优势为零时不会计入 |
+| `trace/credit_windows_blocked` | 因所有原因失效的工具信用窗口数，包括外部故障、编号缺口和所需状态缺失 |
+| `trace/credit_windows_blocked_external` | 因外部故障失效的窗口数，是总失效窗口的子集 |
+| `trace/external_error_turns` | 标记为外部故障的 Turn 数 |
+| `trace/outcome_invalid_rollouts` | 整条 Rollout 没有任何可信终局标签行时才计入；可信 final 后的无标签附加输出不使该 Rollout 变为无效 |
+| `trace/post_final_turns` | 实际用于验证的 final 之后的输出行数；这些行不能继承最终标签或进入 Pair |
+
+正常验证成功和失败都可以是可信终局；verifier 调用／解析失败、外部中断等才会使结果不可信。优先使用明确的 verifier 成功标记，不能根据正格式奖励推断任务成功。
+
+终局优势按可信终局 Rollout 去重统计，其均值／标准差人口可能与原 GRPO batch 不同；复用中心化和归一化口径不代表两条路径优势数值相同，原 GRPO 优势未被修改。
+
+### 评分准备与成本
+
+- `trace/missing_gt`、`missing_state`、`invalid_gt_length`、`overlong_state`：按检查顺序记录第一个输入拒绝原因，彼此互斥；超长状态和 GT 跳过，不截断。
+- `trace/scoring_requests`：去重后的实际逻辑评分请求数，分布式补齐前计数。
+- `trace/scoring_invalid_result_turns`：已映射评分请求却得到无效 LogP 的 Turn 数；共享请求失败可能影响多行。
+- `trace/scoring_seconds`：GT reference RPC 的墙钟时间。
+- `trace/step_time_fraction`：评分请求构造、reference 评分及信用汇总区间占训练 step 的比例；不包含所有 Pair／Replay 工作或所有新增 reference 开销。
+
+### 配对筛选与质量
+
+以下统一省略 `trace/pair/` 前缀：
+
+| 指标 | 定义 |
+| --- | --- |
+| `candidates_sign` | 轮转模式：有负例时的 Chosen 数；全组合模式：正例数乘负例数；无负例时均为 0。工具/环境动作是否按原始 Turn 分组由 `k_pairs_per_group` 控制 |
+| `groups_no_positive`、`groups_no_negative` | 缺少合格正侧／负侧的组数；中性组可能同时计入两者 |
+| `both_sign_group_rate` | 同时具备正负两侧的合格组数 / 有合格行的组数；无合格组时为 0 |
+| `tool_value_match_rate` | 轮转模式为存在兼容池的工具 Chosen 比例；全组合模式为工具组合通过 V 的比例；无工具候选时为 0 |
+| `rejected_value_match` | 轮转模式：没有兼容 V 负例池的 Chosen 数；全组合模式：V 不满足阈值的组合数。outcome 未开启 V 匹配时不计此项 |
+| `rejected_credit_gap` | 因工具有效信用差不足被拒绝的组合数；奖励路线不使用此门槛 |
+| `rejected_length` | 因响应长度比过大被拒绝的组合数 |
+| `rejected_same_action` | 因两侧动作身份相同被拒绝的组合数 |
+| `rejected_group_cap`、`rejected_global_cap` | 通过质量过滤后，受到每组／每步数量上限限制的组合数 |
+| `selected_unique` | 补齐前最终选中的 Pair 数；轮转模式 Chosen 不复用，Rejected 可循环复用；全组合模式两侧均可出现在多个不同 Pair 中 |
+| `trace_selected_unique`、`outcome_selected_unique` | 工具／奖励来源最终选中的 Pair 数 |
+| `question_coverage` | 最终 Pair 覆盖问题数 / 当前批次已有 Turn 的不同问题数；未返回任何 Turn 的问题不在分母 |
+| `cross_turn_rate` | 最终 Pair 两侧原始 Turn 编号不同的比例；工具/环境动作在同 Turn 模式应为 0，`k_pairs_per_group=None` 时允许非零；QA outcome 路由原本允许跨 Turn |
+| `value_gap_{p50,p90,max}` | 最终工具 Pair 两侧动作前状态价值差，仅统计工具来源 |
+| `credit_gap_{min,p50,p90}` | 最终工具 Pair 两侧有效信用差，仅统计工具来源 |
+| `{type}/selected_unique` | 各决策类型最终选中的 Pair 数 |
+| `padding_duplicates` | 为分布式分区补齐而重复的 Pair 条数 |
+
+六个 `rejected_*` 原因按检查顺序互斥，可核对 `candidates_sign = 六个拒绝计数之和 + selected_unique`。累计通过阶段已删除；`groups_eligible`、`groups_both_signs`、`trace_candidates_sign`、`trace_after_value_match` 仅作为计算两个比例的内部计数，不再输出日志。
+
+每个 Chosen 先按 V 阈值筛兼容负例池，负例按偏好分升序、样本索引升序排列；兼容负例索引列表相同的 Chosen 共用局部计数 k，从 0 开始严格分配 `compatible[k % len(compatible)]`，随后推进计数。不同列表独立轮转，即使相互重叠也不共享计数；精确 V 池内负例用完后才循环，V 不兼容的负例不会先占用轮转位置。每个 Chosen 只尝试一个已匹配负例，之后信用差、长度或相同动作过滤失败仍直接跳过，不补选，计数仍已推进；未生成的其它正负组合不计入候选或拒绝数。这些规则适用于默认 `pair_round_robin=true`。设为 `false` 时恢复全部正负组合，每个组合独立检查 V 和其它门槛；`candidates_sign` 为正负例数乘积，`rejected_value_match` 为未通过 V 的组合数。两种模式的候选和匹配率分母不能直接横比。旧盲轮转的 V 拒绝则表示已分配负例不匹配，不等于当前轮转模式的完全没有兼容负例。分布式补齐和跨训练步 Replay 仍可能重复同一个 Pair。
+
+工具按有效信用差、奖励路线按最终奖励差降序选择，再按价值距离、旧策略平均 Token LogP 距离打破平局。全局上限仍基于候选原始差值排序，两种来源尚无尺度校准；触及全局上限时需观察分来源选中数量。精简日志没有改变这一选择逻辑。
+
+`trace/invalid_action_turns`、`trace/duplicate_turns`、`trace/dropped_prompt_turns` 是行级过滤原因，彼此可能重叠。原 `replay/n_new_pairs` 可能包含补齐条数，不能替代 `selected_unique`。
+
+工具信用与终局是否一致，仅保留 `trace/pair/trace/` 下的：
+
+- `outcome_pairs_count`：双方都有可信成功标记的工具 Pair 数；无可信观测时为 0，且不输出下列比例。
+- `chosen_failed_rollout_rate`：上述工具 Pair 中 Chosen 来自最终失败 Rollout 的比例。
+- `rejected_successful_rollout_rate`：上述工具 Pair 中 Rejected 来自最终成功 Rollout 的比例。
+- `same_outcome_rate`：上述工具 Pair 两侧最终结果相同的比例。
+
+这些比例描述局部标签与最终结果的关系，不能充当因果正确率；奖励来源本来就按成功／失败配对，不再重复输出其定义决定的终局比例。新路径只采用可信 verifier 成功标记；无 `label_source` 的历史诊断行保留原 reward > 0 解释。
+
+### Replay、验证与原有 Loss
+
+- `trace/replay/sampled_pairs`：实际采样条数，不能等同于优化次数。
+- `trace/replay/sample_unique_pair_rate`：采样的不同原始 Pair 数 / 采样条数；原始身份含出生 step，不代表动作语义已去重。
+- `trace/replay/sample_age_p90`：采样 Pair 年龄的 90 分位数，单位训练 step。
+- `trace/replay/slic_updated`：本 step 实际完成 SLIC 更新的 0/1 标记。
+- 原 `replay/buffer_size/n_dpo_batch`、`dpo_loss/sft_loss/calibration_loss/quality_gap/rewards/accuracy` 保留。后两者表示拟合偏好标签的程度，不等于任务成功率。
+- `rewards/chosen/rejected/margin` 使用整段概率，长响应易下溢，需要结合 per-token gap、损失分项及梯度解释。
+- `val/queued_rollouts/completed_rollouts/valid_rollouts`、`completion_rate/valid_rollout_rate` 保留；两种比例分母均为排队轨迹数。`val/reward` 不把未返回轨迹自动记失败。
+
+`pair_round_robin` 只切换候选生成方式，不修改 SLIC Loss、Replay 更新强度、GRPO 优势算法或其它配对门槛。CPU 回归不能替代 GPU/NPU 训练收益验证；小状态距离与大信用差仍需独立状态抽查和验证集收益确认。
