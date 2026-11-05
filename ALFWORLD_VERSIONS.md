@@ -1,16 +1,18 @@
 # ALFWorld 实验版本归档
 
-当前实验记录为 **ALFWorld v3a**，复现标签 `alfworld/v3a`，`TRACE_REFERENCE_UPDATE_INTERVAL=None`。对照正式 **v2_e（`ee5da31`，标签 `alfworld/v2_e`）**，在采样与评分历史均为 4 条、其余实验参数一致时，算法变化只有终局优势动态缩放和逐训练 step 更新参考模型，详见下方对照。
+当前实验记录为 **ALFWorld v4a**，复现标签 `alfworld/v4a`，`TRACE_REFERENCE_UPDATE_INTERVAL=None`。对照正式 **v2_e（`ee5da31`，标签 `alfworld/v2_e`）**，在采样与评分历史均为 4 条、其余实验参数一致时，算法变化只有终局优势动态缩放和逐训练 step 更新参考模型，详见下方对照。
+
+本实验刚登记为 v3a，现按用户要求更名为 **v4a**；原 `alfworld/v3a` 标签保留为旧名，不另算一次算法变更。
 
 用户已确认 v2_d、v2_e 均为 `pair_round_robin=false` 全组合，v2_e 相对 v2_d 仅增加 actor 原生最近历史窗口（默认 4 条）。v2_e 功能逻辑基于 `7152e73`，标签记录提交由该功能代码、固化为 false 的三份 ALFWorld 训练配置及补充文档构成。
 
 工作分支曾在 v2_e 后按用户要求，将评分历史改为原累计 `trace_action_history` 的最后 4 条，保留“动作＋执行后观察”的旧日志格式。固定 4 条，不跟随 actor 的 `history_length`；其余评分内容、Response、信用公式和配对配置不变。当时未另命名实验版本，也未移动既有 `alfworld/v2_e` 标签；当时评分缓存契约为 `alfworld-post-action-recent-history-v1`。
 
-随后工作分支将 ALFWorld 终局回填改为复用 QA 的同题正负局部信用范围动态缩放，替代训练/Probe 中固定系数 2。保留 K=3 最后三个真实动作的回填位置及 gamma 距离折扣，Prompt/Response、局部信用、配对和基础训练算法保持不变。`TRACE_TERMINAL_FILL_SCALE` 对 ALFWorld 忽略，关闭回填使用 `TRACE_TERMINAL_FILL_ENABLED=false`。该改动现纳入 v3a，以下历史标签不变。
+随后工作分支将 ALFWorld 终局回填改为复用 QA 的同题正负局部信用范围动态缩放，替代训练/Probe 中固定系数 2。保留 K=3 最后三个真实动作的回填位置及 gamma 距离折扣，Prompt/Response、局部信用、配对和基础训练算法保持不变。`TRACE_TERMINAL_FILL_SCALE` 对 ALFWorld 忽略，关闭回填使用 `TRACE_TERMINAL_FILL_ENABLED=false`。该改动现纳入 v4a，以下历史标签不变。
 
 工作分支曾进一步支持 `ALFWORLD_TRACE_HISTORY_LENGTH`，原动作后日志格式对应缓存版本 `alfworld-post-action-history-v2`。
 
-当前已按用户要求恢复正式 **v2_e（`ee5da31`）** 的 actor 原生历史格式，同时保留动态终局回填与独立评分窗口参数。`ALFWORLD_TRACE_HISTORY_LENGTH` 默认 `4`，`None`/`null` 为全部原生 memory，`0` 无历史，非负整数 N 为最近 N 条；每条仍是动作前 observation＋解析 action，并保留绝对编号。actor 自身的窗口不变。新缓存契约为 `alfworld-actor-memory-history-v2`，保存完整原生记录以便重评分。v3a 将 ALFWorld 训练默认值设为 `TRACE_REFERENCE_UPDATE_INTERVAL=None`，每完成一个训练 step 更新参考；显式设为 0 仍可固定初始参考，N 为每 N 个训练 step 更新。库默认值及 websearch 分支默认值仍为 0，旧标签不移动。
+当前已按用户要求恢复正式 **v2_e（`ee5da31`）** 的 actor 原生历史格式，同时保留动态终局回填与独立评分窗口参数。`ALFWORLD_TRACE_HISTORY_LENGTH` 默认 `4`，`None`/`null` 为全部原生 memory，`0` 无历史，非负整数 N 为最近 N 条；每条仍是动作前 observation＋解析 action，并保留绝对编号。actor 自身的窗口不变。新缓存契约为 `alfworld-actor-memory-history-v2`，保存完整原生记录以便重评分。v4a 将 ALFWorld 训练默认值设为 `TRACE_REFERENCE_UPDATE_INTERVAL=None`，每完成一个训练 step 更新参考；显式设为 0 仍可固定初始参考，N 为每 N 个训练 step 更新。库默认值及 websearch 分支默认值仍为 0，旧标签不移动。
 
 ## 版本汇总
 
@@ -23,7 +25,7 @@
 | v2_b | `alfworld/v2b` | 成功条件移入 Prompt，输入剩余动作预算，Response 改为统一未来成功句；沿用旧轮转。 |
 | v2_d | 未固定标签或精确源码基线 | 用户确认的窗口改动前实验：v2_a 成功状态 Response、无最近 4 步评分历史；`pair_round_robin=false`，全部正负组合，其它过滤、K 分组及总额度沿用原基线。 |
 | v2_e | `alfworld/v2_e` | 相对 v2_d 仅在评分 Prompt 增加 actor 原生最近窗口，默认 4 条动作前 observation＋解析 action，保留绝对编号原文；`pair_round_robin=false` 全组合不变，旧缓存重放补齐，不重新采样。 |
-| v3a | `alfworld/v3a` | 以正式 v2_e 的默认 4 条原生历史为对照；终局优势改为同题正负局部信用范围动态缩放，参考模型每完成一个训练 step 更新为最终 actor 权重（interval=None），下一步使用。 |
+| v4a | `alfworld/v4a` | 以正式 v2_e 的默认 4 条原生历史为对照；终局优势改为同题正负局部信用范围动态缩放，参考模型每完成一个训练 step 更新为最终 actor 权重（interval=None），下一步使用。 |
 
 用户此前确认 v2_a/v2_b 实验的 K_PAIRS 为 None，但已有旧标签的配置默认值实际为 2；旧标签均含旧轮转，不能当作无轮转快照。原标签、`alfworld-v2a` / `alfworld-v2b` 及 QA 标签保持原位置。v2_d 目前仅确认上述实验配置，不推断其精确提交或标签；v2_c 仍未定义。其它中间改动按提交记录，不补造版本名。评分模板见 [评分版本说明](docs/alfworld-trace-goals.md#scoring-versions)。
 
@@ -37,9 +39,9 @@
 | `fcca1b8` | 新增轮转开关，关闭后恢复全组合。 |
 | `52549b5` | 将分配纠正为兼容池内严格 `pos[k] → neg[k % len(neg)]`，每池独立游标。 |
 
-## v3a 相对正式 v2_e
+## v4a 相对正式 v2_e
 
-| 项目 | 正式 v2_e（`ee5da31`） | v3a |
+| 项目 | 正式 v2_e（`ee5da31`） | v4a |
 | --- | --- | --- |
 | 终局回填 | `2 × gamma^distance × outcome_advantage` | 先按同题正/负局部信用范围分别缩放终局优势，再乘距离折扣；缺少对应符号局部信用时该侧回填为 0 |
 | 参考模型 | 固定初始参考 | `TRACE_REFERENCE_UPDATE_INTERVAL=None`：完整 step 的 GRPO/GiGPO 与 SLIC 更新完成后复制最终 actor，供下一 step 评分；step 1 使用初始参考，单步内冻结 |
@@ -66,9 +68,9 @@ export TRACE_K_PAIRS_PER_GROUP=None
 export TRACE_PAIR_ROUND_ROBIN=false
 export ALFWORLD_TRACE_HISTORY_LENGTH=4
 export TRACE_TERMINAL_FILL_ENABLED=true
-export TRACE_REFERENCE_UPDATE_INTERVAL=None  # v3a：每个完整训练 step 后刷新
+export TRACE_REFERENCE_UPDATE_INTERVAL=None  # v4a：每个完整训练 step 后刷新
 ```
 
-固定复现 v3a 可检出 `alfworld/v3a`；复现 v2_e 可检出 `alfworld/v2_e`，不要套用上述逐步参考更新设置；v2_d 只记录已确认实验配置，不伪造精确源码或标签。注意启动脚本或 shell 的环境变量会覆盖代码默认配置。GT/result、局部信用公式、基础 GRPO/GiGPO 及配对额度不变，已有 GT Parquet 无需重新转换；更新后重启训练/rollout，使用新评分契约的数据，不混用旧信用。
+固定复现 v4a 可检出 `alfworld/v4a`；复现 v2_e 可检出 `alfworld/v2_e`，不要套用上述逐步参考更新设置；v2_d 只记录已确认实验配置，不伪造精确源码或标签。注意启动脚本或 shell 的环境变量会覆盖代码默认配置。GT/result、局部信用公式、基础 GRPO/GiGPO 及配对额度不变，已有 GT Parquet 无需重新转换；更新后重启训练/rollout，使用新评分契约的数据，不混用旧信用。
 
 当前分支的新 Probe 缓存保存完整原生 memory（`trace_full_actor_history`）、选中评分窗口和 `alfworld-actor-memory-history-v2` 版本。格式/命令校验失败或外部异常未写入 actor memory，因此不会新增原生历史条目；正常模拟器返回的 no-op 仍按原逻辑保留。旧正式 v2_e 的原生文本快照只在足以覆盖相同窗口时复用；需要其它窗口但缺完整原生记录时，使用 `enrich --replay` 重放保存动作并核验 actor Prompt，无需重新采样。动作后日志不能自动冒充原生历史；`saved` 自定义上下文保持原样。

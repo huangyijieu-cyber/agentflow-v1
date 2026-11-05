@@ -2,9 +2,9 @@
 
 入口：train-roma/alfworld_trace_probe.py。
 
-当前训练实验为 **ALFWorld v3a**，标签 `alfworld/v3a`，对照正式 v2_e（`ee5da31`）。Probe 保持正式 v2_e 的原生历史来源和格式，支持动态终局回填及独立评分历史长度：默认 4 条、`None` 全部、`0` 为空，不跟随 actor 的 `history_length`。沿用 v2_a 的成功状态 Response，使用“离线实际 PDDL → 保存的固定英文 GT → 完整环境状态及原生观察动作历史评分”，所有环境动作统一进行 TRACE 配对，并使用真实终局结果回填。当前配对保持 `pair_round_robin=false` 全组合、K_PAIRS=None 和全步默认 256 对，其余过滤不变。库默认 true 及 websearch 配置保持原样，旧版本标签不移动。
+当前训练实验为 **ALFWorld v4a**，标签 `alfworld/v4a`，对照正式 v2_e（`ee5da31`）。Probe 保持正式 v2_e 的原生历史来源和格式，支持动态终局回填及独立评分历史长度：默认 4 条、`None` 全部、`0` 为空，不跟随 actor 的 `history_length`。沿用 v2_a 的成功状态 Response，使用“离线实际 PDDL → 保存的固定英文 GT → 完整环境状态及原生观察动作历史评分”，所有环境动作统一进行 TRACE 配对，并使用真实终局结果回填。当前配对保持 `pair_round_robin=false` 全组合、K_PAIRS=None 和全步默认 256 对，其余过滤不变。库默认 true 及 websearch 配置保持原样，旧版本标签不移动。
 
-v3a 训练另启用 `TRACE_REFERENCE_UPDATE_INTERVAL=None`，每个完整训练 step 后更新参考；独立 Probe 使用所指定评分服务的权重，不会自动模拟训练 step 或该刷新流程。比较历史窗口时应固定评分服务及权重。转换来源、正式训练接入及配置见 [alfworld-trace-goals.md](alfworld-trace-goals.md)，版本差异见 [版本归档](../ALFWORLD_VERSIONS.md)。
+v4a 训练另启用 `TRACE_REFERENCE_UPDATE_INTERVAL=None`，每个完整训练 step 后更新参考；独立 Probe 使用所指定评分服务的权重，不会自动模拟训练 step 或该刷新流程。比较历史窗口时应固定评分服务及权重。转换来源、正式训练接入及配置见 [alfworld-trace-goals.md](alfworld-trace-goals.md)，版本差异见 [版本归档](../ALFWORLD_VERSIONS.md)。
 
 默认选 data/train/alfworld/train_all_alfworld_3305.parquet 第 0 行，即 train_all_alfworld_0；从 question 解析环境编号 0，而不是使用该行的 id=1。同一题采样 4 条轨迹，每条最多 50 个动作，策略 temperature=0.7、history_length=4。
 

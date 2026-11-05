@@ -144,7 +144,7 @@ Pair 两侧保留各自原始生成 Prompt、响应及原生 token IDs。仍使�
 ALFWorld 和 QA 共用 `data.trace.reference_update_interval`，仅在算法包含
 `slic` 且 `data.trace.enabled=true` 时生效。支持 `grpo+slic`、`gigpo+slic`。
 
-ALFWorld v3a 在 `train-roma/config.yaml` 或 `train-roma/config_grpo+slic.yaml` 中默认配置：
+ALFWorld v4a 在 `train-roma/config.yaml` 或 `train-roma/config_grpo+slic.yaml` 中默认配置：
 
 ```yaml
 env:
@@ -154,7 +154,7 @@ env:
 ALFWorld 分支的底层 YAML 默认值对应 `null`；websearch 分支及库 `TraceConfig()` 默认仍为 0。也可在原有启动命令前设置环境变量：
 
 ```bash
-export TRACE_REFERENCE_UPDATE_INTERVAL=None  # ALFWorld v3a：每完成一个训练 step 刷新
+export TRACE_REFERENCE_UPDATE_INTERVAL=None  # ALFWorld v4a：每完成一个训练 step 刷新
 # export TRACE_REFERENCE_UPDATE_INTERVAL=10  # 每完成 10 个训练 step 刷新
 # export TRACE_REFERENCE_UPDATE_INTERVAL=0   # 固定初始模型；websearch / 库默认值
 ```
@@ -201,7 +201,7 @@ KL loss，它们也使用该参考模型。默认两种 KL 都关闭。SLIC loss
 - `trace/reference_refreshed`：本 step 是否执行刷新。
 - `timing_s/reference_refresh`：刷新阶段耗时，计入 step 总耗时。
 
-`alfworld` 分支当前实验记录为 **ALFWorld v3a**（`alfworld/v3a`，与 QA 版本名分别记录）。
+`alfworld` 分支当前实验记录为 **ALFWorld v4a**（`alfworld/v4a`，与 QA 版本名分别记录）。
 相对正式 v2_e（`ee5da31`），在 actor 与评分历史均为 4 且其余参数一致时，仅新增
 同题局部信用范围内的动态终局回填和逐 step 参考更新。原生 memory 格式不变，
 独立 `ALFWORLD_TRACE_HISTORY_LENGTH` 仍支持 None 全部、0 无历史；改变其长度需另计实验变量。
@@ -249,7 +249,7 @@ Probe 的交互入口、评分后端和 HTML 各自保留；采样缓存和评�
 | `max_gt_tokens` | `256` | GT token 上限，超长跳过 |
 | `gt_alias_strategy` | `first` | 固定第一个非空 GT 别名 |
 | `answer_instruction` | 上文统一指令 | 独立 GT 评分提示 |
-| `reference_update_interval` | ALFWorld v3a：`null`；websearch / 库：`0` | `0` 固定初始参考；正整数 N 每完成 N 个训练 step 更新；`None`/`null` 每步使用最新 actor 快照 |
+| `reference_update_interval` | ALFWorld v4a：`null`；websearch / 库：`0` | `0` 固定初始参考；正整数 N 每完成 N 个训练 step 更新；`None`/`null` 每步使用最新 actor 快照 |
 
 TRACE 论文提供 epsilon=0.1、gamma=0.8、K-step 归一化、终局回填 scale=2 的参考设置；当前 QA 使用同题动态范围缩放，按类型配对、包含 final 的窗口计数和阈值也是项目设计，不能称为精确复现。[TRACE §3 与附录 A.1](https://arxiv.org/html/2607.13988v1)
 
