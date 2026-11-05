@@ -1285,7 +1285,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="olive", role="ref_prefix_compute_log_prob")
     def compute_ref_prefix_log_prob(self, data: DataProto):
         """Shared-prefix GT scoring; ordinary actor/ref paths remain unchanged."""
-        from agentflow.trace.prefix_backend import compute_reference_prefix
+        from agentflow.trace.prefix_scoring import compute_reference_prefix
 
         def reshard_reference(model):
             if self.world_size > 1:

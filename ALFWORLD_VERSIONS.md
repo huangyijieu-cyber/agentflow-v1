@@ -22,7 +22,7 @@
 | v2_d | 未固定标签或精确源码基线 | 用户确认的窗口改动前实验：v2_a 成功状态 Response、无最近 4 步评分历史；`pair_round_robin=false`，全部正负组合，其它过滤、K 分组及总额度沿用原基线。 |
 | v2_e | `alfworld/v2_e` | 相对 v2_d 仅在评分 Prompt 增加 actor 原生最近窗口，默认 4 条动作前 observation＋解析 action，保留绝对编号原文；`pair_round_robin=false` 全组合不变，旧缓存重放补齐，不重新采样。 |
 
-用户此前确认 v2_a/v2_b 实验的 K_PAIRS 为 None，但已有旧标签的配置默认值实际为 2；旧标签均含旧轮转，不能当作无轮转快照。原标签、`alfworld-v2a` / `alfworld-v2b` 及 QA 标签保持原位置。v2_d 目前仅确认上述实验配置，不推断其精确提交或标签；v2_c 仍未定义。其它中间改动按提交记录，不补造版本名。评分模板见 [评分版本说明](docs/alfworld-scoring-versions.md)。
+用户此前确认 v2_a/v2_b 实验的 K_PAIRS 为 None，但已有旧标签的配置默认值实际为 2；旧标签均含旧轮转，不能当作无轮转快照。原标签、`alfworld-v2a` / `alfworld-v2b` 及 QA 标签保持原位置。v2_d 目前仅确认上述实验配置，不推断其精确提交或标签；v2_c 仍未定义。其它中间改动按提交记录，不补造版本名。评分模板见 [评分版本说明](docs/alfworld-trace-goals.md#scoring-versions)。
 
 ## 中间未命名改动
 

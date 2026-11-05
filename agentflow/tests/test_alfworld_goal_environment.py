@@ -590,7 +590,7 @@ class EnvironmentTests(unittest.TestCase):
         import pyarrow.parquet as pq
         import test_alfworld_goal_conversion as fixtures
         module_spec = importlib.util.spec_from_file_location(
-            "prepared_parquet_environment_integration", ROOT / "agentflow/agentflow/trace/alfworld_parquet.py")
+            "prepared_parquet_environment_integration", ROOT / "agentflow/agentflow/trace/alfworld_goal_store.py")
         parquet = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(parquet)
         with tempfile.TemporaryDirectory() as directory:
@@ -617,8 +617,8 @@ class EnvironmentTests(unittest.TestCase):
                     return observation, info
 
             with mock.patch.dict(os.environ, {}, clear=True), \
-                 mock.patch.object(parquet._store_tools(), "_converter", side_effect=AssertionError("conversion forbidden")), \
-                 mock.patch.object(parquet._store_tools(), "read_goal_spec", side_effect=AssertionError("SQLite forbidden")):
+                 mock.patch.object(parquet, "_converter", side_effect=AssertionError("conversion forbidden")), \
+                 mock.patch.object(parquet, "read_goal_spec", side_effect=AssertionError("SQLite forbidden")):
                 sessions = []
                 for _ in range(2):
                     env, base = self.env(RowSimulator())
@@ -637,7 +637,7 @@ class EnvironmentTests(unittest.TestCase):
 
     def test_prepared_row_with_empty_result_is_rejected_before_environment_init(self):
         module_spec = importlib.util.spec_from_file_location(
-            "invalid_parquet_environment_integration", ROOT / "agentflow/agentflow/trace/alfworld_parquet.py")
+            "invalid_parquet_environment_integration", ROOT / "agentflow/agentflow/trace/alfworld_goal_store.py")
         parquet = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(parquet)
         self.scope["_parquet_goal_tools"] = lambda: parquet
@@ -662,9 +662,9 @@ class EnvironmentTests(unittest.TestCase):
             def collect_game_files(self, verbose=False):
                 raise AssertionError("full-split catalogue collection must not run")
 
-        selected = extract(ENV_PATH.with_name("selected_game_env.py"), "SelectedGameAlfredTWEnv",
+        selected = extract(ENV_PATH.with_name("trace_wrapper.py"), "SelectedGameAlfredTWEnv",
                            {"AlfredTWEnv": OfficialBase, "os": os})
-        module = ModuleType("agentflow.envs.alfworld.selected_game_env")
+        module = ModuleType("agentflow.envs.alfworld.trace_wrapper")
         module.SelectedGameAlfredTWEnv = selected
         config = {"env": {"type": "AlfredTWEnv", "domain_randomization": True}}
         self.scope.update({"__file__": str(ENV_PATH), "load_config_file": lambda path: config,
