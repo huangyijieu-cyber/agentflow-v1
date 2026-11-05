@@ -1,6 +1,6 @@
 # TRACE 状态信用与分类型 SLIC 配对
 
-版本命名、差异、参数对照和代码快照统一维护于桌面文档 `webwalker-trace版本记录.md`。**v3a＝原 v2a1，v3b＝原 v2a2**。最新实验 **v3d** 沿用 v3c 的 Replay 容量 512、采样 ×4 和严格 V 匹配，主要设置为 `k_pairs_per_group=None`（YAML 为 `null`），允许同题同类型工具跨 Turn 配对并取消组内数量上限。QA 信用沿用 v3b 的动态范围回填。当前 `alfworld` 分支在 `41f0552` 恢复 v2a 评分、`ad412f6` 应用轮转后，本次修正为先 V 匹配再轮转；None 跨 Turn 设置保持不变。`websearch` 同步修正配对顺序，QA 历史实验定义及已有标签保留。
+QA/WebWalker 的版本命名、差异、参数对照和代码快照维护于桌面文档 `webwalker-trace版本记录.md`。以下 QA **v3a＝原 v2a1，v3b＝原 v2a2**，与 [ALFWorld 版本](../ALFWORLD_VERSIONS.md) 分别记录。最新实验 **v3d** 沿用 v3c 的 Replay 容量 512、采样 ×4 和严格 V 匹配，主要设置为 `k_pairs_per_group=None`（YAML 为 `null`），允许同题同类型工具跨 Turn 配对并取消组内数量上限。QA 信用沿用 v3b 的动态范围回填。当前 `alfworld` 分支在 `41f0552` 恢复 v2a 评分、`ad412f6` 应用轮转后，本次修正为先 V 匹配再轮转；None 跨 Turn 设置保持不变。`websearch` 同步修正配对顺序，QA 历史实验定义及已有标签保留。
 
 **v3c、v3d 均开启严格价值匹配**：`outcome_match_value=true`、`match_epsilon=0.05`，analysis／final 也必须满足 `abs(V_i - V_j) <= 0.05`，并保留可信终局成功／失败标签。此处记录实验实际设置，基础配置默认值仍为 `false`。
 
@@ -144,19 +144,19 @@ Pair 两侧保留各自原始生成 Prompt、响应及原生 token IDs。仍使�
 ALFWorld 和 QA 共用 `data.trace.reference_update_interval`，仅在算法包含
 `slic` 且 `data.trace.enabled=true` 时生效。支持 `grpo+slic`、`gigpo+slic`。
 
-在 `train-roma/config.yaml` 或 `train-roma/config_grpo+slic.yaml` 中配置：
+ALFWorld v3a 在 `train-roma/config.yaml` 或 `train-roma/config_grpo+slic.yaml` 中默认配置：
 
 ```yaml
 env:
-  TRACE_REFERENCE_UPDATE_INTERVAL: ${env:TRACE_REFERENCE_UPDATE_INTERVAL,0}
+  TRACE_REFERENCE_UPDATE_INTERVAL: ${env:TRACE_REFERENCE_UPDATE_INTERVAL,None}
 ```
 
-也可在原有启动命令前设置环境变量：
+ALFWorld 分支的底层 YAML 默认值对应 `null`；websearch 分支及库 `TraceConfig()` 默认仍为 0。也可在原有启动命令前设置环境变量：
 
 ```bash
-export TRACE_REFERENCE_UPDATE_INTERVAL=10    # 每完成 10 个训练 step 刷新
-# export TRACE_REFERENCE_UPDATE_INTERVAL=None  # 每完成一个训练 step 刷新
-# export TRACE_REFERENCE_UPDATE_INTERVAL=0     # 固定初始模型，默认值，保留原实验行为
+export TRACE_REFERENCE_UPDATE_INTERVAL=None  # ALFWorld v3a：每完成一个训练 step 刷新
+# export TRACE_REFERENCE_UPDATE_INTERVAL=10  # 每完成 10 个训练 step 刷新
+# export TRACE_REFERENCE_UPDATE_INTERVAL=0   # 固定初始模型；websearch / 库默认值
 ```
 
 直接使用 Hydra 参数时，写 `data.trace.reference_update_interval=null` 表示每步刷新。
@@ -201,9 +201,11 @@ KL loss，它们也使用该参考模型。默认两种 KL 都关闭。SLIC loss
 - `trace/reference_refreshed`：本 step 是否执行刷新。
 - `timing_s/reference_refresh`：刷新阶段耗时，计入 step 总耗时。
 
-在 `alfworld` 分支本次更新中，评分历史已恢复正式 v2_e（`ee5da31`）的原生 memory 格式，
-同时保留独立 `ALFWORLD_TRACE_HISTORY_LENGTH`（默认 4、None 全部、0 不包含历史）和
-同题局部信用范围内的动态终局回填。设置刷新间隔为 0 可隔离参考更新这一实验变量。
+`alfworld` 分支当前实验记录为 **ALFWorld v3a**（`alfworld/v3a`，与 QA 版本名分别记录）。
+相对正式 v2_e（`ee5da31`），在 actor 与评分历史均为 4 且其余参数一致时，仅新增
+同题局部信用范围内的动态终局回填和逐 step 参考更新。原生 memory 格式不变，
+独立 `ALFWORLD_TRACE_HISTORY_LENGTH` 仍支持 None 全部、0 无历史；改变其长度需另计实验变量。
+保持两种 KL 均关闭可避免参考更新同时改变 KL 约束。设置刷新间隔为 0 可隔离参考更新变量。
 
 ## 代码组织
 
@@ -247,7 +249,7 @@ Probe 的交互入口、评分后端和 HTML 各自保留；采样缓存和评�
 | `max_gt_tokens` | `256` | GT token 上限，超长跳过 |
 | `gt_alias_strategy` | `first` | 固定第一个非空 GT 别名 |
 | `answer_instruction` | 上文统一指令 | 独立 GT 评分提示 |
-| `reference_update_interval` | `0` | `0` 固定初始参考；正整数 N 每完成 N 个训练 step 更新；`None`/`null` 每步使用最新 actor 快照 |
+| `reference_update_interval` | ALFWorld v3a：`null`；websearch / 库：`0` | `0` 固定初始参考；正整数 N 每完成 N 个训练 step 更新；`None`/`null` 每步使用最新 actor 快照 |
 
 TRACE 论文提供 epsilon=0.1、gamma=0.8、K-step 归一化、终局回填 scale=2 的参考设置；当前 QA 使用同题动态范围缩放，按类型配对、包含 final 的窗口计数和阈值也是项目设计，不能称为精确复现。[TRACE §3 与附录 A.1](https://arxiv.org/html/2607.13988v1)
 

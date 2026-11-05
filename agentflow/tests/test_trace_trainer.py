@@ -1252,10 +1252,10 @@ class ReferenceConfigTests(unittest.TestCase):
         import yaml
         for file in ["config.yaml", "config_grpo+slic.yaml"]:
             config = yaml.safe_load((ROOT / "train-roma" / file).read_text())
-            self.assertEqual(config["env"]["TRACE_REFERENCE_UPDATE_INTERVAL"], "${env:TRACE_REFERENCE_UPDATE_INTERVAL,0}")
+            self.assertEqual(config["env"]["TRACE_REFERENCE_UPDATE_INTERVAL"], "${env:TRACE_REFERENCE_UPDATE_INTERVAL,None}")
             self.assertEqual(config["python_args"]["data.trace.reference_update_interval"], "${TRACE_REFERENCE_UPDATE_INTERVAL}")
         config = yaml.safe_load((ROOT / "agentflow/verl/config.yaml").read_text())
-        self.assertEqual(config["data"]["trace"]["reference_update_interval"], 0)
+        self.assertIsNone(config["data"]["trace"]["reference_update_interval"])
 
 
 class ReferenceLifecycleTests(unittest.TestCase):

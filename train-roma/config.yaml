@@ -22,7 +22,7 @@ env:
   TRACE_ENABLED: ${env:TRACE_ENABLED,true}
   # Optional legacy SQLite/Probe goals; prepared training Parquet embeds GT in result.
   ALFWORLD_TRACE_GOALS: ${env:ALFWORLD_TRACE_GOALS,}
-  ALFWORLD_TRACE_HISTORY_LENGTH: ${env:ALFWORLD_TRACE_HISTORY_LENGTH,4}  # Scorer only: None=all, 0=none, N=last N post-action records.
+  ALFWORLD_TRACE_HISTORY_LENGTH: ${env:ALFWORLD_TRACE_HISTORY_LENGTH,4}  # Scorer only: None=all, 0=none, N=last N native pre-action memory records.
   TRACE_EPSILON: ${env:TRACE_EPSILON,0.1}
   TRACE_K: ${env:TRACE_K,3}
   TRACE_GAMMA: ${env:TRACE_GAMMA,0.8}
@@ -46,7 +46,7 @@ env:
   TRACE_SHARED_PREFIX_MAX_TOKENS: ${env:TRACE_SHARED_PREFIX_MAX_TOKENS,8192}
   TRACE_SHARED_PREFIX_MAX_MASK_MIB: ${env:TRACE_SHARED_PREFIX_MAX_MASK_MIB,256}
   TRACE_SHARED_PREFIX_VERIFY: ${env:TRACE_SHARED_PREFIX_VERIFY,true}
-  TRACE_REFERENCE_UPDATE_INTERVAL: ${env:TRACE_REFERENCE_UPDATE_INTERVAL,0}  # 0=fixed; None=every step; N=every N steps.
+  TRACE_REFERENCE_UPDATE_INTERVAL: ${env:TRACE_REFERENCE_UPDATE_INTERVAL,None}  # ALFWorld v3a: None=every step; 0=fixed; N=every N steps.
 
   # ----- 评分模型 (Reward Model) -----
   SCORE_MODEL_NAME: "Qwen3-30B-A3B-Instruct-2507"

@@ -2,15 +2,17 @@
 
 入口：train-roma/alfworld_trace_probe.py。
 
-最近已归档实验为 **ALFWorld v2_e**，标签 `alfworld/v2_e`，使用 actor 原生最近历史窗口。当前分支恢复正式 v2_e 的原生历史来源和格式，仅保留动态终局回填及独立评分历史长度配置：默认 4 条、`None` 全部、`0` 为空，不跟随 actor 的 `history_length`；既有标签不移动，也未另命名实验版本。沿用 v2_a 的成功状态 Response，使用“离线实际 PDDL → 保存的固定英文 GT → 完整环境状态及原生观察动作历史评分”，所有环境动作统一进行 TRACE 配对，并使用真实终局结果回填。用户已确认 v2_d/v2_e 均为 `pair_round_robin=false` 全组合，当前配置保持该设置、K_PAIRS=None 和全步默认 256 对，其余过滤不变。库默认 true 及 websearch 配置保持原样。转换来源、正式训练接入及配置见 [alfworld-trace-goals.md](alfworld-trace-goals.md)。
+当前训练实验为 **ALFWorld v3a**，标签 `alfworld/v3a`，对照正式 v2_e（`ee5da31`）。Probe 保持正式 v2_e 的原生历史来源和格式，支持动态终局回填及独立评分历史长度：默认 4 条、`None` 全部、`0` 为空，不跟随 actor 的 `history_length`。沿用 v2_a 的成功状态 Response，使用“离线实际 PDDL → 保存的固定英文 GT → 完整环境状态及原生观察动作历史评分”，所有环境动作统一进行 TRACE 配对，并使用真实终局结果回填。当前配对保持 `pair_round_robin=false` 全组合、K_PAIRS=None 和全步默认 256 对，其余过滤不变。库默认 true 及 websearch 配置保持原样，旧版本标签不移动。
+
+v3a 训练另启用 `TRACE_REFERENCE_UPDATE_INTERVAL=None`，每个完整训练 step 后更新参考；独立 Probe 使用所指定评分服务的权重，不会自动模拟训练 step 或该刷新流程。比较历史窗口时应固定评分服务及权重。转换来源、正式训练接入及配置见 [alfworld-trace-goals.md](alfworld-trace-goals.md)，版本差异见 [版本归档](../ALFWORLD_VERSIONS.md)。
 
 默认选 data/train/alfworld/train_all_alfworld_3305.parquet 第 0 行，即 train_all_alfworld_0；从 question 解析环境编号 0，而不是使用该行的 id=1。同一题采样 4 条轨迹，每条最多 50 个动作，策略 temperature=0.7、history_length=4。
 
-首次采样保存真实动作、生成 Prompt/Response、可见状态、环境返回、每个状态的最近动作日志快照及版本和最后动作后的状态。随后修改评分 Prompt/固定 Response 只重新评分这些状态；即使重启脚本，也不会重新生成已完成的轨迹。在窗口中可新建样本并切换历史样本；每个样本独立保存轨迹和评分，原有 work-dir 根目录的缓存也可继续使用。
+首次采样保存真实动作、生成 Prompt/Response、可见状态、环境返回、完整原生 memory、各状态的选中历史窗口及版本和最后动作后的状态。随后修改评分 Prompt/固定 Response 只重新评分这些状态；即使重启脚本，也不会重新生成已完成的轨迹。在窗口中可新建样本并切换历史样本；每个样本独立保存轨迹和评分，原有 work-dir 根目录的缓存也可继续使用。
 
 ## 启动窗口
 
-正式训练使用填好 `result` 的 Parquet，见 [离线准备步骤](alfworld-trace-goals.md#规则来源与转换)。本 Probe 继续使用兼容的独立 SQLite；按该文的 `build --dataset ...` 命令生成 `alfworld_trace_goals.sqlite`。新采样和旧缓存补 GT 都只读取这个文件，不在窗口中执行转换。已经保存完整 GT/状态及本次契约的最近动作日志快照的轨迹可以直接评分，无需再次读取转换文件；旧缓存缺快照时按下文执行 `enrich --replay`。
+正式训练使用填好 `result` 的 Parquet，见 [离线准备步骤](alfworld-trace-goals.md#规则来源与转换)。本 Probe 继续使用兼容的独立 SQLite；按该文的 `build --dataset ...` 命令生成 `alfworld_trace_goals.sqlite`。新采样和旧缓存补 GT 都只读取这个文件，不在窗口中执行转换。已经保存完整 GT/状态及当前契约原生历史的轨迹可以直接评分，无需再次读取转换文件；旧正式 v2_e 的原生文本快照只在足以覆盖相同窗口时复用，缺所需原生历史时按下文执行 `enrich --replay`。
 
 在平时能运行 ALFWorld 的 Python 环境、仓库根目录中执行。下面的模型名、服务地址和 tokenizer 路径须对应实际部署；采样与评分可使用不同服务。
 
