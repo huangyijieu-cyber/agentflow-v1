@@ -1099,6 +1099,98 @@ class AgentFlowTrainer(RayPPOTrainer):
 
 
 
+    def _collect_train_batch(self, gen_batch):
+        """Reject QA network spikes before scoring, replay insertion or updates."""
+        check_network = str(self.config.data.get("task", "qa")).lower() == "qa"
+        if check_network and not hasattr(self, "_network_error_rates"):
+            self._network_error_rates = deque(maxlen=10)
+        history = self._network_error_rates if check_network else ()
+        baseline_rate = float(np.median(history)) if history else 0.0
+        # Fixed policy: one initial batch and at most three complete resamples.
+        retry_delays = (60, 120, 240)
+        discarded_rollouts = discarded_errors = backoff_seconds = 0
+        peak_errors = peak_rate = 0
+        health_metrics = {}
+
+        self.async_rollout_manager.wake_up()
+        try:
+            for attempt in range(len(retry_delays) + 1):
+                self.agent_mode_daemon.set_up_data_and_server(
+                    gen_batch.non_tensor_batch, self.async_rollout_manager.server_addresses
+                )
+                if self.agent_mode_daemon._total_tasks_queued == 0:
+                    raise ValueError("No training tasks were queued. Check data preparation.")
+                # Collection failures keep their existing retry/abort semantics;
+                # an arbitrary model, verifier or coordinator error is not an outage.
+                self.agent_mode_daemon.run_until_all_finished()
+                if not self.agent_mode_daemon._completed_rollouts:
+                    raise ValueError("No training tasks completed. Check server and agent execution.")
+
+                if check_network:
+                    health = self.agent_mode_daemon.get_network_health()
+                    if not health["metadata_complete"]:
+                        raise RuntimeError(f"Cannot check QA network health: incomplete rollout metadata: {health}")
+                    network_turns = health["network_turns"]
+                    errors = health["external_error_turns"]
+                    error_rate = errors / network_turns if network_turns else 0.0
+                    expected = network_turns * baseline_rate
+                    threshold = max(40.0, 2 * expected)
+                    # Compare rates, allowing one float ULP for median rounding
+                    # at equality (e.g. median([.1, .2]) * 2 exceeds .3).
+                    spike = errors >= 40 and error_rate >= np.nextafter(2 * baseline_rate, -np.inf)
+                    peak_errors = max(peak_errors, errors)
+                    peak_rate = max(peak_rate, error_rate)
+                    print("[rollout_health] " + json.dumps({
+                        "step": self.global_steps, "attempt": attempt,
+                        **health, "error_rate": error_rate,
+                        "baseline_error_rate": baseline_rate, "history_steps": len(history),
+                        "expected_error_turns": expected, "spike_threshold": threshold,
+                        "accepted": not spike,
+                    }, sort_keys=True), flush=True)
+                    if spike:
+                        discarded_rollouts += health["total_rollouts"]
+                        discarded_errors += errors
+                        self.agent_mode_daemon.clear_data_and_server()
+                        if attempt == len(retry_delays):
+                            raise RuntimeError(
+                                f"QA network spike persists at step {self.global_steps} after 3 retries: "
+                                f"{errors}/{network_turns} network turns failed (threshold={threshold:g}). "
+                                "No batch from these attempts was scored, added to replay or used for training."
+                            )
+                        delay = retry_delays[attempt]
+                        print(f"[rollout_health] Discarded attempt {attempt}; retrying the same batch "
+                              f"in {delay}s ({attempt + 1}/3).", flush=True)
+                        time.sleep(delay)
+                        backoff_seconds += delay
+                        continue
+                    health_metrics = {
+                        f"rollout_health/{key}": value for key, value in {
+                            **{key: value for key, value in health.items() if isinstance(value, (int, float))},
+                            "error_rate": error_rate,
+                            "baseline_error_rate": baseline_rate, "history_steps": len(history),
+                            "expected_error_turns": expected, "spike_threshold": threshold,
+                            "retry_count": attempt, "backoff_seconds": backoff_seconds,
+                            "discarded_rollouts": discarded_rollouts,
+                            "discarded_error_turns": discarded_errors,
+                            "peak_error_turns": peak_errors, "peak_error_rate": peak_rate,
+                        }.items()
+                    }
+
+                batch, metrics = self.agent_mode_daemon.get_train_data_batch(
+                    max_prompt_length=self.config.data.max_prompt_length,
+                    max_response_length=self.config.data.max_response_length,
+                    device=gen_batch.batch["fake_ids"].device,
+                )
+                # Never learn the baseline from rejected attempts or batches
+                # with no network calls (there is no error-rate observation).
+                if check_network and network_turns:
+                    history.append(error_rate)
+                metrics.update(health_metrics)
+                return batch, metrics
+        finally:
+            self.agent_mode_daemon.clear_data_and_server()
+            self.async_rollout_manager.sleep()
+
     @npu_safe_step
     def _train_step(self, batch_dict: dict) -> dict:
         # Isolate in a separate method to automatically recycle the variables before validation.
@@ -1145,28 +1237,8 @@ class AgentFlowTrainer(RayPPOTrainer):
 
             # generate a batch
             with _timer("gen", timing_raw), torch.no_grad():
-                # gen_batch.non_tensor_batch["step"] = np.ones_like(gen_batch.non_tensor_batch["question"]) * self.global_steps
-                self.async_rollout_manager.wake_up()
-                self.agent_mode_daemon.set_up_data_and_server(
-                    gen_batch.non_tensor_batch, self.async_rollout_manager.server_addresses
-                )
-
-                if self.agent_mode_daemon._total_tasks_queued == 0:
-                    raise ValueError("No training tasks were queued. Check data preparation.")
-
-                self.agent_mode_daemon.run_until_all_finished()
-
-                if len(self.agent_mode_daemon._completed_rollouts) == 0:
-                    raise ValueError("No training tasks completed. Check server and agent execution.")
-
-                batch, agent_metrics = self.agent_mode_daemon.get_train_data_batch(
-                    max_prompt_length=self.config.data.max_prompt_length,
-                    max_response_length=self.config.data.max_response_length,
-                    device=gen_batch.batch["fake_ids"].device,
-                )
+                batch, agent_metrics = self._collect_train_batch(gen_batch)
                 metrics.update(agent_metrics)
-                self.agent_mode_daemon.clear_data_and_server()
-                self.async_rollout_manager.sleep()
 
             ## 2. REMAX advantage
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
@@ -1539,6 +1611,20 @@ class AgentFlowTrainer(RayPPOTrainer):
         }
 
     def _save_checkpoint(self):
+        if str(self.config.data.get("task", "qa")).lower() == "qa":
+            # Save alongside the actor before publishing the checkpoint tracker.
+            # This is runtime checkpoint state, not an additional configuration.
+            folder = os.path.join(self.config.trainer.default_local_dir,
+                                  f"global_step_{self.global_steps}")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, "network_health.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"format_version": 1, "completed_step": self.global_steps,
+                           "error_rates": list(getattr(self, "_network_error_rates", ()))}, handle)
+            remote_root = self.config.trainer.get("default_hdfs_dir")
+            if remote_root:
+                from verl.utils.fs import copy
+                copy(path, os.path.join(remote_root, f"global_step_{self.global_steps}", "network_health.json"))
         interval = self._trace_reference_interval()
         if interval != 0:
             # Save reference first: the base implementation publishes the latest
@@ -1569,6 +1655,24 @@ class AgentFlowTrainer(RayPPOTrainer):
 
     def _load_checkpoint(self):
         result = super()._load_checkpoint()
+        self._network_error_rates = deque(maxlen=10)
+        if str(self.config.data.get("task", "qa")).lower() == "qa" and self.global_steps:
+            root = (self.config.trainer.resume_from_path if self.config.trainer.resume_mode == "resume_path"
+                    else os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"))
+            path = os.path.join(root, "network_health.json")
+            if os.path.isfile(path):
+                with open(path, encoding="utf-8") as handle:
+                    saved = json.load(handle)
+                rates = saved.get("error_rates") if isinstance(saved, dict) else None
+                if (not isinstance(saved, dict) or saved.get("format_version") != 1
+                        or saved.get("completed_step") != self.global_steps
+                        or not isinstance(rates, list) or len(rates) > 10
+                        or any(type(rate) not in (int, float) or not np.isfinite(rate) or not 0 <= rate <= 1
+                               for rate in rates)):
+                    raise ValueError(f"Invalid QA network health checkpoint: {path}")
+                self._network_error_rates.extend(rates)
+            else:
+                print("[rollout_health] No saved network baseline; starting with the 40-error floor.")
         self._trace_reference_step = 0
         interval = self._trace_reference_interval()
         if interval == 0:

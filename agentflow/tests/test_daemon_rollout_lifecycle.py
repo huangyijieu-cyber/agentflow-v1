@@ -2,6 +2,8 @@
 import ast
 import asyncio
 import concurrent.futures
+import contextlib
+import copy
 import importlib.util
 import json
 import logging
@@ -74,7 +76,7 @@ class ScriptServer:
 def make_daemon(server=None, roots=("root",), **kwargs):
     clock = Clock()
     scope = dict(vars(typing), asyncio=SimpleNamespace(**{**vars(asyncio), "sleep": clock.sleep}),
-                 concurrent=concurrent, threading=threading, math=math, os=os, uuid=uuid,
+                 concurrent=concurrent, threading=threading, math=math, os=os, uuid=uuid, json=json,
                  time=clock, logger=LOGGER, Rollout=PROTOCOL.Rollout, LLM=PROTOCOL.LLM,
                  NamedResources=PROTOCOL.NamedResources, profiling_enabled=lambda: False,
                  AgentFlowServer=lambda **kw: SimpleNamespace(**kw), _find_available_port=lambda: 0)
@@ -237,6 +239,234 @@ class DaemonLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await task
         server.clear_queues.assert_awaited_once()
         self.assertEqual(daemon._completed_rollouts, {})
+
+
+class NetworkHealthTests(unittest.TestCase):
+    def turn(self, index, tool="Yibu_Brave_Search_Tool", *, external_error=False,
+             turn_type="tool_plan", empty_tokens=False, **metadata):
+        return PROTOCOL.Triplet(
+            prompt={"token_ids": [] if empty_tokens else [1]},
+            response={"token_ids": [] if empty_tokens else [2]},
+            metadata={"trace_task": None, "trace_turn_type": turn_type,
+                      "trace_original_turn": index,
+                      "trace_action_key": json.dumps([tool, "execution = tool.execute(query='q')"]),
+                      "trace_external_error": external_error, **metadata})
+
+    def daemon(self, *rollouts):
+        daemon, _, _ = make_daemon(roots=tuple(rollout.rollout_id for rollout in rollouts))
+        daemon._completed_rollouts = {rollout.rollout_id: rollout for rollout in rollouts}
+        return daemon
+
+    def rollout(self, triplets, rollout_id="root"):
+        return PROTOCOL.Rollout(rollout_id=rollout_id, final_reward=0.0, triplets=triplets)
+
+    def test_three_network_tools_use_raw_rollout_denominator(self):
+        daemon = self.daemon(
+            self.rollout([self.turn(1, "Web_RAG_Search_Tool", external_error=True),
+                          self.turn(2, "Yibu_Brave_Search_Tool", external_error=True)], "a"),
+            self.rollout([self.turn(1, "Wikipedia_RAG_Search_Tool", external_error=True,
+                                   trace_task="qa")], "b"),
+            self.rollout([self.turn(0, turn_type="base", trace_action_key=None)], "c"))
+        self.assertEqual(daemon.get_network_health(), {
+            "network_turns": 3, "external_error_turns": 3,
+            "affected_rollouts": 2, "total_rollouts": 3,
+            "metadata_complete": True, "missing_metadata_turns": 0,
+            "uninspectable_rollouts": 0, "metadata_issues": {}})
+
+    def test_excludes_local_environment_and_non_tool_turns(self):
+        turns = [self.turn(0, "Python_Coder_Tool", external_error=True),
+                 self.turn(1, "Web_RAG_Search_Tool", external_error=True, trace_task="alfworld"),
+                 self.turn(2, "Yibu_Brave_Search_Tool", external_error=True, trace_task="webshop"),
+                 self.turn(3, None, external_error=False)]
+        turns.extend(self.turn(index + 4, external_error=True, turn_type=kind,
+                               trace_action_key=None, trace_original_turn=None)
+                     for index, kind in enumerate(("analysis", "final_answer", "base", "direct")))
+        health = self.daemon(self.rollout(turns)).get_network_health()
+        self.assertEqual(health["network_turns"], 0)
+        self.assertEqual(health["external_error_turns"], 0)
+        self.assertEqual(health["affected_rollouts"], 0)
+        self.assertTrue(health["metadata_complete"])
+
+    def test_original_failure_without_tokens_survives_batch_filtering(self):
+        daemon = self.daemon(self.rollout([self.turn(7, external_error=True, empty_tokens=True)]))
+        before = daemon.get_network_health()
+        batch, metrics = daemon.get_train_data_batch(4, 4, "cpu")
+        self.assertIsNone(batch)
+        self.assertEqual(metrics["agent_mode/n_sample_to_train"], 0)
+        self.assertEqual(before["network_turns"], 1)
+        self.assertEqual(before["external_error_turns"], 1)
+        self.assertTrue(before["metadata_complete"])
+        self.assertEqual(daemon.get_network_health(), before)
+
+    def test_deduplicates_original_turns_but_not_repeated_commands(self):
+        duplicate = self.turn(7, external_error=True, trace_dup=True)
+        daemon = self.daemon(
+            self.rollout([duplicate, duplicate, self.turn(8, trace_dup=True)], "a"),
+            self.rollout([self.turn(7, external_error=True)], "b"))
+        health = daemon.get_network_health()
+        self.assertEqual(health["network_turns"], 3)
+        self.assertEqual(health["external_error_turns"], 2)
+        self.assertEqual(health["affected_rollouts"], 2)
+        self.assertTrue(health["metadata_complete"])
+        daemon.clear_data_and_server()
+        self.assertEqual(daemon.get_network_health()["total_rollouts"], 0)
+        self.assertEqual(daemon.get_network_health()["network_turns"], 0)
+
+    def test_final_success_and_normal_empty_results_follow_existing_classifier(self):
+        spec = importlib.util.spec_from_file_location(
+            "network_health_execution", ROOT / "agentflow/agentflow/trace/execution.py")
+        execution = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(execution)
+        results = [None, "", [], {"results": []}, "No search results",
+                   {"error": "No results found for query: q"},
+                   {"success": True, "error": "ConnectionError",
+                    "attempts": [{"error": "ConnectionError"}], "results": ["evidence"]},
+                   {"status": "ok", "error": "HTTP 503", "results": ["evidence"]},
+                   {"error": "ConnectionError: peer reset connection"}]
+        turns = []
+        for index, tool_result in enumerate(results):
+            status = execution.classify_tool_result(tool_result)
+            turns.append(self.turn(index, external_error=status["external_error"],
+                                   trace_tool_failed=status["failed"],
+                                   trace_error_type=status["error_type"],
+                                   trace_error_source=status["error_source"],
+                                   trace_outcome_success=True))
+        health = self.daemon(self.rollout(turns)).get_network_health()
+        self.assertEqual(health["network_turns"], len(results))
+        self.assertEqual(health["external_error_turns"], 1)
+        self.assertTrue(health["metadata_complete"])
+
+    def test_actual_qa_model_errors_survive_both_production_encoders(self):
+        modules = {}
+        for name, path in {
+            "formatters": "agentflow/agentflow/models/formatters.py",
+            "utils": "agentflow/agentflow/models/utils.py",
+            "execution": "agentflow/agentflow/trace/execution.py",
+        }.items():
+            spec = importlib.util.spec_from_file_location("network_health_" + name, ROOT / path)
+            modules[name] = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(modules[name])
+        formatters, utils, execution = (modules[name] for name in ("formatters", "utils", "execution"))
+        planner_cls = production_class("agentflow/agentflow/models/planner.py", "Planner", {
+            **vars(typing), "os": os, "re": re, "Memory": SimpleNamespace,
+            "NextStep": formatters.NextStep, "QueryAnalysis": formatters.QueryAnalysis,
+            "robust_json_loads": utils.robust_json_loads})
+        executor_cls = production_class("agentflow/agentflow/models/executor.py", "Executor", {
+            **vars(typing), "re": re, "ToolCommand": formatters.ToolCommand,
+            "robust_json_loads": utils.robust_json_loads,
+            # The cases below generate no executable command block.
+            "ToolExecutionContext": lambda timeout: None})
+        solver_cls = production_class("agentflow/agentflow/solver.py", "Solver", {
+            **vars(typing), "time": time, "json": json, "deepcopy": copy.deepcopy,
+            "nullcontext": contextlib.nullcontext, "profiling_enabled": lambda: False,
+            "log_info": lambda message: None, "is_search_tool": lambda tool: True,
+            "classify_tool_result": execution.classify_tool_result,
+            "make_json_serializable_truncated": utils.make_json_serializable_truncated})
+        encoders = []
+        for path in ("train-roma/rollout.py", "train-roma/rollout_main_profiled.py"):
+            tree = ast.parse((ROOT / path).read_text())
+            node = next(node for node in ast.walk(tree)
+                        if isinstance(node, ast.FunctionDef) and node.name == "encode_logs")
+            scope = {"Triplet": PROTOCOL.Triplet}
+            exec(compile(ast.Module(body=[node], type_ignores=[]), path, "exec"), scope)
+            encoders.append((path, scope["encode_logs"]))
+
+        selected = formatters.NextStep(justification="reason", context="context",
+                                       sub_goal="goal", tool_name="Yibu_Brave_Search_Tool")
+        unknown = selected.model_copy(update={"tool_name": "Unknown_Tool"})
+        cases = [("invalid-format", "unstructured planner response", "unused"),
+                 ("missing-tool", '{"context":"c","sub_goal":"s"}', "unused"),
+                 ("unknown-tool", unknown, "unused"),
+                 ("missing-command", selected, "unstructured executor response"),
+                 ("invalid-command-type", selected, None)]
+        for name, next_step, command_response in cases:
+            with self.subTest(case=name), mock.patch("builtins.print"):
+                def engine(prompt, **kwargs):
+                    return next_step if kwargs.get("usage_by") == "[planner] next step" else "answer"
+                engine.last_generation_metadata = {
+                    "prompt_token_ids": [1], "response_token_ids": [2], "finish_reason": "stop"}
+                planner = object.__new__(planner_cls)
+                planner.llm_engine, planner.logs = engine, []
+                planner.available_tools = ["Yibu_Brave_Search_Tool"]
+                planner.toolbox_metadata = {"Yibu_Brave_Search_Tool": {}}
+                planner.is_multimodal, planner.temperature = False, 0.0
+                tool = SimpleNamespace(set_custom_output_dir=mock.Mock(), execute=mock.Mock())
+                executor = object.__new__(executor_cls)
+                executor.tool_instances_cache = {"Yibu_Brave_Search_Tool": tool}
+                executor.max_time, executor.temperature, executor.query_cache_dir = 1, 0.0, "unused"
+                executor.set_query_cache_dir = mock.Mock()
+                executor.llm_generate_tool_command = lambda *args, **kwargs: command_response
+                memory = SimpleNamespace(clear=lambda: None, get_actions=lambda: {},
+                                         get_all_actions=lambda: [], add_action=mock.Mock())
+                verifier = SimpleNamespace(verificate_context=lambda *args: None,
+                                           extract_conclusion=lambda response: ("", "STOP"))
+                solver = solver_cls(planner, verifier, memory, executor,
+                                    max_steps=1, verbose=False, task="qa")
+                output, _ = solver.solve("question")
+                logs = output["planner_logs"]
+                self.assertEqual([log["trace_turn_type"] for log in logs],
+                                 ["base", "analysis", "tool_plan", "final_answer", "direct"])
+                self.assertIsNotNone(logs[2]["trace_action_key"])
+                tool.execute.assert_not_called()
+                for path, encode in encoders:
+                    with self.subTest(encoder=path):
+                        triplets = encode(None, logs) if "profiled" in path else encode(logs)
+                        health = self.daemon(self.rollout(triplets)).get_network_health()
+                        self.assertEqual(health["network_turns"], 0)
+                        self.assertEqual(health["external_error_turns"], 0)
+                        self.assertTrue(health["metadata_complete"], health)
+
+    def test_unexecuted_command_placeholders_cannot_hide_external_or_missing_flags(self):
+        for command in ("No command found.", "Invalid response type."):
+            for error in (True, None):
+                with self.subTest(command=command, error=error):
+                    turn = self.turn(0, external_error=error, trace_action_key=json.dumps([
+                        "Yibu_Brave_Search_Tool", command]))
+                    health = self.daemon(self.rollout([turn])).get_network_health()
+                    self.assertEqual(health["network_turns"], 1)
+                    self.assertEqual(health["external_error_turns"], int(error is True))
+                    self.assertEqual(health["metadata_complete"], error is True)
+
+    def test_missing_and_invalid_metadata_never_becomes_a_healthy_batch(self):
+        cases = [({}, "unknown_trace_turn_type"),
+                 ({"trace_turn_type": []}, "unknown_trace_turn_type"),
+                 ({"trace_task": "unknown"}, "unknown_trace_task"),
+                 ({"trace_action_key": None, "trace_extraction_valid": False,
+                   "trace_tool_failed": True}, "invalid_trace_action_key"),
+                 ({"trace_action_key": "malformed"}, "invalid_trace_action_key"),
+                 ({"trace_original_turn": None}, "invalid_trace_original_turn"),
+                 ({"trace_original_turn": True}, "invalid_trace_original_turn"),
+                 ({"trace_external_error": None}, "invalid_trace_external_error"),
+                 ({"trace_external_error": "false"}, "invalid_trace_external_error")]
+        for metadata, reason in cases:
+            with self.subTest(metadata=metadata):
+                turn = self.turn(0, **metadata)
+                if not metadata:
+                    turn.metadata = {}
+                health = self.daemon(self.rollout([turn])).get_network_health()
+                self.assertFalse(health["metadata_complete"])
+                self.assertEqual(health["missing_metadata_turns"], 1)
+                self.assertEqual(health["metadata_issues"], {reason: 1})
+
+    def test_missing_rollout_payload_is_explicitly_uninspectable(self):
+        for triplets in (None, []):
+            with self.subTest(triplets=triplets):
+                health = self.daemon(self.rollout(triplets)).get_network_health()
+                self.assertFalse(health["metadata_complete"])
+                self.assertEqual(health["total_rollouts"], 1)
+                self.assertEqual(health["uninspectable_rollouts"], 1)
+
+    def test_conflicting_copies_of_an_original_turn_are_explicitly_incomplete(self):
+        for duplicate in (self.turn(7, external_error=True),
+                          self.turn(7, "Python_Coder_Tool"),
+                          self.turn(7, trace_action_key=json.dumps([
+                              "Yibu_Brave_Search_Tool", "different command"]))):
+            with self.subTest(duplicate=duplicate):
+                health = self.daemon(self.rollout([self.turn(7), duplicate])).get_network_health()
+                self.assertFalse(health["metadata_complete"])
+                self.assertEqual(health["network_turns"], 1)
+                self.assertEqual(health["missing_metadata_turns"], 1)
+                self.assertEqual(health["metadata_issues"], {"conflicting_duplicate_turn": 1})
 
 
 class SyncDeadlineTests(unittest.TestCase):

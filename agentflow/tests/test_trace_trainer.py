@@ -18,6 +18,7 @@ import sys
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, call, patch
 import numpy as np
 import torch
 from collections import deque
@@ -1210,6 +1211,9 @@ class ReferenceCheckpointBase:
         self.global_steps = self.resume_step
 
     def _save_checkpoint(self):
+        if self.config.data.get("task", "qa") == "qa":
+            path = Path(self.config.trainer.default_local_dir) / f"global_step_{self.global_steps}"
+            assert (path / "network_health.json").exists()
         # The advertised actor checkpoint must never predate its reference save.
         if self._trace_reference_interval() != 0:
             path = Path(self.config.trainer.default_local_dir) / f"global_step_{self.global_steps}" / "trace_reference"
@@ -1233,7 +1237,7 @@ def load_reference_trainer_methods():
     shell = ast.ClassDef(name="ReferenceTrainerMethods",
                          bases=[ast.Name(id="ReferenceCheckpointBase", ctx=ast.Load())],
                          keywords=[], body=methods, decorator_list=[])
-    scope = {"TraceConfig": CREDIT.TraceConfig, "json": json, "os": os,
+    scope = {"TraceConfig": CREDIT.TraceConfig, "json": json, "os": os, "np": np, "deque": deque,
              "ReferenceCheckpointBase": ReferenceCheckpointBase}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[shell], type_ignores=[])),
                  str(path), "exec"), scope)
@@ -1246,7 +1250,7 @@ ReferenceTrainerMethods = load_reference_trainer_methods()
 class ReferenceSnapshotTrainer(ReferenceTrainerMethods):
     def __init__(self, root, interval=0, task="alfworld"):
         self.config = SimpleNamespace(
-            data=ConfigDict(trace={"enabled": True, "reference_update_interval": interval}),
+            data=ConfigDict(task=task, trace={"enabled": True, "reference_update_interval": interval}),
             trainer=ConfigDict(default_local_dir=root, default_hdfs_dir=None, resume_mode="auto",
                            del_local_ckpt_after_load=False),
         )
@@ -1385,6 +1389,394 @@ class ReferenceLifecycleTests(unittest.TestCase):
         early = [n.lineno for n in ast.walk(step) if isinstance(n, ast.Return) and isinstance(n.value, ast.Constant) and n.value.value is None]
         self.assertTrue(early)
         self.assertTrue(all(line < refresh_line for line in early))
+
+
+def load_network_trainer_methods():
+    """Run the production collector and generation stage with CPU stubs."""
+    path = ROOT / "agentflow/verl/trainer.py"
+    tree = ast.parse(path.read_text())
+    trainer = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                   and node.name == "AgentFlowTrainer")
+    names = {"_collect_train_batch", "_train_step"}
+    methods = [node for node in trainer.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    if len(methods) != len(names):
+        raise AssertionError("Network health trainer methods were not found")
+    for method in methods:
+        method.decorator_list = []
+    step = next(method for method in methods if method.name == "_train_step")
+    step_body = next(node.body for node in step.body if isinstance(node, ast.With))
+    gen_index = next(index for index, node in enumerate(step_body)
+                     if isinstance(node, ast.With) and any(
+                         isinstance(item.context_expr, ast.Call)
+                         and isinstance(item.context_expr.func, ast.Name)
+                         and item.context_expr.func.id == "_timer"
+                         and item.context_expr.args[0].value == "gen" for item in node.items))
+    stage = ast.parse("def _generation_stage(self, batch, metrics, timing_raw): pass").body[0]
+    stage.body = step_body[:gen_index + 1] + [
+        ast.Return(value=ast.Tuple(elts=[ast.Name(id="batch", ctx=ast.Load()),
+                                        ast.Name(id="metrics", ctx=ast.Load())], ctx=ast.Load()))]
+
+    @contextlib.contextmanager
+    def timer(name, timing):
+        timing[name] = 0.0
+        yield
+
+    scope = {"torch": torch, "np": np, "json": json, "time": time, "deque": deque,
+             "DataProto": Proto, "_timer": timer}
+    shell = ast.ClassDef(name="NetworkTrainerMethods", bases=[], keywords=[],
+                         body=methods + [stage], decorator_list=[])
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[shell], type_ignores=[])),
+                 str(path), "exec"), scope)
+    return scope[shell.name]
+
+
+NetworkTrainerMethods = load_network_trainer_methods()
+
+
+def network_health(network_turns, errors, total=8, **extra):
+    return {"network_turns": network_turns, "external_error_turns": errors,
+            "affected_rollouts": min(errors, total), "total_rollouts": total,
+            "metadata_complete": True, **extra}
+
+
+class NetworkHealthDaemon:
+    def __init__(self, health, events):
+        self.health = health
+        self.events = events
+        self.attempt = -1
+        self.inputs, self.servers, self.converted_attempts = [], [], []
+        self.failures = {}
+        self.empty_queue = self.empty_completed = False
+        self._completed_rollouts = []
+        self.batch = Proto({"responses": torch.tensor([[1]])})
+
+    def event(self, name):
+        self.events.append((name, self.attempt))
+        if name in self.failures:
+            raise self.failures[name]
+
+    def set_up_data_and_server(self, inputs, servers):
+        self.attempt += 1
+        self.event("setup")
+        if self._completed_rollouts:
+            raise AssertionError("Rejected rollouts were not cleared before resampling")
+        self.inputs.append(inputs)
+        self.servers.append(servers)
+        self._total_tasks_queued = 0 if self.empty_queue else 1
+
+    def run_until_all_finished(self):
+        self.event("run")
+        self._completed_rollouts = [] if self.empty_completed else [f"rollout-{self.attempt}"]
+
+    def get_network_health(self):
+        self.event("health")
+        return self.health[self.attempt]
+
+    def get_train_data_batch(self, **kwargs):
+        self.event("convert")
+        self.converted_attempts.append(self.attempt)
+        self.conversion_options = kwargs
+        return self.batch, {"daemon/accepted_attempt": self.attempt}
+
+    def clear_data_and_server(self):
+        self.events.append(("clear", self.attempt))
+        self._completed_rollouts = []
+
+
+def make_network_trainer(health, history=(), task="qa"):
+    trainer = NetworkTrainerMethods()
+    trainer.events = []
+    trainer.config = SimpleNamespace(data=ConfigDict(
+        max_prompt_length=128, max_response_length=64, trace={"enabled": True}))
+    if task is not None:
+        trainer.config.data["task"] = task
+    trainer.global_steps = 12
+    trainer.algorithm = "grpo+slic"
+    trainer._network_error_rates = deque(history, maxlen=10)
+    trainer._dpo_ring_buffer = deque(["previous accepted pair"])
+    trainer._annotate_trace_credits = Mock()
+    trainer._trans_to_dpo_batch = Mock()
+    trainer.actor_rollout_wg = SimpleNamespace(update_actor=Mock(), update_actor_by_dpo=Mock())
+    trainer.async_rollout_manager = SimpleNamespace(
+        server_addresses=["cpu-test-server"],
+        wake_up=Mock(side_effect=lambda: trainer.events.append(("wake", None))),
+        sleep=Mock(side_effect=lambda: trainer.events.append(("sleep", None))))
+    trainer.agent_mode_daemon = NetworkHealthDaemon(health, trainer.events)
+    trainer.gen_batch = Proto({"fake_ids": torch.tensor([0])},
+                              {"question": np.array(["same question"]), "data_id": np.array(["q"])})
+    return trainer
+
+
+class NetworkRolloutHealthTests(unittest.TestCase):
+    def collect(self, trainer, stage=False):
+        output = io.StringIO()
+        with patch.object(time, "sleep", side_effect=lambda delay: trainer.events.append(("backoff", delay))) as wait:
+            with contextlib.redirect_stdout(output):
+                if stage:
+                    batch, metrics = trainer._generation_stage(trainer.gen_batch, {"existing/metric": 7}, {})
+                else:
+                    batch, metrics = trainer._collect_train_batch(trainer.gen_batch)
+        return batch, metrics, wait, output.getvalue()
+
+    def test_absolute_floor_rejects_exactly_forty_errors(self):
+        for errors, accepted_attempt in ((39, 0), (40, 1)):
+            with self.subTest(errors=errors):
+                trainer = make_network_trainer([network_health(100, errors), network_health(100, 0)])
+                _, metrics, wait, _ = self.collect(trainer)
+                self.assertEqual(trainer.agent_mode_daemon.converted_attempts, [accepted_attempt])
+                self.assertEqual(metrics["rollout_health/spike_threshold"], 40)
+                self.assertEqual(metrics["rollout_health/retry_count"], accepted_attempt)
+                self.assertEqual(wait.call_args_list, [call(60)] if accepted_attempt else [])
+                self.assertEqual(list(trainer._network_error_rates), [0. if accepted_attempt else .39])
+
+    def test_double_baseline_boundary_uses_current_network_call_count(self):
+        for errors, accepted_attempt in ((199, 0), (200, 1)):
+            with self.subTest(errors=errors):
+                trainer = make_network_trainer([network_health(1000, errors), network_health(2000, 300)], [.1])
+                _, metrics, _, _ = self.collect(trainer)
+                self.assertEqual(metrics["rollout_health/spike_threshold"], 400 if accepted_attempt else 200)
+                self.assertEqual(metrics["rollout_health/expected_error_turns"], 200 if accepted_attempt else 100)
+                self.assertEqual(metrics["rollout_health/retry_count"], accepted_attempt)
+                self.assertEqual(trainer.agent_mode_daemon.converted_attempts, [accepted_attempt])
+
+    def test_decimal_double_baseline_boundary_is_not_lost_to_multiplication_rounding(self):
+        for history, errors, threshold, accepted_attempt in (([.14], 56, 56, 1),
+                                                            ([.1, .2], 60, 60, 1),
+                                                            ([.1, .2], 59, 60, 0)):
+            with self.subTest(history=history, errors=errors):
+                trainer = make_network_trainer([network_health(200, errors), network_health(200, 10)], history)
+                _, metrics, wait, output = self.collect(trainer)
+                self.assertEqual(metrics["rollout_health/retry_count"], accepted_attempt)
+                self.assertAlmostEqual(metrics["rollout_health/spike_threshold"], threshold)
+                self.assertEqual(trainer.agent_mode_daemon.converted_attempts, [accepted_attempt])
+                self.assertEqual(list(trainer._network_error_rates), history + ([.05] if accepted_attempt else [.295]))
+                self.assertEqual('"accepted": false' in output, bool(accepted_attempt))
+                self.assertEqual(wait.call_args_list, [call(60)] if accepted_attempt else [])
+
+    def test_more_network_calls_at_the_same_error_rate_are_accepted(self):
+        trainer = make_network_trainer([network_health(100, 10), network_health(1000, 100)])
+        self.collect(trainer)
+        _, metrics, wait, _ = self.collect(trainer)
+        self.assertEqual(trainer.agent_mode_daemon.converted_attempts, [0, 1])
+        self.assertEqual(metrics["rollout_health/error_rate"], .1)
+        self.assertEqual(metrics["rollout_health/spike_threshold"], 200)
+        self.assertEqual(metrics["rollout_health/retry_count"], 0)
+        wait.assert_not_called()
+
+    def test_baseline_is_median_and_only_keeps_ten_accepted_steps(self):
+        trainer = make_network_trainer([network_health(1000, 499)], [.1, .2, .3, .9])
+        _, metrics, _, _ = self.collect(trainer)
+        self.assertEqual(metrics["rollout_health/baseline_error_rate"], .25)
+        self.assertEqual(metrics["rollout_health/spike_threshold"], 500)
+        history = [index / 100 for index in range(1, 11)]
+        trainer = make_network_trainer([network_health(100, 15), network_health(1000, 129)], history)
+        self.collect(trainer)
+        _, metrics, _, _ = self.collect(trainer)
+        self.assertEqual(trainer._network_error_rates.maxlen, 10)
+        self.assertEqual(list(trainer._network_error_rates), history[2:] + [.15, .129])
+        self.assertAlmostEqual(metrics["rollout_health/baseline_error_rate"], .065)
+        self.assertAlmostEqual(metrics["rollout_health/spike_threshold"], 130)
+        self.assertEqual(metrics["rollout_health/history_steps"], 10)
+
+    def test_rejected_attempts_use_the_same_questions_and_only_accepted_data_is_converted(self):
+        trainer = make_network_trainer([
+            network_health(1000, 400, metadata_issues={"missing": 0}),
+            network_health(1000, 100, metadata_issues={"missing": 0})], [.1])
+        batch, metrics, wait, output = self.collect(trainer, stage=True)
+        self.assertIs(batch, trainer.agent_mode_daemon.batch)
+        self.assertEqual(metrics["existing/metric"], 7)
+        self.assertEqual(metrics["daemon/accepted_attempt"], 1)
+        self.assertEqual(trainer.agent_mode_daemon.converted_attempts, [1])
+        self.assertEqual(list(trainer._network_error_rates), [.1, .1])
+        self.assertTrue(all(value is trainer.gen_batch.non_tensor_batch for value in trainer.agent_mode_daemon.inputs))
+        self.assertTrue(all(value is trainer.async_rollout_manager.server_addresses for value in trainer.agent_mode_daemon.servers))
+        self.assertLess(trainer.events.index(("clear", 0)), trainer.events.index(("backoff", 60)))
+        self.assertLess(trainer.events.index(("backoff", 60)), trainer.events.index(("setup", 1)))
+        self.assertLess(trainer.events.index(("health", 1)), trainer.events.index(("convert", 1)))
+        self.assertEqual(trainer.agent_mode_daemon.conversion_options,
+                         {"max_prompt_length": 128, "max_response_length": 64, "device": torch.device("cpu")})
+        expected = {"network_turns": 1000, "external_error_turns": 100, "error_rate": .1,
+                    "baseline_error_rate": .1, "expected_error_turns": 100, "spike_threshold": 200,
+                    "history_steps": 1, "retry_count": 1, "backoff_seconds": 60,
+                    "discarded_rollouts": 8, "discarded_error_turns": 400,
+                    "peak_error_turns": 400, "peak_error_rate": .4}
+        for key, value in expected.items():
+            self.assertEqual(metrics[f"rollout_health/{key}"], value)
+        self.assertTrue(all(isinstance(value, (int, float)) for value in metrics.values()))
+        records = [json.loads(line.removeprefix("[rollout_health] ")) for line in output.splitlines()
+                   if line.startswith("[rollout_health] {")]
+        self.assertEqual([record["accepted"] for record in records], [False, True])
+        self.assertEqual([record["attempt"] for record in records], [0, 1])
+        wait.assert_called_once_with(60)
+        trainer.async_rollout_manager.wake_up.assert_called_once_with()
+        trainer.async_rollout_manager.sleep.assert_called_once_with()
+
+    def test_three_retries_back_off_for_60_120_240_seconds(self):
+        trainer = make_network_trainer([network_health(100, errors, total=total)
+                                        for errors, total in ((40, 5), (50, 6), (60, 7), (1, 8))])
+        _, metrics, wait, _ = self.collect(trainer)
+        self.assertEqual(wait.call_args_list, [call(60), call(120), call(240)])
+        self.assertEqual(trainer.agent_mode_daemon.converted_attempts, [3])
+        self.assertEqual(metrics["rollout_health/retry_count"], 3)
+        self.assertEqual(metrics["rollout_health/backoff_seconds"], 420)
+        self.assertEqual(metrics["rollout_health/discarded_rollouts"], 18)
+        self.assertEqual(metrics["rollout_health/discarded_error_turns"], 150)
+        self.assertEqual(metrics["rollout_health/peak_error_turns"], 60)
+        self.assertEqual(metrics["rollout_health/peak_error_rate"], .6)
+        self.assertEqual(list(trainer._network_error_rates), [.01])
+
+    def test_exhaustion_aborts_real_train_step_before_scoring_replay_and_updates(self):
+        trainer = make_network_trainer([network_health(100, 40)] * 4, [.1])
+        old_pairs = list(trainer._dpo_ring_buffer)
+        with patch.object(time, "sleep") as wait, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "3 retries"):
+                trainer._train_step({"fake_ids": torch.tensor([0]), "question": np.array(["same question"])})
+        self.assertEqual(wait.call_args_list, [call(60), call(120), call(240)])
+        self.assertEqual(trainer.agent_mode_daemon.attempt, 3)
+        self.assertEqual(trainer.agent_mode_daemon.converted_attempts, [])
+        self.assertEqual(list(trainer._network_error_rates), [.1])
+        self.assertEqual(list(trainer._dpo_ring_buffer), old_pairs)
+        trainer._annotate_trace_credits.assert_not_called()
+        trainer._trans_to_dpo_batch.assert_not_called()
+        trainer.actor_rollout_wg.update_actor.assert_not_called()
+        trainer.actor_rollout_wg.update_actor_by_dpo.assert_not_called()
+        self.assertEqual(trainer.agent_mode_daemon._completed_rollouts, [])
+        trainer.async_rollout_manager.sleep.assert_called_once_with()
+
+    def test_collection_errors_propagate_without_retry_and_always_clean_up(self):
+        for stage in ("setup", "run", "health", "convert"):
+            with self.subTest(stage=stage):
+                trainer = make_network_trainer([network_health(100, 10)], [.1])
+                error = LookupError(f"original {stage} failure")
+                trainer.agent_mode_daemon.failures[stage] = error
+                with patch.object(time, "sleep") as wait, contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(LookupError) as caught:
+                        trainer._collect_train_batch(trainer.gen_batch)
+                self.assertIs(caught.exception, error)
+                self.assertEqual(trainer.agent_mode_daemon.attempt, 0)
+                self.assertEqual(list(trainer._network_error_rates), [.1])
+                self.assertEqual(trainer.agent_mode_daemon._completed_rollouts, [])
+                self.assertIn(("clear", 0), trainer.events)
+                trainer.async_rollout_manager.sleep.assert_called_once_with()
+                wait.assert_not_called()
+
+    def test_missing_metadata_and_empty_collection_fail_without_network_retry(self):
+        for failure in ("metadata", "queue", "completed"):
+            with self.subTest(failure=failure):
+                trainer = make_network_trainer([network_health(100, 10, metadata_complete=failure != "metadata")])
+                trainer.agent_mode_daemon.empty_queue = failure == "queue"
+                trainer.agent_mode_daemon.empty_completed = failure == "completed"
+                expected = RuntimeError if failure == "metadata" else ValueError
+                with patch.object(time, "sleep") as wait, contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(expected):
+                        trainer._collect_train_batch(trainer.gen_batch)
+                self.assertEqual(trainer.agent_mode_daemon.attempt, 0)
+                self.assertEqual(trainer.agent_mode_daemon.converted_attempts, [])
+                self.assertEqual(list(trainer._network_error_rates), [])
+                self.assertEqual(trainer.agent_mode_daemon._completed_rollouts, [])
+                trainer.async_rollout_manager.sleep.assert_called_once_with()
+                wait.assert_not_called()
+
+    def test_non_qa_collection_does_not_read_health_or_change_baseline(self):
+        for task in ("alfworld", "webshop"):
+            with self.subTest(task=task):
+                trainer = make_network_trainer([], [.1], task=task)
+                _, metrics, wait, _ = self.collect(trainer)
+                self.assertNotIn(("health", 0), trainer.events)
+                self.assertEqual(trainer.agent_mode_daemon.converted_attempts, [0])
+                self.assertEqual(list(trainer._network_error_rates), [.1])
+                self.assertFalse(any(key.startswith("rollout_health/") for key in metrics))
+                trainer.async_rollout_manager.wake_up.assert_called_once_with()
+                trainer.async_rollout_manager.sleep.assert_called_once_with()
+                self.assertEqual(trainer.agent_mode_daemon._completed_rollouts, [])
+                wait.assert_not_called()
+
+    def test_default_qa_cold_start_and_zero_network_turns(self):
+        trainer = make_network_trainer([network_health(100, 10)], task=None)
+        del trainer._network_error_rates
+        _, metrics, _, _ = self.collect(trainer)
+        self.assertEqual(list(trainer._network_error_rates), [.1])
+        self.assertEqual(trainer._network_error_rates.maxlen, 10)
+        self.assertEqual(metrics["rollout_health/history_steps"], 0)
+        self.assertEqual(metrics["rollout_health/spike_threshold"], 40)
+        for history in ([], [.2]):
+            trainer = make_network_trainer([network_health(0, 0)], history)
+            _, metrics, wait, _ = self.collect(trainer)
+            self.assertEqual(list(trainer._network_error_rates), history)
+            self.assertEqual(metrics["rollout_health/error_rate"], 0)
+            self.assertEqual(metrics["rollout_health/expected_error_turns"], 0)
+            self.assertEqual(metrics["rollout_health/history_steps"], len(history))
+            wait.assert_not_called()
+
+
+class NetworkHealthCheckpointTests(unittest.TestCase):
+    def test_checkpoint_saves_and_restores_the_ten_step_baseline(self):
+        with tempfile.TemporaryDirectory() as root:
+            trainer = ReferenceSnapshotTrainer(root, task="qa")
+            trainer.global_steps = 7
+            trainer._network_error_rates = deque([.1, .2, .05], maxlen=10)
+            trainer._save_checkpoint()
+            path = Path(root) / "global_step_7" / "network_health.json"
+            self.assertEqual(json.loads(path.read_text()),
+                             {"format_version": 1, "completed_step": 7, "error_rates": [.1, .2, .05]})
+            restored = ReferenceSnapshotTrainer(root, task="qa")
+            restored.resume_step = 7
+            restored._load_checkpoint()
+            self.assertEqual(list(restored._network_error_rates), [.1, .2, .05])
+            self.assertEqual(restored._network_error_rates.maxlen, 10)
+            self.assertTrue(trainer.base_saved)
+
+    def test_old_checkpoint_starts_with_empty_history_and_explicit_path_is_respected(self):
+        with tempfile.TemporaryDirectory() as root:
+            checkpoint = Path(root) / "global_step_7"
+            checkpoint.mkdir()
+            restored = ReferenceSnapshotTrainer(root, task="qa")
+            restored.resume_step = 7
+            restored._network_error_rates = deque([.9], maxlen=10)
+            with contextlib.redirect_stdout(io.StringIO()):
+                restored._load_checkpoint()
+            self.assertEqual(list(restored._network_error_rates), [])
+            (checkpoint / "network_health.json").write_text(json.dumps(
+                {"format_version": 1, "completed_step": 7, "error_rates": [.2]}))
+            restored = ReferenceSnapshotTrainer("not-the-checkpoint-root", task="qa")
+            restored.config.trainer.update(resume_mode="resume_path", resume_from_path=str(checkpoint))
+            restored.resume_step = 7
+            restored._load_checkpoint()
+            self.assertEqual(list(restored._network_error_rates), [.2])
+
+    def test_only_qa_saves_or_reads_network_baseline(self):
+        with tempfile.TemporaryDirectory() as root:
+            checkpoint = Path(root) / "global_step_7"
+            checkpoint.mkdir()
+            (checkpoint / "network_health.json").write_text("invalid JSON ignored by non-QA")
+            for task in ("alfworld", "webshop"):
+                trainer = ReferenceSnapshotTrainer(root, task=task)
+                trainer.resume_step = 7
+                trainer._load_checkpoint()
+                self.assertEqual(list(trainer._network_error_rates), [])
+                trainer.global_steps = 8
+                trainer._network_error_rates.append(.1)
+                trainer._save_checkpoint()
+                self.assertFalse((Path(root) / "global_step_8" / "network_health.json").exists())
+
+    def test_invalid_saved_baseline_is_rejected_without_partial_restore(self):
+        valid = {"format_version": 1, "completed_step": 7, "error_rates": [.1]}
+        invalid = [[], {**valid, "format_version": 2}, {**valid, "completed_step": 8},
+                   {**valid, "error_rates": None}, {**valid, "error_rates": "0.1"},
+                   {**valid, "error_rates": [.1] * 11}]
+        invalid.extend({**valid, "error_rates": [.1, value]}
+                       for value in (True, "0.1", None, -.1, 1.1, float("nan"), float("inf")))
+        with tempfile.TemporaryDirectory() as root:
+            checkpoint = Path(root) / "global_step_7"
+            checkpoint.mkdir()
+            for state in invalid:
+                with self.subTest(state=state):
+                    (checkpoint / "network_health.json").write_text(json.dumps(state))
+                    trainer = ReferenceSnapshotTrainer(root, task="qa")
+                    trainer.resume_step = 7
+                    with self.assertRaisesRegex(ValueError, "network health checkpoint"):
+                        trainer._load_checkpoint()
+                    self.assertEqual(list(trainer._network_error_rates), [])
 
 
 class ReplayProto:

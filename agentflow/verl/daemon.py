@@ -685,6 +685,112 @@ class AgentModeDaemon:
             for stage, name in metric_names.items() if total[stage] > 0
         }
 
+    def get_network_health(self) -> dict:
+        """Inspect raw QA turns before token filtering or training-batch padding.
+
+        QA action keys are JSON-encoded ``[tool_name, command]`` pairs. Only
+        the three network tools count, once per rollout/original planner turn;
+        repeated actions on different turns remain distinct. The existing
+        ``trace_external_error`` flag describes the final execution result, so
+        successful internal retries and normal empty searches remain healthy.
+        Executor parser placeholders that prove no command ran are excluded;
+        these are tool-turn counts, not internal HTTP-attempt counts.
+
+        Counts cover only the current completed attempts, not failed attempts
+        replaced during collection. Missing or contradictory metadata produces
+        partial counts with ``metadata_complete=False``; callers must reject
+        those counts rather than interpret missing flags as successful turns.
+        """
+        network_tools = {
+            "Web_RAG_Search_Tool", "Yibu_Brave_Search_Tool",
+            "Wikipedia_RAG_Search_Tool",
+        }
+        non_tool_turns = {"analysis", "base", "direct", "final_answer"}
+        unexecuted_commands = {"No command found.", "Invalid response type."}
+        network_turns, error_turns, affected_rollouts = set(), set(), set()
+        incomplete_turns, uninspectable_rollouts = set(), set()
+        metadata_issues, seen_turns = {}, {}
+
+        def record_issue(key, reason):
+            incomplete_turns.add(key)
+            metadata_issues.setdefault(reason, set()).add(key)
+
+        for rollout_id, rollout in self._completed_rollouts.items():
+            triplets = rollout.triplets
+            if not isinstance(triplets, (list, tuple)) or not triplets:
+                uninspectable_rollouts.add(rollout_id)
+                continue
+            for position, triplet in enumerate(triplets):
+                metadata = getattr(triplet, "metadata", None)
+                key = (rollout_id, "triplet", position)
+                if not isinstance(metadata, dict):
+                    record_issue(key, "missing_trace_metadata")
+                    continue
+                task = metadata.get("trace_task")
+                if task in ("alfworld", "webshop"):
+                    continue
+                if task not in (None, "qa"):
+                    record_issue(key, "unknown_trace_task")
+                    continue
+                turn_type = metadata.get("trace_turn_type")
+                if isinstance(turn_type, str) and turn_type in non_tool_turns:
+                    continue
+                if turn_type != "tool_plan":
+                    record_issue(key, "unknown_trace_turn_type")
+                    continue
+
+                original_turn = metadata.get("trace_original_turn")
+                original_turn_valid = type(original_turn) is int and original_turn >= 0
+                if original_turn_valid:
+                    key = (rollout_id, "turn", original_turn)
+                action = metadata.get("trace_action_key")
+                if isinstance(action, str):
+                    try:
+                        action = json.loads(action)
+                    except (TypeError, ValueError):
+                        action = None
+                if (not isinstance(action, (list, tuple)) or len(action) != 2
+                        or (action[0] is not None and not isinstance(action[0], str))):
+                    record_issue(key, "invalid_trace_action_key")
+                    continue
+                tool_name = action[0]
+                is_network = tool_name in network_tools
+                external_error = metadata.get("trace_external_error") if is_network else None
+                if original_turn_valid:
+                    signature = (tool_name, action[1], external_error)
+                    if key in seen_turns and seen_turns[key] != signature:
+                        record_issue(key, "conflicting_duplicate_turn")
+                    seen_turns[key] = signature
+                if not is_network:
+                    continue
+                # These exact Executor parser fallbacks contain no executable
+                # command. A recorded external failure still takes precedence
+                # (for example, tool initialization can fail before parsing).
+                if (external_error is False and isinstance(action[1], str)
+                        and action[1] in unexecuted_commands):
+                    continue
+                if not original_turn_valid:
+                    record_issue(key, "invalid_trace_original_turn")
+                    continue
+                network_turns.add(key)
+                if type(external_error) is not bool:
+                    record_issue(key, "invalid_trace_external_error")
+                    continue
+                if external_error:
+                    error_turns.add(key)
+                    affected_rollouts.add(rollout_id)
+
+        return {
+            "network_turns": len(network_turns),
+            "external_error_turns": len(error_turns),
+            "affected_rollouts": len(affected_rollouts),
+            "total_rollouts": len(self._completed_rollouts),
+            "metadata_complete": not incomplete_turns and not uninspectable_rollouts,
+            "missing_metadata_turns": len(incomplete_turns),
+            "uninspectable_rollouts": len(uninspectable_rollouts),
+            "metadata_issues": {reason: len(keys) for reason, keys in metadata_issues.items()},
+        }
+
 
     def get_test_metrics(self):
         """Calculates and returns metrics for a validation run."""

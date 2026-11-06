@@ -108,6 +108,29 @@ $$
 
 包含外部故障转移的工具 K-step 窗口信用不可用，不参与 Pair。不把故障 delta 填成 0，也不删除故障后连接原本不相邻的状态。故障导致终局无法可靠验证时，analysis／final 奖励 Pair 与工具终局回填也不可使用该结果。
 
+QA 训练另有固定的整批网络尖峰验收，不增加 YAML 参数。令当前原始网络工具 Turn 数为 $N_t$、其中 `trace_external_error=true` 的 Turn 数为 $E_t$，最近最多 10 个验收通过、且有网络调用的批次错误率中位数为 $m_t$。当
+
+$$
+E_t\geq\max(40,\;2N_tm_t)
+$$
+
+时丢弃整批 Rollout，并对同一批题、相同 Rollout 数重新生成。没有历史时使用 40 的门槛；失败尝试不进入历史。最多重采 3 次，依次等待 60、120、240 秒，仍有尖峰则报错退出。检测位于 GT/策略评分、Replay 入池及 GRPO/SLIC 更新之前，故障尝试不推进训练 Step 或刷新 ref。仅作用于 QA 训练，包含纯 GRPO；验证和其他任务不启用。
+
+计数读取原始完成 Rollout，按 Rollout＋原始 Turn 去重，只统计 `Web_RAG_Search_Tool`、`Yibu_Brave_Search_Tool`、`Wikipedia_RAG_Search_Tool`，不统计工具内部 HTTP 重试次数。沿用既有外部故障标记；内部重试最终成功和正常无结果不记错误。该口径在 token 过滤和分布式补齐之前，与保留训练行上的 `trace/external_error_turns` 不保证逐项相等。收集阶段已重提的空回包/异常 attempt 不在完成集合内，继续沿用已有收集器重试与退出规则；缺失网络验收元数据时显式报错，不将未知状态当成健康。
+
+每次尝试打印 `[rollout_health]` 日志，包含 Step、attempt、当前错误数、动态阈值与是否接受；成功重采也不会覆盖失败尝试的日志。训练指标包括：
+
+| 指标 | 含义 |
+| --- | --- |
+| `rollout_health/external_error_turns` / `network_turns` / `error_rate` | 最终接受批次的错误数、网络 Turn 总数、错误率 |
+| `rollout_health/baseline_error_rate` / `history_steps` | 本次验收使用的历史中位数及历史批次数 |
+| `rollout_health/spike_threshold` | 当前调用量下的触发门槛，达到即重采 |
+| `rollout_health/peak_error_turns` / `peak_error_rate` | 本批所有尝试中的最大错误数／错误率 |
+| `rollout_health/retry_count` / `backoff_seconds` | 已执行重采次数／累计冷却时间 |
+| `rollout_health/discarded_rollouts` / `discarded_error_turns` | 故障尝试累计丢弃的 Rollout／错误 Turn 数 |
+
+历史基线随 checkpoint 保存为运行时文件 `network_health.json`；恢复旧 checkpoint 没有此文件时，从空历史开始，不要求改配置。
+
 ## 配对、排序与 Loss
 
 候选必须同 `uid`、同决策类型和同标签来源。`k_pairs_per_group` 为正整数时，QA 工具和 ALFWorld 环境动作还必须具有相同原始 Turn id，允许来自不同 Rollout，不允许跨 Turn 配对；每题每 Turn 默认最多 2 对，多个 Turn 各有独立额度。设为 `null` 时，取消上述 Turn 分组和组内数量限制，允许同题同类型动作跨 Turn 配对，仍受全步 `max_pairs_per_step`（默认 256）限制。QA analysis 和实际最终回答保留原 outcome 分组及标签；`null` 也取消这些组的数量上限，但不混合决策类型或标签来源。两侧均过滤无效响应、执行故障、重复动作、被丢弃的 Prompt 和异常数值。SLIC baseline 使用与配对一致的分组及 V 邻域；原始 Turn 编号、信用窗口、有效性和其它 Pair 筛选条件不变。跨 Turn 模式没有额外的不同 Rollout 限制，同一 Rollout 的不同 Turn 也可能配对。
