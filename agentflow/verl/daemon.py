@@ -604,6 +604,9 @@ class AgentModeDaemon:
                     )
                     last_log_time = time.monotonic()
                 if completed_count >= original_task_count:
+                    # Preserve the original final polling delay before cleanup.
+                    # This restores scheduling cadence, not a device barrier.
+                    await asyncio.sleep(2)
                     break
                 # Retry reports do not change the number of original rollout slots.
                 delay = 2 if completed_batch else 5

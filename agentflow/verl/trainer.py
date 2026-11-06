@@ -1111,6 +1111,7 @@ class AgentFlowTrainer(RayPPOTrainer):
         discarded_rollouts = discarded_errors = backoff_seconds = 0
         peak_errors = peak_rate = 0
         health_metrics = {}
+        batch_ready = False
 
         self.async_rollout_manager.wake_up()
         try:
@@ -1186,10 +1187,14 @@ class AgentFlowTrainer(RayPPOTrainer):
                 if check_network and network_turns:
                     history.append(error_rate)
                 metrics.update(health_metrics)
+                batch_ready = True
                 return batch, metrics
         finally:
             self.agent_mode_daemon.clear_data_and_server()
-            self.async_rollout_manager.sleep()
+            # Failed collection can leave workers running. Preserve its error
+            # instead of switching model mode and risking a second exception.
+            if batch_ready:
+                self.async_rollout_manager.sleep()
 
     @npu_safe_step
     def _train_step(self, batch_dict: dict) -> dict:

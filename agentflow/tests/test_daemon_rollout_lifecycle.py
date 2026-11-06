@@ -101,13 +101,36 @@ def result(rollout_id="root", *, error=False, reward=0.0, invalid=False, exhaust
 
 
 class DaemonLifecycleTests(unittest.IsolatedAsyncioTestCase):
-    async def test_complete_group_preserves_zero_reward(self):
-        server = ScriptServer([[result("a"), result("b", reward=1)]])
-        daemon, _, _ = make_daemon(server, roots=("a", "b"))
-        await daemon._async_run_until_finished(False)
-        self.assertEqual([r.final_reward for r in daemon._completed_rollouts.values()], [0.0, 1.0])
-        self.assertEqual(server.queued, [])
-        server.clear_queues.assert_awaited_once()
+    async def test_complete_group_waits_before_cleanup_and_preserves_zero_reward(self):
+        for is_train in (True, False):
+            with self.subTest(is_train=is_train):
+                server = ScriptServer([[result("a"), result("b", reward=1)]])
+                daemon, clock, scope = make_daemon(
+                    server, roots=("a", "b"), rollout_timeout_seconds=1,
+                    rollout_no_progress_timeout_seconds=1)
+                daemon.is_train = is_train
+                entered, release = asyncio.Event(), asyncio.Event()
+
+                async def completion_delay(delay):
+                    entered.set()
+                    await release.wait()
+                    await clock.sleep(delay)
+
+                sleep = mock.AsyncMock(side_effect=completion_delay)
+                scope["asyncio"].sleep = sleep
+                task = asyncio.create_task(daemon._async_run_until_finished(False))
+                try:
+                    await asyncio.wait_for(entered.wait(), timeout=1)
+                    self.assertEqual([r.final_reward for r in daemon._completed_rollouts.values()], [0.0, 1.0])
+                    sleep.assert_awaited_once_with(2)
+                    self.assertFalse(task.done())
+                    server.clear_queues.assert_not_awaited()
+                finally:
+                    release.set()
+                    await task
+                self.assertEqual(clock.now, 2)
+                self.assertEqual(server.queued, [])
+                server.clear_queues.assert_awaited_once()
 
     async def test_same_question_rollouts_each_receive_full_retry_budget(self):
         server = ScriptServer([[result("a", error=True), result("b", error=True)],
@@ -150,9 +173,11 @@ class DaemonLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_server_stale_exhaustion_is_terminal(self):
         server = ScriptServer([[result(error=True, exhausted=True)]])
-        daemon, _, _ = make_daemon(server)
+        daemon, _, scope = make_daemon(server)
+        scope["asyncio"].sleep = mock.AsyncMock()
         with self.assertRaisesRegex(RuntimeError, "TaskTimeout"):
             await daemon._async_run_until_finished(False)
+        scope["asyncio"].sleep.assert_not_awaited()
         self.assertEqual(server.queued, [])
         self.assertEqual(daemon._completed_rollouts, {})
 

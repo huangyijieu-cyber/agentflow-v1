@@ -1610,6 +1610,22 @@ class NetworkRolloutHealthTests(unittest.TestCase):
         wait.assert_called_once_with(60)
         trainer.async_rollout_manager.wake_up.assert_called_once_with()
         trainer.async_rollout_manager.sleep.assert_called_once_with()
+        self.assertLess(trainer.events.index(("clear", 1)), trainer.events.index(("sleep", None)))
+
+    def test_successful_collection_still_propagates_sleep_failure_after_cleanup(self):
+        trainer = make_network_trainer([network_health(100, 10)])
+        error = RuntimeError("ACL failure while switching model mode")
+        trainer.async_rollout_manager.sleep.side_effect = error
+        with patch.object(time, "sleep") as wait, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(RuntimeError) as caught:
+                trainer._collect_train_batch(trainer.gen_batch)
+        self.assertIs(caught.exception, error)
+        self.assertEqual(trainer.agent_mode_daemon.converted_attempts, [0])
+        self.assertEqual(trainer.events[-1], ("clear", 0))
+        self.assertEqual(trainer.agent_mode_daemon._completed_rollouts, [])
+        trainer.async_rollout_manager.wake_up.assert_called_once_with()
+        trainer.async_rollout_manager.sleep.assert_called_once_with()
+        wait.assert_not_called()
 
     def test_three_retries_back_off_for_60_120_240_seconds(self):
         trainer = make_network_trainer([network_health(100, errors, total=total)
@@ -1641,7 +1657,7 @@ class NetworkRolloutHealthTests(unittest.TestCase):
         trainer.actor_rollout_wg.update_actor.assert_not_called()
         trainer.actor_rollout_wg.update_actor_by_dpo.assert_not_called()
         self.assertEqual(trainer.agent_mode_daemon._completed_rollouts, [])
-        trainer.async_rollout_manager.sleep.assert_called_once_with()
+        trainer.async_rollout_manager.sleep.assert_not_called()
 
     def test_collection_errors_propagate_without_retry_and_always_clean_up(self):
         for stage in ("setup", "run", "health", "convert"):
@@ -1649,15 +1665,18 @@ class NetworkRolloutHealthTests(unittest.TestCase):
                 trainer = make_network_trainer([network_health(100, 10)], [.1])
                 error = LookupError(f"original {stage} failure")
                 trainer.agent_mode_daemon.failures[stage] = error
+                trainer.async_rollout_manager.sleep.side_effect = RuntimeError("ACL failure during sleep")
                 with patch.object(time, "sleep") as wait, contextlib.redirect_stdout(io.StringIO()):
                     with self.assertRaises(LookupError) as caught:
                         trainer._collect_train_batch(trainer.gen_batch)
                 self.assertIs(caught.exception, error)
                 self.assertEqual(trainer.agent_mode_daemon.attempt, 0)
+                self.assertEqual([event for event in trainer.events if event[0] == "setup"], [("setup", 0)])
                 self.assertEqual(list(trainer._network_error_rates), [.1])
                 self.assertEqual(trainer.agent_mode_daemon._completed_rollouts, [])
                 self.assertIn(("clear", 0), trainer.events)
-                trainer.async_rollout_manager.sleep.assert_called_once_with()
+                trainer.async_rollout_manager.wake_up.assert_called_once_with()
+                trainer.async_rollout_manager.sleep.assert_not_called()
                 wait.assert_not_called()
 
     def test_missing_metadata_and_empty_collection_fail_without_network_retry(self):
@@ -1674,7 +1693,7 @@ class NetworkRolloutHealthTests(unittest.TestCase):
                 self.assertEqual(trainer.agent_mode_daemon.converted_attempts, [])
                 self.assertEqual(list(trainer._network_error_rates), [])
                 self.assertEqual(trainer.agent_mode_daemon._completed_rollouts, [])
-                trainer.async_rollout_manager.sleep.assert_called_once_with()
+                trainer.async_rollout_manager.sleep.assert_not_called()
                 wait.assert_not_called()
 
     def test_non_qa_collection_does_not_read_health_or_change_baseline(self):
