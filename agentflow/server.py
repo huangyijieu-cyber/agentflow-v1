@@ -32,6 +32,10 @@ class ServerDataStore:
         self._task_queue: asyncio.Queue[Task] = asyncio.Queue()
         self._processing_tasks: Dict[str, Task] = {}  # Currently processing tasks
         self._completed_rollouts: Dict[str, Rollout] = {}
+        # Keep terminal IDs after retrieval so retried HTTP reports stay idempotent.
+        self._claimed_rollout_ids: set[str] = set()
+        self._finished_rollout_ids: set[str] = set()
+        self._queue_generation = 0
 
         self.max_retries = max_retries
         self._failed_tasks: Dict[str, Task] = {}  # Track permanently failed tasks
@@ -43,10 +47,6 @@ class ServerDataStore:
         # Locks for thread-safe access
         self._results_lock = asyncio.Lock()
         self._resources_lock = asyncio.Lock()
-
-        # 制定事件
-        self._stale_check_task: Optional[asyncio.Task] = None
-        self._shutdown_event = asyncio.Event()
 
 
     async def add_task(
@@ -74,7 +74,8 @@ class ServerDataStore:
             num_claims=0,
             metadata=metadata or {},
         )
-        await self._task_queue.put(task)
+        async with self._results_lock:
+            self._task_queue.put_nowait(task)
         # logger.info(f"Task queued: {rollout_id} (mode: {mode}, resources_id: {resources_id})")
 
         return rollout_id
@@ -84,9 +85,15 @@ class ServerDataStore:
         Retrieves the next task from the queue without blocking.
         Returns None if the queue is empty.
         """
-        try:
-            async with self._results_lock:
-                task = self._task_queue.get_nowait()
+        async with self._results_lock:
+            while True:
+                try:
+                    task = self._task_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return None
+                # A late response can finish a task after its retry was queued.
+                if task.rollout_id in self._finished_rollout_ids:
+                    continue
                 task = task.model_copy(
                     update={
                         "last_claim_time": time.time(),
@@ -94,13 +101,12 @@ class ServerDataStore:
                     }
                 )
                 self._processing_tasks[task.rollout_id] = task
+                self._claimed_rollout_ids.add(task.rollout_id)
                 if task.num_claims == 1:
                     logger.debug(f"Next task retrieved: {task.rollout_id}")
                 else:
                     logger.info(f"Task {task.rollout_id} re-claimed (attempt {task.num_claims})")
                 return task
-        except asyncio.QueueEmpty:
-            return None
 
     async def update_resources(self, update: ResourcesUpdate):
         """
@@ -130,29 +136,39 @@ class ServerDataStore:
             return await self.get_resources_by_id(self._latest_resources_id)
         return None
 
-    async def store_rollout(self, rollout: Rollout):
-        """
-        Safely stores a completed rollout from a client.
-        """
-        """修复：防止重复提交覆盖"""
+    async def store_rollout(self, rollout: Rollout) -> bool:
+        """Store one terminal result; acknowledge repeats without recounting them."""
         async with self._results_lock:
-            # 检查是否已存在（且未被取出）
-            if rollout.rollout_id in self._completed_rollouts:
-                logger.warning(f"Rollout {rollout.rollout_id} already stored, ignoring duplicate")
-                return
-            
-            # 检查是否确实来自 processing（防止伪造）
-            if rollout.rollout_id not in self._processing_tasks:
-                logger.error(f"Rollout {rollout.rollout_id} not in processing tasks, possible duplicate or fake")
-                # 可选：拒绝存储
-                # raise ValueError("Invalid rollout_id")
-            
-            self._processing_tasks.pop(rollout.rollout_id, None)
-            self._completed_rollouts[rollout.rollout_id] = rollout
-            
-            # 关键：记录存储时间，用于后续数据新鲜度检查
-            print(f"[DEBUG] Rollout id:{rollout.rollout_id} received and stored: {str(rollout)[:200]}")
+            if rollout.rollout_id in self._finished_rollout_ids:
+                logger.info(f"Rollout {rollout.rollout_id} already finished, ignoring duplicate")
+                return True
+            if rollout.rollout_id not in self._claimed_rollout_ids:
+                logger.warning(f"Rejecting unknown or cleared rollout {rollout.rollout_id}")
+                return False
 
+            # Claimed IDs remain valid during backoff/queued retries. Whichever
+            # attempt reports first completes this task once; later reports are
+            # idempotent even after the daemon has retrieved the result.
+            self._processing_tasks.pop(rollout.rollout_id, None)
+            self._finished_rollout_ids.add(rollout.rollout_id)
+            self._completed_rollouts[rollout.rollout_id] = rollout
+            logger.debug(f"Rollout {rollout.rollout_id} received and stored")
+            return True
+
+    async def clear_queues(self):
+        """Discard the old batch and fence delayed requeues on this event loop."""
+        async with self._results_lock:
+            self._queue_generation += 1
+            while True:
+                try:
+                    self._task_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            self._processing_tasks.clear()
+            self._completed_rollouts.clear()
+            self._failed_tasks.clear()
+            self._claimed_rollout_ids.clear()
+            self._finished_rollout_ids.clear()
 
     async def retrieve_rollout(self, rollout_id: str) -> Optional[Rollout]:
         """
@@ -175,42 +191,41 @@ class ServerDataStore:
         return self._processing_tasks.copy()
 
     async def requeue_task(self, task: Task):
-        # 步骤1：在锁内原子性检查并移除，防止并发重复处理
         async with self._results_lock:
-            # 双重检查：任务是否还在处理中（可能已被其他协程处理）
-            if task.rollout_id not in self._processing_tasks:
-                logger.debug(f"Task {task.rollout_id} already removed from processing, skip requeue")
+            # Reactive and background checks may hold the same stale snapshot.
+            # Never remove a newer claim after another checker requeued it.
+            current = self._processing_tasks.get(task.rollout_id)
+            if current is not task:
                 return
-
-            # 检查是否超过重试次数（在锁内检查，防止计数竞争）
-            if task.num_claims >= self.max_retries:
-                    logger.error(f"Task {task.rollout_id} exceeded max retries ({self.max_retries}), marking as failed")
-                    self._failed_tasks[task.rollout_id] = task
-                    self._processing_tasks.pop(task.rollout_id, None)
-                    return
-
-            # 立即从 processing 中移除，防止其他协程重复检测到此任务
-            self._processing_tasks.pop(task.rollout_id, None)
-            # 创建任务副本用于重试（避免修改原对象影响其他可能的引用）
+            generation = self._queue_generation
+            self._processing_tasks.pop(task.rollout_id)
+            if (task.num_claims or 0) >= self.max_retries:
+                logger.error(f"Task {task.rollout_id} exceeded max claims ({self.max_retries})")
+                self._failed_tasks[task.rollout_id] = task
+                self._finished_rollout_ids.add(task.rollout_id)
+                self._completed_rollouts[task.rollout_id] = Rollout(
+                    rollout_id=task.rollout_id,
+                    metadata={
+                        "resources_id": task.resources_id,
+                        "rollout_error": {
+                            "type": "TaskTimeout",
+                            "phase": "task_timeout",
+                            "message": f"No result after {task.num_claims} claimed attempts",
+                            "retry_exhausted": True,
+                        },
+                    },
+                )
+                return
             task_copy = task.model_copy()
 
-        # 步骤2：在锁外执行延迟（不阻塞其他操作）
-        delay = min(30, 2 ** (task_copy.num_claims - 1))  # 1s, 2s, 4s, max 30s
-        if delay > 0:
-            await asyncio.sleep(delay)
+        delay = min(30, 2 ** max(0, (task_copy.num_claims or 1) - 1))
+        await asyncio.sleep(delay)
 
-        # 步骤3：重新获取锁并入队
         async with self._results_lock:
-            # 最终检查：任务是否在此期间被客户端完成并存储
-            if task_copy.rollout_id in self._completed_rollouts:
-                logger.info(f"Task {task_copy.rollout_id} completed during requeue delay, discarding")
+            if generation != self._queue_generation:
                 return
-
-            # 最终检查：任务是否已被标记为失败
-            if task_copy.rollout_id in self._failed_tasks:
-                logger.warning(f"Task {task_copy.rollout_id} marked as failed during requeue delay, discarding")
+            if task_copy.rollout_id in self._finished_rollout_ids:
                 return
-
             self._task_queue.put_nowait(task_copy)
             logger.warning(f"Requeuing task {task_copy.rollout_id} after timeout (attempt {task_copy.num_claims})")
 
@@ -241,6 +256,8 @@ class AgentFlowServer:
         self._store: Optional[ServerDataStore] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.startup_event = threading.Event()
+        self._shutdown_event: Optional[asyncio.Event] = None
+        self._stale_check_task: Optional[asyncio.Task] = None
 
         # Create FastAPI app instance with a lifespan manager
         self._app = FastAPI(lifespan=self._lifespan)
@@ -264,35 +281,37 @@ class AgentFlowServer:
         self.loop = asyncio.get_running_loop()
         self._store = ServerDataStore()  # Initialize data store here
 
-        # 启动后台定时检查任务
+        self._shutdown_event = asyncio.Event()
         self._stale_check_task = asyncio.create_task(self._stale_check_loop())
 
-        self.startup_event.set()  # Signal that the server is ready
-        yield
-
-        # 优雅关闭
-        self._shutdown_event.set()
-        if self._stale_check_task:
+        self.startup_event.set()
+        try:
+            yield
+        finally:
+            self._shutdown_event.set()
             self._stale_check_task.cancel()
             try:
                 await self._stale_check_task
             except asyncio.CancelledError:
                 pass
-        logger.info("Server is shutting down.")
-
-        self._store = None
-        self.startup_event.clear()  # Clear the startup event
-        self.loop = None
+            logger.info("Server is shutting down.")
+            self._store = None
+            self.startup_event.clear()
+            self.loop = None
 
     async def _stale_check_loop(self):
-        """后台每10秒检查一次孤儿任务"""
+        """Check abandoned tasks independently of workers polling for work."""
         while not self._shutdown_event.is_set():
             try:
                 await asyncio.wait_for(self._shutdown_event.wait(), timeout=10.0)
             except asyncio.TimeoutError:
-                # 每10秒执行一次检查
-                if self._store:
-                    await self._check_and_requeue_stale_tasks()
+                try:
+                    if self._store:
+                        await self._check_and_requeue_stale_tasks()
+                except Exception:
+                    # A transient checker failure must not silently disable
+                    # recovery for the rest of a training run.
+                    logger.exception("Failed to check stale rollout tasks; will retry")
 
 
     async def _check_and_requeue_stale_tasks(self):
@@ -381,7 +400,9 @@ class AgentFlowServer:
                 # 可选：拒绝存储或标记为 stale
                 return GenericResponse(status="rejected", message="Outdated resources")
             
-            await self._store.store_rollout(payload)
+            accepted = await self._store.store_rollout(payload)
+            if not accepted:
+                return GenericResponse(status="rejected", message="Unknown or cleared rollout")
             return GenericResponse(status="ok", message=f"Rollout {payload.rollout_id} stored")
 
     async def start(self):
@@ -418,6 +439,11 @@ class AgentFlowServer:
         if not self._store:
             raise RuntimeError("Store not initialized. The server may not be running.")
         return await self._store.add_task(sample, mode=mode, resources_id=resources_id, metadata=metadata)
+
+    async def clear_queues(self):
+        """Clear the batch on the server loop before reusing the daemon."""
+        if self._store:
+            await self._store.clear_queues()
 
     async def update_resources(self, resources: NamedResources) -> str:
         """
