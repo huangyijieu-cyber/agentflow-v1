@@ -812,7 +812,7 @@ class TraceTrainerIntegrationTests(unittest.TestCase):
             new_rows, new_scores = value_rollout(rollout, [0, 0, credit], reward)
             rows.extend(new_rows)
             scores.update(new_scores)
-        for task, metadata_task in (("webshop", None), ("rule", None), ("qa", "webshop")):
+        for task, metadata_task in (("rule", None), ("qa", "rule")):
             for scale in (0., 2., 3.):
                 with self.subTest(task=task, metadata_task=metadata_task, scale=scale):
                     trainer = make_trainer(scores, {"k": 3, "terminal_fill_enabled": True,

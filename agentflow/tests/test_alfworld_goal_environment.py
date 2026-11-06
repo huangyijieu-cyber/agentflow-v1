@@ -1137,8 +1137,8 @@ class SolverStateTests(unittest.TestCase):
         self.assertEqual(reward, 1)
         self.assertEqual(solver.planner.logs, [])
 
-    def test_non_alfworld_environment_keeps_existing_base_logs(self):
-        solver = self.solver(task="webshop")
+    def test_non_trace_environment_keeps_existing_base_logs(self):
+        solver = self.solver(task="rule")
         with contextlib.redirect_stdout(io.StringIO()):
             result, _ = solver.solve("session-id")
         self.assertTrue(all(item["trace_turn_type"] == "base" for item in result["planner_logs"]))

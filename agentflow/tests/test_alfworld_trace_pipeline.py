@@ -582,7 +582,7 @@ class ValidationScopeTests(unittest.TestCase):
                 self.assertTrue(enabled)
                 self.assertEqual(len(bound_tasks), 1)
                 self.assertEqual(bound_tasks[0]["question"], "val_unseen_all_alfworld_0")
-                (enabled, _), bound_tasks = self.run_until_solve(path, task_name="webshop")
+                (enabled, _), bound_tasks = self.run_until_solve(path, task_name="rule")
                 self.assertTrue(enabled)
                 self.assertEqual(bound_tasks, [])
 

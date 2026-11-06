@@ -63,7 +63,7 @@ def _compute_turn_flags(planner_logs: list, task: str) -> list:
         trace_valid = (valid and log.get("extraction_valid", True) is not False
                        and not log.get("trace_tool_failed", False)
                        and not log.get("trace_external_error", False))
-        response_key = (log.get("trace_state_context"), resp) if task == "alfworld" else resp
+        response_key = (log.get("trace_state_context"), resp) if task in ("alfworld", "webshop") else resp
         trace_dup = bool(resp and response_key in trace_seen_responses) or bool(action_key and action_key in seen_actions)
         # Failed attempts must not make a recovered retry look like a loop.
         # Legacy duplicate flags above retain their original all-turn scope.
@@ -316,6 +316,14 @@ class RolloutAgent(LitAgent):
                 rollout.solver.env.set_trace_task(task)
             else:
                 rollout.solver.env.trace_enabled = False
+        elif self.task == "webshop":
+            if is_train:
+                if getattr(rollout.solver.env, "trace_enabled", False):
+                    rollout.solver.env.set_trace_task(task)
+            else:
+                # Its independent manifest flag still restores frozen goals
+                # and prices at reset, without reading validation GT columns.
+                rollout.solver.env.trace_enabled = False
         result = {}
         # try:
         if True:
@@ -328,7 +336,7 @@ class RolloutAgent(LitAgent):
             yibu_tool = rollout.solver.executor.tool_instances_cache.get("Yibu_Brave_Search_Tool")
             if yibu_tool is not None:
                 yibu_tool.token_usage.set_tokenizer(self.tokenizer)
-            result, reward = await asyncio.to_thread(rollout.solve, question=prompt, ground_truth=task["result"])
+            result, reward = await asyncio.to_thread(rollout.solve, question=prompt, ground_truth=task.get("result"))
 
             if "anchor" in result.keys():
                 anchor = result["anchor"]
@@ -380,7 +388,7 @@ class RolloutAgent(LitAgent):
                 "prompt": task["question"],
                 "model":rollout.llm_engine,
                 "tools":self.tools,
-                "groundtruth": task.get("extra_info", {}).get("groundtruth", task["result"]),
+                "groundtruth": task.get("extra_info", {}).get("groundtruth", task.get("result")),
                 "answer_extracted": answer,
                 "reward": reward_value,
                 "total_result":result,
@@ -399,7 +407,7 @@ class RolloutAgent(LitAgent):
                 "prompt": task["question"],
                 "model":rollout.llm_engine,
                 "tools":self.tools,
-                "groundtruth": task.get("extra_info", {}).get("groundtruth", task["result"]),
+                "groundtruth": task.get("extra_info", {}).get("groundtruth", task.get("result")),
                 "answer_extracted": answer,
                 "reward": reward_value,
                 "total_result":result,
@@ -470,6 +478,8 @@ class RolloutAgent(LitAgent):
                             "trace_turn_type": log.get("trace_turn_type", "unknown"),
                             "trace_original_turn": log.get("trace_original_turn", turn_index),
                             "trace_action_key": log.get("trace_action_key"),
+                            "trace_env_action": log.get("trace_env_action"),
+                            "trace_env_task_score": log.get("trace_env_task_score"),
                             "trace_tool_failed": bool(log.get("trace_tool_failed", False)),
                             "trace_extraction_valid": log.get("extraction_valid", True),
                             "trace_external_error": bool(log.get("trace_external_error", False)),

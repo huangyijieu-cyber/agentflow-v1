@@ -233,6 +233,13 @@ class RolloutAgent(LitAgent):
                 rollout.solver.env.set_trace_task(task)
             else:
                 rollout.solver.env.trace_enabled = False
+        elif self.task == "webshop":
+            if is_train:
+                if getattr(rollout.solver.env, "trace_enabled", False):
+                    rollout.solver.env.set_trace_task(task)
+            else:
+                # Keep frozen catalog restoration while disabling GT scoring.
+                rollout.solver.env.trace_enabled = False
         profile_val = val and profiling_enabled()
         rollout_started = time.perf_counter() if profile_val else 0.0
         result = {}
@@ -247,7 +254,7 @@ class RolloutAgent(LitAgent):
             yibu_tool = rollout.solver.executor.tool_instances_cache.get("Yibu_Brave_Search_Tool")
             if yibu_tool is not None:
                 yibu_tool.token_usage.set_tokenizer(self.tokenizer)
-            result, reward = await asyncio.to_thread(rollout.solve, question=prompt, ground_truth=task["result"])
+            result, reward = await asyncio.to_thread(rollout.solve, question=prompt, ground_truth=task.get("result"))
 
             if "anchor" in result.keys():
                 anchor = result["anchor"]
@@ -300,7 +307,7 @@ class RolloutAgent(LitAgent):
                 "prompt": task["question"],
                 "model":rollout.llm_engine,
                 "tools":self.tools,
-                "groundtruth": task.get("extra_info", {}).get("groundtruth", task["result"]),
+                "groundtruth": task.get("extra_info", {}).get("groundtruth", task.get("result")),
                 "answer_extracted": answer,
                 "reward": reward_value,
                 "total_result":result,
@@ -319,7 +326,7 @@ class RolloutAgent(LitAgent):
                 "prompt": task["question"],
                 "model":rollout.llm_engine,
                 "tools":self.tools,
-                "groundtruth": task.get("extra_info", {}).get("groundtruth", task["result"]),
+                "groundtruth": task.get("extra_info", {}).get("groundtruth", task.get("result")),
                 "answer_extracted": answer,
                 "reward": reward_value,
                 "total_result":result,
@@ -389,6 +396,8 @@ class RolloutAgent(LitAgent):
                             "trace_turn_type": log.get("trace_turn_type", "unknown"),
                             "trace_original_turn": log.get("trace_original_turn", turn_index),
                             "trace_action_key": log.get("trace_action_key"),
+                            "trace_env_action": log.get("trace_env_action"),
+                            "trace_env_task_score": log.get("trace_env_task_score"),
                             "trace_tool_failed": bool(log.get("trace_tool_failed", False)),
                             "trace_extraction_valid": log.get("extraction_valid", True),
                             "trace_external_error": bool(log.get("trace_external_error", False)),

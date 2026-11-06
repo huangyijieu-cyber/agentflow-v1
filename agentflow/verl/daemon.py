@@ -894,15 +894,17 @@ class AgentModeDaemon:
                 turn_dup_list.append(bool(_f.get("dup", False)))
                 trace_dup_list.append(bool(_f.get("trace_dup", _f.get("dup", False))))
                 trace_metadata = trace["metadata"]
-                is_alfworld = trace_metadata.get("trace_task") == "alfworld"
+                trace_task = trace_metadata.get("trace_task")
+                is_environment = trace_task in ("alfworld", "webshop")
+                task_name = "ALFWorld" if trace_task == "alfworld" else "WebShop"
                 task_gt = sample_info["trace_gt"]
-                if is_alfworld and (not isinstance(task_gt, str) or not task_gt.strip()):
-                    raise ValueError("ALFWorld TRACE requires a nonempty prepared Parquet result")
-                if is_alfworld and trace_metadata.get("trace_gt") != task_gt:
-                    raise ValueError("ALFWorld Parquet result differs from the verified environment goal")
+                if is_environment and (not isinstance(task_gt, str) or not task_gt.strip()):
+                    raise ValueError(f"{task_name} TRACE requires a nonempty prepared Parquet result")
+                if is_environment and trace_metadata.get("trace_gt") != task_gt:
+                    raise ValueError(f"{task_name} Parquet result differs from the verified environment goal")
                 state_context = trace_metadata.get("trace_state_context")
-                scoring_valid = trace_metadata.get("trace_scoring_valid", not is_alfworld) is True
-                if is_alfworld and not scoring_valid:
+                scoring_valid = trace_metadata.get("trace_scoring_valid", not is_environment) is True
+                if is_environment and not scoring_valid:
                     state_context = None
                 trace_state_contexts.append(state_context)
                 next_valid = trace_metadata.get("trace_next_scoring_valid") is True
@@ -936,7 +938,7 @@ class AgentModeDaemon:
                 except (TypeError, ValueError, OverflowError):
                     outcome_reward = float("nan")
                 trace_outcome_rewards.append(outcome_reward)
-                outcome_role = (not is_alfworld and
+                outcome_role = (not is_environment and
                                 (trace_turn_types[-1] == "analysis" or trace_final_flags[-1]))
                 trace_valid_list.append(bool(
                     _f.get("trace_valid", _f.get("valid", True))

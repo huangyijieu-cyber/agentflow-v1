@@ -292,20 +292,33 @@ class AgentFlowTrainer(RayPPOTrainer):
         # actual games that happened to share the same original data uid.
         tasks = non.get("trace_task", [None] * size)
         provenance = non.get("trace_goal_metadata", [None] * size)
+        environment_tasks = ("alfworld", "webshop")
+        if self.config.data.get("task") == "webshop" and any(task != "webshop" for task in tasks):
+            raise ValueError("WebShop TRACE requires WebShop-aware rollout metadata; refresh old rollout caches")
         game_by_uid = {}
         for row, task in enumerate(tasks):
-            if task != "alfworld":
+            if task not in environment_tasks:
                 continue
+            task_name = "ALFWorld" if task == "alfworld" else "WebShop"
             if (str(non["trace_turn_type"][row]) != "tool_plan"
                     or bool(non.get("trace_is_final", [False] * size)[row])):
-                raise ValueError("ALFWorld TRACE requires uniform environment-action metadata; refresh old rollout caches")
+                raise ValueError(f"{task_name} TRACE requires uniform environment-action metadata; refresh old rollout caches")
             item = provenance[row]
-            fingerprint = (item.get("goal_spec_hash") or (item.get("source_sha256") or {}).get("gamefile")) if isinstance(item, dict) else None
-            if not fingerprint:
-                raise ValueError("ALFWorld TRACE is missing actual-game goal provenance")
+            if task == "webshop":
+                keys = ("goal_sha256", "manifest_sha256", "task_key", "template_version")
+                if (not isinstance(item, dict)
+                        or any(not isinstance(item.get(key), str) or not item[key] for key in keys)
+                        or item["template_version"] != "webshop-candidate-state-v1"
+                        or not isinstance(ground_truths[row], str) or not ground_truths[row].strip()):
+                    raise ValueError("WebShop TRACE is missing verified goal/manifest/candidate-template provenance")
+                fingerprint = (task, *(item[key] for key in keys), ground_truths[row])
+            else:
+                fingerprint = (item.get("goal_spec_hash") or (item.get("source_sha256") or {}).get("gamefile")) if isinstance(item, dict) else None
+                if not fingerprint:
+                    raise ValueError("ALFWorld TRACE is missing actual-game goal provenance")
             key = str(non["uid"][row])
             if key in game_by_uid and game_by_uid[key] != fingerprint:
-                raise ValueError("ALFWorld TRACE uid contains different actual games or goal templates")
+                raise ValueError(f"{task_name} TRACE uid contains different actual games, goals, manifests or goal templates")
             game_by_uid[key] = fingerprint
         # Full-state facts are diagnostic inputs to the reference only. Invalid
         # simulator/verifier states must never become valid scoring requests,
@@ -316,11 +329,12 @@ class AgentFlowTrainer(RayPPOTrainer):
         contexts = list(contexts)
         next_contexts = list(non.get("trace_next_state_context", [None] * size))
         next_scoring_valid = np.asarray(non.get("trace_next_scoring_valid", np.zeros(size)), dtype=bool).copy()
-        alfworld_rows = [row for row, task in enumerate(tasks) if task == "alfworld"]
+        environment_action_rows = [row for row, task in enumerate(tasks) if task in environment_tasks]
         for row, task in enumerate(tasks):
-            if task == "alfworld":
-                if views[row] != "full_state":
-                    raise ValueError("ALFWorld TRACE requires the explicit full_state scoring view")
+            if task in environment_tasks:
+                expected_view = "full_state" if task == "alfworld" else "webshop_state"
+                if views[row] != expected_view:
+                    raise ValueError(f"{task} TRACE requires the explicit {expected_view} scoring view")
                 if not scoring_valid[row] or not bool(goal_valid[row]):
                     contexts[row] = None
                 if (not next_scoring_valid[row] or not bool(goal_valid[row])
@@ -331,7 +345,7 @@ class AgentFlowTrainer(RayPPOTrainer):
         # Turn numbering alone cannot certify that a real transition was kept.
         environment_rows = defaultdict(list)
         original_turns = non.get("trace_original_turn", non["turn_index_list"])
-        for row in alfworld_rows:
+        for row in environment_action_rows:
             environment_rows[(str(non["uid"][row]), str(non["rollout_id_list"][row]))].append(row)
         for rows in environment_rows.values():
             rows.sort(key=lambda row: int(original_turns[row]))
@@ -339,15 +353,15 @@ class AgentFlowTrainer(RayPPOTrainer):
                 if (int(original_turns[right]) == int(original_turns[left]) + 1
                         and next_scoring_valid[left] and contexts[right] is not None
                         and next_contexts[left] != contexts[right]):
-                    raise ValueError("ALFWorld adjacent action post-state and next pre-state disagree")
+                    raise ValueError("Environment adjacent action post-state and next pre-state disagree")
         # A post-state is a scoring request, never an additional actor row.
         # Encoding all requests together deduplicates s_(t+1) against the next
         # action's pre-state while preserving the native T-action batch.
-        score_contexts = contexts + [next_contexts[row] for row in alfworld_rows]
-        score_targets = list(ground_truths) + [ground_truths[row] for row in alfworld_rows]
+        score_contexts = contexts + [next_contexts[row] for row in environment_action_rows]
+        score_targets = list(ground_truths) + [ground_truths[row] for row in environment_action_rows]
         instructions = non.get("trace_answer_instruction")
         score_instructions = (None if instructions is None else
-                              list(instructions) + [instructions[row] for row in alfworld_rows])
+                              list(instructions) + [instructions[row] for row in environment_action_rows])
         encoding_start = time.perf_counter()
         requests, row_requests, counters = encode_state_requests(
             score_contexts, score_targets, self.tokenizer,
@@ -404,7 +418,7 @@ class AgentFlowTrainer(RayPPOTrainer):
             valid_requests = request_indices >= 0
             mapped[valid_requests] = logps[request_indices[valid_requests]]
             row_logps[:] = mapped[:size]
-            next_logps[np.asarray(alfworld_rows, dtype=np.int64)] = mapped[size:]
+            next_logps[np.asarray(environment_action_rows, dtype=np.int64)] = mapped[size:]
             postprocess_seconds = time.perf_counter() - postprocess_start
 
         credit_start = time.perf_counter()
@@ -444,8 +458,9 @@ class AgentFlowTrainer(RayPPOTrainer):
         reliable = defaultdict(list)
         for key, rows in groups.items():
             rows.sort(key=lambda row: int(turns[row]))
-            is_environment = all(tasks[row] == "alfworld" for row in rows)
-            if any(tasks[row] == "alfworld" for row in rows) and not is_environment:
+            is_environment = all(tasks[row] in environment_tasks for row in rows)
+            if (any(tasks[row] in environment_tasks for row in rows)
+                    and (not is_environment or len({tasks[row] for row in rows}) != 1)):
                 raise ValueError("TRACE rollout mixes environment and answer-based decisions")
             boundaries = terminal_flags if is_environment else final_flags
             finals = [row for row in rows if boundaries[row]
@@ -457,13 +472,19 @@ class AgentFlowTrainer(RayPPOTrainer):
                 prefix = [row for row in rows if within_prefix[row]]
                 reward = outcome_rewards[final]
                 trustworthy = (all(raw_valid[row] for row in prefix)
-                               and all(tasks[row] != "alfworld" or
+                               and all(tasks[row] not in environment_tasks or
                                        (scoring_valid[row] and bool(goal_valid[row])
                                         and next_scoring_valid[row]) for row in prefix)
                                and np.isfinite(reward)
                                and np.isfinite(outcome_rewards[prefix]).all()
                                and np.allclose(outcome_rewards[prefix], reward, rtol=0, atol=1e-8))
                 success = raw_success[final]
+                if tasks[final] == "webshop":
+                    # WebShop full success is exactly 1; partial shopping rewards
+                    # remain continuous for advantages, never thresholded at .5.
+                    trustworthy = bool(trustworthy and 0.0 <= reward <= 1.0
+                                       and isinstance(success, (bool, np.bool_))
+                                       and bool(success) == (reward == 1.0))
                 if trustworthy:
                     if isinstance(success, (bool, np.bool_)):
                         success = bool(success)
@@ -514,7 +535,7 @@ class AgentFlowTrainer(RayPPOTrainer):
                 outcome_advantage=float(outcome_advantages[trusted_rows[0]]) if trusted_rows else float("nan"),
                 config=cfg,
             )
-            if all(tasks[row] == "alfworld" for row in rows):
+            if all(tasks[row] in environment_tasks for row in rows):
                 # The initial pre-state is the shared baseline for both ends
                 # of every real transition, including the terminal post-state.
                 rollout_next_values = (state_values([row_logps[rows[0]], *next_logps[rows]],
@@ -549,7 +570,7 @@ class AgentFlowTrainer(RayPPOTrainer):
             external_blocked[rows] = annotated["external_error_blocked"]
             reached[rows] = annotated["terminal_reached"]
 
-        # QA and ALFWorld share the same per-question signed range scaling.
+        # QA and environment tasks share the same per-question signed range scaling.
         # Range population uses all valid tools/actions, before sign/matching/pair
         # filters, including windows that do not reach a trusted terminal answer.
         # Never filter the state sequence before computing its K-step windows.
@@ -623,7 +644,7 @@ class AgentFlowTrainer(RayPPOTrainer):
         )
         metrics["trace/scoring_invalid_next_result_turns"] = sum(
             index is not None and not np.isfinite(next_logps[row])
-            for row, index in zip(alfworld_rows, row_requests[size:])
+            for row, index in zip(environment_action_rows, row_requests[size:])
         )
         metrics["trace/credit_seconds"] = time.perf_counter() - credit_start
         return metrics

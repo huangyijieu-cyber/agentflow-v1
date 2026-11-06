@@ -297,6 +297,97 @@ def _annotate_alfworld_outcome(planner_logs, result, reward_value):
             "trace_terminal_turn": terminal if completed else None}
 
 
+def annotate_webshop_step(log, state_context, done, info):
+    """Keep actual WebShop transitions separate from response quality/reward."""
+    info = info if isinstance(info, dict) else {}
+    ended = environment_flag(done) is True
+    external = (environment_flag(info.get("env_error")) is True
+                or environment_flag(info.get("external_error")) is True)
+    terminated = environment_flag(info.get("terminated")) is True
+    budget = environment_flag(info.get("truncated_by_max_step")) is True
+    truncated = environment_flag(info.get("truncated")) is True or budget
+    action = info.get("trace_env_action")
+    canonical_action = action.strip().lower() if isinstance(action, str) else None
+    terminal = bool(ended and not external and (
+        (terminated and canonical_action == "click[buy now]")
+        or (budget and not terminated)))
+    invalid = any(environment_flag(info.get(key)) is True
+                  for key in ("format_error", "invalid_action"))
+    goal_valid = info.get("trace_goal_check_valid") is True
+    before_valid = log.get("trace_goal_check_valid_before", False) is True
+    before_state_valid = (log.get("trace_scoring_valid") is True and before_valid
+                          and isinstance(state_context, str) and bool(state_context.strip()))
+    next_context = info.get("trace_state_context")
+    next_valid = bool(info.get("trace_scoring_valid") is True and goal_valid
+                      and isinstance(next_context, str) and next_context.strip() and not external)
+    state_valid = before_state_valid and next_valid
+    log.update({
+        "trace_task": "webshop", "trace_state_view": "webshop_state",
+        "trace_environment_step": True, "trace_turn_type": "tool_plan",
+        "trace_is_final": False,
+        "trace_state_context": state_context, "trace_next_state_context": next_context,
+        "trace_next_scoring_valid": next_valid,
+        "trace_env_done": ended, "trace_env_terminated": terminated,
+        "trace_env_truncated": truncated, "trace_env_truncated_by_max_step": budget,
+        "trace_env_won": environment_flag(info.get("won")),
+        "trace_env_task_score": environment_scalar(info.get("task_score")),
+        "trace_env_action": action, "trace_env_error": external,
+        "trace_env_terminal": terminal,
+        "trace_action_key": json.dumps([state_context, canonical_action], ensure_ascii=False, sort_keys=True),
+        "trace_goal_check_valid": goal_valid, "trace_scoring_valid": state_valid,
+        "extraction_valid": log.get("extraction_valid", True) is not False and not invalid and state_valid,
+        "trace_tool_failed": invalid or external, "trace_external_error": external,
+        "trace_error_type": info.get("env_error_type", "environment_error") if external else "",
+        "trace_error_source": "external" if external else "",
+    })
+
+
+def _annotate_webshop_outcome(planner_logs, result):
+    """Use the last native action's continuous reward, not GRPO's binary one."""
+    candidates = [index for index, item in enumerate(planner_logs)
+                  if item.get("trace_task") == "webshop" and item.get("trace_env_terminal") is True]
+    terminal = candidates[0] if len(candidates) == 1 else None
+    selected = planner_logs[terminal] if terminal is not None else {}
+    raw_reward = selected.get("trace_env_task_score")
+    try:
+        reward = float(raw_reward)
+        finite_reward = not isinstance(raw_reward, bool) and math.isfinite(reward) and 0.0 <= reward <= 1.0
+    except (TypeError, ValueError, OverflowError):
+        reward, finite_reward = None, False
+    output = result.get("base_response")
+    completed = bool(
+        terminal is not None and isinstance(output, str) and output.strip()
+        and selected.get("response") == output
+        and selected.get("finish_reason") in ("stop", "eos", "end_turn")
+        and selected.get("trace_env_done") is True
+        and not selected.get("trace_env_error", False)
+    )
+    prefix = planner_logs[:terminal + 1] if terminal is not None else []
+    trustworthy = bool(
+        completed and finite_reward and prefix
+        and (not selected.get("trace_env_truncated_by_max_step", False) or reward == 0.0)
+        and all(item.get("trace_task") == "webshop"
+                and item.get("trace_goal_check_valid_before") is True
+                and item.get("trace_goal_check_valid") is True
+                and item.get("trace_scoring_valid") is True
+                and item.get("trace_next_scoring_valid") is True
+                and item.get("finish_reason") in ("stop", "eos", "end_turn")
+                and not item.get("trace_external_error", False)
+                for item in prefix)
+    )
+    success = reward == 1.0 if finite_reward else None
+    for index, item in enumerate(planner_logs):
+        item["trace_is_final"] = False
+        item["trace_is_terminal"] = bool(completed and index == terminal)
+        item["trace_outcome_valid"] = bool(trustworthy and index <= terminal)
+        item["trace_outcome_success"] = success if item["trace_outcome_valid"] else None
+        item["trace_outcome_reward"] = reward if item["trace_outcome_valid"] else None
+    return {"trace_outcome_valid": trustworthy,
+            "trace_outcome_success": success if trustworthy else None,
+            "trace_final_turn": None,
+            "trace_terminal_turn": terminal if completed else None}
+
+
 def annotate_trace_outcome(planner_logs, result, reward_value, verifier, task="qa"):
     """Mark the exact answer whose verifier result produced the rollout reward.
 
@@ -306,6 +397,8 @@ def annotate_trace_outcome(planner_logs, result, reward_value, verifier, task="q
     """
     if task == "alfworld":
         return _annotate_alfworld_outcome(planner_logs, result, reward_value)
+    if task == "webshop":
+        return _annotate_webshop_outcome(planner_logs, result)
     selected_key = next(
         (
             key

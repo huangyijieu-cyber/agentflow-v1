@@ -7,19 +7,22 @@
 # ============================================================================
 env:
   # ----- 任务与算法 -----
-  TASK: ${env:TASK,qa}                                    # "webshop" | "qa" | "rule"
+  TASK: ${env:TASK,webshop}                                    # "webshop" | "qa" | "rule"
   ALGORITHM: ${env:ALGORITHM,grpo+slic}                   # "grpo" | "grpo+slic" | "grpo+abpo" | "grpo+simpo" | "grpo+hspo"
   ADV_ESTIMATOR: ${env:ADV_ESTIMATOR,grpo}                # grpo | gigpo | graphgpo
 
   # ----- 训练数据与回放 -----
-  TRAIN_DATA_PATH: ${env:TRAIN_DATA_PATH,train/webwalker_train.parquet}
-  TEST_DATA_PATH: ${env:TEST_DATA_PATH,val/webwalker_val.parquet}
+  TRAIN_DATA_PATH: ${env:TRAIN_DATA_PATH,train/webshop_train_6810_webshop_with_gt.parquet}
+  TEST_DATA_PATH: ${env:TEST_DATA_PATH,val/webshop_test_100_webshop.parquet}
   STALE_ITERATION: ${env:STALE_ITERATION,0}
   REPLAY_BUFFER_SIZE: ${env:REPLAY_BUFFER_SIZE,512}
   REPLAY_COLLECTION: ${env:REPLAY_COLLECTION,uid-turn}    # uid-turn(fast) | cross(slow) | turn(medium)
 
   # ----- TRACE 状态价值与 SLIC 配对（仅算法包含 slic 时生效） -----
   TRACE_ENABLED: ${env:TRACE_ENABLED,true}
+  WEBSHOP_ROOT: ${env:WEBSHOP_ROOT,}  # Empty uses <repo>/data/WebShop-master.
+  WEBSHOP_TRACE_MANIFEST: ${env:WEBSHOP_TRACE_MANIFEST,data/train/webshop_train_6810_webshop_with_gt.manifest.json.gz}
+  WEBSHOP_TRACE_HISTORY_LENGTH: ${env:WEBSHOP_TRACE_HISTORY_LENGTH,4}  # Scorer only; actor history remains unchanged.
   # Optional legacy SQLite/Probe goals; prepared training Parquet embeds GT in result.
   ALFWORLD_TRACE_GOALS: ${env:ALFWORLD_TRACE_GOALS,}
   ALFWORLD_TRACE_HISTORY_LENGTH: ${env:ALFWORLD_TRACE_HISTORY_LENGTH,4}  # Scorer only: None=all, 0=none, N=last N native pre-action memory records.
@@ -27,7 +30,7 @@ env:
   TRACE_K: ${env:TRACE_K,3}
   TRACE_GAMMA: ${env:TRACE_GAMMA,0.8}
   TRACE_TERMINAL_FILL_ENABLED: ${env:TRACE_TERMINAL_FILL_ENABLED,true}
-  TRACE_TERMINAL_FILL_SCALE: ${env:TRACE_TERMINAL_FILL_SCALE,2.0}  # Legacy tasks only; QA/ALFWorld use dynamic scaling and ignore this value.
+  TRACE_TERMINAL_FILL_SCALE: ${env:TRACE_TERMINAL_FILL_SCALE,2.0}  # Legacy tasks only; QA/environment tasks use dynamic scaling and ignore this value.
   TRACE_OUTCOME_MATCH_VALUE: ${env:TRACE_OUTCOME_MATCH_VALUE,false}
   TRACE_OUTCOME_SUCCESS_THRESHOLD: ${env:TRACE_OUTCOME_SUCCESS_THRESHOLD,0.5}
   TRACE_MATCH_EPSILON: ${env:TRACE_MATCH_EPSILON,0.05}
@@ -46,7 +49,7 @@ env:
   TRACE_SHARED_PREFIX_MAX_TOKENS: ${env:TRACE_SHARED_PREFIX_MAX_TOKENS,8192}
   TRACE_SHARED_PREFIX_MAX_MASK_MIB: ${env:TRACE_SHARED_PREFIX_MAX_MASK_MIB,256}
   TRACE_SHARED_PREFIX_VERIFY: ${env:TRACE_SHARED_PREFIX_VERIFY,true}
-  TRACE_REFERENCE_UPDATE_INTERVAL: ${env:TRACE_REFERENCE_UPDATE_INTERVAL,None}  # ALFWorld v4a: None=every step; 0=fixed; N=every N steps.
+  TRACE_REFERENCE_UPDATE_INTERVAL: ${env:TRACE_REFERENCE_UPDATE_INTERVAL,None}  # ALFWorld migration baseline: None=every step; 0=fixed; N=every N steps.
 
   # ----- 评分模型 (Reward Model) -----
   SCORE_MODEL_NAME: "Qwen3-30B-A3B-Instruct-2507"
@@ -111,7 +114,7 @@ env:
   TOOL_STEPS: 5
   TEST_TEMPERATURE: 0.0
   TRAIN_TEMPERATURE: 0.7
-  OUTPUT_TYPE: "final"                                    # base | final | direct
+  OUTPUT_TYPE: ${env:OUTPUT_TYPE,base}                                    # base | final | direct
   AGENT_MAX_TIMEOUT: 600
 
 
