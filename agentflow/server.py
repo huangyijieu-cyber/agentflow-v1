@@ -192,7 +192,7 @@ class ServerDataStore:
 
     async def requeue_task(self, task: Task):
         async with self._results_lock:
-            # Reactive and background checks may hold the same stale snapshot.
+            # Concurrent checks may hold the same stale snapshot.
             # Never remove a newer claim after another checker requeued it.
             current = self._processing_tasks.get(task.rollout_id)
             if current is not task:
@@ -256,8 +256,6 @@ class AgentFlowServer:
         self._store: Optional[ServerDataStore] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.startup_event = threading.Event()
-        self._shutdown_event: Optional[asyncio.Event] = None
-        self._stale_check_task: Optional[asyncio.Task] = None
 
         # Create FastAPI app instance with a lifespan manager
         self._app = FastAPI(lifespan=self._lifespan)
@@ -281,38 +279,14 @@ class AgentFlowServer:
         self.loop = asyncio.get_running_loop()
         self._store = ServerDataStore()  # Initialize data store here
 
-        self._shutdown_event = asyncio.Event()
-        self._stale_check_task = asyncio.create_task(self._stale_check_loop())
-
         self.startup_event.set()
         try:
             yield
         finally:
-            self._shutdown_event.set()
-            self._stale_check_task.cancel()
-            try:
-                await self._stale_check_task
-            except asyncio.CancelledError:
-                pass
             logger.info("Server is shutting down.")
             self._store = None
             self.startup_event.clear()
             self.loop = None
-
-    async def _stale_check_loop(self):
-        """Check abandoned tasks independently of workers polling for work."""
-        while not self._shutdown_event.is_set():
-            try:
-                await asyncio.wait_for(self._shutdown_event.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
-                try:
-                    if self._store:
-                        await self._check_and_requeue_stale_tasks()
-                except Exception:
-                    # A transient checker failure must not silently disable
-                    # recovery for the rest of a training run.
-                    logger.exception("Failed to check stale rollout tasks; will retry")
-
 
     async def _check_and_requeue_stale_tasks(self):
         """

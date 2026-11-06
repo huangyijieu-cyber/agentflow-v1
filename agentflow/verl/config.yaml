@@ -9,7 +9,6 @@ defaults:
 agentflow:
   port: 9999
   max_empty_retries: 2  # Per original rollout, also used for reported execution/Judge failures.
-  task_timeout_seconds: 600  # Reclaim a worker task that never reports a result.
   rollout_no_progress_timeout_seconds: 1200
   rollout_timeout_seconds: 3600  # Incomplete batches raise; never train partial groups.
 

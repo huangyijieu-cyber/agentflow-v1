@@ -506,13 +506,20 @@ class SyncDeadlineTests(unittest.TestCase):
         future.cancel.assert_not_called()
 
     def test_timeout_and_retry_settings_reject_invalid_values(self):
-        for name in ("rollout_timeout_seconds", "rollout_no_progress_timeout_seconds", "task_timeout_seconds"):
+        for name in ("rollout_timeout_seconds", "rollout_no_progress_timeout_seconds"):
             for value in (0, -1, float("nan"), float("inf"), True, "1"):
                 with self.subTest(name=name, value=value), self.assertRaisesRegex(ValueError, name):
                     make_daemon(**{name: value})
         for value in (-1, True, 1.5):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "max_empty_retries"):
                 make_daemon(max_empty_retries=value)
+
+    def test_task_timeout_keeps_the_original_llm_timeout(self):
+        daemon, _, _ = make_daemon()
+        for kwargs, expected in (({}, 12000), ({"llm_timeout_seconds": 1800}, 1800)):
+            with self.subTest(kwargs=kwargs):
+                configured = type(daemon)(9999, 1, {}, None, 1, 0, **kwargs)
+                self.assertEqual(configured.server.task_timeout_seconds, expected)
 
 
 class EndToEndRecoveryTests(unittest.IsolatedAsyncioTestCase):

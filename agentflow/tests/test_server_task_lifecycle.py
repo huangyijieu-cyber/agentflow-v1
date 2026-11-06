@@ -1,7 +1,6 @@
 """CPU async regressions for rollout completion, stale retries and batch fencing."""
 import ast
 import asyncio
-import logging
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -179,42 +178,55 @@ class ServerTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AgentFlowServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
-    async def test_lifespan_checker_stays_alive_and_shuts_down_on_exception(self):
+    async def test_lifespan_starts_without_background_tasks_and_closes(self):
         server = SERVER.AgentFlowServer()
-        with self.assertRaisesRegex(RuntimeError, "test shutdown"):
-            async with server._lifespan(server._app):
-                await asyncio.sleep(0)
-                self.assertTrue(server.startup_event.is_set())
-                self.assertFalse(server._stale_check_task.done())
-                raise RuntimeError("test shutdown")
-        self.assertTrue(server._stale_check_task.done())
+        tasks_before = asyncio.all_tasks()
+        async with server._lifespan(server._app):
+            await asyncio.sleep(0)
+            self.assertTrue(server.startup_event.is_set())
+            self.assertIs(server.loop, asyncio.get_running_loop())
+            self.assertIsInstance(server._store, SERVER.ServerDataStore)
+            self.assertEqual(asyncio.all_tasks(), tasks_before)
         self.assertIsNone(server.loop)
         self.assertIsNone(server._store)
         self.assertFalse(server.startup_event.is_set())
 
-    async def test_checker_logs_transient_failure_and_continues(self):
+    async def test_lifespan_cleans_up_on_exception(self):
         server = SERVER.AgentFlowServer()
-        server._store = SERVER.ServerDataStore()
-        server._shutdown_event = asyncio.Event()
-        calls = 0
+        with self.assertRaisesRegex(RuntimeError, "test shutdown"):
+            async with server._lifespan(server._app):
+                self.assertTrue(server.startup_event.is_set())
+                self.assertIs(server.loop, asyncio.get_running_loop())
+                self.assertIsInstance(server._store, SERVER.ServerDataStore)
+                raise RuntimeError("test shutdown")
+        self.assertIsNone(server.loop)
+        self.assertIsNone(server._store)
+        self.assertFalse(server.startup_event.is_set())
 
-        async def check():
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                raise RuntimeError("temporary check failure")
-            server._shutdown_event.set()
+    async def test_task_poll_requeues_only_after_legacy_timeout(self):
+        server = SERVER.AgentFlowServer(task_timeout_seconds=12000)
+        clock = mock.Mock(return_value=1000.0)
+        with mock.patch.object(SERVER, "time", SimpleNamespace(time=clock)), \
+             mock.patch.object(SERVER, "asyncio", async_api(sleep=mock.AsyncMock())):
+            async with server._lifespan(server._app):
+                poll = next(route.endpoint for route in server._app.routes if route.path == "/task")
+                rollout_id = await server.queue_task({"question": "sample"})
+                first = await poll()
+                self.assertTrue(first.is_available)
+                self.assertEqual(first.task.rollout_id, rollout_id)
+                self.assertEqual(first.task.num_claims, 1)
 
-        async def expired(awaitable, timeout):
-            awaitable.close()
-            raise asyncio.TimeoutError
+                for elapsed in (601, 12000):
+                    clock.return_value = first.task.last_claim_time + elapsed
+                    self.assertFalse((await poll()).is_available)
+                    self.assertIs(server._store.get_processing_tasks()[rollout_id], first.task)
 
-        server._check_and_requeue_stale_tasks = check
-        with mock.patch.object(SERVER, "asyncio", async_api(wait_for=expired)), \
-             self.assertLogs(SERVER.logger, logging.ERROR) as logs:
-            await server._stale_check_loop()
-        self.assertEqual(calls, 2)
-        self.assertIn("will retry", "\n".join(logs.output))
+                clock.return_value = first.task.last_claim_time + 12001
+                retried = await poll()
+                self.assertTrue(retried.is_available)
+                self.assertEqual(retried.task.rollout_id, rollout_id)
+                self.assertEqual(retried.task.num_claims, 2)
+                self.assertIsNone(await server._store.get_next_task())
 
     async def test_http_acknowledges_duplicates_and_rejects_cleared_result(self):
         server = SERVER.AgentFlowServer()

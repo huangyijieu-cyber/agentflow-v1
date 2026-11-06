@@ -481,14 +481,13 @@ Daemon 对每条最初排队的 Rollout 分别计算重提交预算，同一道�
 | 配置 | 默认值 | 含义 |
 | --- | --- | --- |
 | `agentflow.max_empty_retries` | `2` | 每条原始 Rollout 的应用故障／无效训练数据重提交上限，不包含首次提交 |
-| `agentflow.task_timeout_seconds` | `600` | Server 判断已领取任务 stale 的间隔，独立于原有 LLM 超时 |
 | `agentflow.rollout_no_progress_timeout_seconds` | `1200` | 没有接纳新的有效完成或触发新重提交的最长等待秒数；重复／孤立结果不算进展 |
 | `agentflow.rollout_timeout_seconds` | `3600` | 整个 batch 的收集上限秒数，重试不会重置它 |
 | 环境变量 `AGENTFLOW_ROLLOUT_RPC_TIMEOUT_S` | `120` | Runner 获取资源／回传结果的单次控制 RPC 上限秒数；设置在 worker 进程环境中 |
 
-例如，训练命令可追加 `agentflow.rollout_timeout_seconds=5400 agentflow.rollout_no_progress_timeout_seconds=1800`。三个 `agentflow.*timeout_seconds` 和 RPC 上限都必须是有限正数，重提交预算必须是非负整数。Judge SDK 自身的请求超时／重试策略未在此修改，网络连通性仍需单独恢复。
+例如，训练命令可追加 `agentflow.rollout_timeout_seconds=5400 agentflow.rollout_no_progress_timeout_seconds=1800`。两个 `agentflow.*timeout_seconds` 和 RPC 上限都必须是有限正数，重提交预算必须是非负整数。Judge SDK 自身的请求超时／重试策略未在此修改，网络连通性仍需单独恢复。
 
-Server 对 stale 任务还保留独立的领取重试预算（默认最多领取 3 次），使用原 Rollout ID；Daemon 的应用故障重提交使用新 ID。这是两层预算，不能将所有故障简单理解为总共 3 次执行。总截止时间／无进展截止时间优先：默认 `task_timeout_seconds=600` 时，完全静默的 worker 可能在 Server 用尽领取次数前先触发无进展保护。后台 stale 巡检失败会记录错误并继续巡检。
+Server 对 stale 任务还保留独立的领取重试预算（默认最多领取 3 次），使用原 Rollout ID；Daemon 的应用故障重提交使用新 ID。这是两层预算，不能将所有故障简单理解为总共 3 次执行。单任务 stale 阈值恢复沿用原来的 `llm_timeout_seconds`（默认 12000 秒），撤回独立的 `agentflow.task_timeout_seconds=600` 设置；只在客户端轮询 `/task` 时检查，不启动后台定时巡检。总截止时间／无进展截止时间保持原值，不受此次回退影响。
 
 Server 在当前 session 内对完成回传保持幂等，重复结果只计一次；旧批次清理会拒绝迟到结果，并阻止正在退避的旧任务再次入队。Daemon 忽略已替换、重复或孤立的尝试；退出时在 Server 事件循环内清理队列。若收集失败／取消时清理也失败，保留最初异常并记录清理错误；正常收集后清理失败同样抛错。同步等待另有总上限加 15 秒的兜底，超时取消协调协程。日志显示完成数、重提交数及剩余截止时间。
 

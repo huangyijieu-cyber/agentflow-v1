@@ -114,12 +114,10 @@ class AgentModeDaemon:
         max_empty_retries=2,
         rollout_timeout_seconds=3600,
         rollout_no_progress_timeout_seconds=1200,
-        task_timeout_seconds=600,
     ):
         for name, value in (
             ("rollout_timeout_seconds", rollout_timeout_seconds),
             ("rollout_no_progress_timeout_seconds", rollout_no_progress_timeout_seconds),
-            ("task_timeout_seconds", task_timeout_seconds),
         ):
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be a finite positive number")
@@ -131,7 +129,7 @@ class AgentModeDaemon:
         self.server_port = port
         self.llm_timeout_seconds = llm_timeout_seconds
         self.server = AgentFlowServer(
-            host="127.0.0.1", port=self.server_port, task_timeout_seconds=task_timeout_seconds
+            host="127.0.0.1", port=self.server_port, task_timeout_seconds=self.llm_timeout_seconds
         )
         self.proxy_port = _find_available_port()  # Run proxy on a different port
 

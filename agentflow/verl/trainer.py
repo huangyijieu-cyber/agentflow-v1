@@ -1744,7 +1744,6 @@ class AgentFlowTrainer(RayPPOTrainer):
             max_empty_retries=self.config.agentflow.get("max_empty_retries", 2),
             rollout_timeout_seconds=self.config.agentflow.get("rollout_timeout_seconds", 3600),
             rollout_no_progress_timeout_seconds=self.config.agentflow.get("rollout_no_progress_timeout_seconds", 1200),
-            task_timeout_seconds=self.config.agentflow.get("task_timeout_seconds", 600),
         )
         self.agent_mode_daemon.start()
 
