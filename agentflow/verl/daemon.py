@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import socket
@@ -111,12 +112,26 @@ class AgentModeDaemon:
         llm_timeout_seconds=1200 * 10,
         enable_rollout_validation=True,
         max_empty_retries=2,
+        rollout_timeout_seconds=3600,
+        rollout_no_progress_timeout_seconds=1200,
+        task_timeout_seconds=600,
     ):
+        for name, value in (
+            ("rollout_timeout_seconds", rollout_timeout_seconds),
+            ("rollout_no_progress_timeout_seconds", rollout_no_progress_timeout_seconds),
+            ("task_timeout_seconds", task_timeout_seconds),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be a finite positive number")
+        if isinstance(max_empty_retries, bool) or not isinstance(max_empty_retries, int) or max_empty_retries < 0:
+            raise ValueError("max_empty_retries must be a nonnegative integer")
+        self.rollout_timeout_seconds = rollout_timeout_seconds
+        self.rollout_no_progress_timeout_seconds = rollout_no_progress_timeout_seconds
         # Server and Task Configuration
         self.server_port = port
         self.llm_timeout_seconds = llm_timeout_seconds
         self.server = AgentFlowServer(
-            host="127.0.0.1", port=self.server_port, task_timeout_seconds=self.llm_timeout_seconds
+            host="127.0.0.1", port=self.server_port, task_timeout_seconds=task_timeout_seconds
         )
         self.proxy_port = _find_available_port()  # Run proxy on a different port
 
@@ -342,15 +357,8 @@ class AgentModeDaemon:
 
     async def _async_set_up(self, data, server_addresses, is_train=True):
         """Async helper to set up data and resources on the server."""
+        await self.server.clear_queues()
         self.clear_data_and_server()
-
-        # Clear any orphaned rollouts from previous runs
-        try:
-            orphaned_rollouts = await self.server.retrieve_completed_rollouts()
-            if orphaned_rollouts:
-                logger.info(f"Cleared {len(orphaned_rollouts)} orphaned rollouts from previous runs")
-        except Exception as e:
-            logger.warning(f"Failed to clear orphaned rollouts: {e}")
 
         self.backend_llm_server_addresses = server_addresses
         self.is_train = is_train
@@ -402,8 +410,9 @@ class AgentModeDaemon:
         coro = self._async_set_up(data, server_addresses, is_train)
         future = asyncio.run_coroutine_threadsafe(coro, self.server.loop)
         try:
-            future.result()  # Wait for completion with a timeout = 60
+            future.result(timeout=60)
         except Exception as e:
+            future.cancel()
             logger.error(f"Failed to set up data on server: {e}")
             raise
 
@@ -489,200 +498,162 @@ class AgentModeDaemon:
             logger.warning(f"Warning: Rollout {rollout.rollout_id} contains empty prompt")
 
     def _validate_rollout_for_retry(self, rollout: Rollout) -> bool:
-          """Returns True if rollout should be retried due to empty/invalid data"""
-          if not self.enable_rollout_validation:
-              return False
-
-          # Check for empty/invalid rollouts
-          is_invalid = (
-              rollout.triplets is None or
-              len(rollout.triplets) == 0 or
-              any(not r.response.get("token_ids", []) for r in rollout.triplets) or
-              any(not r.prompt.get("token_ids", []) for r in rollout.triplets)
-          )
-
-          if is_invalid:
-              data_id = self._get_data_id_from_rollout(rollout)
-              retry_count = self._empty_rollout_counts.get(data_id, 0)
-
-              if retry_count < self.max_empty_retries:
-                  self._empty_rollout_counts[data_id] = retry_count + 1
-                  logger.warning(f"Retrying empty rollout for data_id {data_id} (attempt {retry_count + 1})")
-                  return True
-              else:
-                  logger.error(f"Data_id {data_id} exceeded max empty retries, using fallback")
-
-          return False
-
-    def _get_data_id_from_rollout(self, rollout: Rollout) -> str:
-        """Extract data_id from rollout for retry tracking"""
-        # Find the original sample data for this rollout
-        original_sample = self._task_id_to_original_sample.get(rollout.rollout_id, {})
-        return original_sample.get("data_id", rollout.rollout_id)
+        """Check data validity; retry budgets belong to individual rollout roots."""
+        if not self.enable_rollout_validation:
+            return False
+        return (
+            not rollout.triplets
+            or any(not r.response.get("token_ids", []) for r in rollout.triplets)
+            or any(not r.prompt.get("token_ids", []) for r in rollout.triplets)
+        )
 
     async def _async_run_until_finished(self, verbose=True, avg_task_time_sec=150):
-        """Async helper to wait for all tasks to complete with dynamic timeout and smart completion"""
+        """Collect complete rollout groups or raise; never train on failed attempts."""
         original_task_count = self._total_tasks_queued
-        retried_rollout_ids = set()
-        start_time = time.time()
+        active_attempts = {key: key for key in self._task_id_to_original_sample}
+        start_time = time.monotonic()
         last_progress_time = start_time
-        last_completed_count = 0
-
-        # Dynamic timeout: base time per task + buffer for complexity
-        estimated_total_time = original_task_count * avg_task_time_sec * 1.5  # 50% buffer
-        min_timeout = 600  # At least 10 minutes
-        max_timeout = 3600  # At most 1 hour
-        dynamic_timeout = max(min_timeout, min(max_timeout, estimated_total_time))
+        last_log_time = start_time - 30
+        retry_total = 0
         profile_timeout = None
-        if not self.is_train and profiling_enabled():
-            profile_timeout = int(os.environ.get("AGENTFLOW_PROFILE_VAL_TIMEOUT_S", "3600"))
-            if profile_timeout <= 0:
-                raise ValueError("AGENTFLOW_PROFILE_VAL_TIMEOUT_S must be positive")
+        collection_failed = False
 
-        logger.info(f"Starting {original_task_count} {'training' if self.is_train else 'validation'} tasks")
-        logger.info(f"Estimated completion time: {dynamic_timeout/60:.1f} minutes (avg {avg_task_time_sec}s per task)")
+        logger.info(
+            "Starting %s %s tasks; timeout=%ss, no-progress timeout=%ss, retries per rollout=%s",
+            original_task_count, "training" if self.is_train else "validation",
+            self.rollout_timeout_seconds, self.rollout_no_progress_timeout_seconds, self.max_empty_retries,
+        )
+        try:
+            if not self.is_train and profiling_enabled():
+                profile_timeout = int(os.environ.get("AGENTFLOW_PROFILE_VAL_TIMEOUT_S", "3600"))
+                if profile_timeout <= 0:
+                    raise ValueError("AGENTFLOW_PROFILE_VAL_TIMEOUT_S must be positive")
+            while len(self._completed_rollouts) < original_task_count:
+                now = time.monotonic()
+                elapsed = now - start_time
+                completed_count = len(self._completed_rollouts)
+                # Only the explicitly requested profiling mode accepts partial validation.
+                if profile_timeout is not None and elapsed >= profile_timeout:
+                    logger.warning("Timing profile stopped after %ss: %s/%s validation tasks completed",
+                                   profile_timeout, completed_count, original_task_count)
+                    break
+                if elapsed >= self.rollout_timeout_seconds:
+                    raise TimeoutError(
+                        f"Rollout batch exceeded {self.rollout_timeout_seconds}s: "
+                        f"{completed_count}/{original_task_count} completed; no incomplete batch will be trained."
+                    )
+                if now - last_progress_time >= self.rollout_no_progress_timeout_seconds:
+                    raise TimeoutError(
+                        f"No rollout progress for {self.rollout_no_progress_timeout_seconds}s: "
+                        f"{completed_count}/{original_task_count} completed, {len(active_attempts)} pending; "
+                        "check worker/Judge connectivity. No incomplete batch will be trained."
+                    )
 
-        while True:
-            current_time = time.time()
-            elapsed = current_time - start_time
-            completed_count = len(self._completed_rollouts)
-            completion_rate = completed_count / original_task_count if original_task_count > 0 else 0
-
-            # Check completion conditions
-            # if completed_count >= self._total_tasks_queued:
-            if completed_count >= original_task_count:
-                logger.info("All tasks completed")
-                break
-            if profile_timeout is not None and elapsed >= profile_timeout:
-                logger.warning(
-                    "Timing profile stopped after %ss: %s/%s validation tasks completed",
-                    profile_timeout, completed_count, original_task_count,
+                # Bound individual control-plane awaits as well as the complete batch.
+                remaining = min(self.rollout_timeout_seconds - elapsed,
+                                self.rollout_no_progress_timeout_seconds - (now - last_progress_time))
+                completed_batch = await asyncio.wait_for(
+                    self.server.retrieve_completed_rollouts(), timeout=min(30.0, remaining)
                 )
-                break
-
-            # Smart early exit: if >90% done and no progress for 2 minutes
-            # if completion_rate >= 0.9 and (current_time - last_progress_time) > 120:
-            #     logger.info(f"Early completion: {completion_rate:.1%} tasks done ({completed_count}/{original_task_count})")
-            #     break
-
-            # # Dynamic timeout check
-            # if elapsed > dynamic_timeout:
-            #     logger.info(f"Timeout after {elapsed/60:.1f} minutes. Completed {completion_rate:.1%} ({completed_count}/{original_task_count})")
-            #     break
-
-            # No progress timeout (5 minutes for training, 3 minutes for validation)
-            # no_progress_limit = 600  # 10 miniutes
-            # if (current_time - last_progress_time) > no_progress_limit:
-            #     logger.warning(f"No progress for {no_progress_limit/60:.1f} minutes. Completed {completion_rate:.1%}")
-            #     if not self.is_train and completion_rate >= 0.5:  # Accept if validation or >50% training done
-            #         logger.warning("Accepting current results")
-            #         break
-
-            completed_batch = await self.server.retrieve_completed_rollouts()
-
-            # Update progress tracking
-            if completed_count > last_completed_count:
-                last_progress_time = current_time
-                last_completed_count = completed_count
-
-            new_retries = 0
-            for rollout in completed_batch:
-                self._validate_data(rollout)
-
-                # Check if this rollout is from our current session
-                if rollout.rollout_id not in self._task_id_to_original_sample:
-                    logger.warning(f"Skipping orphaned rollout {rollout.rollout_id} (not from current session)")
-                    continue
-
-                # Only retry during training and if this rollout hasn't been retried before
-                if (self.is_train and
-                    rollout.rollout_id not in retried_rollout_ids and
-                    self._validate_rollout_for_retry(rollout)):
-
-                    retry_task_metadata = {"retry": True, "original_rollout_id": rollout.rollout_id}
-                    original_sample = self._task_id_to_original_sample[rollout.rollout_id]
-
-                    try:
-                        new_rollout_id = await self.server.queue_task(
+                for rollout in completed_batch:
+                    root_id = active_attempts.get(rollout.rollout_id)
+                    if root_id is None:
+                        logger.warning("Ignoring duplicate, replaced or orphaned rollout %s", rollout.rollout_id)
+                        continue
+                    error = (rollout.metadata or {}).get("rollout_error")
+                    invalid = self.is_train and self._validate_rollout_for_retry(rollout)
+                    if error or invalid:
+                        error_type = error.get("type", "RolloutError") if isinstance(error, dict) else "InvalidRollout"
+                        phase = error.get("phase", "rollout") if isinstance(error, dict) else "data_validation"
+                        retry_count = self._empty_rollout_counts.get(root_id, 0)
+                        exhausted = isinstance(error, dict) and error.get("retry_exhausted") is True
+                        if exhausted or retry_count >= self.max_empty_retries:
+                            raise RuntimeError(
+                                f"Rollout {root_id} failed ({error_type}, phase={phase}); "
+                                f"retry budget exhausted after {retry_count} resubmissions. "
+                                "Aborting this batch without an optimizer update; inspect worker logs."
+                            )
+                        original_sample = self._task_id_to_original_sample[rollout.rollout_id]
+                        new_id = await asyncio.wait_for(self.server.queue_task(
                             sample=original_sample,
                             mode="train" if self.is_train else "val",
                             resources_id=self._current_resources_id,
-                            metadata=retry_task_metadata
-                        )
-                        self._task_id_to_original_sample[new_rollout_id] = original_sample
-                        retried_rollout_ids.add(rollout.rollout_id)
-                        self._total_tasks_queued += 1
-                        new_retries += 1
-                        logger.info(f"Resubmitted rollout {rollout.rollout_id} as {new_rollout_id}")
-                    except Exception as e:
-                        logger.error(f"Failed to resubmit rollout {rollout.rollout_id}: {e}")
-                        # Accept the original rollout even if retry fails
+                            metadata={"retry": True, "original_rollout_id": root_id,
+                                      "data_id": original_sample.get("data_id"), "is_train": self.is_train},
+                        ), timeout=min(30.0, max(0.001, self.rollout_timeout_seconds - (time.monotonic() - start_time))))
+                        active_attempts.pop(rollout.rollout_id)
+                        self._task_id_to_original_sample.pop(rollout.rollout_id)
+                        active_attempts[new_id] = root_id
+                        self._task_id_to_original_sample[new_id] = original_sample
+                        self._empty_rollout_counts[root_id] = retry_count + 1
+                        retry_total += 1
+                        logger.warning("Retrying rollout %s as %s (%s/%s, %s at %s)",
+                                       root_id, new_id, retry_count + 1, self.max_empty_retries, error_type, phase)
+                    else:
+                        self._validate_data(rollout)
                         self._completed_rollouts[rollout.rollout_id] = rollout
-                else:
-                    self._completed_rollouts[rollout.rollout_id] = rollout
+                        active_attempts.pop(rollout.rollout_id)
+                    last_progress_time = time.monotonic()
 
-            if verbose and (elapsed % 30 < 5 or new_retries > 0):  # Log every 30s or when retries happen
-                eta_minutes = (dynamic_timeout - elapsed) / 60
-                if self.is_train:
-                    valid_rollouts = len([r for r in self._completed_rollouts.values()
-                                        if r.triplets and len(r.triplets) > 0])
-                    logger.info(f"[{elapsed/60:.1f}m] Progress: {completion_rate:.1%} ({completed_count}/{original_task_count}), "
-                          f"Valid: {valid_rollouts}, Retries: {new_retries}, ETA: {eta_minutes:.1f}m")
-                else:
-                    logger.info(f"[{elapsed/60:.1f}m] Validation: {completion_rate:.1%} ({completed_count}/{original_task_count})")
+                completed_count = len(self._completed_rollouts)
+                if verbose and time.monotonic() - last_log_time >= 30:
+                    elapsed = time.monotonic() - start_time
+                    logger.info(
+                        "[%.1fm] Progress: %.1f%% (%s/%s), Pending: %s, Retries: %s, Deadline remaining: %.1fm",
+                        elapsed / 60, 100 * completed_count / original_task_count,
+                        completed_count, original_task_count, len(active_attempts), retry_total,
+                        max(0.0, self.rollout_timeout_seconds - elapsed) / 60,
+                    )
+                    last_log_time = time.monotonic()
+                if completed_count >= original_task_count:
+                    break
+                # Retry reports do not change the number of original rollout slots.
+                delay = 2 if completed_batch else 5
+                await asyncio.sleep(min(delay, max(0.001, self.rollout_timeout_seconds - (time.monotonic() - start_time)),
+                                        max(0.001, self.rollout_no_progress_timeout_seconds - (time.monotonic() - last_progress_time))))
+        except BaseException:
+            collection_failed = True
+            raise
+        finally:
+            # Invalidate queued/in-flight IDs even on failure/cancellation. Late
+            # reports must not be accepted by this or a subsequent training batch.
+            try:
+                await asyncio.wait_for(self.server.clear_queues(), timeout=10.0)
+            except BaseException:
+                if not collection_failed:
+                    raise
+                logger.exception("Failed to clear rollout queues while handling a collection failure; preserving the original error")
 
-            # Adaptive sleep based on progress
-            if len(completed_batch) > 0 or new_retries > 0:
-                await asyncio.sleep(2)  # Active progress
-            elif completion_rate > 0.8:
-                await asyncio.sleep(3)  # Near completion
-            else:
-                await asyncio.sleep(5)  # Normal waiting
-
-        valid_rollouts = len([r for r in self._completed_rollouts.values()
-                            if r.triplets and len(r.triplets) > 0])
-        final_elapsed = time.time() - start_time
-        final_rate = len(self._completed_rollouts) / original_task_count if original_task_count > 0 else 0
-
-        logger.info(f"Finished after {final_elapsed/60:.1f} minutes. "
-              f"Completion rate: {final_rate:.1%} ({len(self._completed_rollouts)}/{original_task_count}), "
-              f"Valid rollouts: {valid_rollouts}")
+        logger.info("Rollout collection finished after %.1fm: %s/%s completed, %s resubmissions",
+                    (time.monotonic() - start_time) / 60, len(self._completed_rollouts),
+                    original_task_count, retry_total)
 
     def run_until_all_finished(self, verbose=True):
-        """Synchronously waits for all queued tasks to be completed and reported."""
+        """Wait with a hard thread-side deadline, including if the loop stalls."""
         if self._total_tasks_queued == 0:
             logger.warning("Warning: No tasks were queued.")
             return
-
-
-        ## 服务器状态检查
-        if not self.server.loop:
-            raise RuntimeError("Server event loop not set.")
-        if not self.server.loop.is_running():
+        if not self.server.loop or not self.server.loop.is_running():
             raise RuntimeError("Server event loop is not running.")
         if not self.server.startup_event.is_set():
             raise RuntimeError("Server is not ready (startup event not set).")
 
-
-
-        coro = self._async_run_until_finished(verbose)
-        future = asyncio.run_coroutine_threadsafe(coro, self.server.loop)
-        # timeout = 500
+        future = asyncio.run_coroutine_threadsafe(self._async_run_until_finished(verbose), self.server.loop)
+        timeout = self.rollout_timeout_seconds + 15.0  # Inner deadline plus bounded cleanup.
         try:
-            future.result()  # Wait indefinitely for all tasks to complete
+            future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
-            # 记录部分完成的任务数
-            completed = len(self._completed_rollouts)
-            logger.error(
-                f"Task completion timed out after {timeout} seconds. Completed {completed}/{self._total_tasks_queued} tasks."
-            )
-            # 尝试取消 future（协程可能不支持取消，但尝试无害）
+            # An inner TimeoutError already carries the actual no-progress cause.
+            if future.done():
+                raise
             future.cancel()
-            raise TimeoutError(f"Waiting for tasks timed out after {timeout}s")
-        except Exception as e:
-            logger.error(f"Error while waiting for tasks to finish: {e}")
-            completed = len(self._completed_rollouts)
-            logger.info(f"Completed {completed}/{self._total_tasks_queued} tasks before error.")
+            raise TimeoutError(
+                f"Rollout coordinator did not respond within {timeout}s; "
+                f"{len(self._completed_rollouts)}/{self._total_tasks_queued} completed. "
+                "Waiting was cancelled; no incomplete batch will be trained."
+            ) from None
+        except BaseException:
+            future.cancel()
             raise
 
     def _get_format_metrics(self, split: str) -> dict:
@@ -1097,14 +1068,9 @@ class AgentModeDaemon:
         self._empty_rollout_counts.clear()  # Clear retry counters
         self._current_resources_id = None
 
-        # For a true reset, the server's internal queues would also need clearing.
-        # This implementation assumes that `set_up_data_and_server` is called
-        # for each new run, effectively starting a fresh batch.
-        # extra status clearup
+        # Server queues are cleared asynchronously on its own event loop at
+        # setup and in the collection finally block, never from this thread.
         self.is_train = True
-        # server rollout clearup
-        if hasattr(self.server, 'clear_queues'):
-            self.server.clear_queues()
 
     def _fillna_reward(self, rollout):
         if rollout.final_reward is None:

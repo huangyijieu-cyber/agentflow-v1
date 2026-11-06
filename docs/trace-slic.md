@@ -450,3 +450,29 @@ TRACE_TEST_PREFIX_DISTRIBUTED=1 python -m unittest discover \
 - `val/queued_rollouts/completed_rollouts/valid_rollouts`、`completion_rate/valid_rollout_rate` 保留；两种比例分母均为排队轨迹数。`val/reward` 不把未返回轨迹自动记失败。
 
 本轮不修改 SLIC Loss、Replay 更新强度、GRPO 优势算法及配置。CPU 回归不能替代 GPU/NPU 训练收益验证；小状态距离与大信用差仍需独立状态抽查和验证集收益确认。
+
+## Rollout 故障回传、有限重试与等待上限
+
+Judge 的 API 错误（包括 `ChatOpenAI` 返回的 `{"error": "APIConnectionError", ...}`）、非字符串异常结果或 SDK 异常会使当前尝试失败。Runner 将 `rollout_error`（错误类型与阶段）和 `resources_id` 回传给 Server，不生成 0 奖励或可训练 Triplet。正常判错得到的真实 0 奖励仍然有效；原有字符串 verdict 解析失败的兼容处理保持不变。回传元数据不包含原始异常消息／请求内容，具体根因查看 worker 日志。
+
+Daemon 对每条最初排队的 Rollout 分别计算重提交预算，同一道题的多条 Rollout 不共享预算。默认允许失败后重新提交 2 次；临时 Judge／执行故障恢复后，只接纳成功尝试，保持原始组大小和正常训练数据组装。该故障处理同样用于验证，且不会因 `enable_rollout_validation=false` 而关闭。持续故障耗尽预算、服务端 stale 任务耗尽领取次数或到达等待上限时，当前收集调用明确抛错，终止本 step，不以残缺组进入后续优化。
+
+统一配置位于 `agentflow/verl/config.yaml`，可以通过训练命令的 Hydra 参数覆盖，无需在两份任务训练 YAML 中重复添加：
+
+| 配置 | 默认值 | 含义 |
+| --- | --- | --- |
+| `agentflow.max_empty_retries` | `2` | 每条原始 Rollout 的应用故障／无效训练数据重提交上限，不包含首次提交 |
+| `agentflow.task_timeout_seconds` | `600` | Server 判断已领取任务 stale 的间隔，独立于原有 LLM 超时 |
+| `agentflow.rollout_no_progress_timeout_seconds` | `1200` | 没有接纳新的有效完成或触发新重提交的最长等待秒数；重复／孤立结果不算进展 |
+| `agentflow.rollout_timeout_seconds` | `3600` | 整个 batch 的收集上限秒数，重试不会重置它 |
+| 环境变量 `AGENTFLOW_ROLLOUT_RPC_TIMEOUT_S` | `120` | Runner 获取资源／回传结果的单次控制 RPC 上限秒数；设置在 worker 进程环境中 |
+
+例如，训练命令可追加 `agentflow.rollout_timeout_seconds=5400 agentflow.rollout_no_progress_timeout_seconds=1800`。三个 `agentflow.*timeout_seconds` 和 RPC 上限都必须是有限正数，重提交预算必须是非负整数。Judge SDK 自身的请求超时／重试策略未在此修改，网络连通性仍需单独恢复。
+
+Server 对 stale 任务还保留独立的领取重试预算（默认最多领取 3 次），使用原 Rollout ID；Daemon 的应用故障重提交使用新 ID。这是两层预算，不能将所有故障简单理解为总共 3 次执行。总截止时间／无进展截止时间优先：默认 `task_timeout_seconds=600` 时，完全静默的 worker 可能在 Server 用尽领取次数前先触发无进展保护。后台 stale 巡检失败会记录错误并继续巡检。
+
+Server 在当前 session 内对完成回传保持幂等，重复结果只计一次；旧批次清理会拒绝迟到结果，并阻止正在退避的旧任务再次入队。Daemon 忽略已替换、重复或孤立的尝试；退出时在 Server 事件循环内清理队列。若收集失败／取消时清理也失败，保留最初异常并记录清理错误；正常收集后清理失败同样抛错。同步等待另有总上限加 15 秒的兜底，超时取消协调协程。日志显示完成数、重提交数及剩余截止时间。
+
+排查时先按 worker 日志检查 Judge 地址、代理和网络连接，再检查资源 GET／结果 POST 是否超时，以及 Server stale 巡检日志。训练端的异常会指出原始 Rollout、错误类型／阶段或完成数；恢复外部服务后重新启动失败的训练运行。若看到清理失败，应同时重启对应 Server／worker，避免保留旧的内存队列。单纯提高等待上限不能修复持续断网。
+
+仅显式开启的验证计时模式 `AGENTFLOW_PROFILE_VAL_TIMING=1` 配合 `AGENTFLOW_PROFILE_VAL_TIMEOUT_S` 保留原有的限时部分返回用途；正常训练／验证不以不完整 batch 冒充完成。本节不改变 GRPO／SLIC、PDDL、actor prompt、reference 配置或任务分组参数；CPU 故障注入回归不代表已完成 Ascend 分布式训练验证。

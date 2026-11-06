@@ -268,17 +268,39 @@ Required JSON structure:
 # <true_false>: "True" or "False".
 # """
 
-    verification_result = llm_scorer_engine(query_prompt, response_format=AnswerVerification)
+    try:
+        verification_result = llm_scorer_engine(query_prompt, response_format=AnswerVerification)
+    except Exception as error:
+        raise RuntimeError(
+            f"Judge API request failed ({type(error).__name__}); rollout has no verified reward."
+        ) from error
+
+    # ChatOpenAI returns API failures as dictionaries. They are infrastructure
+    # failures, not incorrect answers or unparseable judge verdicts. Let the
+    # runner report a failed attempt so the daemon can apply its retry policy.
+    if isinstance(verification_result, dict) and verification_result.get("error"):
+        error_type = verification_result["error"]
+        if not isinstance(error_type, str) or re.fullmatch(r"[A-Za-z0-9_]{1,80}", error_type) is None:
+            error_type = "APIError"
+        # API messages/details can contain request data or credentials.
+        raise RuntimeError(
+            f"Judge API request failed ({error_type}); rollout has no verified reward."
+        )
 
     if hasattr(verification_result, "true_false"):
         return finish(verification_result.true_false)
     else:
+        if not isinstance(verification_result, str):
+            raise RuntimeError(
+                f"Judge returned unsupported response type {type(verification_result).__name__}; "
+                "rollout has no verified reward."
+            )
         print("verification_result:", verification_result)
         ## judger output parsing
         judger_response = extract_json_from_markdown(verification_result)
 
         ## failed to load then it is forced to False.
-        if judger_response is None:
+        if not isinstance(judger_response, dict):
             return finish(False, valid=False)
         
         if "true_false" in judger_response.keys():

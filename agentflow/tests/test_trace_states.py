@@ -523,11 +523,12 @@ class OutcomeMetadataTests(unittest.TestCase):
 
 
 class VerifierDetailsTests(unittest.TestCase):
-    def scorer(self, response, parsed=None):
+    def scorer(self, response, parsed=None, engine=None):
         return extract_function("train-roma/utils.py", "compute_score", {
-            "llm_scorer_engine": lambda *args, **kwargs: response,
+            "llm_scorer_engine": engine or (lambda *args, **kwargs: response),
             "AnswerVerification": object,
             "extract_json_from_markdown": lambda value: parsed,
+            "re": re,
         })
 
     def test_true_and_false_keep_legacy_result_and_trusted_boolean(self):
@@ -538,13 +539,69 @@ class VerifierDetailsTests(unittest.TestCase):
                              {"valid": True, "success": success, "legacy_result": success})
 
     def test_parse_failure_and_nonboolean_are_not_verifier_negative_labels(self):
-        for parsed, legacy in ((None, False), ({}, False), ({"true_false": "False"}, "False")):
+        for parsed, legacy in ((None, False), ({}, False), ([], False), ([True], False),
+                               (1, False), ({"true_false": "False"}, "False")):
             score = self.scorer("unparsed response", parsed)
             self.assertEqual(score("q", "gt", "a"), legacy)
             details = score("q", "gt", "a", return_details=True)
             self.assertFalse(details["valid"])
             self.assertIsNone(details["success"])
             self.assertEqual(details["legacy_result"], legacy)
+
+    def test_api_error_envelopes_raise_without_becoming_rewards(self):
+        for kind, expected in (("APIConnectionError", "APIConnectionError"),
+                               ("rate_limit", "rate_limit"),
+                               ({"code": 503}, "APIError"),
+                               ("unsafe request details", "APIError")):
+            response = {"error": kind, "message": "private request", "details": "private credential"}
+            score = self.scorer(response)
+            for detailed in (False, True):
+                with self.subTest(kind=kind, detailed=detailed), \
+                     contextlib.redirect_stdout(io.StringIO()) as output, \
+                     self.assertRaisesRegex(RuntimeError, f"Judge API request failed \\({expected}\\)") as error:
+                    score("q", "gt", "a", return_details=detailed)
+                self.assertNotIn("private", str(error.exception))
+                self.assertEqual(output.getvalue(), "")
+
+    def test_nontext_responses_raise_without_becoming_rewards(self):
+        for response in (None, [], 42, b"response", {}, {"true_false": True}):
+            score = self.scorer(response)
+            for detailed in (False, True):
+                with self.subTest(response=response, detailed=detailed), \
+                     self.assertRaisesRegex(RuntimeError, "Judge returned unsupported response type"):
+                    score("q", "gt", "a", return_details=detailed)
+
+    def test_raised_api_errors_preserve_failure_instead_of_returning_false(self):
+        def fail(*args, **kwargs):
+            raise ConnectionError("connection interrupted")
+        score = self.scorer(None, engine=fail)
+        with self.assertRaisesRegex(RuntimeError, "Judge API request failed \\(ConnectionError\\)") as error:
+            score("q", "gt", "a", return_details=True)
+        self.assertIsInstance(error.exception.__cause__, ConnectionError)
+
+    def test_actual_text_parser_preserves_plain_and_markdown_verdicts(self):
+        scope = {"json": json, "re": re}
+        scope["_try_load"] = extract_function("train-roma/utils.py", "_try_load", scope)
+        parser = extract_function("train-roma/utils.py", "extract_json_from_markdown", scope)
+        for success in (True, False):
+            payload = json.dumps({"analysis": "checked", "true_false": success})
+            for response in (payload, f"```json\n{payload}\n```", "Verdict: " + payload):
+                score = self.scorer(response)
+                score.__globals__["extract_json_from_markdown"] = parser
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(score("q", "gt", "a", return_details=True),
+                                     {"valid": True, "success": success, "legacy_result": success})
+
+    def test_evaluate_wrappers_propagate_judge_failure_without_reward(self):
+        score = self.scorer({"error": "APIConnectionError"})
+        for path in ("train-roma/rollout.py", "train-roma/rollout_main_profiled.py"):
+            evaluate = extract_function(path, "evaluate", {
+                "asyncio": asyncio, "compute_score": score, "Optional": Optional})
+            evaluate = REWARD.reward(evaluate)
+            details = {}
+            with self.subTest(path=path), self.assertRaisesRegex(RuntimeError, "Judge API request failed"):
+                asyncio.run(evaluate("q", "gt", "a", trace_outcome=details))
+            self.assertEqual(details, {})
 
     def test_both_evaluate_wrappers_still_return_float_and_collect_details(self):
         def score(*args, **kwargs):

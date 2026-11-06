@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from contextlib import nullcontext
@@ -53,6 +54,11 @@ class AgentRunner(ParallelWorkerBase):
         # Worker-specific attributes
         self.worker_id = worker_id
         self.max_tasks = max_tasks
+        # Bound task RPCs even when the HTTP client's retry/request timeout is
+        # much larger. Idle polling and model execution retain their own policy.
+        self.rollout_rpc_timeout = float(os.environ.get("AGENTFLOW_ROLLOUT_RPC_TIMEOUT_S", "120"))
+        if not math.isfinite(self.rollout_rpc_timeout) or self.rollout_rpc_timeout <= 0:
+            raise ValueError("AGENTFLOW_ROLLOUT_RPC_TIMEOUT_S must be finite and positive")
 
     def _log_prefix(self, rollout_id: Optional[str] = None) -> str:
         """Generates a standardized log prefix for the current worker."""
@@ -195,7 +201,7 @@ class AgentRunner(ParallelWorkerBase):
         return num_tasks_processed
 
     async def run_async(self) -> bool:
-        """Poll the task and rollout once."""
+        """Execute one task; return whether its success/failure was acknowledged."""
         self.agent.set_runner(self)  # Ensure the agent has a reference to this runner
         logger.info("#1. poll_next_task_async")
         task = await self.client.poll_next_task_async()
@@ -205,50 +211,58 @@ class AgentRunner(ParallelWorkerBase):
         rollout_id = task.rollout_id
 
         resources_id = task.resources_id
-        resources_update = None
-        if resources_id:
-            logger.info("#2. get_resources_by_id_async")
-            resources_update = await self.client.get_resources_by_id_async(resources_id)
-        else:
-            logger.debug(f"{self._log_prefix(rollout_id)} No 'resources_id'. Fetching latest resources.")
-            resources_update = await self.client.get_latest_resources_async()
-        
-
-        if not resources_update:
-            logger.info("#3. not resources_update")
-            logger.error(f"{self._log_prefix(rollout_id)} Failed to fetch resources. Skipping.")
-            return False
-
-        rollout_obj = Rollout(rollout_id=task.rollout_id)  # Default empty rollout
-
+        phase = "resources"
         try:
-            # with self.tracer.trace_context(name=f"rollout_{rollout_id}"):
-                start_time = time.time()
-                rollout_method = (
-                    self.agent.training_rollout_async if task.mode == "train" else self.agent.validation_rollout_async
-                )
-                # Pass the task input, not the whole task object
-                result = await rollout_method(task.input, task.rollout_id, resources_update.resources)
-                # print("result in run_async:", result)
-                rollout_obj = self._to_rollout_object(result, task.rollout_id)
-                ## update resource_id
-                rollout_obj.metadata["resources_id"] = resources_id
-                # print("rollout_obj in run_async:", rollout_obj)
-                end_time = time.time()
-                logger.info(
-                    f"{self._log_prefix(rollout_id)} Completed in "
-                    f"{end_time - start_time:.2f}s. Reward: {rollout_obj.final_reward}"
-                )
-                print(f"[DEBUG] Posting rollout: {str(rollout_obj)[:200]}")
-                response = await self.client.post_rollout_async(rollout_obj)
-                print(f"[DEBUG] Post rollout response: {str(response)[:200]}")
+            if resources_id:
+                resource_request = self.client.get_resources_by_id_async(resources_id)
+            else:
+                resource_request = self.client.get_latest_resources_async()
+            resources_update = await asyncio.wait_for(resource_request, timeout=self.rollout_rpc_timeout)
+            if not resources_update:
+                raise RuntimeError("Failed to fetch rollout resources")
+            resources_id = resources_update.resources_id
+            phase = "rollout"
+            start_time = time.time()
+            rollout_method = (
+                self.agent.training_rollout_async if task.mode == "train" else self.agent.validation_rollout_async
+            )
+            result = await rollout_method(task.input, task.rollout_id, resources_update.resources)
+            rollout_obj = self._to_rollout_object(result, task.rollout_id)
+            rollout_obj.metadata["resources_id"] = resources_id
+            logger.info(
+                f"{self._log_prefix(rollout_id)} Completed in "
+                f"{time.time() - start_time:.2f}s. Reward: {rollout_obj.final_reward}"
+            )
+        except Exception as exc:
+            logger.exception(f"{self._log_prefix(rollout_id)} Exception during {phase}; reporting failed attempt.")
+            # A failed evaluation/execution is not a normal zero-reward sample.
+            # The daemon owns the retry budget and decides when training fails.
+            rollout_obj = Rollout(
+                rollout_id=rollout_id,
+                metadata={
+                    "resources_id": resources_id,
+                    "rollout_error": {
+                        "type": type(exc).__name__,
+                        "message": ("Rollout resources could not be fetched" if phase == "resources"
+                                    else "Rollout execution or evaluation failed"),
+                        "phase": phase,
+                    },
+                },
+            )
+
+        # Do not turn a lost POST acknowledgement into a second, empty rollout:
+        # the original success may already have reached the server. The client
+        # retries the same payload; the daemon's deadline covers total RPC loss.
+        try:
+            response = await asyncio.wait_for(
+                self.client.post_rollout_async(rollout_obj), timeout=self.rollout_rpc_timeout
+            )
         except Exception:
-            logger.info("#4. except Exception")
-            import traceback
-            logger.error(f"detail:{traceback.print_exc()}")
-            logger.error(f"{self._log_prefix(rollout_id)} Exception during rollout.")
+            logger.exception(f"{self._log_prefix(rollout_id)} Failed to report rollout result.")
             return False
-        logger.info("#5. return true")
+        if not isinstance(response, dict) or response.get("status") not in ("ok", "success", "received"):
+            logger.error(f"{self._log_prefix(rollout_id)} Rollout result was not acknowledged: {str(response)[:200]}")
+            return False
         return True
 
     async def iter_async(self) -> int:
